@@ -1,0 +1,59 @@
+# systemd unit for the Claude Telegram Bot.
+#
+# Install:
+#   sudo cp deploy/tg-bot.service /etc/systemd/system/claude-tg-bot.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now claude-tg-bot
+#   journalctl -u claude-tg-bot -f
+#
+# IMPORTANT: run as the SAME user that ran `claude setup-token`, so the service
+# can read the Claude subscription credentials from that user's home directory.
+# Edit User, WorkingDirectory, and the ExecStart path to match your install.
+#
+# NOTE: every path below (User, WorkingDirectory, ExecStart, ReadWritePaths,
+# the home `.claude` dir) is an EXAMPLE — edit them all to match your install.
+
+[Unit]
+Description=Claude Telegram Bot (private Telegram frontend to Claude / Claude Code)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=claude
+WorkingDirectory=/opt/claude-tg-bot
+ExecStart=/opt/claude-tg-bot/.venv/bin/python /opt/claude-tg-bot/bot.py
+
+# Reads .env from WorkingDirectory via python-dotenv.
+# Do NOT set ANTHROPIC_API_KEY here — this bot runs on the subscription.
+Environment=PYTHONUNBUFFERED=1
+# REQUIRED: systemd does not inherit your login PATH/HOME, so without these the
+# spawned `claude` CLI is not found (it lives in ~/.local/bin) and its
+# subscription credentials (~/.claude) are not located — runs then fail. Set HOME
+# to the service user's home and put ~/.local/bin on PATH. Match the user below.
+Environment=HOME=/home/claude
+Environment=PATH=/home/claude/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+Restart=always
+RestartSec=5
+
+# Hardening / sandboxing (loosen if it interferes with the claude CLI
+# credential store).
+NoNewPrivileges=true
+ProtectSystem=strict
+# CRITICAL: ProtectHome=read-only + ReadWritePaths must keep the user's
+# ~/.claude dir writable, or the claude CLI cannot read/refresh the
+# subscription credentials and the login silently breaks. ReadWritePaths must
+# ALSO include WorkingDirectory (for bot.db + the per-topic workdirs).
+# Replace /home/claude/.claude and /opt/claude-tg-bot with YOUR paths.
+ProtectHome=read-only
+ReadWritePaths=/opt/claude-tg-bot /home/claude/.claude
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+# Cap RSS at 1G. Raise this if big code-mode runs get OOM-killed.
+MemoryMax=1G
+
+[Install]
+WantedBy=multi-user.target

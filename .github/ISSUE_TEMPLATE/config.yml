@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Claude Code / Agent SDK questions
+    url: https://github.com/anthropics/claude-code
+    about: >-
+      This bot is a thin frontend over Claude Code and the Claude Agent SDK.
+      Bugs or questions about Claude Code, the Agent SDK, or Anthropic services
+      belong upstream — please report them there, not here.
