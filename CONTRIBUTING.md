@@ -6,6 +6,14 @@ add abstractions beyond what the task needs. [`AGENTS.md`](AGENTS.md) is the sin
 source of truth for how this project works; this file is the short contributor
 version of its rules.
 
+## Editing existing code
+
+When you **change or remove existing logic, don't delete it outright** — comment the
+old version out next to the new code with a short reference to the task/issue it
+changed for (e.g. `# was: <old> — replaced for #120`), so changes stay auditable and
+easy to revert. Full deletion is reserved for tasks whose explicit goal is
+removal/cleanup (e.g. a dead-code sweep). See `#110`/`#118` for the in-tree pattern.
+
 ## Language: English everywhere
 
 The repository is **English only** — it may be released publicly.

@@ -109,6 +109,8 @@ CATALOG: dict[str, dict[str, str]] = {
     "btn.prev": {"en": "◂ Prev", "ru": "◂ Назад"},
     "btn.next": {"en": "Next ▸", "ru": "Далее ▸"},
     "btn.chat": {"en": "💬 Chat", "ru": "💬 Чат"},
+    "btn.upgrade_code": {"en": "🟩 Convert to code", "ru": "🟩 Сделать кодом"},
+    "btn.downgrade_chat": {"en": "💬 Convert to chat", "ru": "💬 Сделать чатом"},
     "btn.code": {"en": "🟩 Code", "ru": "🟩 Код"},
     "btn.stop": {"en": "⏹ Stop", "ru": "⏹ Стоп"},
     # -- /sessions per-session options menu + browser actions (#95) --------- #
@@ -117,6 +119,7 @@ CATALOG: dict[str, dict[str, str]] = {
     "btn.status": {"en": "ℹ️ Status", "ru": "ℹ️ Статус"},
     "btn.rename": {"en": "✏️ Rename", "ru": "✏️ Переименовать"},
     "btn.export": {"en": "📄 Export", "ru": "📄 Экспорт"},
+    "btn.transcript": {"en": "📄 Transcript", "ru": "📄 Транскрипт"},
     "btn.export_files": {"en": "📦 Export files", "ru": "📦 Экспорт файлов"},
     "btn.favorite": {"en": "⭐ Favorite", "ru": "⭐ В избранное"},
     "btn.unfavorite": {"en": "☆ Unfavorite", "ru": "☆ Из избранного"},
@@ -256,24 +259,36 @@ CATALOG: dict[str, dict[str, str]] = {
     "settings.header": {
         "en": (
             "⚙️ <b>Settings</b>\n"
-            "Type: <b>{mode}</b> <i>(fixed at /new)</i> · "
+            "Type: <b>{mode}</b> <i>(/code · /chat to switch)</i> · "
             "Model: <code>{model}</code>\n"
-            "Permissions: <b>{perm}</b> <i>(code)</i> · Usage: <b>{usage}</b>\n"
+            "{perm_line}Usage: <b>{usage}</b>\n"
             "Memory: <b>{memory}</b>\n"
             "Language: <b>{language}</b>\n\n"
             "Tap to change."
         ),
         "ru": (
             "⚙️ <b>Настройки</b>\n"
-            "Тип: <b>{mode}</b> <i>(задан при /new)</i> · "
+            "Тип: <b>{mode}</b> <i>(/code · /chat для смены)</i> · "
             "Модель: <code>{model}</code>\n"
-            "Права: <b>{perm}</b> <i>(код)</i> · Использование: <b>{usage}</b>\n"
+            "{perm_line}Использование: <b>{usage}</b>\n"
             "Память: <b>{memory}</b>\n"
             "Язык: <b>{language}</b>\n\n"
             "Нажмите, чтобы изменить."
         ),
     },
+    "settings.perm_seg": {
+        "en": "Permissions: <b>{perm}</b> <i>(code)</i> · ",
+        "ru": "Права: <b>{perm}</b> <i>(код)</i> · ",
+    },
     "settings.row_model": {"en": "🧠 Model: {val} ▸", "ru": "🧠 Модель: {val} ▸"},
+    "settings.row_tools": {"en": "🧰 Tools ▸", "ru": "🧰 Инструменты ▸"},
+    "settings.row_effort": {"en": "⚡ Effort: {val} ▸", "ru": "⚡ Усилие: {val} ▸"},
+    "tool.scope_both": {"en": "chat + code", "ru": "чат + код"},
+    "tool.scope_code": {"en": "code", "ru": "код"},
+    "settings.row_users": {"en": "👥 Users ▸", "ru": "👥 Пользователи ▸"},
+    "settings.row_admin": {"en": "👑 Admin ▸", "ru": "👑 Админ ▸"},
+    "settings.back_to": {"en": "◂ Settings", "ru": "◂ Настройки"},
+    "settings.saved": {"en": "✓ Saved", "ru": "✓ Сохранено"},
     "settings.row_perm": {"en": "🔐 Permissions: {val} ▸", "ru": "🔐 Права: {val} ▸"},
     "settings.row_usage": {"en": "📊 Usage: {val} ▸", "ru": "📊 Использование: {val} ▸"},
     "settings.row_streaming": {"en": "Streaming: {val}", "ru": "Стриминг: {val}"},
@@ -359,12 +374,30 @@ CATALOG: dict[str, dict[str, str]] = {
 
     # -- /mode -------------------------------------------------------------- #
     "mode.show": {
-        "en": "This session is {glyph} <b>{mode}</b>. {tagline}\nIts type is "
-              "fixed when it's created — use /newchat or /newcode to start a "
-              "session of the other type, or /sessions to switch.",
-        "ru": "Эта сессия — {glyph} <b>{mode}</b>. {tagline}\nЕё тип задан при "
-              "создании — используйте /newchat или /newcode, чтобы создать сессию "
-              "другого типа, либо /sessions для переключения.",
+        "en": "This session is {glyph} <b>{mode}</b>. {tagline}",
+        "ru": "Эта сессия — {glyph} <b>{mode}</b>. {tagline}",
+    },
+    "mode.hint_upgrade": {
+        "en": "Need a terminal or files? Upgrade with /code — the conversation carries over.",
+        "ru": "Нужен терминал или файлы? Повысьте до /code — диалог сохранится.",
+    },
+    "mode.hint_downgrade": {
+        "en": "Back to a plain chat with /chat — workdir files are kept.",
+        "ru": "Вернуться к обычному чату — /chat — файлы рабочей папки сохранятся.",
+    },
+    "mode.upgraded": {
+        "en": "{glyph} <b>Upgraded to a code session.</b>{defer}\n{tagline}",
+        "ru": "{glyph} <b>Повышено до код-сессии.</b>{defer}\n{tagline}",
+    },
+    "mode.downgraded": {
+        "en": "{glyph} <b>Back to a chat session</b> — your files are kept.{defer}\n{tagline}",
+        "ru": "{glyph} <b>Снова чат-сессия</b> — файлы сохранены.{defer}\n{tagline}",
+    },
+    "mode.already": {"en": "Already a <b>{mode}</b> session.", "ru": "Уже <b>{mode}</b>-сессия."},
+    "mode.switched_toast": {"en": "Now a {mode} session.", "ru": "Теперь {mode}-сессия."},
+    "session.upgrade_hint": {
+        "en": "💡 This is a chat. Need to run code or edit files? Upgrade with /code.",
+        "ru": "💡 Это чат. Нужно запускать код или править файлы? Повысьте через /code.",
     },
 
     # -- /model ------------------------------------------------------------- #
@@ -534,16 +567,16 @@ CATALOG: dict[str, dict[str, str]] = {
 
     # -- /memory ------------------------------------------------------------ #
     "memory.show": {
-        "en": "Big memory: <b>{current}</b>.\nWhen <b>on</b>, this chat session "
-              "uses the <b>1M-token</b> context window — good for long, important "
-              "conversations. When <b>off</b>, it uses the standard window. Either "
-              "way your conversation already persists across restarts. Toggle with "
+        "en": "Big memory: <b>{current}</b>.\nWhen <b>on</b>, this session requests "
+              "the <b>1M-token</b> context window (chat or code). ⚠️ That beta is "
+              "currently ignored under the Pro/Max subscription, so it's a no-op for "
+              "now. Your conversation persists across restarts either way. Toggle with "
               "<code>/memory on</code> / <code>/memory off</code>.",
-        "ru": "Большая память: <b>{current}</b>.\nКогда <b>вкл</b>, эта чат-сессия "
-              "использует окно контекста на <b>1M токенов</b> — хорошо для долгих "
-              "важных разговоров. Когда <b>выкл</b>, используется стандартное окно. "
-              "В любом случае ваш разговор сохраняется между перезапусками. "
-              "Переключение: <code>/memory on</code> / <code>/memory off</code>.",
+        "ru": "Большая память: <b>{current}</b>.\nКогда <b>вкл</b>, эта сессия "
+              "запрашивает окно контекста на <b>1M токенов</b> (чат или код). ⚠️ Эта "
+              "бета сейчас игнорируется на подписке Pro/Max, так что пока ни на что не "
+              "влияет. Разговор и так сохраняется между перезапусками. Переключение: "
+              "<code>/memory on</code> / <code>/memory off</code>.",
     },
     "memory.usage": {
         "en": "Usage: <code>/memory on</code> or <code>/memory off</code>.",
@@ -802,16 +835,20 @@ CATALOG: dict[str, dict[str, str]] = {
         "ru": "Нет записи в списке доступа для <code>{val}</code>.",
     },
     "limit.prompt": {
-        "en": "Send: <code>&lt;id|@user&gt; &lt;tokens&gt;</code> (or <code>off</code>; /cancel).",
-        "ru": "Отправьте: <code>&lt;id|@user&gt; &lt;токены&gt;</code> (или <code>off</code>; /cancel).",
+        "en": "Send: <code>&lt;id|@user&gt; &lt;tokens&gt; [day|week]</code> (or <code>off</code>; /cancel).",
+        "ru": "Отправьте: <code>&lt;id|@user&gt; &lt;токены&gt; [day|week]</code> (или <code>off</code>; /cancel).",
     },
     "limit.usage": {
-        "en": "Usage: <code>/limit &lt;id|@user&gt; &lt;tokens&gt;|off</code>.",
-        "ru": "Использование: <code>/limit &lt;id|@user&gt; &lt;токены&gt;|off</code>.",
+        "en": "Usage: <code>/limit &lt;id|@user&gt; &lt;tokens&gt; [day|week] | off</code> (default: day).",
+        "ru": "Использование: <code>/limit &lt;id|@user&gt; &lt;токены&gt; [day|week] | off</code> (по умолчанию: day).",
     },
     "limit.set": {
-        "en": "✅ Added <b>{n}</b> tokens to <code>{val}</code>'s grant.",
-        "ru": "✅ Добавлено <b>{n}</b> токенов к лимиту <code>{val}</code>.",
+        "en": "✅ <code>{val}</code> — <b>{window}</b> cap set to <b>{n}</b> tokens.",
+        "ru": "✅ <code>{val}</code> — лимит на <b>{window}</b>: <b>{n}</b> токенов.",
+    },
+    "limit.cleared": {
+        "en": "✅ Rate limits cleared for <code>{val}</code>.",
+        "ru": "✅ Лимиты сняты для <code>{val}</code>.",
     },
     "limit.unlimited": {
         "en": "✅ <code>{val}</code> is now unlimited.",
@@ -841,12 +878,12 @@ CATALOG: dict[str, dict[str, str]] = {
         "ru": "<i>(других пользователей нет)</i>",
     },
     "users.entry": {
-        "en": "• <code>{id}</code>{uname} — <b>{level}</b> · exp: {expiry} · tok: {quota}",
-        "ru": "• <code>{id}</code>{uname} — <b>{level}</b> · истекает: {expiry} · ток: {quota}",
+        "en": "• <code>{id}</code>{uname} — <b>{level}</b> · exp: {expiry} · caps: {quota}",
+        "ru": "• <code>{id}</code>{uname} — <b>{level}</b> · истекает: {expiry} · лимиты: {quota}",
     },
     "users.pending": {
-        "en": "• @{name} — <b>{level}</b> · exp: {expiry} · tok: {quota} <i>(unpinned)</i>",
-        "ru": "• @{name} — <b>{level}</b> · истекает: {expiry} · ток: {quota} <i>(не привязан)</i>",
+        "en": "• @{name} — <b>{level}</b> · exp: {expiry} · caps: {quota} <i>(unpinned)</i>",
+        "ru": "• @{name} — <b>{level}</b> · истекает: {expiry} · лимиты: {quota} <i>(не привязан)</i>",
     },
     "users.never": {"en": "never", "ru": "никогда"},
     "users.unlimited": {"en": "∞", "ru": "∞"},
@@ -858,6 +895,103 @@ CATALOG: dict[str, dict[str, str]] = {
         "en": "🔒 Token quota reached (<b>{used}/{grant}</b>). Ask the owner to top up with /limit.",
         "ru": "🔒 Лимит токенов исчерпан (<b>{used}/{grant}</b>). Попросите владельца пополнить через /limit.",
     },
+
+    # -- #120 rolling rate limits + per-user effort/permissions gates ------- #
+    "access.rate_day_exceeded": {
+        "en": "🔒 Daily token limit reached (<b>{used}/{cap}</b>). It frees up as your last 24h of usage ages out.",
+        "ru": "🔒 Дневной лимит токенов исчерпан (<b>{used}/{cap}</b>). Освободится по мере устаревания последних 24 часов.",
+    },
+    "access.rate_week_exceeded": {
+        "en": "🔒 Weekly token limit reached (<b>{used}/{cap}</b>). It frees up as your last 7 days age out.",
+        "ru": "🔒 Недельный лимит токенов исчерпан (<b>{used}/{cap}</b>). Освободится по мере устаревания последних 7 дней.",
+    },
+    "effort.max_denied": {
+        "en": "🔒 The <b>max</b> effort level is restricted (it's costly on the shared subscription). Ask the owner to grant it.",
+        "ru": "🔒 Уровень <b>max</b> ограничен (дорого расходует общую подписку). Попросите владельца разрешить его.",
+    },
+    "perm.chat_na": {
+        "en": "Permissions apply to <b>code</b> sessions only — chat's web tools are read-only and auto-approved, so there's nothing to gate here.",
+        "ru": "Права применяются только к <b>код</b>-сессиям — веб-инструменты чата только для чтения и одобряются автоматически, гейтить нечего.",
+    },
+
+    # -- /users list buttons + the per-user management card (#120) ---------- #
+    "users.tap_hint": {
+        "en": "<i>Tap a user to manage memory, limits, effort, tools, expiry, and see usage.</i>",
+        "ru": "<i>Нажмите на пользователя: память, лимиты, effort, инструменты, срок доступа и статистика.</i>",
+    },
+    "users.entry_usage": {
+        "en": "   ↳ used: day {day} · week {week} · total {total}",
+        "ru": "   ↳ расход: день {day} · неделя {week} · всего {total}",
+    },
+    "users.btn_owner": {"en": "👑 You (owner)", "ru": "👑 Вы (владелец)"},
+    "users.btn_add": {"en": "➕ Add user", "ru": "➕ Добавить"},
+    "users.btn_entry": {"en": "{who} · {level}", "ru": "{who} · {level}"},
+    "users.btn_pending": {"en": "@{name} · {level} (unpinned)", "ru": "@{name} · {level} (не привязан)"},
+    "usercard.title": {
+        "en": "<b>User</b> <code>{who}</code> {kind}",
+        "ru": "<b>Пользователь</b> <code>{who}</code> {kind}",
+    },
+    "usercard.kind_owner": {"en": "(owner)", "ru": "(владелец)"},
+    "usercard.kind_pending": {"en": "(unpinned)", "ru": "(не привязан)"},
+    "usercard.level": {"en": "Level: <b>{level}</b>", "ru": "Уровень: <b>{level}</b>"},
+    "usercard.expiry": {"en": "Access expires: <b>{expiry}</b>", "ru": "Доступ истекает: <b>{expiry}</b>"},
+    "usercard.rate": {
+        "en": "Limits: day <b>{day}</b> · week <b>{week}</b>",
+        "ru": "Лимиты: день <b>{day}</b> · неделя <b>{week}</b>",
+    },
+    "usercard.memory": {"en": "Global memory: <b>{state}</b>", "ru": "Глобальная память: <b>{state}</b>"},
+    "usercard.maxeffort": {"en": "Max effort allowed: <b>{state}</b>", "ru": "Разрешён max effort: <b>{state}</b>"},
+    "usercard.tools": {"en": "Tools allowed: <b>{tools}</b>", "ru": "Разрешено инструментов: <b>{tools}</b>"},
+    "usercard.cap_all": {"en": "all", "ru": "все"},
+    "usercard.usage": {
+        "en": "Used: day <b>{day}</b> · week <b>{week}</b> · total <b>{total}</b> ({reqs} req)",
+        "ru": "Израсходовано: день <b>{day}</b> · неделя <b>{week}</b> · всего <b>{total}</b> ({reqs} зап.)",
+    },
+    "usercard.memory_warn": {
+        "en": "<i>⚠️ Global memory loads your ~/.claude for this user — not just CLAUDE.md/memory but your <b>settings</b> (permission allow-rules + env). Grant only to fully-trusted users, and keep secrets / allow-rules out of ~/.claude/settings.json.</i>",
+        "ru": "<i>⚠️ Глобальная память загружает ваш ~/.claude для этого пользователя — не только CLAUDE.md/память, но и <b>настройки</b> (правила авто-allow + env). Выдавайте только полностью доверенным и не держите секреты / allow-правила в ~/.claude/settings.json.</i>",
+    },
+    "usercard.owner_note": {
+        "en": "<i>The owner is always code, never expires, is uncapped, and may use max effort.</i>",
+        "ru": "<i>Владелец всегда code, не истекает, без лимитов и может использовать max effort.</i>",
+    },
+    "usercard.not_found": {"en": "User not found.", "ru": "Пользователь не найден."},
+    "usercard.btn_level": {"en": "Level: {level} → {next}", "ru": "Уровень: {level} → {next}"},
+    "usercard.btn_memory": {"en": "🧠 Memory: {state}", "ru": "🧠 Память: {state}"},
+    "usercard.btn_maxeffort": {"en": "⚡ Max effort: {state}", "ru": "⚡ Max effort: {state}"},
+    "usercard.btn_tools": {"en": "🧰 Tools: {val}", "ru": "🧰 Инструменты: {val}"},
+    "usercard.btn_expiry": {"en": "⏳ Set expiry…", "ru": "⏳ Срок доступа…"},
+    "usercard.btn_day": {"en": "📊 Day limit…", "ru": "📊 Лимит/день…"},
+    "usercard.btn_week": {"en": "📅 Week limit…", "ru": "📅 Лимит/неделя…"},
+    "usercard.btn_clear_limits": {"en": "♾ Clear limits", "ru": "♾ Снять лимиты"},
+    "usercard.btn_remove": {"en": "🗑 Remove access", "ru": "🗑 Убрать доступ"},
+    "usercard.btn_back": {"en": "◂ Users", "ru": "◂ Пользователи"},
+    "usercard.tools_header": {
+        "en": "🧰 <b>Tools for</b> <code>{who}</code>\nTap to allow / deny each. Applies to all their sessions.",
+        "ru": "🧰 <b>Инструменты для</b> <code>{who}</code>\nНажмите, чтобы разрешить / запретить. Действует на все их сессии.",
+    },
+    "usercard.btn_confirm_remove": {"en": "🗑 Yes, remove", "ru": "🗑 Да, убрать"},
+    "usercard.confirm_remove": {
+        "en": "Remove access for <code>{who}</code>?",
+        "ru": "Убрать доступ для <code>{who}</code>?",
+    },
+    "usercard.prompt_expiry": {
+        "en": "Send an expiry date <code>YYYY-MM-DD</code> (or <code>never</code>; /cancel).",
+        "ru": "Отправьте дату окончания <code>ГГГГ-ММ-ДД</code> (или <code>never</code>; /cancel).",
+    },
+    "usercard.prompt_day": {
+        "en": "Send the DAILY token cap (e.g. <code>500k</code>, or <code>off</code>; /cancel).",
+        "ru": "Отправьте ДНЕВНОЙ лимит токенов (напр. <code>500k</code>, или <code>off</code>; /cancel).",
+    },
+    "usercard.prompt_week": {
+        "en": "Send the WEEKLY token cap (e.g. <code>2m</code>, or <code>off</code>; /cancel).",
+        "ru": "Отправьте НЕДЕЛЬНЫЙ лимит токенов (напр. <code>2m</code>, или <code>off</code>; /cancel).",
+    },
+    "whoami.usage": {
+        "en": "Usage — day <b>{day}</b> · week <b>{week}</b> · total <b>{total}</b>",
+        "ru": "Расход — день <b>{day}</b> · неделя <b>{week}</b> · всего <b>{total}</b>",
+    },
+    "whoami.caps": {"en": "Limits: <b>{caps}</b>", "ru": "Лимиты: <b>{caps}</b>"},
 
     # -- /status ------------------------------------------------------------ #
     "status.header": {
@@ -1194,6 +1328,9 @@ CATALOG: dict[str, dict[str, str]] = {
     "usage.label.overage": {"en": "overage", "ru": "перерасход"},
 
     # -- command-menu descriptions (setMyCommands) -------------------------- #
+    "cmd.new": {"en": "➕ New chat session", "ru": "➕ Новая сессия (чат)"},
+    "cmd.code": {"en": "🟩 Upgrade this session to code", "ru": "🟩 Повысить сессию до кода"},
+    "cmd.chat": {"en": "💬 Downgrade this session to chat", "ru": "💬 Понизить сессию до чата"},
     "cmd.newchat": {"en": "💬 New chat session", "ru": "💬 Новая чат-сессия"},
     "cmd.newcode": {"en": "🟩 New code session", "ru": "🟩 Новая код-сессия"},
     "cmd.sessions": {
@@ -1204,7 +1341,8 @@ CATALOG: dict[str, dict[str, str]] = {
     "cmd.status": {"en": "Current session info", "ru": "Сведения о текущей сессии"},
     "cmd.stop": {"en": "Stop the current reply", "ru": "Остановить текущий ответ"},
     "cmd.retry": {"en": "Re-run the last prompt", "ru": "Повторить последний запрос"},
-    "cmd.reset": {"en": "Clear the session context", "ru": "Очистить контекст сессии"},
+    "cmd.clear": {"en": "Clear the session context", "ru": "Очистить контекст сессии"},
+    "cmd.reset": {"en": "Clear the session context (alias of /clear)", "ru": "Очистить контекст (синоним /clear)"},
     "cmd.model": {
         "en": "Switch model: opus | sonnet | haiku",
         "ru": "Сменить модель: opus | sonnet | haiku",
@@ -1239,6 +1377,7 @@ CATALOG: dict[str, dict[str, str]] = {
     "cmd.clearqueue": {"en": "Clear the pending queue", "ru": "Очистить очередь"},
     "cmd.stream": {"en": "Live streaming: on | off", "ru": "Живой стриминг: on | off"},
     "cmd.settings": {"en": "Open the settings menu", "ru": "Открыть меню настроек"},
+    "cmd.tools": {"en": "Configure this session's tools", "ru": "Настроить инструменты сессии"},
     "cmd.language": {"en": "Choose the interface language", "ru": "Выбрать язык интерфейса"},
     "cmd.help": {"en": "Show help", "ru": "Показать справку"},
     "cmd.whoami": {"en": "Show your id and username", "ru": "Показать ваш id и username"},
