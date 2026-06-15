@@ -60,7 +60,7 @@ def test_every_row_renders_in_every_locale():
 def test_lang_placeholder_does_not_collide_with_param():
     # A catalog placeholder supplied via kwargs must not clash with t()'s own
     # positional-only `lang` parameter (regression: settings.header used {lang}).
-    out = i18n.t("settings.header", "ru", mode="код", model="opus", perm="ask",
+    out = i18n.t("settings.header", "ru", mode="код", model="opus", perm_line="",
                  usage="footer", stream="вкл", memory="выкл", drafts="вкл",
                  language="Русский")
     assert "Русский" in out

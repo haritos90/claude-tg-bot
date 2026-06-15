@@ -22,6 +22,7 @@ import base64
 import contextlib
 import io
 import shutil
+import time
 import zipfile
 from pathlib import Path
 from datetime import datetime
@@ -39,6 +40,7 @@ from aiogram.types import (
 )
 
 import db
+import engine
 import i18n
 import markup
 import usage
@@ -111,16 +113,19 @@ PERM_MODE_TO_NAME: dict[str, str] = {v: k for k, v in PERM_NAME_TO_MODE.items()}
 # localized (the "cmd.<name>" l10n rows); owner-only admin commands live in
 # _OWNER_COMMAND_NAMES and are shown only to the owner (chat scope).
 _COMMAND_NAMES: list[str] = [
-    # — create / switch sessions (the things you do most) —
-    "newchat", "newcode", "sessions", "rename",
-    # — run control —
-    "status", "stop", "retry", "reset",
-    # — tuning —
-    "model", "effort", "fork", "memory", "permissions", "files", "export", "maxturns",
-    # — info / queue —
-    "recap", "history", "usage", "context", "queue", "clearqueue",
+    # — most used: create / switch / CONFIGURE. /settings is the hub for all tuning
+    #   (model, tools, permissions, memory, usage, language, users…), so the pure
+    #   config commands are dropped from this menu — still typeable, just not in the
+    #   way (owner request 2026-06-15: navigate from /settings, not a wall of cmds). —
+    "new", "sessions", "settings", "rename",
+    # — run control + type switch (#133: /code upgrades, /chat downgrades) —
+    "status", "code", "chat", "clear",
+    # — session content / files —
+    "recap", "history", "files", "export",
+    # — advanced run options —
+    "fork", "maxturns", "context", "queue", "clearqueue", "retry",
     # — meta —
-    "settings", "language", "help", "whoami",
+    "help", "whoami",
 ]
 
 # Owner-only admin commands, appended after the shared list in the owner's
@@ -130,7 +135,7 @@ _OWNER_COMMAND_NAMES: list[str] = ["auto", "allow", "deny", "users", "level", "e
 # Code-mode-only commands — omitted from a chat-level user's command menu (#102) so
 # they don't see commands they can't use. (Enforcement is in the handlers; this
 # only declutters the menu. The owner's chat scope still shows everything.)
-_CODE_COMMAND_NAMES: list[str] = ["newcode", "files", "export", "permissions", "maxturns"]
+_CODE_COMMAND_NAMES: list[str] = ["code", "files", "export", "permissions", "maxturns"]
 
 
 def _chat_command_names() -> list[str]:
@@ -310,6 +315,14 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         """True iff the message comes from the configured owner."""
         return bool(message.from_user) and message.from_user.id == settings.owner_id
 
+    def _may_max_effort(uid: int | None, uname: str | None) -> bool:
+        """Whether this user may select the (expensive) `max` reasoning effort — the
+        owner, or a user explicitly granted it. Guests are blocked so they can't burn
+        the owner's one shared subscription via max thinking (#120 / effort gate)."""
+        if uid is not None and uid == settings.owner_id:
+            return True
+        return bool(allowlist.allow_max_effort_of(uid, uname))
+
     def _lang(obj) -> str:
         """Resolve the acting user's interface locale (Message or CallbackQuery).
 
@@ -377,6 +390,8 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             ),
             "usage": getattr(sessions, "usage_mode", "footer"),
             "memory": bool(state.big_memory if state else False),
+            "tools": state.tools_enabled if state else None,
+            "effort": (state.effort if state and state.effort else "default"),
         }
 
     async def _settings_apply(
@@ -395,12 +410,38 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 await db.set_big_memory(key, not bool(cur and cur.big_memory))
                 await _rebuild_session(key)
             return "main"
+        if verb == "tool" and args:
+            # Toggle one tool in this session's enabled set (#129). The universe is
+            # the session mode's tool list; None stored = "the whole universe on".
+            name = args[0]
+            cur = await db.get_thread(key)
+            mode = cur.mode if cur else "chat"
+            universe = engine.CODE_TOOLS if mode == "code" else engine.CHAT_TOOLS
+            if name in universe:
+                base = cur.tools_enabled if (cur and cur.tools_enabled is not None) else list(universe)
+                enabled = {t for t in base if t in universe}
+                enabled.discard(name) if name in enabled else enabled.add(name)
+                ordered = [t for t in universe if t in enabled]
+                # Store None when the full universe is enabled, so a tool added to a
+                # mode later defaults ON; [] is a deliberately tool-free session.
+                await db.set_tools_enabled(key, None if set(ordered) == set(universe) else ordered)
+                await _rebuild_session(key)
+            return "tools"
         if verb == "set" and len(args) >= 2:
             cat, val = args[0], args[1]
             if cat == "model":
                 await db.set_model(key, MODEL_ALIASES.get(val, val))
                 await _rebuild_session(key)
+            elif cat == "effort":
+                if val == "max" and not (uid == settings.owner_id
+                                         or allowlist.allow_max_effort_of(uid, None)):
+                    return "effort"  # max effort is gated (#123) — ignore the tap
+                await db.set_effort(key, None if val in ("default", "none") else val)
+                await _rebuild_session(key)
             elif cat == "perm":
+                cur = await db.get_thread(key)
+                if cur is not None and cur.mode != "code":
+                    return "main"  # permissions are inert in chat (tool-free)
                 if val == "full-access" and not is_owner:
                     return "perm"  # owner-only; ignore the tap
                 await db.set_permission_mode(key, PERM_NAME_TO_MODE.get(val, "default"))
@@ -409,6 +450,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 if not is_owner:
                     return "main"  # global display — owner-only
                 await sessions.set_usage_mode(val)
+                return "admin"  # collapse back to the Admin submenu, choice applied
             elif cat == "lang":
                 if val in i18n.LANGUAGES:
                     await db.set_user_lang(uid, val)
@@ -419,6 +461,22 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 return "main"
             return cat
         return "main"
+
+    @router.message(Command("tools"))
+    async def cmd_tools(message: Message) -> None:
+        """Open the per-session Tools page — toggle each tool on/off (#129). Chat
+        shows the web research tools; code shows the full agent toolset."""
+        await _ensure_state(message)
+        key = await _session_key(message)
+        lang = _lang(message)
+        vals = await _gather_vals(key, lang)
+        try:
+            await bot.send_message(
+                message.chat.id, _settings_text(vals, lang), parse_mode="HTML",
+                reply_markup=_settings_keyboard("tools", vals, _is_owner(message), lang),
+            )
+        except Exception as exc:
+            await reply(message, i18n.t("settings.open_error", lang, err=markup.escape_html(str(exc))))
 
     @router.message(Command("settings"))
     async def cmd_settings(message: Message) -> None:
@@ -467,6 +525,21 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 return
             if verb == "nav":
                 page = parts[2] if len(parts) > 2 else "main"
+                if page == "users":
+                    # Admin hub: render the per-user list IN this settings message —
+                    # its usr:* buttons take over, and "◂ Settings" (st:nav:main)
+                    # returns here. Owner-only; a guest tap falls back to main.
+                    if is_owner:
+                        snap = allowlist.snapshot()
+                        with contextlib.suppress(Exception):
+                            await msg.edit_text(
+                                "\n".join(await _users_text(snap, lang)), parse_mode="HTML",
+                                reply_markup=_users_keyboard(snap, lang))
+                        await cb.answer()
+                        return
+                    page = "main"
+                if page == "admin" and not is_owner:
+                    page = "main"  # Admin submenu is owner-only
             else:
                 page = await _settings_apply(
                     key, verb, parts[2:], is_owner, cb.from_user.id
@@ -480,7 +553,9 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                     parse_mode="HTML",
                     reply_markup=_settings_keyboard(page, vals, is_owner, lang),
                 )
-            await cb.answer()
+            # Confirm a "set" choice with a small toast so the tap is acknowledged
+            # (owner request — selecting e.g. a usage mode now visibly confirms).
+            await cb.answer(i18n.t("settings.saved", lang) if verb == "set" else None)
         except Exception:
             with contextlib.suppress(Exception):
                 await cb.answer(i18n.t("common.error", _lang(cb)))
@@ -613,24 +688,32 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         )
 
     async def _do_new(message: Message, arg: str) -> None:
-        # A session's type (chat/code) is FIXED at creation — a session is one or
-        # the other for its whole life (no /mode switching). In a DM we create a
-        # bot-managed session; in the (frozen) supergroup we create a forum topic.
+        # #133: every session is BORN a chat; the type is no longer fixed (/code and
+        # /chat switch it later). An explicit "code" request (or /newcode) creates the
+        # chat then upgrades it — only if the user has code access (#102). In the
+        # (frozen) supergroup we still create a forum topic.
         lang = _lang(message)
         mode, name = _parse_new(arg)
-        # #102: a chat-level user may not create a code session (owner is always
-        # code, so level_of() returns "code" for them and this never fires).
-        if mode == "code":
-            uid = message.from_user.id if message.from_user else 0
-            uname = message.from_user.username if message.from_user else None
-            if allowlist.level_of(uid, uname) != "code":
-                await reply(message, i18n.t("access.code_denied", lang))
-                return
+        uid = message.from_user.id if message.from_user else 0
+        uname = message.from_user.username if message.from_user else None
+        can_code = (uid == settings.owner_id) or (allowlist.level_of(uid, uname) == "code")
+        want_code = (mode == "code")
+        if want_code and not can_code:
+            await reply(message, i18n.t("access.code_denied", lang))
+            return
         if not name:
-            name = _default_session_name(mode, lang)
+            name = _default_session_name("code" if want_code else "chat", lang)
         if message.chat.type == "private":
-            await _new_dm_session(message.chat.id, mode, name)
-            await reply(message, _created_text(mode, name, lang))
+            key = await _new_dm_session(message.chat.id, "chat", name)
+            if want_code:
+                await db.switch_mode(key, "code")
+                await _rebuild_session(key)
+            final = "code" if want_code else "chat"
+            txt = _created_text(final, name, lang)
+            # On a fresh CHAT, tell code-capable users they can upgrade (#133 / req).
+            if final == "chat" and can_code:
+                txt += "\n" + i18n.t("session.upgrade_hint", lang)
+            await reply(message, txt)
             return
         try:
             topic = await bot.create_forum_topic(chat_id=message.chat.id, name=name)
@@ -703,6 +786,8 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             await _do_expire(message, text)
         elif action == "limit":
             await _do_limit(message, text)
+        elif action.startswith(("usrexp:", "usrrday:", "usrrweek:")):
+            await _apply_user_value(message, action, text)
         elif action == "sessearch":
             await _open_sessions(message, keyword=text)
 
@@ -866,14 +951,26 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         ])
         fav = bool(st.favorite)
         B = InlineKeyboardButton
-        rows = [
-            [B(text=i18n.t("btn.switch", lang), callback_data=f"ses:sw:{key}")],
+        # Upgrade chat→code (only if the session OWNER has code access) / downgrade
+        # code→chat (#133). The owner of a DM session is its creator.
+        owner_uid = st.created_by or st.chat_id
+        can_code = (owner_uid == settings.owner_id) or (allowlist.level_of(owner_uid, None) == "code")
+        rows = [[B(text=i18n.t("btn.switch", lang), callback_data=f"ses:sw:{key}")]]
+        if st.mode == "chat" and can_code:
+            rows.append([B(text=i18n.t("btn.upgrade_code", lang), callback_data=f"ses:up:{key}")])
+        elif st.mode == "code":
+            rows.append([B(text=i18n.t("btn.downgrade_chat", lang), callback_data=f"ses:down:{key}")])
+        rows += [
             [B(text=i18n.t("btn.recap", lang), callback_data=f"ses:recap:{key}"),
              B(text=i18n.t("btn.status", lang), callback_data=f"ses:status:{key}")],
             [B(text=i18n.t("btn.rename", lang), callback_data=f"ses:rename:{key}"),
              B(text=i18n.t("btn.unfavorite" if fav else "btn.favorite", lang),
                callback_data=f"ses:fav:{key}")],
         ]
+        # Transcript export right in the menu (owner request — don't hide it in the
+        # /history command); works for chat + code. Code sessions also get the
+        # working-dir zip below.
+        rows.append([B(text=i18n.t("btn.transcript", lang), callback_data=f"ses:hist:{key}")])
         if st.mode == "code":
             rows.append([B(text=i18n.t("btn.export_files", lang), callback_data=f"ses:exfiles:{key}")])
         rows.append([B(text=i18n.t("btn.delete", lang), callback_data=f"ses:del:{key}")])
@@ -964,6 +1061,25 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                     with contextlib.suppress(Exception):
                         await msg.edit_text(text, parse_mode="HTML", reply_markup=kb)
                 await cb.answer()
+                return
+            if verb in ("up", "down") and len(parts) > 2 and is_dm:
+                # Upgrade / downgrade the session type (#133), then re-render the menu.
+                key = int(parts[2])
+                if await _owned_session(key, cb.from_user.id) is None:
+                    await cb.answer()
+                    return
+                new_mode = "code" if verb == "up" else "chat"
+                _, ok = await _switch_session_mode(
+                    key, cb.from_user.id, cb.from_user.username, new_mode, lang)
+                if not ok:
+                    await cb.answer(i18n.t("access.code_denied", lang), show_alert=True)
+                    return
+                opts = await _session_options(key, lang)
+                if opts is not None:
+                    text, kb = opts
+                    with contextlib.suppress(Exception):
+                        await msg.edit_text(text, parse_mode="HTML", reply_markup=kb)
+                await cb.answer(i18n.t("mode.switched_toast", lang, mode=i18n.mode_word(new_mode, lang)))
                 return
             if verb == "recap" and len(parts) > 2 and is_dm:
                 key = int(parts[2])
@@ -1183,31 +1299,11 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
 
     @router.message(Command("new"))
     async def cmd_new(message: Message) -> None:
-        """Generic create. With an arg, behaves like /new chat|code <name>; with no
-        arg, offers a tap-to-pick chooser so the session TYPE is always explicit
-        (the type can't be changed later)."""
+        """Create a new session — born as a 💬 chat (#133); upgrade to code with /code
+        (or /newcode) when you need a terminal/files. Optional name: /new my project.
+        (No more chat/code chooser — every session starts as chat and is promotable.)"""
         await _ensure_state(message)
-        arg = _command_arg(message)
-        if arg:
-            await _do_new(message, arg)
-            return
-        if message.chat.type != "private":
-            # Frozen supergroup path: a topic has no chat/code split here.
-            await _do_new(message, "")
-            return
-        lang = _lang(message)
-        kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text=i18n.t("btn.chat", lang), callback_data="new:chat"),
-            InlineKeyboardButton(text=i18n.t("btn.code", lang), callback_data="new:code"),
-        ]])
-        await bot.send_message(
-            message.chat.id,
-            i18n.t("session.new_pick", lang,
-                   tagline_chat=mode_tagline("chat", lang=lang),
-                   tagline_code=mode_tagline("code", lang=lang)),
-            parse_mode="HTML",
-            reply_markup=kb,
-        )
+        await _do_new(message, _command_arg(message))
 
     @router.callback_query(F.data.startswith("new:"))
     async def on_new_cb(cb: CallbackQuery) -> None:
@@ -1270,6 +1366,11 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 return
             key = await _callback_key(cb)
             lang = _lang(cb)
+            uid = cb.from_user.id if cb.from_user else 0
+            uname = cb.from_user.username if cb.from_user else None
+            if level == "max" and not _may_max_effort(uid, uname):
+                await cb.answer(i18n.t("effort.max_denied", lang), show_alert=True)
+                return
             if level == "default":
                 await db.set_effort(key, None)
                 deferred = await _rebuild_session(key)
@@ -1290,19 +1391,64 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             with contextlib.suppress(Exception):
                 await cb.answer(i18n.t("common.error", _lang(cb)))
 
+    async def _switch_session_mode(key: int, uid: int, uname, new_mode: str, lang: str):
+        """Switch a session to new_mode (#133), carrying its conversation. Gates an
+        upgrade to code by access level; the workdir files persist either way.
+        Returns (reply_text, ok)."""
+        st = await db.get_thread(key)
+        if st is None:
+            return i18n.t("common.error", lang), False
+        if st.mode == new_mode:
+            return i18n.t("mode.already", lang, mode=i18n.mode_word(new_mode, lang)), False
+        if new_mode == "code" and not (uid == settings.owner_id
+                                       or allowlist.level_of(uid, uname) == "code"):
+            return i18n.t("access.code_denied", lang), False
+        await db.switch_mode(key, new_mode)
+        deferred = await _rebuild_session(key)
+        defer = i18n.t("common.defer_note", lang) if deferred else ""
+        msg_key = "mode.upgraded" if new_mode == "code" else "mode.downgraded"
+        return i18n.t(msg_key, lang, glyph=mode_glyph(new_mode),
+                      tagline=mode_tagline(new_mode, lang=lang), defer=defer), True
+
+    @router.message(Command("code"))
+    async def cmd_code(message: Message) -> None:
+        """Upgrade the current session to a 🟩 code session (#133) — needs code access.
+        Keeps the conversation; the session gets a working dir + the full toolset."""
+        await _ensure_state(message)
+        key = await _session_key(message)
+        uid = message.from_user.id if message.from_user else 0
+        uname = message.from_user.username if message.from_user else None
+        text, _ = await _switch_session_mode(key, uid, uname, "code", _lang(message))
+        await reply(message, text)
+
+    @router.message(Command("chat"))
+    async def cmd_chat(message: Message) -> None:
+        """Downgrade the current session back to 💬 chat (#133) — keeps the conversation
+        AND the workdir files (just no code tools until you /code again)."""
+        await _ensure_state(message)
+        key = await _session_key(message)
+        uid = message.from_user.id if message.from_user else 0
+        uname = message.from_user.username if message.from_user else None
+        text, _ = await _switch_session_mode(key, uid, uname, "chat", _lang(message))
+        await reply(message, text)
+
     @router.message(Command("mode"))
     async def cmd_mode(message: Message) -> None:
-        """Show this session's type. The type (chat/code) is FIXED at creation —
-        a session can't be switched between chat and code (that would mix two
-        kinds of state). Open another session or create one with /new."""
+        """Show this session's type and how to switch it (#133): /code upgrades to a
+        code session, /chat downgrades back (workdir files are kept either way)."""
         state = await _ensure_state(message)
         lang = _lang(message)
-        await reply(
-            message,
-            i18n.t("mode.show", lang, glyph=mode_glyph(state.mode),
-                   mode=i18n.mode_word(state.mode, lang),
-                   tagline=mode_tagline(state.mode, lang=lang)),
-        )
+        uid = message.from_user.id if message.from_user else 0
+        uname = message.from_user.username if message.from_user else None
+        can_code = (uid == settings.owner_id) or (allowlist.level_of(uid, uname) == "code")
+        lines = [i18n.t("mode.show", lang, glyph=mode_glyph(state.mode),
+                        mode=i18n.mode_word(state.mode, lang),
+                        tagline=mode_tagline(state.mode, lang=lang))]
+        if state.mode == "chat" and can_code:
+            lines.append(i18n.t("mode.hint_upgrade", lang))
+        elif state.mode == "code":
+            lines.append(i18n.t("mode.hint_downgrade", lang))
+        await reply(message, "\n".join(lines))
 
     @router.message(Command("model"))
     async def cmd_model(message: Message) -> None:
@@ -1347,11 +1493,15 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         state = await _ensure_state(message)
         key = await _session_key(message)
         lang = _lang(message)
+        uid = message.from_user.id if message.from_user else 0
+        uname = message.from_user.username if message.from_user else None
+        may_max = _may_max_effort(uid, uname)
         arg = _command_arg(message).lower().strip()
         if not arg:
-            # No arg → interactive picker (#99).
+            # No arg → interactive picker (#99). Hide `max` from users not allowed
+            # to use it (the gate below still enforces it for typed input).
             cur = state.effort or "default"
-            levels = list(EFFORT_LEVELS) + ["default"]
+            levels = [lv for lv in EFFORT_LEVELS if lv != "max" or may_max] + ["default"]
             btns = [
                 InlineKeyboardButton(
                     text=(f"✓ {lv}" if lv == cur else lv), callback_data=f"pe:{lv}"
@@ -1374,6 +1524,9 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             return
         if arg not in EFFORT_LEVELS:
             await reply(message, i18n.t("effort.usage", lang))
+            return
+        if arg == "max" and not may_max:
+            await reply(message, i18n.t("effort.max_denied", lang))
             return
         await db.set_effort(key, arg)
         deferred = await _rebuild_session(key)
@@ -1446,8 +1599,12 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                    name=markup.escape_html(name)),
         )
 
-    @router.message(Command("reset"))
+    @router.message(Command("clear", "reset"))
     async def cmd_reset(message: Message) -> None:
+        """Clear the session context and start fresh — the Claude Code /clear
+        equivalent (forceful: cancels the run, drops the resume ids + transcript).
+        Renamed /reset → /clear to match Claude Code (owner request); /reset kept as
+        an alias."""
         await _ensure_state(message)
         key = await _session_key(message)
         lang = _lang(message)
@@ -1600,6 +1757,13 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         state = await _ensure_state(message)
         key = await _session_key(message)
         lang = _lang(message)
+        # Permissions apply ONLY to code sessions. Chat carries only the read-only,
+        # AUTO-approved web tools — no gated/dangerous tools (and the engine hardcodes
+        # permission_mode="default" for chat) — so this setting is inert there. Say so
+        # instead of storing a silent no-op (owner UX request).
+        if state.mode != "code":
+            await reply(message, i18n.t("perm.chat_na", lang))
+            return
         arg = _command_arg(message).lower()
 
         if not arg:
@@ -1715,23 +1879,21 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             i18n.t("usage.set", lang, name=arg, help=i18n.t(f"usage.help.{arg}", lang)),
         )
 
-    @router.message(Command("stop"))
-    async def cmd_stop(message: Message) -> None:
-        await _ensure_state(message)
-        key = await _session_key(message)
-        lang = _lang(message)
-        try:
-            stopped = await sessions.stop(key)
-        except Exception as exc:
-            await reply(
-                message,
-                i18n.t("stop.error", lang, err=markup.escape_html(str(exc))),
-            )
-            return
-        if stopped:
-            await reply(message, i18n.t("stop.done", lang))
-        else:
-            await reply(message, i18n.t("stop.nothing", lang))
+    # /stop command REMOVED 2026-06-15 (owner request) — the ⏹ Stop is an inline
+    # BUTTON on the live control message (streamer + on_stop_cb), so a typed command
+    # is redundant. Kept commented per the project convention; restore by uncommenting
+    # this + re-adding "stop" to _COMMAND_NAMES.
+    # @router.message(Command("stop"))
+    # async def cmd_stop(message: Message) -> None:
+    #     await _ensure_state(message)
+    #     key = await _session_key(message)
+    #     lang = _lang(message)
+    #     try:
+    #         stopped = await sessions.stop(key)
+    #     except Exception as exc:
+    #         await reply(message, i18n.t("stop.error", lang, err=markup.escape_html(str(exc))))
+    #         return
+    #     await reply(message, i18n.t("stop.done" if stopped else "stop.nothing", lang))
 
     @router.message(Command("whoami"))
     async def cmd_whoami(message: Message) -> None:
@@ -1739,10 +1901,19 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         user = message.from_user
         uid = getattr(user, "id", None)
         uname = getattr(user, "username", None)
-        await reply(
-            message,
-            i18n.t("whoami", lang, uid=uid, uname=uname or "-"),
-        )
+        lines = [i18n.t("whoami", lang, uid=uid, uname=uname or "-")]
+        # Per-user rolling usage + any caps (#120), so a user can see their own spend.
+        if uid is not None:
+            try:
+                bd = await db.get_user_usage_breakdown(uid)
+                lines.append(i18n.t("whoami.usage", lang, day=_fmt_tokens(bd["day"]),
+                                    week=_fmt_tokens(bd["week"]), total=_fmt_tokens(bd["total"])))
+                rate = allowlist.rate_of(uid, uname)
+                if rate.get("day") is not None or rate.get("week") is not None:
+                    lines.append(i18n.t("whoami.caps", lang, caps=_fmt_caps(rate, lang)))
+            except Exception:
+                pass
+        await reply(message, "\n".join(lines))
 
     def _parse_grant(arg: str) -> tuple[str, str | None, str | None, str | None]:
         """Parse ``<id|@user> [chat|code] [until DATE]`` into
@@ -1900,33 +2071,48 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         if not _is_owner(message):
             await reply(message, i18n.t("common.owner_only_access", lang))
             return
+        # #120: /limit now sets a ROLLING-WINDOW cap (day or week), replacing the
+        # #105 lifetime token grant. Syntax: /limit <id|@user> <tokens> [day|week] | off.
+        #
+        # was (#105 lifetime grant — top-up; replaced by rolling caps above):
+        #   amt = toks[1].lower()
+        #   if amt in ("off", "none", "unlimited"): tokens = None
+        #   else:
+        #       try:
+        #           tokens = int(amt.replace("_", "").replace(",", ""))
+        #           if tokens < 0: raise ValueError
+        #       except ValueError: ... ; return
+        #   if not allowlist.grant_tokens(target, tokens): ... ; return
+        #   reply limit.unlimited / limit.set
         toks = arg.split()
         if len(toks) < 2:
             await reply(message, i18n.t("limit.usage", lang))
             return
         target = toks[0]
         amt = toks[1].lower()
+        window = toks[2].lower() if len(toks) > 2 else "day"
         if amt in ("off", "none", "unlimited"):
-            tokens: int | None = None
-        else:
-            try:
-                tokens = int(amt.replace("_", "").replace(",", ""))
-                if tokens < 0:
-                    raise ValueError
-            except ValueError:
-                await reply(message, i18n.t("limit.bad", lang))
+            if not allowlist.set_rate(target, day=None, week=None):
+                await reply(message, i18n.t("limit.not_found", lang, val=markup.escape_html(target)))
                 return
-        if not allowlist.grant_tokens(target, tokens):
+            await reply(message, i18n.t("limit.cleared", lang, val=markup.escape_html(target)))
+            return
+        if window not in ("day", "week"):
+            await reply(message, i18n.t("limit.usage", lang))
+            return
+        n = _parse_token_amount(amt)
+        if n is None:
+            await reply(message, i18n.t("limit.bad", lang))
+            return
+        if not allowlist.set_rate(target, **{window: n}):
             await reply(message, i18n.t("limit.not_found", lang, val=markup.escape_html(target)))
             return
-        if tokens is None:
-            await reply(message, i18n.t("limit.unlimited", lang, val=markup.escape_html(target)))
-        else:
-            await reply(message, i18n.t("limit.set", lang, val=markup.escape_html(target), n=_fmt_tokens(tokens)))
+        await reply(message, i18n.t("limit.set", lang, val=markup.escape_html(target),
+                                    n=_fmt_tokens(n), window=window))
 
     @router.message(Command("limit"))
     async def cmd_limit(message: Message) -> None:
-        """Owner: add to a user's token grant — /limit @user <tokens>|off."""
+        """Owner: set a user's rolling token cap — /limit @user <tokens> [day|week]|off (#120)."""
         lang = _lang(message)
         if not _is_owner(message):
             await reply(message, i18n.t("common.owner_only_access", lang))
@@ -1938,17 +2124,26 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             return
         await _do_limit(message, arg)
 
-    @router.message(Command("users"))
-    async def cmd_users(message: Message) -> None:
-        lang = _lang(message)
-        if not _is_owner(message):
-            await reply(message, i18n.t("common.owner_only_access", lang))
-            return
-        snap = allowlist.snapshot()
+    async def _users_text(snap: dict, lang: str) -> list[str]:
+        """The /users summary lines (owner + each entry/pending), each WITH per-user
+        usage (day/week/total) — shown for everyone regardless of whether limits are
+        set (owner request). The token column shows the #120 ROLLING caps (day/week)."""
+        async def _usage_line(uid):
+            try:
+                bd = await db.get_user_usage_breakdown(uid)
+                return i18n.t("users.entry_usage", lang, day=_fmt_tokens(bd["day"]),
+                              week=_fmt_tokens(bd["week"]), total=_fmt_tokens(bd["total"]))
+            except Exception:
+                return None
+
+        owner_id = snap.get("owner_id")
         lines = [
             i18n.t("users.header", lang),
-            i18n.t("users.owner_id", lang, id=snap.get("owner_id")),
+            i18n.t("users.owner_id", lang, id=owner_id),
         ]
+        ou = await _usage_line(owner_id)   # owner is uncapped but still worth seeing
+        if ou:
+            lines.append(ou)
         entries = snap.get("entries", {})
         pending_u = snap.get("pending", {})
         if not entries and not pending_u:
@@ -1957,25 +2152,288 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             uname = rec.get("username")
             uname_s = f" @{markup.escape_html(uname)}" if uname else ""
             exp = rec.get("expires_at") or i18n.t("users.never", lang)
-            grant = rec.get("token_grant")
-            if grant is None:
-                quota = i18n.t("users.unlimited", lang)
-            else:
-                used = await db.get_user_usage_tokens(uid)
-                quota = f"{_fmt_tokens(used)}/{_fmt_tokens(grant)}"
+            # was (#105 lifetime grant — replaced by #120 rolling caps):
+            #   grant = rec.get("token_grant")
+            #   if grant is None: quota = i18n.t("users.unlimited", lang)
+            #   else: used = await db.get_user_usage_tokens(uid); quota = f"{used}/{grant}"
+            quota = _fmt_caps(rec.get("rate"), lang)
             lines.append(i18n.t("users.entry", lang, id=uid, uname=uname_s,
                                 level=rec.get("level", "chat"),
                                 expiry=markup.escape_html(str(exp)), quota=quota))
+            ul = await _usage_line(uid)
+            if ul:
+                lines.append(ul)
         for name, rec in pending_u.items():
             exp = rec.get("expires_at") or i18n.t("users.never", lang)
-            grant = rec.get("token_grant")
-            quota = i18n.t("users.unlimited", lang) if grant is None else f"0/{_fmt_tokens(grant)}"
+            quota = _fmt_caps(rec.get("rate"), lang)  # was: token_grant (#105 → #120)
             lines.append(i18n.t("users.pending", lang, name=markup.escape_html(name),
                                 level=rec.get("level", "chat"),
                                 expiry=markup.escape_html(str(exp)), quota=quota))
+            # pending (un-pinned) users have no id yet → no usage to show.
         lines.append("")
         lines.append(i18n.t("users.footnote", lang))
-        await reply(message, "\n".join(lines))
+        lines.append(i18n.t("users.tap_hint", lang))
+        return lines
+
+    def _users_keyboard(snap: dict, lang: str) -> InlineKeyboardMarkup:
+        """One tappable button per user (owner first), opening their settings card
+        (#120 per-user management). callback_data carries the target token: a numeric
+        id for entries / the owner, or a username for an un-pinned pending user."""
+        B = InlineKeyboardButton
+        rows: list[list[InlineKeyboardButton]] = []
+        owner_id = snap.get("owner_id")
+        rows.append([B(text=i18n.t("users.btn_owner", lang), callback_data=f"usr:card:{owner_id}")])
+        for uid, rec in snap.get("entries", {}).items():
+            uname = rec.get("username")
+            who = f"@{uname}" if uname else str(uid)
+            rows.append([B(
+                text=i18n.t("users.btn_entry", lang, who=who, level=rec.get("level", "chat")),
+                callback_data=f"usr:card:{uid}")])
+        for name, rec in snap.get("pending", {}).items():
+            rows.append([B(
+                text=i18n.t("users.btn_pending", lang, name=name, level=rec.get("level", "chat")),
+                callback_data=f"usr:card:{name}")])
+        rows.append([B(text=i18n.t("users.btn_add", lang), callback_data="usr:add")])
+        rows.append([
+            B(text=i18n.t("settings.back_to", lang), callback_data="st:nav:admin"),
+            B(text=i18n.t("btn.close", lang), callback_data="usr:close"),
+        ])
+        return InlineKeyboardMarkup(inline_keyboard=rows)
+
+    async def _render_user_card(target: str, lang: str):
+        """Build the (text, keyboard) for one user's settings card. Owner-aware: the
+        owner only exposes the GLOBAL MEMORY toggle (always code/uncapped/etc.)."""
+        B = InlineKeyboardButton
+        d = allowlist.describe(target)
+        if d is None:
+            kb = InlineKeyboardMarkup(inline_keyboard=[[
+                B(text=i18n.t("usercard.btn_back", lang), callback_data="usr:list")]])
+            return i18n.t("usercard.not_found", lang), kb
+        is_owner = d["kind"] == "owner"
+        who = f"@{d['username']}" if d.get("username") else str(d.get("id") or target)
+        tid = d.get("id")
+        bd = await db.get_user_usage_breakdown(tid) if tid is not None else \
+            {"day": 0, "week": 0, "total": 0, "requests": 0}
+        rate = d.get("rate") or {"day": None, "week": None}
+
+        def cap(v):
+            return i18n.t("users.unlimited", lang) if v is None else _fmt_tokens(v)
+
+        kind_label = (i18n.t("usercard.kind_owner", lang) if is_owner else
+                      i18n.t("usercard.kind_pending", lang) if d["kind"] == "pending" else "")
+        lines = [
+            i18n.t("usercard.title", lang, who=markup.escape_html(who), kind=kind_label),
+            i18n.t("usercard.level", lang, level=d.get("level", "chat")),
+            i18n.t("usercard.expiry", lang,
+                   expiry=markup.escape_html(str(d.get("expires_at") or i18n.t("users.never", lang)))),
+            i18n.t("usercard.rate", lang, day=cap(rate.get("day")), week=cap(rate.get("week"))),
+            i18n.t("usercard.memory", lang, state=i18n.onoff(d.get("global_memory"), lang)),
+            i18n.t("usercard.maxeffort", lang, state=i18n.onoff(d.get("allow_max_effort"), lang)),
+            i18n.t("usercard.tools", lang, tools=_fmt_cap(d.get("tool_cap"), lang)),
+            i18n.t("usercard.usage", lang, day=_fmt_tokens(bd["day"]), week=_fmt_tokens(bd["week"]),
+                   total=_fmt_tokens(bd["total"]), reqs=bd["requests"]),
+        ]
+        if d.get("global_memory") and not is_owner:
+            lines.append(i18n.t("usercard.memory_warn", lang))
+        if is_owner:
+            lines.append(i18n.t("usercard.owner_note", lang))
+
+        rows: list[list[InlineKeyboardButton]] = []
+        mem_btn = B(text=i18n.t("usercard.btn_memory", lang, state=i18n.onoff(d.get("global_memory"), lang)),
+                    callback_data=f"usr:mem:{target}")
+        if is_owner:
+            rows.append([mem_btn])
+        else:
+            nxt = "code" if d.get("level") == "chat" else "chat"
+            rows.append([B(text=i18n.t("usercard.btn_level", lang, level=d.get("level", "chat"), next=nxt),
+                           callback_data=f"usr:lvl:{target}")])
+            rows.append([mem_btn,
+                         B(text=i18n.t("usercard.btn_maxeffort", lang, state=i18n.onoff(d.get("allow_max_effort"), lang)),
+                           callback_data=f"usr:eff:{target}")])
+            rows.append([B(text=i18n.t("usercard.btn_tools", lang, val=_fmt_cap(d.get("tool_cap"), lang)),
+                           callback_data=f"usr:tools:{target}")])
+            rows.append([B(text=i18n.t("usercard.btn_expiry", lang), callback_data=f"usr:exp:{target}")])
+            rows.append([B(text=i18n.t("usercard.btn_day", lang), callback_data=f"usr:rday:{target}"),
+                         B(text=i18n.t("usercard.btn_week", lang), callback_data=f"usr:rweek:{target}")])
+            if rate.get("day") is not None or rate.get("week") is not None:
+                rows.append([B(text=i18n.t("usercard.btn_clear_limits", lang), callback_data=f"usr:rclr:{target}")])
+            rows.append([B(text=i18n.t("usercard.btn_remove", lang), callback_data=f"usr:del:{target}")])
+        rows.append([B(text=i18n.t("usercard.btn_back", lang), callback_data="usr:list")])
+        return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
+
+    async def _render_user_tools(target: str, lang: str):
+        """(text, keyboard) for the per-user TOOL CAP sub-page (#131): toggle which
+        tools this user may use at all. cap=None = every tool allowed."""
+        B = InlineKeyboardButton
+        d = allowlist.describe(target)
+        if d is None or d["kind"] == "owner":
+            return await _render_user_card(target, lang)  # owner is always uncapped
+        cap = d.get("tool_cap")
+        allowed = set(cap) if cap is not None else set(ALL_TOOLS)
+        who = f"@{d['username']}" if d.get("username") else str(d.get("id") or target)
+        text = i18n.t("usercard.tools_header", lang, who=markup.escape_html(who))
+        rows = [[B(text=("✅ " if t in allowed else "⬜ ") + t + " · " + _tool_scope_label(t, lang),
+                   callback_data=f"usr:tcap:{target}:{t}")]
+                for t in ALL_TOOLS]
+        rows.append([B(text=i18n.t("btn.back", lang), callback_data=f"usr:card:{target}")])
+        return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+    @router.message(Command("users"))
+    async def cmd_users(message: Message) -> None:
+        lang = _lang(message)
+        if not _is_owner(message):
+            await reply(message, i18n.t("common.owner_only_access", lang))
+            return
+        snap = allowlist.snapshot()
+        await bot.send_message(
+            message.chat.id, "\n".join(await _users_text(snap, lang)),
+            parse_mode="HTML", reply_markup=_users_keyboard(snap, lang),
+        )
+
+    @router.callback_query(F.data.startswith("usr:"))
+    async def on_user_cb(cb: CallbackQuery) -> None:
+        """Per-user management card taps (#120). Owner-only: a guest must never
+        manage access. Mutations re-render the card in place; free-text values
+        (expiry / day / week caps) go through arg-capture (_apply_user_value)."""
+        lang = _lang(cb)
+        if not (cb.from_user and cb.from_user.id == settings.owner_id):
+            await cb.answer(i18n.t("common.owner_only_access", lang))
+            return
+        try:
+            parts = (cb.data or "").split(":", 2)
+            verb = parts[1] if len(parts) > 1 else ""
+            target = parts[2] if len(parts) > 2 else ""
+            msg = cb.message
+            if msg is None:
+                await cb.answer()
+                return
+            if verb == "close":
+                with contextlib.suppress(Exception):
+                    await msg.delete()
+                await cb.answer()
+                return
+            if verb == "add":
+                # ➕ Add user — arg-capture (reuses /allow's prompt + _do_allow path).
+                pending[(msg.chat.id, thread_key(msg), cb.from_user.id)] = "allow"
+                with contextlib.suppress(Exception):
+                    await bot.send_message(msg.chat.id, i18n.t("allow.prompt", lang), parse_mode="HTML")
+                await cb.answer()
+                return
+            if verb == "list":
+                snap = allowlist.snapshot()
+                with contextlib.suppress(Exception):
+                    await msg.edit_text("\n".join(await _users_text(snap, lang)), parse_mode="HTML",
+                                        reply_markup=_users_keyboard(snap, lang))
+                await cb.answer()
+                return
+            if verb in ("exp", "rday", "rweek"):
+                # Free-text value → arg-capture the owner's next message.
+                action = {"exp": "usrexp", "rday": "usrrday", "rweek": "usrrweek"}[verb]
+                pending[(msg.chat.id, thread_key(msg), cb.from_user.id)] = f"{action}:{target}"
+                prompt = {"exp": "usercard.prompt_expiry", "rday": "usercard.prompt_day",
+                          "rweek": "usercard.prompt_week"}[verb]
+                with contextlib.suppress(Exception):
+                    await bot.send_message(msg.chat.id, i18n.t(prompt, lang), parse_mode="HTML")
+                await cb.answer()
+                return
+            if verb == "tools":
+                text, kb = await _render_user_tools(target, lang)
+                with contextlib.suppress(Exception):
+                    await msg.edit_text(text, parse_mode="HTML", reply_markup=kb)
+                await cb.answer()
+                return
+            if verb == "tcap":
+                # target carries "<target>:<toolname>" (split(":",2) kept it whole).
+                tgt, _, tool = target.partition(":")
+                d = allowlist.describe(tgt)
+                if d and d["kind"] != "owner" and tool in ALL_TOOLS:
+                    cap = d.get("tool_cap")
+                    allowed = set(cap) if cap is not None else set(ALL_TOOLS)
+                    allowed.discard(tool) if tool in allowed else allowed.add(tool)
+                    ordered = [t for t in ALL_TOOLS if t in allowed]
+                    # Store None when ALL tools are allowed, so a tool added later
+                    # stays allowed by default; otherwise the explicit allowed list.
+                    allowlist.set_tool_cap(tgt, None if set(ordered) == set(ALL_TOOLS) else ordered)
+                text, kb = await _render_user_tools(tgt, lang)
+                with contextlib.suppress(Exception):
+                    await msg.edit_text(text, parse_mode="HTML", reply_markup=kb)
+                await cb.answer()
+                return
+            if verb == "del":
+                kb = InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text=i18n.t("usercard.btn_confirm_remove", lang),
+                                          callback_data=f"usr:delok:{target}")],
+                    [InlineKeyboardButton(text=i18n.t("usercard.btn_back", lang),
+                                          callback_data=f"usr:card:{target}")],
+                ])
+                with contextlib.suppress(Exception):
+                    await msg.edit_text(i18n.t("usercard.confirm_remove", lang,
+                                               who=markup.escape_html(target)),
+                                        parse_mode="HTML", reply_markup=kb)
+                await cb.answer()
+                return
+            if verb == "delok":
+                allowlist.remove(target)
+                snap = allowlist.snapshot()
+                with contextlib.suppress(Exception):
+                    await msg.edit_text("\n".join(await _users_text(snap, lang)), parse_mode="HTML",
+                                        reply_markup=_users_keyboard(snap, lang))
+                await cb.answer(i18n.t("common.deleted", lang))
+                return
+            # In-place toggles (re-render the card afterwards).
+            if verb == "lvl":
+                d = allowlist.describe(target)
+                if d:
+                    allowlist.set_level(target, "code" if d.get("level") == "chat" else "chat")
+            elif verb == "mem":
+                d = allowlist.describe(target)
+                if d:
+                    allowlist.set_global_memory(target, not d.get("global_memory"))
+            elif verb == "eff":
+                d = allowlist.describe(target)
+                if d:
+                    allowlist.set_allow_max_effort(target, not d.get("allow_max_effort"))
+            elif verb == "rclr":
+                allowlist.set_rate(target, day=None, week=None)
+            text, kb = await _render_user_card(target, lang)
+            with contextlib.suppress(Exception):
+                await msg.edit_text(text, parse_mode="HTML", reply_markup=kb)
+            await cb.answer()
+        except Exception:
+            with contextlib.suppress(Exception):
+                await cb.answer(i18n.t("common.error", lang))
+
+    async def _apply_user_value(message: Message, action: str, text: str) -> None:
+        """Apply an arg-captured user-card value (expiry / day cap / week cap), then
+        re-post the card. action is 'usrexp:<t>' / 'usrrday:<t>' / 'usrrweek:<t>'."""
+        lang = _lang(message)
+        if not _is_owner(message):
+            return
+        kind, _, target = action.partition(":")
+        raw = text.strip()
+        if kind == "usrexp":
+            if raw.lower() in ("never", "none", "off"):
+                allowlist.set_expiry(target, None)
+            else:
+                exp = normalize_date(raw)
+                if exp is None:
+                    await reply(message, i18n.t("expire.bad_date", lang))
+                    return
+                allowlist.set_expiry(target, exp)
+        elif kind in ("usrrday", "usrrweek"):
+            window = "day" if kind == "usrrday" else "week"
+            # '0' is NOT a clear here — it sets a 0-token deny-all cap, consistent
+            # with `/limit @user 0 day` (#120 audit). Clear with off/none/unlimited.
+            if raw.lower() in ("off", "none", "unlimited"):
+                allowlist.set_rate(target, **{window: None})
+            else:
+                n = _parse_token_amount(raw)
+                if n is None:
+                    await reply(message, i18n.t("limit.bad", lang))
+                    return
+                allowlist.set_rate(target, **{window: n})
+        card_text, kb = await _render_user_card(target, lang)
+        await bot.send_message(message.chat.id, card_text, parse_mode="HTML", reply_markup=kb)
 
     @router.message(Command("status"))
     async def cmd_status(message: Message) -> None:
@@ -2397,11 +2855,19 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 return
             stopped = await sessions.stop(tid)
             await cb.answer(i18n.t("stopbtn.stopping" if stopped else "stopbtn.nothing", lang))
-            # Instant feedback: grey out the button (the streamer also removes the
-            # whole control message once the interrupted turn finishes).
             if cb.message is not None:
-                with contextlib.suppress(Exception):
-                    await cb.message.edit_reply_markup(reply_markup=None)
+                if stopped:
+                    # Instant feedback: grey out the button; the streamer removes the
+                    # whole control message once the interrupted turn finishes.
+                    with contextlib.suppress(Exception):
+                        await cb.message.edit_reply_markup(reply_markup=None)
+                else:
+                    # Nothing to stop — typically an ORPHANED control message left
+                    # over after a bot restart (the new process has no record of that
+                    # turn, so its Stop button is dead). Delete the stale message so
+                    # the button clears instead of lingering forever.
+                    with contextlib.suppress(Exception):
+                        await cb.message.delete()
         except Exception:
             with contextlib.suppress(Exception):
                 await cb.answer(i18n.t("common.error", _lang(cb)))
@@ -2453,12 +2919,31 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         st = await db.get_thread(key)
         if st is not None and st.mode == "code" and allowlist.level_of(uid, uname) != "code":
             return i18n.t("access.code_denied", lang)
-        grant = allowlist.token_grant_of(uid, uname)
-        if grant is not None:
-            used = await db.get_user_usage_tokens(uid)
-            if used >= grant:
-                return i18n.t("access.quota_exceeded", lang,
-                              used=_fmt_tokens(used), grant=_fmt_tokens(grant))
+        # Effort gate enforced PER-TURN (#123 audit): the max-effort permission is
+        # checked at selection time, but if the owner later revokes it a stored
+        # effort=max would keep burning the shared subscription. Downgrade it here so
+        # revocation takes effect on the next turn (handle_text then rebuilds the
+        # session) — mirrors the run-time code-level gate above. Owner is exempt.
+        if st is not None and st.effort == "max" and not _may_max_effort(uid, uname):
+            await db.set_effort(key, "xhigh")
+        # Rolling-window rate limits (#120): deny when the user's trailing-24h or
+        # trailing-7d input+output tokens reach their cap. Windows are computed from
+        # usage timestamps, so they free up on their own (no reset job). The legacy
+        # lifetime token_grant (#105) is no longer enforced — superseded by these.
+        rate = allowlist.rate_of(uid, uname)
+        now = time.time()
+        day_cap = rate.get("day")
+        if day_cap is not None:
+            used = await db.get_user_usage_tokens(uid, since=now - 86400)
+            if used >= day_cap:
+                return i18n.t("access.rate_day_exceeded", lang,
+                              used=_fmt_tokens(used), cap=_fmt_tokens(day_cap))
+        week_cap = rate.get("week")
+        if week_cap is not None:
+            used = await db.get_user_usage_tokens(uid, since=now - 7 * 86400)
+            if used >= week_cap:
+                return i18n.t("access.rate_week_exceeded", lang,
+                              used=_fmt_tokens(used), cap=_fmt_tokens(week_cap))
         return None
 
     @router.message(F.text & ~F.text.startswith("/"))
@@ -2658,13 +3143,16 @@ def _mark(name: str, current: str) -> str:
 
 
 def _settings_text(v: dict, lang: str = "en") -> str:
-    """The settings header showing every current value (localized)."""
+    """The settings header showing every current value (localized). The Permissions
+    segment is shown only for code sessions (chat has no gated tools), mirroring the
+    hidden perm row — keeps the header honest on the chat/Tools surface."""
+    perm_line = i18n.t("settings.perm_seg", lang, perm=v["perm"]) if v.get("mode") == "code" else ""
     return i18n.t(
         "settings.header",
         lang,
         mode=i18n.mode_word(v["mode"], lang),
         model=markup.escape_html(v["model"]),
-        perm=v["perm"],
+        perm_line=perm_line,
         usage=v["usage"],
         memory=i18n.onoff(v["memory"], lang),
         language=i18n.lang_name(v.get("lang", lang)),
@@ -2688,6 +3176,13 @@ def _settings_keyboard(
             for a in ("opus", "sonnet", "haiku")
         ]
         rows.append([back])
+    elif page == "effort":
+        # Reasoning effort (#settings hub). `max` is shown but the apply branch gates
+        # it by the per-user max-effort permission (#123), so a guest tap is ignored.
+        levels = list(EFFORT_LEVELS) + ["default"]
+        rows = [[B(text=_mark(lv, v.get("effort", "default")), callback_data=f"st:set:effort:{lv}")]
+                for lv in levels]
+        rows.append([back])
     elif page == "perm":
         names = ["ask", "auto-edits", "plan"] + (["full-access"] if is_owner else [])
         rows = [
@@ -2700,7 +3195,8 @@ def _settings_keyboard(
             [B(text=_mark(n, v["usage"]), callback_data=f"st:set:usage:{n}")]
             for n in ("off", "footer", "pinned", "both")
         ]
-        rows.append([back])
+        # Back goes to the Admin submenu (usage lives there now).
+        rows.append([B(text=i18n.t("btn.back", lang), callback_data="st:nav:admin")])
     elif page == "lang":
         rows = [
             [B(text=_mark(i18n.lang_name(code), i18n.lang_name(v.get("lang", lang))),
@@ -2708,21 +3204,45 @@ def _settings_keyboard(
             for code in i18n.LANGUAGES
         ]
         rows.append([back])
+    elif page == "tools":
+        # One ✅/⬜ toggle per tool in this session's universe (#129): chat = the web
+        # research tools, code = the full agent toolset. None enabled = all on.
+        mode = v.get("mode", "chat")
+        universe = engine.CODE_TOOLS if mode == "code" else engine.CHAT_TOOLS
+        enabled = v.get("tools")
+        enabled_set = set(enabled) if enabled is not None else set(universe)
+        rows = [
+            [B(text=("✅ " if t in enabled_set else "⬜ ") + t + " · " + _tool_scope_label(t, lang),
+               callback_data=f"st:tool:{t}")]
+            for t in universe
+        ]
+        rows.append([back])
+    elif page == "admin":
+        # Owner Admin submenu (#settings): usage display + the per-user management hub,
+        # grouped at the bottom for parity with how users are managed.
+        rows = [
+            [B(text=i18n.t("settings.row_usage", lang, val=v["usage"]),
+               callback_data="st:nav:usage")],
+            [B(text=i18n.t("settings.row_users", lang), callback_data="st:nav:users")],
+            [back],
+        ]
     else:  # main
         rows = [
             [B(text=i18n.t("settings.row_model", lang, val=v["model"]),
                callback_data="st:nav:model")],
-            [B(text=i18n.t("settings.row_perm", lang, val=v["perm"]),
-               callback_data="st:nav:perm")],
+            [B(text=i18n.t("settings.row_effort", lang, val=v.get("effort", "default")),
+               callback_data="st:nav:effort")],
+            [B(text=i18n.t("settings.row_tools", lang), callback_data="st:nav:tools")],
         ]
-        # Usage display + native-draft streaming are GLOBAL (the subscription
-        # windows are account-wide; the pinned message + draft setting are
-        # shared), so only the owner sees/changes these rows.
-        if is_owner:
+        # Permissions apply only to CODE sessions (chat's web tools are read-only +
+        # auto-approved), so hide the row in chat — keeps the menu honest.
+        if v.get("mode") == "code":
             rows.append(
-                [B(text=i18n.t("settings.row_usage", lang, val=v["usage"]),
-                   callback_data="st:nav:usage")]
+                [B(text=i18n.t("settings.row_perm", lang, val=v["perm"]),
+                   callback_data="st:nav:perm")]
             )
+        # (Owner-only Usage display + the per-user Users hub moved into the 👑 Admin
+        # submenu at the BOTTOM — owner request 2026-06-15, for parity with the card.)
         # Streaming toggle RETIRED (native Telegram streaming is always on); the
         # row is commented out (restore alongside /stream + the apply branch).
         rows.append(
@@ -2739,6 +3259,9 @@ def _settings_keyboard(
             [B(text=i18n.t("lang.row", lang, name=i18n.lang_name(v.get("lang", lang))),
                callback_data="st:nav:lang")]
         )
+        # Owner-only Admin submenu (usage display + the per-user hub) at the bottom.
+        if is_owner:
+            rows.append([B(text=i18n.t("settings.row_admin", lang), callback_data="st:nav:admin")])
         rows.append([B(text=i18n.t("btn.close", lang), callback_data="st:close")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -2786,6 +3309,55 @@ def _fmt_tokens(n) -> str:
     if n < 1_000_000:
         return f"{n / 1000:.1f}k".replace(".0k", "k")
     return f"{n / 1_000_000:.1f}M".replace(".0M", "M")
+
+
+def _parse_token_amount(s: str):
+    """Parse a human token amount ('500k', '2m', '500000', '1.5M') → int, or None
+    if it is not a usable non-negative number. Underscores/commas/spaces ignored."""
+    s = (s or "").strip().lower().replace("_", "").replace(",", "").replace(" ", "")
+    mult = 1
+    if s.endswith("k"):
+        mult, s = 1000, s[:-1]
+    elif s.endswith("m"):
+        mult, s = 1_000_000, s[:-1]
+    try:
+        val = float(s) * mult
+    except ValueError:
+        return None
+    return int(val) if val >= 0 else None
+
+
+def _fmt_caps(rate, lang: str = "en") -> str:
+    """Compact rolling-cap display for the per-user views: the localized 'unlimited'
+    glyph when uncapped, else the present windows as 'd:500k w:2m'."""
+    rate = rate or {}
+    parts = []
+    if rate.get("day") is not None:
+        parts.append("d:" + _fmt_tokens(rate["day"]))
+    if rate.get("week") is not None:
+        parts.append("w:" + _fmt_tokens(rate["week"]))
+    return " ".join(parts) if parts else i18n.t("users.unlimited", lang)
+
+
+# The full per-user tool-cap universe (#131): every tool a user could use across
+# chat + code, in a stable order. The owner toggles which of these a user may use.
+ALL_TOOLS: list[str] = list(engine.CHAT_TOOLS) + [
+    t for t in engine.CODE_TOOLS if t not in engine.CHAT_TOOLS
+]
+
+
+def _fmt_cap(cap, lang: str = "en") -> str:
+    """Tool-cap summary for the per-user card: localized 'all' when uncapped (None),
+    else 'N/total' allowed tools."""
+    if cap is None:
+        return i18n.t("usercard.cap_all", lang)
+    return f"{len(cap)}/{len(ALL_TOOLS)}"
+
+
+def _tool_scope_label(tool: str, lang: str = "en") -> str:
+    """Which session types a tool applies to, shown on the toggle button: the web
+    tools run in CHAT and CODE; everything else is CODE only (needs a working dir)."""
+    return i18n.t("tool.scope_both" if tool in engine.CHAT_TOOLS else "tool.scope_code", lang)
 
 
 def _cu(obj: object, *names: str):

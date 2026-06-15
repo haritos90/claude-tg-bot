@@ -46,11 +46,20 @@ class _ThreadRecord:
     cwd: str | None = None
     permission_mode: str | None = None
     big_memory: bool | None = None
+    # Per-user GLOBAL MEMORY resolved for this session's owner; a change (owner
+    # toggles it) triggers a rebuild so setting_sources flips.
+    global_memory: bool | None = None
     # Pro-command options the live session was built for (#23); a change rebuilds.
     effort: str | None = None
     max_turns: int | None = None
     add_dirs: tuple = ()
     fork: bool = False
+    # Per-session enabled tools the live session was built for (#129); a change
+    # rebuilds. A tuple (or None = the mode's default universe) for cheap comparison.
+    tools_enabled: tuple | None = None
+    # Per-USER tool cap (owner-set, #131) the live session was built for; a change
+    # (owner edits the user's cap) rebuilds. Tuple, or None = uncapped.
+    tool_cap: tuple | None = None
 
     # Queue items are (qid, text, attachments) tuples — qid is a per-thread
     # monotonic id (so a single queued follow-up can be cancelled by id, #13);
@@ -83,10 +92,14 @@ def _send_thread_id(thread_id: int) -> int | None:
 class SessionManager:
     """Owns one isolated worker pipeline per forum topic."""
 
-    def __init__(self, bot, settings, gate: PermissionGate) -> None:
+    def __init__(self, bot, settings, gate: PermissionGate, allowlist=None) -> None:
         self.bot = bot
         self.settings = settings
         self.gate = gate
+        # Allowlist (optional — omitted in some tests): resolves per-user
+        # build-affecting prefs, currently GLOBAL MEMORY for a session's owner.
+        # None → every session stays isolated (setting_sources=[]).
+        self.allowlist = allowlist
         self._records: dict[int, _ThreadRecord] = {}
 
         # Account-wide subscription rate-limit windows, keyed by rate_limit_type.
@@ -123,6 +136,29 @@ class SessionManager:
 
     # --------------------------------------------------------------- session mgmt
 
+    def _resolve_global_memory(self, state: db.ThreadState) -> bool:
+        """Whether THIS session should load global (~/.claude) memory — a per-USER
+        owner-granted opt-out of isolation. Resolved from the session OWNER (the DM
+        creator, == chat_id for DM rows). False when no allowlist is wired."""
+        if not self.allowlist:
+            return False
+        owner_uid = state.created_by if state.created_by else state.chat_id
+        try:
+            return bool(self.allowlist.global_memory_of(owner_uid, None))
+        except Exception:
+            return False
+
+    def _resolve_tool_cap(self, state: db.ThreadState):
+        """The per-user TOOL CAP (owner-set) for this session's OWNER, or None =
+        uncapped (#131). Resolved from the allowlist like global memory."""
+        if not self.allowlist:
+            return None
+        owner_uid = state.created_by if state.created_by else state.chat_id
+        try:
+            return self.allowlist.tool_cap_of(owner_uid, None)
+        except Exception:
+            return None
+
     def _build_session(self, state: db.ThreadState) -> ClaudeSession:
         """Construct a fresh ClaudeSession for a thread from its stored state.
 
@@ -155,6 +191,9 @@ class SessionManager:
             resume_session_id=resume_id,
             permission_mode=state.permission_mode,
             big_memory=state.big_memory,
+            global_memory=self._resolve_global_memory(state),
+            tools_enabled=state.tools_enabled,
+            tool_cap=self._resolve_tool_cap(state),
             effort=state.effort,
             max_turns=state.max_turns,
             add_dirs=state.add_dirs,
@@ -162,6 +201,7 @@ class SessionManager:
             sandbox=self.settings.sandbox_code and not state.no_sandbox,
             sandbox_uid=self.settings.sandbox_uid,
             sandbox_allow_exec=self.settings.sandbox_allow_exec,
+            extra_blocked_keywords=getattr(self.settings, "extra_blocked_keywords", None),
         )
 
     async def _get_session(
@@ -172,6 +212,10 @@ class SessionManager:
         A rebuild aclose()s the old client first so we never leak a connection,
         and never share an SDK client across distinct configs.
         """
+        gmem = self._resolve_global_memory(state)
+        tkey = tuple(state.tools_enabled) if state.tools_enabled is not None else None
+        cap = self._resolve_tool_cap(state)
+        capkey = tuple(cap) if cap is not None else None
         needs_rebuild = (
             rec.session is None
             or rec.mode != state.mode
@@ -179,6 +223,9 @@ class SessionManager:
             or rec.cwd != state.cwd
             or rec.permission_mode != state.permission_mode
             or rec.big_memory != state.big_memory
+            or rec.global_memory != gmem
+            or rec.tools_enabled != tkey
+            or rec.tool_cap != capkey
             or rec.effort != state.effort
             or rec.max_turns != state.max_turns
             or rec.add_dirs != tuple(state.add_dirs)
@@ -207,6 +254,9 @@ class SessionManager:
             rec.cwd = state.cwd
             rec.permission_mode = state.permission_mode
             rec.big_memory = state.big_memory
+            rec.global_memory = gmem
+            rec.tools_enabled = tkey
+            rec.tool_cap = capkey
             rec.effort = state.effort
             rec.max_turns = state.max_turns
             rec.add_dirs = tuple(state.add_dirs)

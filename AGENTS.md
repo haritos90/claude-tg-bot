@@ -7,12 +7,16 @@ contributors) working on this project.** Read it before making changes — the
 This is a **private Telegram bot** that acts as a personal frontend to Claude and
 Claude Code. It is **DM-first**: each user talks to the bot in a private chat,
 where the bot keeps named, fully-isolated **sessions** they switch between. A
-session is **either chat or code, fixed when it's created** (no switching — that
-would mix two kinds of state):
+session is **born a chat and can be promoted to code (and back)** — the type is
+**mutable** (#133, reverses the old "fixed at creation" rule #53); the conversation
+carries across the switch:
 
-- **chat** — a plain Claude conversation (Agent SDK session with **no tools**).
+- **chat** — a Claude conversation with the read-only **web** tools (WebSearch /
+  WebFetch); no terminal, files, or code execution.
 - **code** — a full Claude Code agent with its own per-session working directory,
-  capable of running Bash and editing files on the server.
+  capable of running Bash and editing files on the server. Reached by upgrading a
+  chat (`/code`), gated by the user's code-access level; `/chat` downgrades back
+  (keeping the workdir files). One `/new` creates a chat.
 
 > **Supergroup/Topics mode is FROZEN.** The bot still contains the
 > forum-Topics-as-sessions code, but it is dormant "until Telegram fixes drafts in
@@ -75,6 +79,13 @@ Work the task you were handed, or an **Open** one.
    (e.g. `feat(engine): stream tool status into the topic`).
 8. **Keep changes small and idiomatic** — match the surrounding file, comment the
    *why* not the *what*, and don't add abstractions beyond what the task needs.
+9. **Preserve replaced code as a commented-out block with a task reference.** When
+   changing or removing existing logic, don't delete it outright — comment the old
+   version next to the new code, tagged with the task/issue it changed for (e.g.
+   `# was: <old> — replaced for #120`), so every change stays auditable and easy to
+   revert. **Exception:** a task whose explicit goal IS removal/cleanup may delete
+   (e.g. a dead-code sweep like #77). In-tree examples: #110/#118 (toggles commented
+   out, not deleted, so they can be restored).
 
 ---
 
@@ -140,18 +151,45 @@ These are SDK/Telegram traps that already bit us. Re-check them before editing
 
 - **Isolation is `setting_sources=[]`, NOT `None`.** In this SDK, `None` means
   "load ALL filesystem settings" (user + project, including any `CLAUDE.md`) — the
-  *opposite* of isolation. Pass `[]` (empty list) to load nothing.
+  *opposite* of isolation. Pass `[]` (empty list) to load nothing. **One sanctioned
+  exception:** per-user GLOBAL MEMORY — when the owner grants a user `global_memory`
+  (the per-user card / `allowlist.global_memory_of`), that user's sessions load
+  `["user"]` (the owner's `~/.claude` settings + `CLAUDE.md`/memory) instead of `[]`.
+  It is owner-gated and OFF by default; `sessions._resolve_global_memory` resolves it
+  for the session OWNER (`created_by`), and the engine flips `setting_sources`
+  accordingly. Granting it to a NON-owner exposes the owner's `~/.claude` to that
+  user — deliberate, and the per-user card warns about it. **Blast-radius caveat
+  (#130, audit):** `["user"]` ALSO loads `~/.claude/settings.json`, whose
+  `permissions.allow` rules can auto-allow tools the bot keeps out of `allowed_tools`
+  (bypassing the `can_use_tool` gate) and whose `env` can be merged into the child (a
+  settings `ANTHROPIC_API_KEY` would survive the `_build_env` pop and flip billing).
+  So: trusted users only, keep secrets/allow-rules out of `~/.claude/settings.json`,
+  and the proper fix (inject `CLAUDE.md` directly instead of widening
+  `setting_sources`) is tracked as **#130**.
 - **Permission gating hinges on `tools` vs `allowed_tools`.** `allowed_tools` is
   the **auto-allow** list — those tools execute *without ever calling*
   `can_use_tool`. So dangerous tools must live in `tools` (the callable universe)
   but **not** in `allowed_tools`; only then do they hit the "ask" path and our
   gate fires. Putting a dangerous tool in `allowed_tools` silently bypasses the
   approval buttons.
-- **Chat mode needs `tools=[]` to actually be tool-free.** `tools=None` does NOT
-  mean "no tools" — the SDK omits the `--tools` flag and the CLI enables its
-  **default** tool set (WebSearch, etc.), so the model will still try tools in
-  chat. Pass `tools=[]` (empty list → `--tools ""`). `allowed_tools=[]` alone is
-  not enough — it only controls auto-approval, not the tool universe.
+- **Chat ships ONLY the web research tools — and `tools` is an EXPLICIT list, never
+  `None`.** `tools=None` does NOT mean "no tools": the SDK omits `--tools` and the
+  CLI enables its full DEFAULT set (Bash, etc.), so chat would get everything. Pass
+  an explicit list — `["WebSearch","WebFetch"]` for chat (web-capable like the
+  Claude apps), or `[]` for a truly tool-free chat. The same tools go in
+  `allowed_tools` so they AUTO-run (chat has no `can_use_tool` gate). **This
+  REVERSES the old "chat is tool-free" rule (#24):** chat is now web-capable by
+  default (owner request 2026-06-15); code mode is unchanged (full toolset,
+  dangerous tools gated). `allowed_tools=[]` alone never limits the universe — it
+  only controls auto-approval.
+- **The CLI honours prompt KEYWORD triggers, even on the SDK path — neutralize
+  them.** Typing `ultrathink` escalates per-turn effort and `ultracode` opts the
+  turn into multi-agent Workflow orchestration — either burns the one shared
+  subscription / bypasses the per-user effort gate. The engine disables Workflows in
+  the child env (`CLAUDE_CODE_DISABLE_WORKFLOWS=1`) AND splits the keyword with a
+  space in the prompt (`engine.defuse_triggers`, list = `DEFAULT_KEYWORD_TRIGGERS` +
+  `BLOCKED_PROMPT_KEYWORDS`). Don't remove either guard; effort is controlled only
+  via `/effort` (per-user gated — `max` is owner-granted).
 - **Subscription auth:** never set `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN`;
   the engine strips them from the child env. Their presence forces paid billing.
 - **`RateLimitInfo.utilization` is usually `None`.** The CLI sends a numeric
@@ -169,11 +207,16 @@ These are SDK/Telegram traps that already bit us. Re-check them before editing
   keep the per-message `session_id` as `"default"`.
 - **Sessions are durable by default.** Both modes resume their persisted session
   id (`code_session_id` / `chat_session_id`, saved every turn), so context survives
-  a restart / `/stop`. `big_memory` is now ONLY the 1M-context-window toggle for
-  chat — it no longer gates resume. `/reset` clears the session ids. A session's
-  **mode is fixed at creation** (`/new chat|code`) — there is no `/mode` switching
-  (it would mix chat/code state). Changing `big_memory` triggers a rebuild (same
-  busy-guard as a model change).
+  a restart / `/stop`. `big_memory` is the 1M-context-window toggle (now for BOTH
+  modes, #133) — it no longer gates resume. NOTE (#134): the 1M beta is IGNORED under
+  the OAuth subscription, so big_memory's 1M is currently a no-op. `/reset` clears the
+  session ids. A session's **mode is MUTABLE** (#133, reverses #53): `/code` upgrades
+  a chat to code, `/chat` downgrades back. `db.switch_mode` carries the conversation
+  by copying the resumable session id from the old mode's column into the new mode's;
+  BOTH modes run in the per-session workdir (engine) so the transcript is findable
+  from either — that's the prerequisite for cross-mode resume. The mode change goes
+  through the same rebuild path as a model change (`_get_session` already rebuilds on
+  `rec.mode != state.mode`). Changing `big_memory` also triggers a rebuild.
 - **The permission gate enforces the policy itself.** The SDK calls `can_use_tool`
   for every non-auto-allowed tool regardless of `permission_mode`, so
   `permissions.make_callback` must honour the mode: `bypassPermissions` (`/auto on`
@@ -193,6 +236,16 @@ These are SDK/Telegram traps that already bit us. Re-check them before editing
   independently. Never split already-rendered HTML: a tag cut across a chunk
   boundary is unbalanced and Telegram rejects (and `_safe()` silently drops) it.
 - Code blocks render as `<pre>` so Telegram shows the tap-to-copy button.
+- **Inline button labels: emoji-first + short.** Lead with an emoji and keep the
+  text to **1–2 words** — users scan icons faster than text (`📊 Stats` beats
+  `View Statistics`); a 3-word label like `🟩 Upgrade to code` is the upper bound,
+  prefer `🟩 Convert to code`. Keep **≤ 3–4 buttons per row** (mobile width), group
+  related actions in one row (e.g. ✅/✖ side by side), put **destructive** actions
+  (`🗑 Delete`) on their own row at the bottom, and **paginate** long lists. Every
+  button's `callback_data` is capped at **64 bytes** (one emoji = 4 UTF-8 bytes), so
+  keep payloads compact — match the existing `verb:arg` callback scheme. (Telegram
+  inline-keyboard UX guidance: see the
+  [inline keyboard guide](https://botnamefinder.com/blog/telegram-inline-keyboard-builder-guide).)
 - **DM streaming is native `sendMessageDraft` (the headline).** In a private chat
   the streamer pushes the growing reply as a message DRAFT (`_render_draft`):
   Telegram animates the appended characters letter-by-letter on the client, far

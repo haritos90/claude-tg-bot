@@ -65,9 +65,10 @@ async def main() -> None:
     # JSON-backed allowlist with the owner always allowed.
     allowlist = Allowlist(settings.allowlist_path, settings.owner_id)
 
-    # Core components, all sharing the single Bot instance.
+    # Core components, all sharing the single Bot instance. The session manager
+    # gets the allowlist so it can resolve per-user GLOBAL MEMORY at build time.
     gate = PermissionGate(bot)
-    sessions = SessionManager(bot, settings, gate)
+    sessions = SessionManager(bot, settings, gate, allowlist)
 
     # Best-effort restore of usage mode, the persisted rate snapshot and the
     # pinned message id. A fresh database must not block startup.

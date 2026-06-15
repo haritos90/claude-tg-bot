@@ -64,6 +64,9 @@ class ThreadState:
     # claude runs WITHOUT the bubblewrap jail even if SANDBOX_CODE is on, so the
     # owner can compare sandboxed vs raw behaviour. Guests can never set it.
     no_sandbox: bool = False
+    # Per-session enabled tools (#129): None = the mode's full default universe
+    # (chat → web tools, code → all); a list = exactly those (``[]`` = tool-free).
+    tools_enabled: list[str] | None = None
 
 
 def _require_conn() -> aiosqlite.Connection:
@@ -199,6 +202,10 @@ async def init_db(db_path: str) -> None:
             await _conn.execute(
                 "ALTER TABLE threads ADD COLUMN no_sandbox INTEGER DEFAULT 0"
             )
+        # Per-session enabled-tools list (#129): JSON array, or NULL = mode default
+        # (chat → web tools, code → all). Distinct from [] which means tool-free.
+        if "tools_enabled" not in existing:
+            await _conn.execute("ALTER TABLE threads ADD COLUMN tools_enabled TEXT")
         await _conn.commit()
 
 
@@ -211,6 +218,19 @@ def _parse_dirs(raw) -> list[str]:
     except (ValueError, TypeError):
         return []
     return [str(x) for x in v] if isinstance(v, list) else []
+
+
+def _parse_tools_enabled(raw):
+    """Parse the tools_enabled JSON column to list[str] or None (#129). NULL → None
+    (= the mode's full default tool set); a JSON list → that list (``[]`` = tool-free).
+    A garbled value degrades to None (default) rather than silently disabling tools."""
+    if raw is None:
+        return None
+    try:
+        v = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    return [str(x) for x in v] if isinstance(v, list) else None
 
 
 async def get_thread(thread_id: int) -> ThreadState | None:
@@ -226,7 +246,8 @@ async def get_thread(thread_id: int) -> ThreadState | None:
             "COALESCE(stream_enabled, 1) AS stream_enabled, "
             "effort, max_turns, add_dirs, COALESCE(fork_pending, 0) AS fork_pending, "
             "COALESCE(favorite, 0) AS favorite, "
-            "COALESCE(no_sandbox, 0) AS no_sandbox "
+            "COALESCE(no_sandbox, 0) AS no_sandbox, "
+            "tools_enabled "
             "FROM threads WHERE thread_id = ?",
             (thread_id,),
         )
@@ -254,6 +275,7 @@ async def get_thread(thread_id: int) -> ThreadState | None:
         fork_pending=bool(row["fork_pending"]),
         favorite=bool(row["favorite"]),
         no_sandbox=bool(row["no_sandbox"]),
+        tools_enabled=_parse_tools_enabled(row["tools_enabled"]),
     )
 
 
@@ -290,6 +312,30 @@ async def set_mode(thread_id: int, mode: str) -> None:
         await conn.execute(
             "UPDATE threads SET mode = ? WHERE thread_id = ?", (mode, thread_id)
         )
+        await conn.commit()
+
+
+async def switch_mode(thread_id: int, new_mode: str) -> None:
+    """Change a session's TYPE and CARRY its conversation across the switch (#133):
+    copy the resumable session id from the OLD mode's column into the NEW mode's, so
+    chat↔code continue one conversation. Both modes now run in the per-session workdir
+    (engine), so the transcript is findable from either. No-op if already new_mode."""
+    st = await get_thread(thread_id)
+    if st is None or st.mode == new_mode:
+        return
+    src_id = st.chat_session_id if st.mode == "chat" else st.code_session_id
+    target_col = "code_session_id" if new_mode == "code" else "chat_session_id"
+    conn = _require_conn()
+    async with _lock:
+        await conn.execute(
+            "UPDATE threads SET mode = ? WHERE thread_id = ?", (new_mode, thread_id)
+        )
+        if src_id:
+            # target_col is a fixed literal (not user input) — safe to interpolate.
+            await conn.execute(
+                f"UPDATE threads SET {target_col} = ? WHERE thread_id = ?",
+                (src_id, thread_id),
+            )
         await conn.commit()
 
 
@@ -339,6 +385,18 @@ async def set_no_sandbox(thread_id: int, on: bool) -> None:
         await conn.execute(
             "UPDATE threads SET no_sandbox = ? WHERE thread_id = ?",
             (1 if on else 0, thread_id),
+        )
+        await conn.commit()
+
+
+async def set_tools_enabled(thread_id: int, tools: list[str] | None) -> None:
+    """Persist the per-session enabled-tools list (#129). None → NULL (mode default);
+    a list is stored as JSON (``[]`` = tool-free)."""
+    conn = _require_conn()
+    raw = None if tools is None else json.dumps([str(t) for t in tools])
+    async with _lock:
+        await conn.execute(
+            "UPDATE threads SET tools_enabled = ? WHERE thread_id = ?", (raw, thread_id)
         )
         await conn.commit()
 
@@ -552,21 +610,55 @@ async def get_usage_totals(thread_id: int) -> dict:
     }
 
 
-async def get_user_usage_tokens(user_id: int) -> int:
-    """Total input+output tokens a user has spent across ALL their sessions —
-    the 'used' side of the per-user token quota (#105). A user owns the DM rows
-    whose chat_id == their id, so we sum usage joined on that."""
+async def get_user_usage_tokens(user_id: int, since: float | None = None) -> int:
+    """Total input+output tokens a user has spent across ALL their sessions. With
+    ``since`` (epoch seconds), counts only usage at-or-after that time — the basis
+    for the rolling-window rate limits (#120). A user owns the DM rows whose
+    chat_id == their id, so we sum usage joined on that."""
     conn = _require_conn()
+    query = (
+        "SELECT COALESCE(SUM(u.input_tokens + u.output_tokens), 0) AS t "
+        "FROM usage u JOIN threads th ON u.thread_id = th.thread_id "
+        "WHERE th.chat_id = ?"
+    )
+    params: list = [user_id]
+    if since is not None:
+        query += " AND u.ts >= ?"
+        params.append(since)
     async with _lock:
-        cur = await conn.execute(
-            "SELECT COALESCE(SUM(u.input_tokens + u.output_tokens), 0) AS t "
-            "FROM usage u JOIN threads th ON u.thread_id = th.thread_id "
-            "WHERE th.chat_id = ?",
-            (user_id,),
-        )
+        cur = await conn.execute(query, params)
         row = await cur.fetchone()
         await cur.close()
     return int(row["t"] or 0)
+
+
+async def get_user_usage_breakdown(user_id: int) -> dict:
+    """Per-user input+output token usage over the trailing day / week plus the
+    lifetime total and request count (feeds the per-user stats card, #120). Windows
+    are computed from usage.ts, so no reset job is needed."""
+    now = time.time()
+    day_since = now - 86400
+    week_since = now - 7 * 86400
+    conn = _require_conn()
+    async with _lock:
+        cur = await conn.execute(
+            "SELECT "
+            "COALESCE(SUM(CASE WHEN u.ts >= ? THEN u.input_tokens + u.output_tokens ELSE 0 END), 0) AS day, "
+            "COALESCE(SUM(CASE WHEN u.ts >= ? THEN u.input_tokens + u.output_tokens ELSE 0 END), 0) AS week, "
+            "COALESCE(SUM(u.input_tokens + u.output_tokens), 0) AS total, "
+            "COUNT(*) AS requests "
+            "FROM usage u JOIN threads th ON u.thread_id = th.thread_id "
+            "WHERE th.chat_id = ?",
+            (day_since, week_since, user_id),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+    return {
+        "day": int(row["day"] or 0),
+        "week": int(row["week"] or 0),
+        "total": int(row["total"] or 0),
+        "requests": int(row["requests"] or 0),
+    }
 
 
 # --------------------------------------------------------------------------- #

@@ -8,8 +8,9 @@ since that would force paid API billing instead of the Pro/Max subscription.
 from __future__ import annotations
 
 import os
+import re
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -40,6 +41,12 @@ class Settings:
     sandbox_code: bool = False
     sandbox_uid: int = 65534          # the unprivileged uid/gid the jail drops to
     sandbox_allow_exec: bool = True   # True = perm "7" (exec ok); False = "6" (noexec workdir)
+    # Extra prompt keyword triggers to neutralize, ON TOP of the built-in defaults
+    # (engine.DEFAULT_KEYWORD_TRIGGERS = ultrathink, ultracode). Loaded from
+    # BLOCKED_PROMPT_KEYWORDS (comma/space-separated). Each word is made inert in
+    # user prompts so it can't trigger a hidden CLI behaviour — see the README and
+    # engine.defuse_triggers. Empty by default (the defaults still apply).
+    extra_blocked_keywords: list[str] = field(default_factory=list)
 
 
 def load_settings() -> Settings:
@@ -124,6 +131,11 @@ def load_settings() -> Settings:
         sandbox_uid = 65534
     sandbox_allow_exec = _flag("SANDBOX_EXEC", True)
 
+    # Extra keyword triggers to neutralize in prompts (on top of the engine
+    # defaults). Comma- or whitespace-separated; blanks dropped.
+    raw_keywords = os.environ.get("BLOCKED_PROMPT_KEYWORDS", "") or ""
+    extra_blocked_keywords = [w for w in re.split(r"[,\s]+", raw_keywords.strip()) if w]
+
     return Settings(
         bot_token=bot_token,
         owner_id=owner_id,
@@ -134,4 +146,5 @@ def load_settings() -> Settings:
         sandbox_code=sandbox_code,
         sandbox_uid=sandbox_uid,
         sandbox_allow_exec=sandbox_allow_exec,
+        extra_blocked_keywords=extra_blocked_keywords,
     )

@@ -41,7 +41,7 @@ header rows. Columns:
 - **Closed** — `| ID | Theme | Title | Resolution |`
 - **Deferred** — `| ID | Pri | Eff | Theme | Title | Reason |`
 
-**Next free ID:** 121
+**Next free ID:** 136
 
 ---
 
@@ -60,7 +60,9 @@ Not started; promote to Open when picked up.
 | ID | Pri | Eff | Theme | Title |
 |---|---|---|---|---|
 | 119 | P1 | XL | security | Fully-contained sandbox (e2e): credential broker + egress allowlist + per-session isolation + DoS limits |
-| 120 | P2 | M | security | Per-user subscription rate limits (tokens per rolling window, e.g. day + week) |
+| 130 | P2 | M | security | Global memory: inject CLAUDE.md directly instead of `setting_sources=["user"]` (don't load settings.json permissions/env) |
+| 134 | P2 | S | observability | `big_memory` 1M-context beta is IGNORED under the subscription (custom betas are API-key-only) — verify + document/rework |
+| 135 | P2 | M | observability | Subscription usage shows just "5h OK" far from the limit — surface the real % used (Claude Code `/usage` shows e.g. 49%) via the account usage source the SDK rate-events don't expose |
 
 ### Details
 
@@ -220,35 +222,33 @@ allowlist (CONNECT proxy + cgroup-nftables hard block) · 119d per-session
 user-supplied service creds (`/secret`) · 119e DoS hardening (cgroup mem/CPU +
 seccomp).
 
-**#120 — per-user subscription rate limits (rolling windows)** (P2 · M · security)
+**#130 — global memory: inject CLAUDE.md directly, not via `setting_sources=["user"]`** (P2 · M · security)
 
-Cap how much of the owner's ONE shared subscription each shared user can spend, as
-tokens per **rolling window** (e.g. 500k/day + 2M/week), set by the owner from
-Telegram; the owner is exempt.
+The #121 audit found that per-user GLOBAL MEMORY (#122) loads the `"user"` source,
+which pulls in `~/.claude/settings.json` — not just CLAUDE.md/memory. That settings
+file can carry `permissions.allow` rules (auto-allow tools the bot deliberately keeps
+OUT of `allowed_tools`, bypassing the `can_use_tool` gate) and an `env` block (a
+settings `ANTHROPIC_API_KEY` survives `engine._build_env`'s pop and can flip a user's
+turns to paid billing — the #1 hard rule). Owner-gated + OFF by default + the owner's
+settings.json has none today, so no active leak — but the blast radius exceeds the
+"reads your ~/.claude" framing.
 
-_Why bot-side, not SDK:_ the Agent SDK is per-RUN/per-session and stateless across
-a user's sessions and over time — it has `max_turns` (exposed as `/maxturns`) and
-`max_budget_usd` (a likely no-op under subscription auth, see #62), but **nothing**
-for "user X may spend N tokens per rolling day across all their sessions." That is
-an account-wide, multi-session policy the SDK can't model, so the bot is the right
-enforcement layer — and it already records the data.
+Fix: stop widening `setting_sources`. When `global_memory` is on, READ the owner's
+memory files (`~/.claude/CLAUDE.md` + the memory dir) and inject their content
+directly — chat: append to the system prompt; code: via an additive system-prompt
+preset — keeping `setting_sources=[]` so settings.json (permissions/env) is never
+loaded. Verify the memory actually reaches the model in both modes. Until then:
+trusted users only; the card + AGENTS/engine document the caveat.
 
-_Design (reuses the #105 quota infra):_
-- Storage: extend the allowlist v2 entry with rolling caps, e.g.
-  `"rate": {"day": 500000, "week": 2000000}` (null/absent = no cap). Keep the
-  existing lifetime `token_grant`; compose them (deny if ANY is exceeded).
-- Enforce in the existing pre-turn gate `handlers._access_block`: sum the user's
-  `input+output` tokens over the trailing 24h / 7d from `usage` (extend
-  `db.get_user_usage_tokens(uid, since=epoch)`; `usage.ts` is stored, `chat_id ==
-  uid` for DM rows). Rolling windows need NO reset job — computed from timestamps.
-  Refuse over-budget turns with a localized message naming the window + when it
-  frees up (oldest-in-window ts + period).
-- Owner UI: extend `/limit` (e.g. `/limit @bob 500k/day`) or add `/ratelimit`,
-  following the arg-capture/picker convention; surface usage-vs-cap in `/users` and
-  the user's `/whoami`.
-- Counting: `input+output` (consistent with #105); optionally exclude `cache_read`.
-  Per-model weighting + an optional global (all-users-combined) cap are out of scope
-  for v1.
+**#134 — big_memory 1M beta ignored under subscription** (P2 · S · observability)
+
+The CLI logs "Custom betas are only available for API key users. Ignoring provided
+betas" — so `betas=["context-1m-2025-08-07"]` (engine; passed for code always + chat
+when big_memory) is a NO-OP under the OAuth subscription. So `big_memory`'s 1M-window
+promise (#32/#54) is inactive today; only its durable-resume half still works. Verify
+whether 1M is reachable another way under subscription; otherwise relabel big_memory
+as "durable context" only (drop the 1M claim in `/status`, help, AGENTS, README) so it
+isn't misleading.
 
 ---
 
@@ -373,6 +373,19 @@ Title-only history.
 | 116 | security | Sandbox #104 — resource limit (process cap) | The launcher sets `ulimit -u 512` before exec'ing the jail, blunting a fork-bomb DoS from sandboxed code. (seccomp + cgroup memory/CPU limits — needing a compiled BPF policy / a systemd scope — are noted as lower-priority future hardening, not shipped here.) | Sandboxed code can't fork-bomb the host. |
 | 114 | security | Sandbox #104 — network egress allowlist | **Superseded by #119.** Necessary but not sufficient on its own: while the subscription token lives inside the jail it leaks via the bot's own output channel (agent reads it, the bot streams it to the user) and via any allowed data-store (e.g. GitHub) — so a firewall alone can't protect it. Egress was folded into the e2e design (#119), whose credential-broker removes the token from the jail entirely; the A–E egress-mechanism analysis lives on in #119's Details (component 2). | — |
 | 117 | isolation | Sandbox #104 — perm 6/7 noexec toggle on the workdir | **Won't do — folded into #119 rationale.** noexec is capability-reduction (counter to the goal of containing, not de-powering, sessions) and weak regardless (interpreters run scripts even from a noexec dir; bwrap 0.8 has no per-bind noexec). Recorded in #119 (component 4) so it isn't re-proposed. | — |
+| 120 | security | Per-user subscription rate limits (rolling day/week windows) | `allowlist` entry `rate={day,week}` (None=no cap) + `set_rate`/`rate_of`; `db.get_user_usage_tokens(since=)` + `get_user_usage_breakdown`; enforced pre-turn in `_access_block` over the trailing 24h/7d (no reset job). Set via the per-user card or `/limit @user <n> [day\|week]\|off`. Replaces the #105 lifetime cap; owner exempt. | Per-user daily/weekly token caps. |
+| 121 | features | Per-user management card (owner: tap a user → level/expiry/limits/memory/effort/stats) | `/users` lists tappable users → `_render_user_card`/`on_user_cb`: toggle level/global-memory/max-effort, set expiry + day/week caps (arg-capture), clear limits, remove, and per-user usage stats. Owner-only; the owner's own card exposes the global-memory toggle. | Manage each user from one tap-through card. |
+| 122 | isolation | Per-user global memory (owner-granted opt-out of `setting_sources=[]`) | `allowlist` `global_memory` (+ owner via `owner_prefs`); `sessions._resolve_global_memory` resolves it for the session owner (`created_by`) and `engine` flips `setting_sources` to `["user"]` (loads `~/.claude` + CLAUDE.md/memory). OFF by default; applies on the next rebuild; the card warns it exposes the owner's `~/.claude`. | Give a user (or yourself) global memory. |
+| 123 | security | Per-user effort-`max` gate | `allowlist` `allow_max_effort` (owner always allowed); `/effort` picker hides `max` and both the picker + typed path reject it for un-granted users — stops a guest burning the shared subscription with max thinking. | Only granted users can pick max effort. |
+| 124 | features | Web-capable chat (WebSearch/WebFetch) | Chat now ships the read-only web tools auto-allowed (like the Claude apps), reversing #24's tool-free chat; system prompt updated; verified live (the model used WebSearch). | Chat can search the web. |
+| 125 | security | Neutralize harness keyword triggers (ultracode/ultrathink) | The bundled CLI acts on `ultracode` (→ multi-agent Workflow) and `ultrathink` (→ effort) keywords. The engine sets `CLAUDE_CODE_DISABLE_WORKFLOWS=1` AND splits the keyword with a space in every prompt (`defuse_triggers`); list = `DEFAULT_KEYWORD_TRIGGERS` + `BLOCKED_PROMPT_KEYWORDS` (env). | ultracode/ultrathink can't burn the subscription. |
+| 126 | ux | `/permissions` gated to code sessions | Chat is tool-free (the engine hardcodes `permission_mode="default"`), so `/permissions` + the `/settings` row now say "code only" / are hidden in chat. | Permissions menu only where it applies. |
+| 127 | reliability | Stale Stop button after a bot restart | A restart orphans the per-turn control message; tapping its Stop (no live turn) now deletes the dead message instead of lingering forever. | Old Stop buttons clear on tap. |
+| 128 | docs | README streaming Bot-API link + Known issues + full-control features | Added the `sendMessageDraft` link to the streaming feature, a Known issues section (Telegram Desktop macOS draft "retype" on long answers; iOS renders fine), and a features bullet for full Telegram management. Also: the "comment-out replaced code, don't delete" convention in AGENTS/CLAUDE/CONTRIBUTING. | — |
+| 129 | features | Full per-session Tools page (toggle every tool on/off) | `engine.tools_enabled`/`_resolve_tools` + `CHAT_TOOLS` (replaced the `web_search` bool); `db.threads.tools_enabled` (NULL=default, `[]`=tool-free); `sessions` rebuild-on-change wiring; `/tools` + `/settings → 🧰 Tools` with ✅/⬜ toggles (chat = web tools, code = full toolset, dangerous ones still gated). MCP connectors out of scope (#62/#119). | Configure each session's tools from Telegram. |
+| 131 | security | Per-user tool cap (owner restricts which tools a shared user may use) | `allowlist` `tool_cap` (list = allowed tools, None = uncapped) + `tool_cap_of`/`set_tool_cap`; `sessions._resolve_tool_cap` → `engine._resolve_tools` intersects the session's enabled tools with the cap (owner always uncapped). Set from the `/users` card → 🧰 Tools sub-page (toggle each tool; applies to all the user's sessions). Audit-driven follow-up to the #121 batch. | Owner controls which tools each shared user can use. |
+| 132 | ux | Settings as the single hub + command-menu declutter + transcript export in /sessions | `/settings` moved to menu position 4 (between `/sessions` and `/rename`); pure-config commands (model/effort/tools/memory/permissions/usage/language) dropped from the `/` menu (still typeable) — navigate from `/settings`; added a `👥 Users` hub row (owner) that opens the per-user list in-place with `➕ Add user` + `◂ Settings`; added `📄 Transcript` export to the `/sessions` options menu; chat settings header no longer shows the inert Permissions line (#121 audit #6). | One settings hub; fewer menu items; transcript export in the sessions menu. |
+| 133 | core | Chat-default sessions + upgrade/downgrade to code (mutable type, carry conversation) | Reverses #53: every session is born 💬 chat (one `/new`); `/code` upgrades to a code session (working dir + full tools + approval gate, gated by code-access level), `/chat` downgrades back KEEPING the workdir files. `db.switch_mode` carries the conversation by copying the resumable session id old-mode→new-mode column; BOTH modes now run in the per-session workdir (`engine`), so cross-mode resume finds the transcript (verified live — a chat-planted fact was recalled after upgrade). Session-menu **Convert** button (shown per code-access), `/mode` shows how to switch, the new-chat message hints `/code` only to code-capable users, the chat system prompt tells the model to suggest `/code` for code requests, and `big_memory` now applies to both modes. AGENTS/README + button-label UX convention updated; existing chat sessions reset context once (owner-accepted). | Sessions start as chat and upgrade to code (and back), keeping the conversation. |
 
 ---
 

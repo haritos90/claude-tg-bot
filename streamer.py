@@ -313,8 +313,14 @@ class Streamer:
         body = self._full[: self._shown].strip()
         if not body:
             return  # nothing yet — the empty "Thinking…" draft already shows
-        # Render the model text alone (no status block): split raw first so a
-        # fence cut at the tail stays balanced, then render the frontier chunk.
+        # Render the model text alone (no status block): split raw first so a fence
+        # cut at the tail stays balanced, then render the FRONTIER (tail) chunk so the
+        # live draft tracks the model's current frontier (best live progress).
+        # KNOWN ISSUE: for answers past Telegram's ~4096-char draft cap this tail
+        # "jumps", which Telegram DESKTOP FOR macOS re-renders as a visible "retype"
+        # (iOS animates it smoothly in one pass). That is a client-side draft-render
+        # limitation, documented in the README (Known issues) — NOT a bot bug; the
+        # final finish() message is always correct and complete on every client.
         raw_chunks = markup.split_markdown(body, limit=markup.SAFE_LIMIT)
         frontier = raw_chunks[-1] if raw_chunks else body
         chunk = markup.md_to_html(frontier) or "…"

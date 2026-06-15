@@ -3,13 +3,15 @@
 A **private, multi-user** Telegram bot that is your personal frontend to **Claude**
 and **Claude Code** — use it yourself and share access with other Telegram users,
 each talking to the bot in a **DM**. You keep named **sessions** and switch between
-them; each is fully isolated (histories never cross) and is **either chat or code,
-fixed at creation**:
+them; each is fully isolated (histories never cross). A session is **born a chat and
+can be upgraded to code (and back)** — same conversation, more power:
 
-- **chat** — a plain Claude conversation.
-- **code** — a full Claude Code agent with its own working directory on the
-  server; it runs shell commands and edits files (dangerous tools wait for an
-  **Allow** / **Deny** tap, or run freely with `/auto on`).
+- **chat** — a Claude conversation with **web** tools (search + fetch); no terminal
+  or files.
+- **code** — a full Claude Code agent with its own working directory on the server;
+  it runs shell commands and edits files (dangerous tools wait for an **Allow** /
+  **Deny** tap, or run freely with `/auto on`). Upgrade a chat with **`/code`**
+  (needs code access); **`/chat`** downgrades back, keeping the files.
 
 Everything runs on your **Claude Pro/Max subscription** via the
 [Claude Agent SDK](https://docs.claude.com/en/api/agent-sdk/overview) — **no
@@ -22,16 +24,28 @@ Anthropic API key, no per-token billing.**
 
 ## Features
 
-- **Streaming:** uses native Telegram streaming tailored for generative AI tools
-  (Telegram only supports it for DMs now).
+- **Streaming:** uses native Telegram streaming
+  ([`sendMessageDraft`](https://core.telegram.org/bots/api#sendmessagedraft))
+  tailored for generative AI tools (Telegram only supports it in DMs now).
+- **Web-capable chat** — chat sessions can **search the web** and **read pages**
+  (`WebSearch` / `WebFetch`), like the Claude apps; code sessions add the full
+  agent toolset (Bash, file edits, notebooks).
 - **Isolated sessions** — each is its own Claude session (context, working dir,
-  resume id), chat **or** code, fixed at creation; nothing leaks between them
+  resume id), **born chat, upgradeable to code** (`/code` ⇄ `/chat`, same
+  conversation); nothing leaks between them
   (see **One subscription, isolated memory** below). Browse / switch / rename /
   ⭐ / delete via `/sessions`.
 - **Allowlist access** — only the owner and explicitly allowed users can talk to
   the bot; each allowed user has a **level** (chat or code), an optional
-  **expiry**, and an optional **token cap**. The list lives in a gitignored
-  `allowlist.json`.
+  **expiry**, and optional rolling **token limits** (day/week). The list lives in a
+  gitignored `allowlist.json`.
+- **Full owner control from Telegram** — `/settings` is the hub for everything, no
+  server access needed. Open **👥 Users** and tap a person to set their **access**
+  (chat vs **code**), **expiry**, rolling **token limits** (day/week), **global
+  memory**, **max-effort**, and **which tools** they may use — plus their **usage
+  stats** — all from one card. Each session's tools are also configurable per-session
+  (`/tools` or `/settings → Tools`): WebSearch/WebFetch for chat, the full agent
+  toolset for code.
 - **Approvals & auto mode** — in code mode Bash/Write/Edit pause for an inline
   **Allow / Deny** tap; `/auto on` (owner) runs everything without asking.
   `/permissions` switches ask / auto-edits / plan / full-access.
@@ -50,9 +64,9 @@ Anthropic API key, no per-token billing.**
 
 ```
 You ──DM──▸ @your_bot
-             └── /newchat | /newcode ──▸ one isolated session   (switch with /sessions)
-                   ├── chat: Agent SDK, no tools
-                   └── code: Agent SDK + tools, cwd = BASE_WORKDIR/<session>
+             └── /new ──▸ a chat session   (switch with /sessions · upgrade with /code)
+                   ├── chat: Agent SDK + web research (WebSearch/WebFetch)
+                   └── code: Agent SDK + full tools, cwd = BASE_WORKDIR/<session>
                                 └── dangerous tool? ──▸ inline Allow / Deny
 ```
 
@@ -166,8 +180,8 @@ sensible defaults.
 python bot.py
 ```
 
-Open a DM, `/start`, create a session with `/newchat` or `/newcode`, and say
-hello. `/help` lists every command.
+Open a DM, `/start`, create a session with `/new`, and say hello — when you need a
+terminal or files, upgrade it with `/code`. `/help` lists every command.
 
 ---
 
@@ -197,7 +211,7 @@ else). Plain text goes straight to the current session's Claude.
 
 | Group | Commands |
 |---|---|
-| **Sessions** | `/newchat` `/newcode` `/sessions` `/rename` |
+| **Sessions** | `/new` `/code` (upgrade) `/chat` (downgrade) `/sessions` `/rename` |
 | **Run** | `/status` `/stop` `/retry` `/reset` |
 | **Tuning** | `/model` `/effort` `/fork` `/memory` · *(code)* `/permissions` `/files` `/export` `/maxturns` |
 | **Info** | `/recap` `/history` `/usage` `/context` `/queue` `/clearqueue` |
@@ -229,6 +243,14 @@ else). Plain text goes straight to the current session's Claude.
   **network egress allowlist**, per-session secrets, and DoS limits — is tracked
   as **#119 in [`TODO.md`](TODO.md)** and not yet built. The owner can toggle
   isolation per session with `/sandbox on|off`.
+- **Hidden CLI keyword triggers are neutralized.** The bundled Claude CLI acts on
+  prompt keywords like `ultrathink` (escalates reasoning effort) and `ultracode`
+  (spins up multi-agent **Workflow** orchestration) — either could let any user
+  silently burn the owner's one shared subscription or bypass the per-user effort
+  gate. The bot disables Workflows outright (`CLAUDE_CODE_DISABLE_WORKFLOWS=1`) and
+  defuses the keywords in every prompt. The blocked list defaults to `ultrathink,
+  ultracode`; add more (no code change) via the **`BLOCKED_PROMPT_KEYWORDS`** env
+  var (comma/space-separated). Reasoning depth is controlled only through `/effort`.
 
 Report vulnerabilities privately — see [`SECURITY.md`](SECURITY.md).
 
@@ -279,6 +301,19 @@ Watch `/usage` and `/status`: chain follow-ups within the 5-minute prompt cache,
 keep one project per session, and right-size the model with `/model`. The owner's
 personal limit-saving notes live in a local, gitignored `CLAUDE.md`; shared
 conventions in `AGENTS.md`.
+
+---
+
+## Known issues
+
+- **Long answers can look like they "retype" on Telegram Desktop for macOS.** Live
+  replies stream as a native message *draft*, which Telegram caps at ~4096
+  characters. Past that cap the draft tracks the model's frontier, and **Telegram
+  Desktop for macOS** re-renders the whole draft on each jump — so a long answer can
+  appear to rewrite itself several times *while streaming*. On **iOS** the same
+  stream animates smoothly in one pass. This is a client-side draft-rendering
+  limitation, not a bot bug: the **final posted message is always complete and
+  correct** on every client.
 
 ---
 

@@ -10,6 +10,7 @@ no API key is present. We therefore strip those vars from the child env.
 """
 
 import os
+import re
 import contextlib
 import shutil
 from dataclasses import dataclass
@@ -26,10 +27,20 @@ from claude_agent_sdk import (
     ToolUseBlock,
 )
 
-# Short, friendly system prompt for chat (no-tools) mode.
+# Short, friendly system prompt for chat mode. Chat now ships the read-only web
+# research tools (see _build_options), so the prompt tells the model it CAN browse
+# — otherwise it falls back to "I have no internet access" out of habit.
 CHAT_SYSTEM_PROMPT = (
     "You are a friendly, helpful assistant. Answer clearly and to the point. "
     "Use Markdown formatting when it helps. "
+    "You have live web access: use the WebSearch tool to find current information "
+    "and the WebFetch tool to read specific pages whenever the user asks about "
+    "recent events, current docs, prices, news, or any fact worth verifying. "
+    "Never claim you lack internet access or cannot browse — you can. "
+    "This is a CHAT session: you have web tools but NO terminal, file access, or code "
+    "execution. If the user wants to run commands, execute code, or read/write files, "
+    "tell them this session can be upgraded to a code session with the /code command — "
+    "do NOT attempt those actions yourself. "
     "Your replies are shown in a Telegram chat, which CANNOT render LaTeX or math "
     "markup — never use $...$, $$...$$, \\(...\\), \\[...\\], or backslash commands "
     "like \\frac or \\text. Write math in plain Unicode instead "
@@ -70,6 +81,56 @@ CODE_AUTO_ALLOW_TOOLS = [
     "NotebookRead",
     "TodoWrite",
 ]
+
+# The chat-mode tool universe: the READ-ONLY web research tools (chat has no cwd,
+# so no Bash/file tools). These make chat behave like the Claude apps. The Tools
+# settings page (#129) toggles which of these are enabled per session; the default
+# (tools_enabled=None) is "all of them on".
+CHAT_TOOLS = [
+    "WebSearch",
+    "WebFetch",
+]
+
+
+# Prompt keyword triggers the bundled CLI honours on the user's MESSAGE TEXT (not
+# just the interactive REPL), so they fire on the SDK path too: "ultrathink"
+# escalates reasoning effort for the turn (ultrathink_effort), and "ultracode" opts
+# the turn into multi-agent Workflow orchestration. Either lets a user silently
+# bypass the bot's per-user effort gate and burn the owner's ONE shared
+# subscription, so we DEFUSE them in the prompt by SPLITTING the word with a space:
+# that breaks the CLI's \bword\b match WITHOUT blocking or removing the message — it
+# still goes through, the keyword is just inert. Effort is controlled
+# only via /effort (gated); Workflows are ALSO disabled outright in the child env
+# (CLAUDE_CODE_DISABLE_WORKFLOWS) — belt and suspenders.
+#
+# These are the built-in DEFAULTS — not hardcoded inline. A deployer can neutralize
+# MORE keywords (without touching code) via the BLOCKED_PROMPT_KEYWORDS env var
+# (config.extra_blocked_keywords), which is appended to this list. See the README.
+DEFAULT_KEYWORD_TRIGGERS: tuple[str, ...] = ("ultrathink", "ultracode")
+
+def build_trigger_re(keywords):
+    """Compile a case-insensitive word-boundary alternation over `keywords`, or
+    return None when the list is empty (nothing to defuse)."""
+    parts = [re.escape(k.strip()) for k in (keywords or []) if k and str(k).strip()]
+    if not parts:
+        return None
+    return re.compile(r"\b(" + "|".join(parts) + r")\b", re.IGNORECASE)
+
+
+def defuse_triggers(text: str, trigger_re) -> str:
+    """Split each matched trigger word with a space so the bundled CLI can't act on
+    it (see DEFAULT_KEYWORD_TRIGGERS). Non-destructive — the message still goes
+    through and the word stays readable; it just no longer matches the CLI's
+    whole-word keyword. No-op without a regex or text."""
+    if not trigger_re or not text:
+        return text
+
+    def _space(m):
+        w = m.group(0)
+        mid = len(w) // 2 or 1
+        return w[:mid] + " " + w[mid:]
+
+    return trigger_re.sub(_space, text)
 
 
 @dataclass
@@ -157,6 +218,10 @@ class ClaudeSession:
         resume_session_id: str | None = None,
         permission_mode: str = "default",
         big_memory: bool = False,
+        tools_enabled: list[str] | None = None,
+        tool_cap: list[str] | None = None,
+        global_memory: bool = False,
+        extra_blocked_keywords: list[str] | None = None,
         effort: str | None = None,
         max_turns: int | None = None,
         add_dirs: list[str] | None = None,
@@ -173,6 +238,28 @@ class ClaudeSession:
         # Big memory: opt-in 1M context window for CHAT mode (code mode already
         # runs with the 1M beta). Set per topic via /memory.
         self.big_memory = big_memory
+        # Per-session ENABLED TOOLS (the Tools settings page, #129). None = the mode's
+        # full default universe (chat → CHAT_TOOLS web research tools; code →
+        # CODE_TOOLS); a list = exactly those, intersected with the universe in
+        # _resolve_tools. Supersedes the earlier web_search bool — chat is web-capable
+        # by default (relaxes the old "chat is tool-free" rule #24) and the page can
+        # turn any tool off; code mode's dangerous tools still hit the approval gate.
+        self.tools_enabled = list(tools_enabled) if tools_enabled is not None else None
+        # Per-USER tool cap (owner-set, #131): the tools this session's OWNER is
+        # allowed to use at all. None = uncapped. _resolve_tools intersects the
+        # session's enabled set with this, so the owner can restrict a shared user's
+        # tools regardless of what that user toggles per session.
+        self.tool_cap = list(tool_cap) if tool_cap is not None else None
+        # Per-user GLOBAL MEMORY (owner-granted opt-out of isolation): when on, this
+        # session loads setting_sources=["user"] (~/.claude settings + the user
+        # CLAUDE.md / memory) instead of []. Relaxes the per-session isolation
+        # invariant for that user only; OFF by default.
+        self.global_memory = bool(global_memory)
+        # Prompt keyword triggers to neutralize: the built-in DEFAULT_KEYWORD_TRIGGERS
+        # plus any deployer extras (BLOCKED_PROMPT_KEYWORDS). Compiled once per session.
+        self._trigger_re = build_trigger_re(
+            list(DEFAULT_KEYWORD_TRIGGERS) + list(extra_blocked_keywords or [])
+        )
         # Pro-command per-session options (#23): reasoning effort, agentic turn
         # cap, extra code dirs, and a one-shot fork (resume → branch a new id).
         self.effort = effort
@@ -195,10 +282,19 @@ class ClaudeSession:
         self._interrupted = False
 
     def _build_env(self) -> dict[str, str]:
-        """Copy the current env and remove API-key vars to force subscription auth."""
+        """Copy the current env, strip API-key vars (force subscription auth), and
+        disable the harness Workflows feature.
+
+        CLAUDE_CODE_DISABLE_WORKFLOWS=1 turns off multi-agent orchestration and its
+        "ultracode" prompt-keyword trigger at the source: the bundled CLI otherwise
+        lets ANY user opt a turn into multi-agent Workflow orchestration just by
+        typing "ultracode" — a token bomb on the owner's ONE shared subscription.
+        The bot is an Agent-SDK frontend and never wants that tool. (The keyword is
+        also defused in the prompt itself; see defuse_triggers.)"""
         env = dict(os.environ)
         env.pop("ANTHROPIC_API_KEY", None)
         env.pop("ANTHROPIC_AUTH_TOKEN", None)
+        env["CLAUDE_CODE_DISABLE_WORKFLOWS"] = "1"
         return env
 
     def _sandbox_launcher(self) -> str:
@@ -225,6 +321,23 @@ class ClaudeSession:
         # writable inside; confinement comes from the bind mounts (only the workdir
         # is rw-bound — secrets / other sessions / the host are simply not mounted).
 
+    def _resolve_tools(self, universe: list[str]) -> list[str]:
+        """The enabled subset of a mode's tool universe for this session. None (the
+        default) = the whole universe; a stored list = only the tools the session has
+        switched on (intersection, so a stale/foreign name can never widen the set).
+        The Tools settings page (#129) edits the stored list."""
+        if self.tools_enabled is None:
+            result = list(universe)
+        else:
+            enabled = set(self.tools_enabled)
+            result = [t for t in universe if t in enabled]
+        # Per-user owner cap (#131): never widen beyond what the owner allows. A
+        # capped user's session can enable only tools in BOTH its toggles and the cap.
+        if self.tool_cap is not None:
+            cap = set(self.tool_cap)
+            result = [t for t in result if t in cap]
+        return result
+
     def _build_options(self) -> ClaudeAgentOptions:
         """Construct ClaudeAgentOptions for the current mode/model/cwd."""
         env = self._build_env()
@@ -233,8 +346,20 @@ class ClaudeSession:
             "model": self.model,
             # Isolation: pass [] (NOT None) so the CLI loads NO user/project/local
             # settings and NO CLAUDE.md. In this SDK version None means "load all
-            # filesystem sources" — the opposite of what we want.
-            "setting_sources": [],
+            # filesystem sources" — the opposite of what we want. When the owner
+            # grants a user GLOBAL MEMORY, load the "user" source instead so the
+            # owner's ~/.claude (CLAUDE.md / memory) is in scope — a deliberate,
+            # per-user relaxation of the isolation invariant.
+            #
+            # BLAST RADIUS (#130, audit): "user" also loads ~/.claude/settings.json,
+            # whose permissions.allow rules can AUTO-allow tools the bot keeps out of
+            # allowed_tools (bypassing the can_use_tool gate) and whose env can be
+            # merged into the child (a settings ANTHROPIC_API_KEY would survive the
+            # _build_env pop and flip billing). Owner-gated + off by default, and the
+            # owner's settings.json has none today — but the proper fix (inject
+            # CLAUDE.md directly instead of widening setting_sources) is #130. Until
+            # then, only grant to fully-trusted users; the card warns.
+            "setting_sources": ["user"] if self.global_memory else [],
             "include_partial_messages": True,  # enable text-delta streaming
             "env": env,
         }
@@ -253,35 +378,51 @@ class ClaudeSession:
         if self.mode == "code":
             if self.sandbox:
                 self._enable_sandbox(common)
+            code_tools = self._resolve_tools(CODE_TOOLS)
+            code_extra: dict = {}
+            if self.big_memory:
+                # #133: big_memory is the unified 1M-context toggle for BOTH modes now
+                # (chat applies it below) — was unconditional for code. NOTE #134: the
+                # beta is IGNORED under the OAuth subscription, so this is currently a
+                # no-op; kept so it's correct if/when subscription betas are allowed.
+                code_extra["betas"] = ["context-1m-2025-08-07"]
             return ClaudeAgentOptions(
                 cwd=self.cwd,
                 permission_mode=self.permission_mode,
                 can_use_tool=self.can_use_tool,
-                # `tools` = the universe of callable tools; `allowed_tools` =
-                # only the read-only auto-allow set. Dangerous tools are usable
-                # but not auto-allowed, so the CLI evaluates them as "ask" and
-                # our can_use_tool gate fires for each one before execution.
-                tools=list(CODE_TOOLS),
-                allowed_tools=list(CODE_AUTO_ALLOW_TOOLS),
+                # `tools` = the (per-session enabled) callable universe; `allowed_tools`
+                # = only the read-only auto-allow subset of those. Dangerous enabled
+                # tools are usable but not auto-allowed, so the CLI evaluates them as
+                # "ask" and our can_use_tool gate fires for each before execution.
+                tools=code_tools,
+                allowed_tools=[t for t in code_tools if t in CODE_AUTO_ALLOW_TOOLS],
                 add_dirs=list(self.add_dirs),
-                betas=["context-1m-2025-08-07"],
+                **code_extra,
                 **common,
             )
 
-        # Default / chat mode: a pure conversation with NO tools.
-        # `tools=[]` (empty list, NOT None) makes the CLI emit `--tools ""`,
-        # which gives the model an EMPTY tool universe. Passing None would leave
-        # the CLI's DEFAULT tool set enabled (WebSearch, etc.), so chat mode
-        # would not actually be tool-free. allowed_tools=[] then auto-allows
-        # nothing on top of that.
+        # Chat mode: a conversation that ships ONLY the read-only web research
+        # tools (WebSearch / WebFetch) so it can look up current info like
+        # claude.ai — no Bash, no file edits. `tools` is the EXACT universe the
+        # model may call: an explicit list (NOT None — None would let the CLI
+        # enable its full default toolset; [] would make it tool-free). The same
+        # tools go in `allowed_tools` so they are AUTO-allowed (no approval UI —
+        # chat has no can_use_tool gate, matching the app). A stored
+        # tools_enabled=[] (via the Tools page) makes a truly tool-free chat.
+        chat_tools = self._resolve_tools(CHAT_TOOLS)
         chat_extra: dict = {}
         if self.big_memory:
             # Big-memory topics get the 1M context window in chat too.
             chat_extra["betas"] = ["context-1m-2025-08-07"]
         return ClaudeAgentOptions(
             system_prompt=CHAT_SYSTEM_PROMPT,
-            tools=[],
-            allowed_tools=[],
+            # Chat now runs in the per-session workdir too (#133), so its conversation
+            # transcript lives in the SAME project as code mode — that's what lets a
+            # session upgrade chat→code (or back) and keep one continuous conversation.
+            # Chat has no file tools, so the cwd is only transcript storage here.
+            cwd=self.cwd,
+            tools=list(chat_tools),
+            allowed_tools=list(chat_tools),
             permission_mode="default",
             **chat_extra,
             **common,
@@ -290,12 +431,12 @@ class ClaudeSession:
     async def _ensure_client(self) -> None:
         """Lazily create and connect the underlying SDK client."""
         if self.client is None:
-            # Code mode runs the agent IN self.cwd; the CLI refuses to start if the
-            # directory does not exist ("Working directory does not exist"). Create
-            # the per-session workdir up front. (Chat mode passes no cwd, so skip.)
-            if self.mode == "code" and self.cwd:
+            # Both modes run the agent IN self.cwd (chat too, #133 — that's where the
+            # conversation transcript lives, so chat↔code resume the SAME session). The
+            # CLI refuses to start if the directory does not exist, so create it up front.
+            if self.cwd:
                 os.makedirs(self.cwd, exist_ok=True)
-                if self.sandbox:
+                if self.mode == "code" and self.sandbox:
                     # Persistent per-session claude state dir for the jail (#115).
                     os.makedirs(f"{self.cwd}.sbxstate", exist_ok=True)
             self.client = ClaudeSDKClient(self._build_options())
@@ -312,6 +453,11 @@ class ClaudeSession:
         from the `resume` option set at connect time, so attachment turns keep the
         thread's context.
         """
+        # Defuse harness keyword triggers (ultrathink / ultracode / deployer extras)
+        # so a user's message can't silently escalate effort or spin up multi-agent
+        # orchestration. The DB transcript logs the ORIGINAL text (done upstream in
+        # sessions.py); only the CLI-bound copy is defused.
+        prompt = defuse_triggers(prompt, self._trigger_re)
         if not attachments:
             await self.client.query(prompt)
             return

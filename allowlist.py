@@ -5,21 +5,41 @@ pinned, their ``@username``) has an allowlist **entry** that has not expired.
 Numeric ids are authoritative; usernames are a convenience that is upgraded to an
 id on first contact (``pin``).
 
-Each entry carries per-user access metadata (one rewrite serving #102/#103/#105):
+Each entry carries per-user access metadata (#102/#103/#105 + the per-user
+controls #120/global-memory/max-effort):
 
-- ``level``       — ``"chat"`` (may only use chat sessions) or ``"code"`` (chat + code).
-- ``expires_at``  — an ISO date (``YYYY-MM-DD``) / datetime, or ``None`` for never.
-- ``token_grant`` — a cumulative token allowance (``None`` = unlimited). "Used" is
-  computed elsewhere (aggregate ``db.usage``); ``remaining = grant - used``.
+- ``level``         — ``"chat"`` (chat sessions only) or ``"code"`` (chat + code).
+- ``expires_at``    — an ISO date (``YYYY-MM-DD``) / datetime, or ``None`` for never.
+- ``token_grant``   — a legacy cumulative token allowance (``None`` = unlimited).
+  Kept for backward compatibility but NO LONGER enforced — superseded by ``rate``
+  (#120 replaced the lifetime cap with rolling windows).
+- ``rate``          — rolling-window token caps ``{"day": <int|null>, "week":
+  <int|null>}`` (``None`` = no cap for that window). Enforced from the trailing
+  24h / 7d of ``db.usage`` (no reset job — computed from timestamps).
+- ``global_memory`` — when ``True``, that user's sessions load ``setting_sources=
+  ["user"]`` (the owner's ``~/.claude`` settings + ``CLAUDE.md`` / memory) instead
+  of ``[]``. This DELIBERATELY relaxes the per-session isolation invariant for the
+  user, so it is owner-granted and OFF by default (see ``engine``).
+- ``allow_max_effort`` — when ``True``, the user may select the ``max`` reasoning
+  effort (expensive on the shared subscription); OFF by default, owner-granted.
+
+The OWNER is synthesised in memory (never an access entry), so the owner's only
+build-affecting preference — ``global_memory`` — lives in a separate top-level
+``owner_prefs`` map; the owner is always ``code`` / unexpiring / uncapped /
+max-effort-allowed.
 
 On-disk JSON (version 2)::
 
     {
       "version": 2,
+      "owner_prefs": {"global_memory": <bool>},
       "entries": {"<id>": {"username": <str|null>, "level": "chat|code",
-                            "expires_at": <str|null>, "token_grant": <int|null>}},
+                            "expires_at": <str|null>, "token_grant": <int|null>,
+                            "rate": {"day": <int|null>, "week": <int|null>},
+                            "global_memory": <bool>, "allow_max_effort": <bool>}},
       "pending_usernames": {"<name>": {"level": ..., "expires_at": ...,
-                                       "token_grant": ...}}
+                                       "token_grant": ..., "rate": ...,
+                                       "global_memory": ..., "allow_max_effort": ...}}
     }
 
 A **legacy** ``{"ids": [...], "usernames": [...]}`` file is migrated in memory to
@@ -49,6 +69,10 @@ from typing import Optional
 _USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{4,32}$")
 
 LEVELS = ("chat", "code")
+
+# Sentinel for "leave this field unchanged" in set_rate (so a caller can update
+# only the day OR only the week cap without clobbering the other).
+_UNSET = object()
 
 
 def _norm_username(name: str) -> str:
@@ -82,8 +106,14 @@ class Allowlist:
     def __init__(self, path, owner_id: int) -> None:
         self.path = Path(path)
         self.owner_id = owner_id
-        self._entries: dict[int, dict] = {}   # id   -> {username, level, expires_at, token_grant}
-        self._pending: dict[str, dict] = {}   # name -> {level, expires_at, token_grant}
+        # id   -> {username, level, expires_at, token_grant, rate, global_memory, allow_max_effort}
+        self._entries: dict[int, dict] = {}
+        # name -> same minus username (carried once the user is pinned to an id)
+        self._pending: dict[str, dict] = {}
+        # Owner-only build-affecting preference (the owner is never an access
+        # entry). Only global_memory matters for the owner — they are always
+        # code / unexpiring / uncapped / max-effort-allowed.
+        self._owner_prefs: dict = {"global_memory": False}
         self._mtime: Optional[float] = None
         self._load()
 
@@ -111,6 +141,27 @@ class Allowlist:
         except (TypeError, ValueError):
             return None
 
+    @staticmethod
+    def _norm_bool(v) -> bool:
+        if isinstance(v, bool):
+            return v
+        if isinstance(v, (int, float)):
+            return v != 0
+        return str(v).strip().lower() in ("1", "true", "yes", "on")
+
+    @classmethod
+    def _norm_rate(cls, v) -> dict:
+        """Normalize a rolling-window cap dict to ``{"day": int|None, "week":
+        int|None}`` (None = no cap for that window). Fail-soft to no caps."""
+        v = v if isinstance(v, dict) else {}
+        return {"day": cls._norm_grant(v.get("day")), "week": cls._norm_grant(v.get("week"))}
+
+    @staticmethod
+    def _norm_tool_cap(v):
+        """Normalize a per-user tool cap to a ``list[str]`` (the tools the user MAY
+        use) or ``None`` (no cap = the session's full default set). #131."""
+        return [str(x) for x in v] if isinstance(v, list) else None
+
     def _norm_record(self, rec: Optional[dict]) -> dict:
         rec = rec or {}
         uname = rec.get("username")
@@ -120,6 +171,10 @@ class Allowlist:
             "level": self._norm_level(rec.get("level")),
             "expires_at": self._norm_expiry(rec.get("expires_at")),
             "token_grant": self._norm_grant(rec.get("token_grant")),
+            "rate": self._norm_rate(rec.get("rate")),
+            "global_memory": self._norm_bool(rec.get("global_memory")),
+            "allow_max_effort": self._norm_bool(rec.get("allow_max_effort")),
+            "tool_cap": self._norm_tool_cap(rec.get("tool_cap")),
         }
 
     def _norm_pending(self, rec: Optional[dict]) -> dict:
@@ -128,7 +183,15 @@ class Allowlist:
             "level": self._norm_level(rec.get("level")),
             "expires_at": self._norm_expiry(rec.get("expires_at")),
             "token_grant": self._norm_grant(rec.get("token_grant")),
+            "rate": self._norm_rate(rec.get("rate")),
+            "global_memory": self._norm_bool(rec.get("global_memory")),
+            "allow_max_effort": self._norm_bool(rec.get("allow_max_effort")),
+            "tool_cap": self._norm_tool_cap(rec.get("tool_cap")),
         }
+
+    def _norm_owner_prefs(self, rec: Optional[dict]) -> dict:
+        rec = rec if isinstance(rec, dict) else {}
+        return {"global_memory": self._norm_bool(rec.get("global_memory"))}
 
     # -- loading / saving ---------------------------------------------------
 
@@ -140,7 +203,9 @@ class Allowlist:
                 data = json.load(fh)
             entries: dict[int, dict] = {}
             pending: dict[str, dict] = {}
+            owner_prefs = self._norm_owner_prefs(None)
             if isinstance(data, dict) and ("entries" in data or "version" in data):
+                owner_prefs = self._norm_owner_prefs(data.get("owner_prefs"))
                 for sid, rec in (data.get("entries") or {}).items():
                     try:
                         uid = int(sid)
@@ -171,10 +236,12 @@ class Allowlist:
                                       "token_grant": None}
             self._entries = entries
             self._pending = pending
+            self._owner_prefs = owner_prefs
             self._mtime = mtime
         except Exception:
             self._entries = {}
             self._pending = {}
+            self._owner_prefs = self._norm_owner_prefs(None)
             self._mtime = None
 
     def _reload_if_changed(self) -> None:
@@ -188,6 +255,7 @@ class Allowlist:
     def _save(self) -> None:
         payload = {
             "version": 2,
+            "owner_prefs": dict(self._owner_prefs),
             "entries": {str(uid): rec for uid, rec in sorted(self._entries.items())},
             "pending_usernames": {n: rec for n, rec in sorted(self._pending.items())},
         }
@@ -260,6 +328,43 @@ class Allowlist:
             return None
         return self._norm_grant(rec.get("token_grant"))
 
+    def rate_of(self, user_id: Optional[int], username: Optional[str]) -> dict:
+        """The user's rolling-window token caps ``{"day": int|None, "week":
+        int|None}`` (None = no cap). Owner is always uncapped (#120)."""
+        self._reload_if_changed()
+        if user_id is not None and user_id == self.owner_id:
+            return {"day": None, "week": None}
+        rec = self._find(user_id, username)
+        return self._norm_rate(rec.get("rate")) if rec else {"day": None, "week": None}
+
+    def global_memory_of(self, user_id: Optional[int], username: Optional[str]) -> bool:
+        """Whether this user's sessions load the global (``~/.claude``) memory
+        instead of running fully isolated. Owner reads its own ``owner_prefs``;
+        everyone else defaults to False (isolated)."""
+        self._reload_if_changed()
+        if user_id is not None and user_id == self.owner_id:
+            return self._norm_bool(self._owner_prefs.get("global_memory"))
+        rec = self._find(user_id, username)
+        return self._norm_bool(rec.get("global_memory")) if rec else False
+
+    def allow_max_effort_of(self, user_id: Optional[int], username: Optional[str]) -> bool:
+        """Whether this user may select the (expensive) ``max`` reasoning effort.
+        Owner is always allowed; everyone else defaults to False (#120/effort gate)."""
+        self._reload_if_changed()
+        if user_id is not None and user_id == self.owner_id:
+            return True
+        rec = self._find(user_id, username)
+        return self._norm_bool(rec.get("allow_max_effort")) if rec else False
+
+    def tool_cap_of(self, user_id: Optional[int], username: Optional[str]):
+        """The tools this user MAY use (a ``list[str]``), or ``None`` = uncapped (the
+        session's full default set). Owner is always uncapped (#131)."""
+        self._reload_if_changed()
+        if user_id is not None and user_id == self.owner_id:
+            return None
+        rec = self._find(user_id, username)
+        return self._norm_tool_cap(rec.get("tool_cap")) if rec else None
+
     def pin(self, user_id: Optional[int], username: Optional[str]) -> bool:
         """Upgrade a username-only match to a stable numeric id, CARRYING its
         record (level/expiry/grant). Also refreshes a known entry's username.
@@ -295,12 +400,22 @@ class Allowlist:
     # -- mutations ----------------------------------------------------------
 
     def _record_for_target(self, target: str) -> Optional[dict]:
-        """The mutable record for an id-or-username target, or None if absent."""
+        """The mutable record for an id-or-username target, or None if absent. A
+        username resolves to its pending record OR — if the user was already pinned
+        to an id — the entry whose stored username matches, so a card/command opened
+        on a pending user keeps working after they're pinned mid-session (#121 audit;
+        same username->entry fallback `remove()` already uses)."""
         raw = target.strip()
         candidate = raw[1:] if raw.startswith("-") else raw
         if candidate.isascii() and candidate.isdigit():
             return self._entries.get(int(raw))
-        return self._pending.get(_norm_username(raw))
+        name = _norm_username(raw)
+        if name in self._pending:
+            return self._pending[name]
+        for rec in self._entries.values():
+            if rec.get("username") == name:
+                return rec
+        return None
 
     def add(
         self,
@@ -381,6 +496,74 @@ class Allowlist:
         self._save()
         return True
 
+    def _is_owner_target(self, target: str) -> bool:
+        """True iff a mutation target string resolves to the owner's numeric id."""
+        raw = target.strip()
+        candidate = raw[1:] if raw.startswith("-") else raw
+        return candidate.isascii() and candidate.isdigit() and int(raw) == self.owner_id
+
+    def set_global_memory(self, target: str, on: bool) -> bool:
+        """Grant/revoke GLOBAL MEMORY for a user. The owner's flag lives in
+        ``owner_prefs`` (the owner is never an access entry). Returns True if the
+        target exists (or is the owner)."""
+        self._reload_if_changed()
+        if self._is_owner_target(target):
+            self._owner_prefs["global_memory"] = bool(on)
+            self._save()
+            return True
+        rec = self._record_for_target(target)
+        if rec is None:
+            return False
+        rec["global_memory"] = bool(on)
+        self._save()
+        return True
+
+    def set_allow_max_effort(self, target: str, on: bool) -> bool:
+        """Grant/revoke permission to select the ``max`` effort level. The owner is
+        always allowed (no-op success). Returns True if the target exists."""
+        self._reload_if_changed()
+        if self._is_owner_target(target):
+            return True  # owner is always allowed; nothing to store
+        rec = self._record_for_target(target)
+        if rec is None:
+            return False
+        rec["allow_max_effort"] = bool(on)
+        self._save()
+        return True
+
+    def set_tool_cap(self, target: str, tools) -> bool:
+        """Set/clear a user's TOOL CAP (#131): ``tools`` is a list (the only tools
+        the user may use) or None (uncapped). Owner is always uncapped (no-op
+        success). Returns True if the target exists."""
+        self._reload_if_changed()
+        if self._is_owner_target(target):
+            return True
+        rec = self._record_for_target(target)
+        if rec is None:
+            return False
+        rec["tool_cap"] = self._norm_tool_cap(tools)
+        self._save()
+        return True
+
+    def set_rate(self, target: str, day=_UNSET, week=_UNSET) -> bool:
+        """Set/clear a user's rolling-window caps (#120). Pass ``day``/``week`` as an
+        int (cap, in tokens), None (clear that window), or leave unset to keep it.
+        The owner is uncapped (no-op success). Returns True if the target exists."""
+        self._reload_if_changed()
+        if self._is_owner_target(target):
+            return True  # owner is never rate-limited
+        rec = self._record_for_target(target)
+        if rec is None:
+            return False
+        rate = self._norm_rate(rec.get("rate"))
+        if day is not _UNSET:
+            rate["day"] = None if day is None else self._norm_grant(day)
+        if week is not _UNSET:
+            rate["week"] = None if week is None else self._norm_grant(week)
+        rec["rate"] = rate
+        self._save()
+        return True
+
     def remove(self, target: str) -> bool:
         """Remove a matching id or username (also drops an id-entry whose stored
         username matches, so ``/deny @name`` works after the user was pinned).
@@ -407,11 +590,49 @@ class Allowlist:
             self._save()
         return removed
 
+    def describe(self, target: str) -> Optional[dict]:
+        """A normalized, owner-aware view of ONE target's settings (feeds the
+        per-user card). Returns None when the target is neither the owner nor a
+        known entry/pending user. ``kind`` is ``"owner"``/``"entry"``/``"pending"``."""
+        self._reload_if_changed()
+        raw = target.strip()
+        candidate = raw[1:] if raw.startswith("-") else raw
+        is_id = candidate.isascii() and candidate.isdigit()
+        if is_id and int(raw) == self.owner_id:
+            return {
+                "kind": "owner", "id": self.owner_id, "username": None,
+                "level": "code", "expires_at": None, "token_grant": None,
+                "rate": {"day": None, "week": None},
+                "global_memory": self._norm_bool(self._owner_prefs.get("global_memory")),
+                "allow_max_effort": True,
+                "tool_cap": None,
+            }
+        rec = self._record_for_target(target)
+        if rec is None:
+            return None
+        # A username target may resolve to a pinned ENTRY (see _record_for_target's
+        # username->entry fallback); find its id so the card shows entry + usage
+        # stats, not "(unpinned)" with id=None (#121 audit).
+        rec_id = None if is_id else next(
+            (uid for uid, e in self._entries.items() if e is rec), None
+        )
+        if is_id or rec_id is not None:
+            out = self._norm_record(rec)
+            out["kind"] = "entry"
+            out["id"] = int(raw) if is_id else rec_id
+        else:
+            out = self._norm_pending(rec)
+            out["kind"] = "pending"
+            out["id"] = None
+            out["username"] = _norm_username(raw)
+        return out
+
     def snapshot(self) -> dict:
         """A stable, sorted view of the current allowlist (feeds ``/users``)."""
         self._reload_if_changed()
         return {
             "owner_id": self.owner_id,
+            "owner_prefs": dict(self._owner_prefs),
             "entries": {uid: dict(rec) for uid, rec in sorted(self._entries.items())},
             "pending": {n: dict(rec) for n, rec in sorted(self._pending.items())},
         }
