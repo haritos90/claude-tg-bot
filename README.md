@@ -1,23 +1,26 @@
 # claude-tg-bot
 
-A **private, multi-user** Telegram bot that turns a Telegram supergroup into a
-personal frontend for **Claude** and **Claude Code**.
+A **private, multi-user** Telegram bot that is your personal frontend for
+**Claude** and **Claude Code** — in a **DM** with the bot.
 
-Each forum **Topic** in the group is a fully isolated session — histories never
-cross between topics. Two modes per topic:
+The bot keeps named **sessions** you switch between, each fully isolated
+(histories never cross). A session is **either chat or code, fixed when you
+create it**:
 
 - **chat** — a plain Claude conversation.
 - **code** — a full Claude Code agent with its own working directory on the
-  server. It can run shell commands and edit files; anything dangerous waits for
-  you to tap **Allow** / **Deny**.
+  server. It runs shell commands and edits files; with `/auto on` it works
+  without asking, otherwise dangerous tools wait for an **Allow** / **Deny** tap.
 
 Everything runs on your **Claude Pro/Max subscription** through the
 [Claude Agent SDK](https://docs.claude.com/en/api/agent-sdk/overview) — **no
 Anthropic API key and no per-token billing.**
 
-> **Telegram Premium is _not_ required.** Bots, BotFather, supergroups, forum
-> Topics, admin rights, and inline buttons are all free. (See "Do I need
-> Premium?" below.)
+> **Smooth streaming via native message drafts.** In a DM the reply streams in
+> letter-by-letter using Telegram's `sendMessageDraft` (Bot API 9.3+). This only
+> works in private chats, so the older **supergroup/Topics** mode (the code is
+> still here) is **frozen** — DM is the live mode. Telegram Premium is not
+> required.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 ![Python](https://img.shields.io/badge/python-3.11%2B-blue)
@@ -26,37 +29,44 @@ Anthropic API key and no per-token billing.**
 
 ## Features
 
-- **Topics-as-sessions:** one forum topic = one isolated Claude session (own
-  context, own working directory, own resume id). The **General** topic is its
-  own session too. Nothing leaks between topics, and no global `~/.claude` /
-  `CLAUDE.md` is loaded into any session (`setting_sources=[]`).
+- **Sessions:** each session is one isolated Claude session (own context, working
+  directory, resume id) — chat **or** code, fixed at creation. Nothing leaks
+  between sessions, and no global `~/.claude` / `CLAUDE.md` is loaded
+  (`setting_sources=[]`). Browse / switch / rename / delete via `/sessions`.
 - **Access control by allowlist:** only the owner plus explicitly allowed users
   can talk to the bot. The user list lives in a **gitignored** `allowlist.json`,
   so your identities never reach a public repo.
-- **Claude-Code-style streaming:** a live message with an animated spinner, text
-  that fills in as it's generated, and per-tool status lines (`🔧 Bash: …`,
-  `✏️ Edit …`). Code is rendered in **copyable** Telegram code blocks (tap to
-  copy).
-- **Approval prompts:** in code mode, Bash/Write/Edit and other risky tools pause
-  for an inline **Allow / Deny** tap before they run. `/permissions` switches
-  between ask / auto-edits / plan / yolo.
+- **Native letter-by-letter streaming:** the reply streams in smoothly via
+  Telegram message drafts (`sendMessageDraft`). Code is rendered in **copyable**
+  Telegram code blocks. In code mode each burst of output between tools is its own
+  message (so progress is visible); intermediate messages are silent and links
+  never expand into previews.
+- **Approvals & auto mode:** in code mode, Bash/Write/Edit pause for an inline
+  **Allow / Deny** tap — or run `/auto on` (owner) to execute everything without
+  asking, like a local Claude Code session. `/permissions` switches between
+  ask / auto-edits / plan / yolo.
 - **Ambient usage:** `/usage` shows your subscription's **5h** and **7d** windows
   as "% left" — either as a thin footer under replies or a pinned, live-updated
   message.
 - **Task chaining:** send a follow-up while a run is going (or right after) — it
   queues and runs in the *same* session, reusing context and the warm cache.
-- State is in SQLite, so topics, usage, and settings survive a bot restart.
+- **Localized interface:** the bot's UI is available in English and Russian. The
+  language is auto-detected from your Telegram client on first contact and can be
+  changed any time with `/language` or the ⚙️ settings menu. (Claude's own answers
+  are unaffected — the model already replies in your language.)
+- State is in SQLite, so sessions, usage, settings, and your language survive a
+  bot restart.
 
 ---
 
 ## How it works
 
 ```
-Telegram (your private supergroup, Topics ON)
-  └── Topic  ──>  message_thread_id  ──>  one isolated session
-                                            ├── chat: Agent SDK, no tools
-                                            └── code: Agent SDK + tools, cwd = BASE_WORKDIR/<thread_id>
-                                                        └── dangerous tool? -> inline Allow/Deny
+You  ──DM──▸  @your_bot
+               └── /new  ──▸  one isolated session   (switch with /sessions)
+                               ├── chat: Agent SDK, no tools
+                               └── code: Agent SDK + tools, cwd = BASE_WORKDIR/<session>
+                                           └── dangerous tool? ──▸ inline Allow/Deny
 ```
 
 The bot uses long polling (no webhook, no domain, no public port).
@@ -75,7 +85,8 @@ The bot uses long polling (no webhook, no domain, no public port).
 
 ## Part A — Telegram setup (step by step, first-timer friendly)
 
-You'll do all of this inside the Telegram app.
+You only need a bot token and your numeric id — **no group, Topics, or admin
+rights**. You talk to the bot in a private chat (DM).
 
 ### 1. Create the bot and get its token
 
@@ -84,37 +95,22 @@ You'll do all of this inside the Telegram app.
 3. BotFather replies with a **token** like `123456789:AAE...`. Keep it secret —
    it goes into `.env` as `TELEGRAM_BOT_TOKEN`.
 
-### 2. Let the bot read messages in groups (disable Group Privacy)
-
-By default a bot in a group only sees commands and replies — **not** ordinary
-messages. This bot needs to read the plain text you type in each topic, so:
-
-1. In BotFather: `/mybots` → your bot → **Bot Settings** → **Group Privacy** →
-   **Turn off** ("Privacy mode is disabled").
-
-### 3. Create the group and enable Topics
-
-1. Create a **new group** and add your bot to it.
-2. Group → **Edit** → turn on **Topics**. (Telegram converts the group to a
-   *supergroup* automatically — free, and required for Topics.)
-
-### 4. Make the bot an admin
-
-1. Group → **Edit** → **Administrators** → **Add Admin** → your bot.
-2. Enable **Manage Topics** (so `/new` can create topics) and **Pin Messages**
-   (so the optional `/usage pinned` live counter can pin itself). Leaving the
-   other admin rights on is fine for a private group.
-
-### 5. Find your numeric Telegram id (`OWNER_ID`)
+### 2. Find your numeric Telegram id (`OWNER_ID`)
 
 1. Message **[@userinfobot](https://t.me/userinfobot)** — it replies with your
    **Id** (a number). That's `OWNER_ID`.
-2. (You can also message the running bot `/whoami` once you're the owner.)
+2. (You can also send the running bot `/whoami` once it's up.)
+
+### 3. Say hello
+
+Open a **private chat** with your bot and send `/start`. Create sessions with
+`/newchat` or `/newcode` (or `/new` to pick), and switch between them with
+`/sessions`. No group, Topics, or admin setup is involved.
 
 ### Do I need Telegram Premium?
 
-**No.** Creating bots, supergroups, Topics, admin rights, and inline buttons are
-all free. Premium only adds unrelated perks this bot doesn't use.
+**No.** Creating bots and using inline buttons are free. Premium only adds
+unrelated perks this bot doesn't use.
 
 ---
 
@@ -155,7 +151,7 @@ Edit `.env`:
 TELEGRAM_BOT_TOKEN=123456789:AAE...   # from BotFather (step A1)
 OWNER_ID=123456789                    # your numeric id (step A5)
 DEFAULT_MODEL=claude-opus-4-8         # opus | sonnet | haiku also accepted
-BASE_WORKDIR=./workdirs               # code-mode working dirs, one per topic
+BASE_WORKDIR=./workdirs               # code-mode working dirs, one per session
 DB_PATH=./bot.db                      # SQLite state
 ALLOWLIST_PATH=./allowlist.json       # who may use the bot (gitignored)
 # Do NOT add ANTHROPIC_API_KEY — this bot runs on your subscription.
@@ -171,7 +167,8 @@ ALLOWLIST_PATH=./allowlist.json       # who may use the bot (gitignored)
 python bot.py
 ```
 
-Open a topic in your group and say hello. `/help` lists every command.
+Open a DM with your bot and send `/start`; create a session with `/newchat` or
+`/newcode` and say hello. `/help` lists every command.
 
 ---
 
@@ -204,27 +201,33 @@ Manage the list from Telegram (owner only): `/allow <id|@user>`,
 | Command | What it does |
 |---|---|
 | `/help`, `/start` | Show the command reference. |
-| `/new <name>` | Create a new topic = fresh isolated session. |
-| `/mode chat\|code` | Switch this topic's engine. Default: `chat`. |
-| `/model <id>` | Model for this topic (`opus` / `sonnet` / `haiku` or a full id). |
+| `/new`, `/newchat`, `/newcode` | Create a new isolated session (chat or code). `/new` shows a chooser. |
+| `/sessions` | Browse / search / switch / ⭐-favorite / delete your sessions. |
+| `/rename <name>` | Rename the current session. |
+| `/mode` | Show this session's engine (chat or code — **fixed at creation**). |
+| `/model <id>` | Model for this session (`opus` / `sonnet` / `haiku` or a full id). |
 | `/cwd <path>` | (code) Working directory; relative paths resolve under `BASE_WORKDIR`. |
 | `/permissions ask\|auto-edits\|plan\|yolo` | Code-mode approval policy. `ask` = inline Allow/Deny (default). |
-| `/usage off\|footer\|pinned\|both` | Ambient 5h/7d subscription usage display. |
-| `/reset` | Clear this topic's session (drops context **and** warm cache). |
-| `/stop` | Interrupt the run in progress in this topic. |
+| `/auto on\|off` | (owner) Run code-mode tools without asking, like a local Claude Code session. |
+| `/usage off\|footer\|pinned\|both` | (owner) Ambient 5h/7d subscription usage display. |
+| `/history`, `/recap` | Export the full transcript / show the last exchange. |
+| `/language [ru\|en]` | Choose the bot's interface language (or tap to pick). |
+| `/settings` | Inline menu: model, permissions, streaming, memory, language… |
+| `/reset` | Clear this session's context (drops context **and** warm cache). |
+| `/stop` | Interrupt the run in progress in this session. |
 | `/status` | Mode, model, cwd, queue, cache timer, subscription limits, token totals. |
 | `/whoami` | Your numeric id + username. |
 | `/allow`, `/deny`, `/users` | Owner-only: manage the allowlist. |
 
-Plain text in a topic goes straight to that topic's Claude session; the reply
-streams back into the same topic.
+Plain text goes straight to the current session's Claude; the reply streams back
+into your chat.
 
 ---
 
 ## Saving subscription limits
 
 Watch `/usage` and `/status`: reuse the 5-minute prompt cache (chain follow-ups
-before the timer expires), keep one project per topic, and right-size the model
+before the timer expires), keep one project per session, and right-size the model
 with `/model`. The owner keeps personal limit-saving habits in a local,
 gitignored `CLAUDE.md`; shared project conventions are in `AGENTS.md`.
 
@@ -250,11 +253,11 @@ journalctl -u claude-tg-bot -f
 ## Security
 
 - The only access control is the owner + allowlist; every other update is dropped
-  before any handler. **Keep the group private.**
+  before any handler. **Keep your bot token and `allowlist.json` private.**
 - Secrets and identities live only in `.env` and `allowlist.json` (both
   gitignored). They are never committed or logged.
 - **Code mode is effectively a shell on your server.** It runs as your service
-  user, scoped to a per-topic working directory, with dangerous tools gated
+  user, scoped to a per-session working directory, with dangerous tools gated
   behind an explicit Allow/Deny tap. Treat the approval prompts seriously, and
   use `/permissions yolo` only when you really mean it.
 
