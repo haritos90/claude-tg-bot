@@ -1,0 +1,16 @@
+# Project tooling config. Pins lint + test behavior so local runs match CI
+# (CI runs `ruff check .` and `pytest -q`). See CONTRIBUTING.md and AGENTS.md §3.
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+# Deliberately lenient (matching the project's posture): correctness-focused
+# rules without enforcing line length / formatting on the existing code. Run
+# `ruff format` separately if you want reflow.
+#   E4/E7/E9 pycodestyle errors · F Pyflakes · W warnings · B flake8-bugbear
+select = ["E4", "E7", "E9", "F", "W", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

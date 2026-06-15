@@ -1,0 +1,96 @@
+name: Bug report
+description: Report something in the bot that isn't working as expected.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Thanks for the report. Please fill in as much as you can — the more
+        precise the reproduction, the faster the fix.
+
+
+        **Security issues do not go here.** If this is about leaking the token /
+        `allowlist.json` / the subscription session, a permission-gate bypass, or
+        anything forcing paid API billing, follow `SECURITY.md` instead (private
+        report).
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: Describe the bug. What did the bot do?
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What did you expect instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: The exact messages / commands / taps, in order.
+      placeholder: |
+        1. Send '/newcode myproj'
+        2. Send '...'
+        3. See ...
+    validations:
+      required: true
+
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Mode
+      description: Which session type was active?
+      options:
+        - chat
+        - code
+    validations:
+      required: true
+
+  - type: dropdown
+    id: role
+    attributes:
+      label: Role
+      description: Were you acting as the owner or an allowlisted user?
+      options:
+        - owner
+        - allowlisted user
+    validations:
+      required: true
+
+  - type: input
+    id: model
+    attributes:
+      label: Model
+      description: Model in use, if relevant (e.g. opus / sonnet / haiku or a full id).
+    validations:
+      required: false
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Python version, OS, and how the bot is run.
+      placeholder: |
+        Python: 3.11.x
+        OS: Debian 12
+        Run via: python bot.py   (or: systemd unit)
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: >-
+        Relevant log output or tracebacks. **REDACT the bot token, your Telegram
+        user id(s), and any `allowlist.json` contents before pasting.**
+      render: text
+    validations:
+      required: false

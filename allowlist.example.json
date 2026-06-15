@@ -1,0 +1,19 @@
+{
+  "_comment": "Copy to allowlist.json (gitignored) and put your real users here. The OWNER_ID from .env is ALWAYS allowed and is never listed. Easiest is to manage entries from Telegram (owner only): /allow, /deny, /level, /expire, /limit, /users. Format v2: 'entries' is keyed by numeric Telegram id; 'pending_usernames' holds @username grants not yet seen (auto-pinned to the id on the user's first message). Per user: level 'chat' (chat mode only) or 'code' (chat + code); expires_at = null or 'YYYY-MM-DD'; token_grant = null (unlimited) or an integer cap. A legacy {\"ids\":[...],\"usernames\":[...]} file is still read and upgraded automatically.",
+  "version": 2,
+  "entries": {
+    "123456789": {
+      "username": "example_user",
+      "level": "code",
+      "expires_at": null,
+      "token_grant": null
+    }
+  },
+  "pending_usernames": {
+    "someone_without_id_yet": {
+      "level": "chat",
+      "expires_at": "2026-12-31",
+      "token_grant": 2000000
+    }
+  }
+}

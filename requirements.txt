@@ -1,0 +1,14 @@
+# Runtime dependencies — Python 3.11+
+# Setup:
+#   python3 -m venv .venv
+#   . .venv/bin/activate
+#   pip install -r requirements.txt
+#
+# NOTE: claude-agent-sdk drives the Claude Code CLI (`claude`), which must be
+# installed and logged in to your Claude Pro/Max subscription. See README.md
+# (no ANTHROPIC_API_KEY is used — everything runs on the subscription).
+
+aiogram==3.28.2
+claude-agent-sdk==0.2.101
+aiosqlite==0.22.1
+python-dotenv==1.2.2

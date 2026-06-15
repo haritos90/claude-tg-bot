@@ -1,0 +1,48 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# Least-privilege default token: this CI only reads the repo.
+permissions:
+  contents: read
+
+# Cancel an in-progress run when new commits land on the same ref.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Lint (ruff)
+        run: ruff check .
+
+      - name: Byte-compile
+        run: python -m py_compile *.py
+
+      - name: Import smoke test
+        # No .env is present in CI; importing must not load settings or start
+        # polling (guarded by __main__), so this verifies the module graph only.
+        run: |
+          python -c "import config, db, access, allowlist, markup, streamer, permissions, engine, sessions, usage, handlers, bot"
+
+      - name: Unit tests
+        run: pytest -q

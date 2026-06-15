@@ -41,7 +41,7 @@ header rows. Columns:
 - **Closed** — `| ID | Theme | Title | Resolution |`
 - **Deferred** — `| ID | Pri | Eff | Theme | Title | Reason |`
 
-**Next free ID:** 106
+**Next free ID:** 121
 
 ---
 
@@ -59,126 +59,196 @@ Not started; promote to Open when picked up.
 
 | ID | Pri | Eff | Theme | Title |
 |---|---|---|---|---|
-| 95 | P1 | L | ux | `/sessions` redesign — tap a session → options menu; New chat/New code buttons; quick actions on switch |
-| 97 | P2 | M | core | Unique git-commit-style session ids (short hash, not a position or plain number) |
-| 98 | P2 | M | ux | Merge `/permissions` + `/auto` into one permissions control (Anthropic-style) |
-| 99 | P2 | S | ux | `/model` + `/effort` offer an interactive picker (like `/settings` sub-pages) |
-| 100 | P2 | M | features | Replace `/cwd` + `/dirs` with `/files` (read-only working-dir tree) |
-| 101 | P2 | M | ux | Arg-capture for ALL arg-commands + document the rule in CLAUDE.md |
-| 102 | P2 | M | security | Per-user access level — chat-only vs chat+code |
-| 103 | P2 | M | security | Time-limited access — per-user expiry date |
-| 104 | P2 | XL | isolation | Per-code-session Linux user sandbox (own uid, confined to workdir, perms 6/7) |
-| 105 | P2 | M | security | Optional per-user token quota + top-up command |
+| 119 | P1 | XL | security | Fully-contained sandbox (e2e): credential broker + egress allowlist + per-session isolation + DoS limits |
+| 120 | P2 | M | security | Per-user subscription rate limits (tokens per rolling window, e.g. day + week) |
 
 ### Details
 
-**#95 — `/sessions` redesign: tap → options, New chat/code buttons** (P1 · L · ux)
-— Too many inline buttons per row. Make each row just the session NAME; tapping it
-opens an options menu (Switch · Recap · Rename · Status · ⭐ favorite · 🗑 delete).
-Add **New chat** / **New code** to the bottom action row (next to Search/Close). On
-switch, offer quick actions (recap / export transcript). `handlers.py` + i18n.
+**#119 — fully-contained sandbox (e2e): credential broker + egress allowlist + per-session isolation + DoS limits** (P1 · XL · security · _supersedes #114 + #117_)
 
-**#97 — unique git-commit-style session ids** (P2 · M · core) — `/sessions` numbers
-rows by list POSITION (`enumerate`), which shifts as sessions are added/removed. Give
-each session a UNIQUE, hash-like id — like a git short commit SHA (e.g. `a3f9c2`), NOT a
-position and NOT a plain number (owner request 2026-06-15). Proposal: derive a stable
-short hash deterministically from the immutable thread key — e.g.
-`sha1(f"sess:{thread_id}").hexdigest()[:7]` — so no migration / new column is needed and
-existing sessions get an id immediately; show it in the `/sessions` rows, the session
-card and `/status`, and accept it (git-style unique-prefix match) to reference a session
-in switch / rename / delete / `/files`. Internal callbacks already carry the real key +
-the #69 owner/key guard, so addressing is unchanged — this just adds a stable PUBLIC id.
-Coordinate with #95 (rows) and #100 (`/files`). `db` + `handlers` + `i18n`.
+Umbrella design for a sandbox a semi-/untrusted **code**-level user can't use to
+(a) break the server, (b) steal the owner's data incl. the **subscription
+token**, or (c) read **other sessions'** data — **without stripping the session's
+capabilities** (it keeps full tools + internet to chosen services; we contain
+blast radius, not features). Analyse, then split into the sub-tasks at the end.
 
-**#98 — merge `/permissions` + `/auto`** (P2 · M · ux) — `/auto on` == `/permissions
-yolo`; the two overlap and confuse. Collapse into ONE permissions control (Ask ·
-Auto-edits · Plan · Full-access), Claude-Code-style; make `/auto` an alias (or retire
-it). One row in `/settings`. `handlers.py` + i18n.
+**Threat model.** _Assets:_ (1) the owner's subscription OAuth token
+(`~/.claude/.credentials.json`) — must be UN-extractable by any session; (2) host
+integrity — no breakout, no using the box to attack others, no resource-DoS of
+the bot; (3) other sessions' workdir + transcript (invisible across sessions);
+(4) the bot's own secrets (`.env`: Telegram token, allowlist). _Adversary:_ a
+code-level user the owner granted access to (semi-trusted → untrusted), driving
+the agent and seeing its output, plus the agent misbehaving. _NON-goal:_ reducing
+capability — the agent should still run Bash/edits and reach chosen services.
 
-**#99 — `/model` + `/effort` interactive pickers** (P2 · S · ux) — After `/model`
-(and `/effort`) with no arg, show an inline picker (like the `/settings` model
-sub-page) instead of just printing the current value. `handlers.py`.
+**The exfil channels — close ALL or the asset leaks.** Data/token can leave via:
+(1) _filesystem_ — host files (other sessions, `/root`, `.env`) → already closed
+by the bwrap FS confinement (#104: only the session's own workdir is mounted);
+(2) _network egress_ → the allowlist (component 2); (3) _the bot's own output_ —
+the agent `cat`s a secret and the bot streams it to the user (`Read` is
+auto-allowed) — **a firewall cannot close this**; (4) _an ALLOWED destination_ —
+permitting GitHub turns GitHub into an exfil store. **Consequence:** (3)+(4) prove
+**no egress control can protect a token that lives inside the jail** — so the
+token must NOT be in the jail. This is the core, and the piece #114 was missing.
 
-**#100 — replace `/cwd` + `/dirs` with `/files`** (P2 · M · features) — Decided: drop
-`/cwd` and `/dirs` entirely (a session's working dir is fixed; "extra dirs" confused).
-Add `/files` (code sessions): a read-only tree of the working directory so you can SEE
-what's there. `handlers.py` + a tree helper.
+**Component 1 — credential broker (token leaves the jail; THE core fix).** The
+subscription token stays OUTSIDE the jail in a small host broker process. `claude`
+in the jail sends API traffic to the broker; the broker injects the real
+subscription OAuth bearer and forwards to the real `api.anthropic.com`, streaming
+the reply back. Inside the jail there is NO real token (at most a dummy the broker
+overwrites) — so channels (3)+(4) become moot: nothing to read, print or POST.
+The subscription is USABLE (via the broker) but UN-extractable.
+- _Billing stays subscription (P0):_ the broker forwards the OAuth bearer from
+  `~/.claude/.credentials.json`; it must NEVER inject `ANTHROPIC_API_KEY` /
+  `ANTHROPIC_AUTH_TOKEN` (those flip to paid per-token billing). `ANTHROPIC_BASE_URL`
+  is a route, not a key — P0-safe.
+- _Two build variants (pick after recon):_ **(a) plaintext-to-broker** —
+  `ANTHROPIC_BASE_URL=http://127.0.0.1:PORT`, broker does the real HTTPS; no MITM
+  cert needed (simplest, IF claude honours BASE_URL under subscription auth + http).
+  **(b) DNS-redirect + TLS-terminate** — point `api.anthropic.com` inside the jail
+  at the broker; broker terminates TLS with a CA the jail trusts read-only, swaps
+  the header, re-originates TLS (robust if BASE_URL isn't honoured).
+- _OAuth refresh:_ access tokens expire; the broker owns refresh (refresh token →
+  new access token), persisting new tokens host-side, never into the jail.
 
-**#101 — arg-capture everywhere + CLAUDE.md rule** (P2 · M · ux) — Every command that
-needs an argument should, with no arg, PROMPT and capture the user's next message as
-the value (ideally via bot-suggested commands) — like `/new`/`/rename` already do.
-Apply to all arg-commands; document the rule in CLAUDE.md (personal overlay).
+**Component 2 — egress allowlist (limit where the jail can reach; was #114).**
+Even with no token in the jail, don't let the box reach arbitrary hosts (attack
+relay) and DO enable chosen services (git/GitHub, package registries). Allow only
+the broker + an allowlisted set of dev hosts; drop the rest. The session still
+runs `claude` + its Bash tool as an unprivileged uid inside the bwrap jail. Keep
+the mechanism in `deploy/` shell for distro portability; sandbox is **off by
+default**, so a botched rule only affects sandboxed turns. Mechanism options A–E
+(below) are this component's choices.
 
-> **#102–#105 form one "multi-user access management" epic** (the owner's
-> "basic seed of access sharing", 2026-06-15). They share a single rewrite of the
-> allowlist store from flat sets (`{ids, usernames}`) to a per-entry record map —
-> `{users: {"<id>": {level, expires, grant, used?}}, usernames: {"<name>": {…}}}`
-> — with a forward-migration reading the old sets as `level=code, no expiry, no
-> cap`. The owner is always `code`, never expires, never capped. Username→id
-> auto-pin on first contact (already shipped, verified 2026-06-15) carries the
-> entry's metadata across the upgrade. **Build #102+#103+#105 together** (one
-> model, one migration); #104 is separable but pairs with #102's "may run code".
+**Two gotchas that shape every option:**
 
-**#102 — per-user access level: chat-only vs chat+code** (P2 · M · security) —
-Today the allowlist is binary (allowed → BOTH chat and code). Add a per-user
-`level`: `chat` (may only create/use chat sessions) or `code` (chat + code).
-Owner grant: `/allow @user [chat|code]` (default `chat` — least privilege), plus
-`/level @user chat|code` to change later. Enforce by gating `/newcode`, `/new
-code`, and switching INTO a code session on the caller's level (deny via an i18n
-message); a downgraded user's existing code sessions become blocked. `/users`
-shows each entry's level. Touches `allowlist.py` (model + migration + `level()`),
-`handlers.py` (arg parse + gates + `/level`), `i18n.py`. Shares the model rewrite
-with #103/#105.
+- **CDN-IP churn + leak.** Anthropic's API is CDN-fronted: its IPs rotate and a
+  whole CDN range may host thousands of other sites. So an *IP* allowlist is both
+  fragile (needs constant refresh) **and leaky** (allowlisting the CDN's range
+  effectively allows every other site behind that CDN — an exfil path). This is
+  why a *domain*-based filter (a proxy) is stronger than an IP filter.
+- **userns uid vs `nftables skuid`.** The jail uses `--unshare-user --uid 65534`.
+  From the host kernel's view the egress socket's owner is the *outer* mapped uid
+  (root), so an `nftables meta skuid 65534` match **won't fire**. Per-uid IP
+  rules therefore need either a real-uid drop (re-architect the sandbox) **or** a
+  **cgroup match** (`socket cgroupv2 …`) — put the jail in its own cgroup and
+  filter on that, which sidesteps the uid problem cleanly.
 
-**#103 — time-limited access (per-user expiry)** (P2 · M · security) — An entry
-may carry an `expires` timestamp; past it the user is denied (fail-closed,
-owner-exempt). Store `expires` (UTC ISO date / epoch) in the shared model. Enforce
-in `Allowlist.is_allowed` (and so `AllowlistMiddleware` drops expired users). Owner
-grant: `/allow @user [level] [until YYYY-MM-DD]` or a separate `/expire @user
-YYYY-MM-DD|never`. `/users` shows the expiry with a ⚠ near/over it. Decide + document
-the clock (UTC). Edge: a user whose access lapses mid-turn — block the NEXT turn with
-a clear message. Build with #102 (same model). `allowlist.py` + `handlers.py` + `i18n.py`.
+**Options (pick one when reviving):**
 
-**#104 — per-code-session Linux user sandbox** (P2 · XL · isolation) — Run each
-code session's `claude` subprocess as a DEDICATED unprivileged Linux user confined to
-that session's workdir (`BASE_WORKDIR/<key>`), so code can't read/write/execute outside
-its folder, touch other sessions, or reach the host. Owner picks the perm level per
-session: `6` = read+write only (no execute) vs `7` = +execute. Open design questions to
-resolve BEFORE building:
-- **Privilege drop:** the bot runs as root on the VPS, so it can create users + drop
-  privileges. Options: a per-session system user (`useradd`, own the workdir, `chmod
-  700`) launched via `runuser`/`setpriv`/`sudo -u`, OR a `preexec_fn` doing
-  `setgid/setuid` on the spawned process. Confirm the claude-agent-sdk lets us inject
-  the launching uid (it spawns the CLI itself — may need a wrapper `cli_path`/env);
-  re-introspect the SDK (AGENTS §4).
-- **Confinement** (perms alone don't isolate — a foreign user still reads world-readable
-  system files): prefer a real sandbox — `bubblewrap`/`firejail`/`systemd-run`
-  (`ProtectSystem=strict`, `ReadWritePaths=<workdir>`, `PrivateTmp`, `NoNewPrivileges`)
-  or a mount namespace exposing only the workdir. A `noexec` mount (or dropping the x
-  bit) implements the `6` vs `7` choice.
-- **Subscription-credential hazard (P0):** the CLI needs `~/.claude/.credentials.json`
-  (the subscription token). A sandboxed foreign user that can read it could exfiltrate
-  it. Must grant the subprocess credential access WITHOUT letting sandboxed code
-  read/copy/leak it (short-lived fd/env not on the writable fs, or a broker). Solve this
-  before shipping. Never introduce `ANTHROPIC_API_KEY` (subscription only).
-- **Cleanup:** tear down the per-session user + reset perms on session delete (#58) /
-  `aclose`.
-Touches `engine.py` (launch), `sessions.py` (lifecycle), `deploy/` (sudoers/caps +
-docs), `config.py` (toggle + default perm). Large — split: (a) drop-privs launch,
-(b) confinement, (c) credential broker, (d) cleanup + perm toggle. Pairs with #102.
+- **A — CONNECT forward-proxy + domain allowlist (recommended core).** Run a tiny
+  host proxy (tinyproxy/squid with an allowlist, or ~40 lines of Python/Go) that
+  only permits `CONNECT api.anthropic.com:443` (+ allowed hosts). Give the jail
+  `HTTPS_PROXY=http://<host>:<port>` via `--setenv`. A CONNECT proxy *tunnels*
+  TLS (no MITM cert needed) and allowlists by the hostname in the CONNECT line —
+  the agent can't reach `evil.com`. _Pros:_ domain-based (beats CDN churn),
+  auditable/loggable. _Cons:_ a long-running component to manage; **must verify
+  the `claude` CLI honours `HTTPS_PROXY`** (Node/undici usually does — confirm the
+  streaming SSE call does too). _Catch:_ a proxy alone doesn't *force* its use —
+  pair with a hard block (see E) so the agent can't ignore `HTTPS_PROXY` and dial
+  out directly. Effort M.
+- **B — nftables IP allowlist.** Resolve Anthropic IPs into an nftables set
+  (refresh on a timer); `accept` to the set, `drop` the rest, scoped by **cgroup
+  match** (per the gotcha above) or a real-uid drop. _Pros:_ no proxy, kernel-
+  enforced. _Cons:_ hits the CDN-IP churn+leak problem head-on — fragile and
+  potentially over-broad. Effort M (cgroup) / L (uid re-architecture).
+- **C — `--unshare-net` + veth + host nftables/NAT.** Give the jail its own netns,
+  wire a veth to the host, NAT + filter at the veth. _Pros:_ hardest boundary —
+  you see every packet. _Cons:_ most plumbing (per-session veth create/teardown,
+  IP alloc, forwarding, crash cleanup) and the most live-VPS risk; bwrap's netns
+  is anonymous so the `ip link` dance is awkward. Effort L–XL.
+- **D — `--unshare-net` + slirp4netns (userspace, unprivileged).** A userspace
+  TCP/IP stack for the jail; restrict it / point it only at the A-proxy. _Pros:_
+  no root nftables, unprivileged-friendly. _Cons:_ extra dependency + latency.
+  Effort M–L.
+- **E — A + a hard "proxy is the only exit" guarantee (the real production
+  answer).** Combine A's domain filtering with a guarantee the proxy can't be
+  bypassed: either nftables (cgroup match) dropping all jail egress except to the
+  proxy's address, or `--unshare-net`+slirp routing solely to the proxy. Gets
+  domain-based filtering **and** no bypass. Effort M–L.
 
-**#105 — optional per-user token quota + top-up** (P2 · M · security) — An OPTIONAL,
-owner-settable per-user token cap with a command to ADD allowance (credit/top-up model).
-Each user has a remaining balance; turns decrement it; at 0 the bot refuses new turns
-until the owner tops up. Implementation: per-user cumulative usage = aggregate
-`db.usage` across the user's sessions (the user owns the negative DM keys) into a per-user
-total, plus a per-user `grant` (sum of grants); `remaining = grant − used`. Owner command
-`/limit @user <tokens>` adds `<tokens>` to the grant (`/limit @user off` = unlimited;
-unset = unlimited). Enforce pre-turn in `sessions.handle_text`/`_run_one` for non-owners;
-deny with an i18n message showing remaining. `/users` + `/status` show used/remaining.
-Decide: lifetime cap vs per-window (v1 = lifetime cumulative, owner tops up). Touches
-`db.py` (per-user rollup + grants), `handlers.py` (`/limit`, displays), `sessions.py`
-(gate), `i18n.py`. Shares the user-record model with #102/#103.
+**Cross-cutting must-dos when building:** (1) verify `claude` actually routes
+through `HTTPS_PROXY` incl. the streaming connection; (2) **never write a global
+firewall rule** — scope every rule to the jail's cgroup/uid or you risk locking
+the bot/yourself out of the live VPS; (3) test matrix from inside the jail —
+`curl https://api.anthropic.com` ✅, `curl https://example.com` ✗, a token-exfil
+`POST` to an arbitrary host ✗, **and** a real `claude` turn still completes;
+(4) keep all of it in `deploy/` shell, gated behind the existing `SANDBOX_CODE`
+opt-in. **Recommendation: option E (A's proxy + a hard egress block).**
+
+**Component 3 — per-session secret isolation (incl. user-supplied service creds).**
+Each session's workdir + state (`.sbxstate`, #115) is already per-key and unmounted
+from others — keep that invariant. For services needing auth (e.g. `git push`), the
+USER supplies THEIR OWN credential, scoped to that session only (a `/secret`-style
+command writing into that session's jail HOME) — the owner's creds NEVER enter any
+jail. A user leaking their own credential is their problem, not the owner's.
+
+**Component 4 — host integrity / DoS.** Process cap shipped (#116, `ulimit -u`).
+Add per-session cgroup memory + CPU limits (a systemd scope) and a seccomp profile
+to shrink the kernel attack surface (also lowers the residual userns/kernel-escape
+risk — bwrap is not a VM, so keep the host kernel patched). _#117's workdir-noexec
+is REJECTED here: it is capability-reduction (counter to the non-goal) and weak
+anyway — interpreters (`python`/`sh`) run scripts regardless, and bwrap 0.8 has no
+per-bind noexec. Recorded so it isn't re-proposed._
+
+**Component 5 — all OS/network mechanism in `deploy/` shell.** Broker + proxy +
+firewall wiring as shell/standalone scripts under `deploy/` (Python only sets env
++ lifecycle), per the distro-portability rule; all gated behind `SANDBOX_CODE`.
+
+**Component interaction (so the pieces fit).** The broker listens on host loopback;
+the egress mechanism must keep it reachable. Simplest combination: **shared netns +
+cgroup-nftables** (loopback broker stays reachable, egress filtered by cgroup);
+`--unshare-net`+slirp would instead route the broker via the slirp gateway. Decide
+together with component 2.
+
+**Recon FIRST (cheap, ZERO token risk — decides feasibility + variant).** (1) Does
+`claude` route through `ANTHROPIC_BASE_URL` / `HTTPS_PROXY` under SUBSCRIPTION auth,
+and start with a dummy credential? → picks broker variant (a) vs (b). (2) Capture
+the exact headers `claude` sends to `api.anthropic.com` (point it at a logging proxy
+ON THE HOST with the real token — token never leaves the host) so the broker can
+reproduce auth + any `anthropic-beta` OAuth headers + the refresh flow.
+
+**Maps to the 3 goals.** _break the server_ → FS confinement (#104) + egress
+allowlist + DoS limits (#116 + cgroup/seccomp) + patched kernel. _steal my
+data/token_ → credential broker (token not in jail; closes FS + network +
+chat-output at once) + FS confinement keeps `.env` out. _steal other sessions'
+data_ → per-session workdir/state binds (#115), no cross-session mounts.
+
+**Suggested task split.** 119a recon (claude base-url/proxy + dummy-cred + header
+capture) · 119b credential broker + OAuth refresh (`deploy/`) · 119c egress
+allowlist (CONNECT proxy + cgroup-nftables hard block) · 119d per-session
+user-supplied service creds (`/secret`) · 119e DoS hardening (cgroup mem/CPU +
+seccomp).
+
+**#120 — per-user subscription rate limits (rolling windows)** (P2 · M · security)
+
+Cap how much of the owner's ONE shared subscription each shared user can spend, as
+tokens per **rolling window** (e.g. 500k/day + 2M/week), set by the owner from
+Telegram; the owner is exempt.
+
+_Why bot-side, not SDK:_ the Agent SDK is per-RUN/per-session and stateless across
+a user's sessions and over time — it has `max_turns` (exposed as `/maxturns`) and
+`max_budget_usd` (a likely no-op under subscription auth, see #62), but **nothing**
+for "user X may spend N tokens per rolling day across all their sessions." That is
+an account-wide, multi-session policy the SDK can't model, so the bot is the right
+enforcement layer — and it already records the data.
+
+_Design (reuses the #105 quota infra):_
+- Storage: extend the allowlist v2 entry with rolling caps, e.g.
+  `"rate": {"day": 500000, "week": 2000000}` (null/absent = no cap). Keep the
+  existing lifetime `token_grant`; compose them (deny if ANY is exceeded).
+- Enforce in the existing pre-turn gate `handlers._access_block`: sum the user's
+  `input+output` tokens over the trailing 24h / 7d from `usage` (extend
+  `db.get_user_usage_tokens(uid, since=epoch)`; `usage.ts` is stored, `chat_id ==
+  uid` for DM rows). Rolling windows need NO reset job — computed from timestamps.
+  Refuse over-budget turns with a localized message naming the window + when it
+  frees up (oldest-in-window ts + period).
+- Owner UI: extend `/limit` (e.g. `/limit @bob 500k/day`) or add `/ratelimit`,
+  following the arg-capture/picker convention; surface usage-vs-cap in `/users` and
+  the user's `/whoami`.
+- Counting: `input+output` (consistent with #105); optionally exclude `cache_read`.
+  Per-model weighting + an optional global (all-users-combined) cap are out of scope
+  for v1.
 
 ---
 
@@ -279,7 +349,30 @@ Title-only history.
 | 68 | reliability | `reset()` racing an in-flight `handle_text` could orphan a worker | `handle_text` now resolves the record and takes its lock inside a retry loop that re-checks `self._records.get(thread_id) is rec`; if `reset()` popped the record while we blocked on the lock, it retries with the fresh record (the prompt runs on a live record, never lost) instead of building a session + worker on the orphaned one — closing the two-workers-per-thread race. Verified: py_compile + import + 45 tests + live restart. | Fixed a rare race where `/reset` during an in-flight message could spawn a duplicate, untracked worker. |
 | 93 | ux | smooth streaming in code mode + live code-block split | Live code-block splitting: `markup.split_closed_blocks` detects a fully-closed fenced block (closing fence + newline) mid-stream; `sessions._split_live_blocks` (after each `update()` in code mode) commits the prose+block prefix as its own copyable message(s) via the new `streamer.flush_segment()` and keeps streaming the tail — a finished snippet is copyable immediately and the DM draft stays smooth (no completed block whose moving close-tag snaps the animation). `segment_break` refactored onto a shared `_begin_next_segment`. An adversarial multi-agent audit then caught + fixed a double-post (a cumulative `text_full` snapshot resurrecting an already-flushed block → `text_full` is now ignored once segmented, matching the result-branch guard) and an O(n²) re-scan on a long unclosed block (cheap fence-count gate). Tests: 7 `split_closed_blocks` units + 2 `_run_one` integration (double-post regression); 47 green; live (Run polling). | Code mode now streams smoothly and breaks each finished code block into its own copyable message live, as it is generated. |
 | 94 | ux | spinner in the ⏹ Stop / "working" control | `streamer._delayed_control` animates a braille spinner (`_SPIN_FRAMES`, ~1.2 s cadence, just above Telegram's ~1 edit/sec cap) next to the "working…" label, keeping the ⏹ Stop button on every edit; the loop re-checks the streaming flags under the lock and is torn down by `_remove_control()`/`cancel()` (no orphaned task). Audit follow-up: the control message id is registered + re-checked under the lock right after the send, so a turn ending mid-send can't orphan it. Live. | The ⏹ Stop / "working…" control now shows a live spinner while a turn runs. |
-| 96 | ux | session glyph — code → shell-prompt ▸ | `mode_glyph("code")` → `▸` (shell-prompt / bash-cursor-like) instead of ⌨️; the 6 hardcoded ⌨️ in `i18n.py` (btn.code, cmd.newcode, help + /new chooser) and 2 handler docstrings swapped to ▸; chat stays 💬. i18n en/ru parity tests green. The `/rename`-button ✏️ + per-row list/info icons fold into the #95 `/sessions` redesign (no standalone rename button exists yet). | Code sessions are now marked with a ▸ shell-prompt glyph instead of a keyboard. |
+| 95 | ux | `/sessions` redesign — tap a session → options menu; New chat/New code buttons; quick actions on switch | Each list row is now a single full-width NAME button → tapping it opens a per-session options menu (✅ Switch · 📋 Recap · ✏️ Rename · ℹ️ Status · ⭐/☆ favorite · 🗑 Delete · ◂ Back). The browser footer gained **💬 New chat** / **🟩 New code** (next to Search/Close). The switch card now carries quick actions (📋 Recap · 📄 Export). Recap/Rename/Status/Export are now key-addressable (`_recap_messages`, `_history_doc`, `_session_options`, key-aware `_do_rename` + a `rename:<key>` pending action); every per-session action is ownership-gated via `_owned_session` (chat_id OR created_by). i18n en/ru parity + 47 tests + ruff green. | The `/sessions` list is scannable — tap a session for a full actions menu; create chat/code sessions right from the browser. |
+| 96 | ux | session glyph — code → shell-prompt ▸ | `mode_glyph("code")` → `▸` (shell-prompt / bash-cursor-like) instead of ⌨️; the 6 hardcoded ⌨️ in `i18n.py` (btn.code, cmd.newcode, help + /new chooser) and 2 handler docstrings swapped to ▸; chat stays 💬. i18n en/ru parity tests green. The `/rename`-button ✏️ + per-row list/info icons fold into the #95 `/sessions` redesign (no standalone rename button exists yet). **(Superseded by #107 — code glyph is now 🟩.)** | Code sessions are now marked with a ▸ shell-prompt glyph instead of a keyboard. |
+| 97 | core | Unique git-commit-style session ids (short hash, not a position or plain number) | `db.session_sid(thread_id)` = `sha1("sess:"+id).hexdigest()[:6]` — a stable, migration-free PUBLIC id derived from the immutable thread_id, so every existing session gets one immediately. Shown as `<code>{sid}</code>` in `/sessions` rows, the switch card (`session.card_meta`), and `/status` (`status.header`), REPLACING the `enumerate` list position that shifted as sessions were added/removed. Also bumped the row button's name clip 20→40 so long names (e.g. «Пикабу iOS приложение») aren't cut. Typed sid-reference folds into #95/#100. | Sessions now have a fixed short id (e.g. `0d4be1`) instead of a number that shifted. |
+| 98 | ux | Merge `/permissions` + `/auto` into one permissions control (Anthropic-style) | One control, four policies — `ask · auto-edits · plan · full-access` — the SDK `bypassPermissions` mode renamed from `yolo` everywhere (`PERM_NAME_TO_MODE`, the `/settings` perm sub-page, `cmd_permissions`, i18n `perm.*`, `permissions.py` comments). `full-access` stays owner-only. `/auto on\|off` is reframed as a thin shortcut for `/permissions full-access\|ask` (its help now says so). One `/settings` row (the perm sub-page). i18n en/ru parity green. | `/permissions` is the single approval control (ask/auto-edits/plan/full-access); `/auto` is just a shortcut. |
+| 99 | ux | `/model` + `/effort` offer an interactive picker | No-arg `/model` and `/effort` now pop an inline button picker (current marked ✓) instead of printing the value — `/model` → opus/sonnet/haiku; `/effort` → low/medium/high/xhigh/max/default. Taps hit new `pm:`/`pe:` callbacks (`on_model_pick`/`on_effort_pick`) that set the value, rebuild the session, and edit the message to confirm. | `/model` and `/effort` with no argument show a tap-to-pick menu. |
+| 100 | features | Replace `/cwd` + `/dirs` with `/files` (read-only working-dir tree) | Dropped `/cwd` + `/dirs` (a session's working dir is fixed at `BASE_WORKDIR/<key>`) and added `/files` — a read-only, depth/entry-capped tree (`_build_tree`) of the session's working dir, sent inline or as a `files.txt` document when large. Removed both from the command menu + help text; the `set_cwd`/`set_add_dirs` db plumbing is left intact (unused). | `/files` shows the working-dir tree; `/cwd`+`/dirs` retired (working dir is fixed per session). |
+| 101 | ux | Arg-capture for ALL arg-commands + document the rule in CLAUDE.md | Free-text arg-commands now PROMPT + capture the next message when invoked with no arg (with a `/cancel` escape) instead of erroring: `/allow` + `/deny` join `/new`, `/rename` (incl. the #95 per-session `rename:<key>`), and `/sessions` Search. Built on the existing module `pending` dict + `_run_pending`; `_do_allow`/`_do_deny` extracted so the direct-arg and captured paths share logic (both owner-gated). Fixed-CHOICE commands (`/model`, `/effort`, `/permissions`, `/usage`, `/memory`, `/language`) keep pickers / `/settings` sub-pages — the better UX than typing. The convention (+ the picker exception) is documented in CLAUDE.md. | Commands that need a value now ask for it (with /cancel) instead of erroring. |
+| 102 | security | Per-user access level — chat-only vs chat+code | Allowlist rewritten to a per-entry record map (`allowlist.py`, v2 JSON, fail-closed, 13 unit tests) with a per-user `level` (`chat`/`code`); legacy `{ids,usernames}` migrate to `code`; owner always `code`. Enforced by gating code-session CREATION (`_do_new`, `/newcode`, the `/new` + `/sessions` choosers) and switching INTO / running a turn in a code session (`_access_block` in `on_text`/`_submit`) for non-code users. `/level @user chat|code` changes it; `/users` shows it. The default `/` command menu omits code-mode commands (`/newcode`,`/files`,`/permissions`,`/maxturns`) so chat-only users don't see them (owner chat scope shows all). | Per-user chat-vs-code access — chat-only users can't create/use code sessions or see code commands. |
+| 103 | security | Time-limited access — per-user expiry date | Entries carry an optional `expires_at` (UTC date); past it the user is denied inside `Allowlist.is_allowed`, so `AllowlistMiddleware` drops them (fail-closed — an unparseable expiry counts as expired; owner exempt). Granted via `/allow @user [level] until YYYY-MM-DD` or `/expire @user YYYY-MM-DD|never`; `/users` shows it. | Access can expire on a date; expired users are dropped, owner never expires. |
+| 104 | isolation | Per-code-session Linux user sandbox (own uid, confined to workdir, perms 6/7) | Opt-in per-code-session **bubblewrap** jail (`config.SANDBOX_CODE`, default OFF). When on, code mode launches `claude` via `deploy/sandbox-claude.sh` (wired through `ClaudeAgentOptions.cli_path` in `engine._enable_sandbox`): dropped to an unprivileged uid (default 65534), filesystem confined to the session workdir (the only rw bind) + a private tmpfs HOME, the subscription credential injected READ-ONLY via `--ro-bind-data` (real `~/.claude` invisible), env wiped with `--clearenv` (no `TELEGRAM_BOT_TOKEN` leak), network kept (resolv.conf target bound so DNS resolves). Verified end-to-end: claude auths + the agent's Bash writes its workdir, while the bot `.env` / secrets / other sessions / `/root` are unreadable; bwrap's userns maps the jail uid to outer-root for host writes so the root-owned workdir is writable (no chown). **Residual P0 (owner-deferred):** the agent shares claude's process so it CAN read the injected token — blocked from escaping the workdir; egress-blocking is a future phase. Also future: cross-restart session-state persistence (HOME is tmpfs) + the perm 6/7 noexec toggle (reserved). | Optional bubblewrap sandbox for code sessions — unprivileged, workdir-confined, secrets unreadable. Enable with `SANDBOX_CODE=1`. |
+| 105 | security | Optional per-user token quota + top-up command | Each entry has an optional cumulative `token_grant` (None = unlimited); "used" = `SUM(input+output)` over the user's sessions (`db.get_user_usage_tokens`). Enforced pre-turn in `_access_block`: at/over grant the turn is refused with a remaining message. `/limit @user <tokens>` tops up the grant (`/limit @user off` = unlimited); `/users` shows used/grant. Owner uncapped. | Optional per-user token budget with `/limit` top-ups; over-budget users pause until topped up. |
+| 106 | ux | Waiting/Stop control animated braille dots | Removed the spinner animation from `streamer._delayed_control`: it now posts a STATIC "⏳ Working…" + ⏹ Stop message; the rotating-glyph loop and `_SPIN_FRAMES`/`_SPIN_INTERVAL` are deleted (owner: at Telegram's ~1 edit/sec cap the dots read as flicker, not motion). Teardown (`_remove_control`/`cancel`) unchanged. | The "working…" control no longer animates dots — just a static label + Stop. |
+| 107 | ux | Code session glyph → 🟩 (terminal-like) | `mode_glyph("code")` → 🟩 (was ▸, #96); the literal `▸` mode-glyphs in `i18n.py` (btn.code, cmd.newcode, help en+ru) + 2 handler docstrings swapped to 🟩; the generic `▸` chevrons (btn.next, lang.row, settings.row_*, deep-link button) left intact; chat stays 💬. i18n en/ru parity tests green. | Code sessions are marked with a big green square (terminal-like). |
+| 108 | ux | /recap rendered raw Markdown | `cmd_recap` now renders Claude's stored reply via `markup.md_to_html` (was `escape_html`, which leaked literal `##`/`**`/code fences — the reported bug); the user's echoed prompt stays escaped; a long/code-heavy reply is sent as size-safe rendered chunks (never splitting rendered HTML across a tag). `/history` stays a raw `.md` export. | /recap now shows Claude's reply formatted, not as raw Markdown. |
+| 109 | reliability | Dead DM session un-switchable + un-deletable | `db.delete_dm_session` no longer refuses `key >= 0` (the `chat_id` scope already protects shared supergroup rows; guards `user_id > 0`); `delok` honours the bool + new `session.delete_failed` toast (was a false "deleted"); `_session_key` heals a missing/dangling current pointer (re-points to a real negative-key session or mints a default) so a stale pointer can't resurrect an empty row. The stuck «Пикабу iOS приложение» row (a code session that landed at key 0) was migrated 0→-3 (created_by=owner, cwd=workdirs/-3, 7 usage rows preserved, `dm_seq` bumped to 3) so it survives as a normal, switchable, deletable session. | Stuck sessions can now be deleted; the broken «Пикабу» one was recovered. |
+| 110 | ux | Retire the streaming on/off setting | `/stream` handler, the `/settings` streaming row, the `_settings_apply` `tog/stream` branch, and the `/status` streaming line are all COMMENTED OUT (not deleted) — DM uses native Telegram streaming (always on), so the toggle was redundant. The plumbing (`sessions.set_stream`, the `stream_enabled` column, `rec.stream_enabled`) is kept intact so streaming/speed control can be restored by uncommenting. | Removed the redundant streaming toggle (native streaming is always on). |
+| 111 | ux | Terminal-style code session cards | The code-mode tagline and the `/status` directory line render as a shell prompt — `🟩 …` + `<code>{cwd} $</code>` (`mode.tagline_where` is now a monospace prompt line, `status.directory` → `📂 <code>{cwd} $</code>`); the switch card passes the session's `cwd` into the tagline. Chat sessions keep 💬. | Code sessions look terminal-like (a green-square prompt with the working dir). |
+| 112 | features | Export code-session working-directory files (.zip) | New `/export` (code sessions only) + an 📦 Export-files button in the `/sessions` options menu: zips the session's workdir (`_workdir_zip`, in-memory `ZIP_DEFLATED`, capped ~49 MB) and sends it as a Telegram document. Distinct from `/history` (transcript export). | Owner request — pull a code session's files out as a zip. |
+| 113 | ux | Post-#95/#98/#100 UX feedback fixes | (1) `/language` (+ the `/settings` picker) now refresh the `/` command menu in the chosen language via a per-chat `BotCommandScopeChat` (`_apply_user_menu`), overriding Telegram's client-language default — and scoping the menu to the user's level (chat-level users never see code commands, closing the #102 menu gap for non-owners). (2) The `/sessions` options menu is re-posted at the bottom after Recap/Status/Export so it stays reachable without scrolling (`_repost_options`). (3) `/files` + `/export` are gated to code sessions (`common.code_only`). (4) Removed the lingering streaming row from `/settings` (header line, `_settings_text`, `_gather_vals`) and dropped `/stream` from the command menu. | RU command menu now follows /language; tidier sessions menu; code-only file commands; no stale streaming setting. |
+| 118 | isolation | Owner-only per-session sandbox opt-out (run a code session raw) | New owner-only `/sandbox on\|off` (code sessions): `off` sets a per-session `no_sandbox` flag (new `threads` column + `db.set_no_sandbox`, migrated in) so THIS code session's claude runs WITHOUT the bubblewrap jail even when `SANDBOX_CODE` is on — to tell a sandbox issue apart from a bot bug; `on` re-isolates. The engine sandboxes a code session only when `settings.sandbox_code and not state.no_sandbox`; the flag is owner-set only (command is owner-gated), so guests can never escape. Rebuilds the session on change; in the owner's command menu. | The owner can run a code session with isolation OFF to A/B-test the sandbox vs a bot bug. |
+| 115 | isolation | Sandbox #104 — persist code-session state across restarts | The bubblewrap jail's HOME is a private tmpfs, but `~/.claude/projects` is now bind-mounted from a per-session host dir (`BASE_WORKDIR/<key>.sbxstate`, passed as `SBX_STATE`, created in `engine._ensure_client`, removed on session delete) so claude's `resume` survives a client rebuild / bot restart. Verified end-to-end: a brand-new sandboxed client resumed a prior session and recalled the planted word. The credential overlay stays ephemeral. | Sandboxed code sessions keep their context across restarts. |
+| 116 | security | Sandbox #104 — resource limit (process cap) | The launcher sets `ulimit -u 512` before exec'ing the jail, blunting a fork-bomb DoS from sandboxed code. (seccomp + cgroup memory/CPU limits — needing a compiled BPF policy / a systemd scope — are noted as lower-priority future hardening, not shipped here.) | Sandboxed code can't fork-bomb the host. |
+| 114 | security | Sandbox #104 — network egress allowlist | **Superseded by #119.** Necessary but not sufficient on its own: while the subscription token lives inside the jail it leaks via the bot's own output channel (agent reads it, the bot streams it to the user) and via any allowed data-store (e.g. GitHub) — so a firewall alone can't protect it. Egress was folded into the e2e design (#119), whose credential-broker removes the token from the jail entirely; the A–E egress-mechanism analysis lives on in #119's Details (component 2). | — |
+| 117 | isolation | Sandbox #104 — perm 6/7 noexec toggle on the workdir | **Won't do — folded into #119 rationale.** noexec is capability-reduction (counter to the goal of containing, not de-powering, sessions) and weak regardless (interpreters run scripts even from a noexec dir; bwrap 0.8 has no per-bind noexec). Recorded in #119 (component 4) so it isn't re-proposed. | — |
 
 ---
 

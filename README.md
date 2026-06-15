@@ -1,26 +1,23 @@
-# claude-tg-bot
+# Telegram bot for Claude via Claude Agent SDK
 
-A **private, multi-user** Telegram bot that is your personal frontend for
-**Claude** and **Claude Code** — in a **DM** with the bot.
-
-The bot keeps named **sessions** you switch between, each fully isolated
-(histories never cross). A session is **either chat or code, fixed when you
-create it**:
+A **private, multi-user** Telegram bot that is your personal frontend to **Claude**
+and **Claude Code** — use it yourself and share access with other Telegram users,
+each talking to the bot in a **DM**. You keep named **sessions** and switch between
+them; each is fully isolated (histories never cross) and is **either chat or code,
+fixed at creation**:
 
 - **chat** — a plain Claude conversation.
 - **code** — a full Claude Code agent with its own working directory on the
-  server. It runs shell commands and edits files; with `/auto on` it works
-  without asking, otherwise dangerous tools wait for an **Allow** / **Deny** tap.
+  server; it runs shell commands and edits files (dangerous tools wait for an
+  **Allow** / **Deny** tap, or run freely with `/auto on`).
 
-Everything runs on your **Claude Pro/Max subscription** through the
+Everything runs on your **Claude Pro/Max subscription** via the
 [Claude Agent SDK](https://docs.claude.com/en/api/agent-sdk/overview) — **no
-Anthropic API key and no per-token billing.**
+Anthropic API key, no per-token billing.**
 
-> **Smooth streaming via native message drafts.** In a DM the reply streams in
-> letter-by-letter using Telegram's `sendMessageDraft` (Bot API 9.3+). This only
-> works in private chats, so the older **supergroup/Topics** mode (the code is
-> still here) is **frozen** — DM is the live mode. Telegram Premium is not
-> required.
+> **Streaming:** in a DM the reply streams in live via Telegram message drafts
+> (`sendMessageDraft`; no Premium needed). The older group/Topics path still
+> exists in the code but is dormant — **DM is the supported mode.**
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 ![Python](https://img.shields.io/badge/python-3.11%2B-blue)
@@ -29,214 +26,242 @@ Anthropic API key and no per-token billing.**
 
 ## Features
 
-- **Sessions:** each session is one isolated Claude session (own context, working
-  directory, resume id) — chat **or** code, fixed at creation. Nothing leaks
-  between sessions, and no global `~/.claude` / `CLAUDE.md` is loaded
-  (`setting_sources=[]`). Browse / switch / rename / delete via `/sessions`.
-- **Access control by allowlist:** only the owner plus explicitly allowed users
-  can talk to the bot. The user list lives in a **gitignored** `allowlist.json`,
-  so your identities never reach a public repo.
-- **Native letter-by-letter streaming:** the reply streams in smoothly via
-  Telegram message drafts (`sendMessageDraft`). Code is rendered in **copyable**
-  Telegram code blocks. In code mode each burst of output between tools is its own
-  message (so progress is visible); intermediate messages are silent and links
-  never expand into previews.
-- **Approvals & auto mode:** in code mode, Bash/Write/Edit pause for an inline
-  **Allow / Deny** tap — or run `/auto on` (owner) to execute everything without
-  asking, like a local Claude Code session. `/permissions` switches between
-  ask / auto-edits / plan / yolo.
-- **Ambient usage:** `/usage` shows your subscription's **5h** and **7d** windows
-  as "% left" — either as a thin footer under replies or a pinned, live-updated
-  message.
-- **Task chaining:** send a follow-up while a run is going (or right after) — it
-  queues and runs in the *same* session, reusing context and the warm cache.
-- **Localized interface:** the bot's UI is available in English and Russian. The
-  language is auto-detected from your Telegram client on first contact and can be
-  changed any time with `/language` or the ⚙️ settings menu. (Claude's own answers
-  are unaffected — the model already replies in your language.)
-- State is in SQLite, so sessions, usage, settings, and your language survive a
-  bot restart.
+- **Isolated sessions** — each is its own Claude session (context, working dir,
+  resume id), chat **or** code, fixed at creation; nothing leaks between them
+  (see **One subscription, isolated memory** below). Browse / switch / rename /
+  ⭐ / delete via `/sessions`.
+- **Allowlist access** — only the owner and explicitly allowed users can talk to
+  the bot; each allowed user has a **level** (chat or code), an optional
+  **expiry**, and an optional **token cap**. The list lives in a gitignored
+  `allowlist.json`.
+- **Approvals & auto mode** — in code mode Bash/Write/Edit pause for an inline
+  **Allow / Deny** tap; `/auto on` (owner) runs everything without asking.
+  `/permissions` switches ask / auto-edits / plan / full-access.
+- **Ambient usage** — `/usage` and `/status` show your subscription's **5h** and
+  **7d** windows as "% left", as a footer or a pinned live message.
+- **Task chaining** — send a follow-up during or right after a run; it queues into
+  the *same* session, reusing context and the warm cache.
+- **Localized UI** — English and Russian, auto-detected from your Telegram client
+  and changeable with `/language` (Claude's own answers are unaffected).
+- **Durable state** — sessions, usage, settings, and language live in SQLite and
+  survive a restart.
 
 ---
 
 ## How it works
 
 ```
-You  ──DM──▸  @your_bot
-               └── /new  ──▸  one isolated session   (switch with /sessions)
-                               ├── chat: Agent SDK, no tools
-                               └── code: Agent SDK + tools, cwd = BASE_WORKDIR/<session>
-                                           └── dangerous tool? ──▸ inline Allow/Deny
+You ──DM──▸ @your_bot
+             └── /newchat | /newcode ──▸ one isolated session   (switch with /sessions)
+                   ├── chat: Agent SDK, no tools
+                   └── code: Agent SDK + tools, cwd = BASE_WORKDIR/<session>
+                                └── dangerous tool? ──▸ inline Allow / Deny
 ```
 
-The bot uses long polling (no webhook, no domain, no public port).
+Long polling — no webhook, domain, or public port.
+
+### One subscription, isolated memory
+
+Every session — yours and other users' — runs on the **same** Pro/Max subscription
+(a Telegram identity is **not** a separate Claude account), so they all draw from
+**one shared usage-limit pool**. But there is **no global or cross-session
+memory**: the bot sets `setting_sources=[]`, so no account- or machine-wide
+`CLAUDE.md` / settings ever load, and each session keeps only its **own**
+conversation (its own resume id, persisted across restarts). That isolation is
+exactly what lets one subscription safely serve many independent sessions and
+users. (The shared limit pool is also why per-user **token caps** exist — see
+**Access control**.)
 
 ---
 
-## Prerequisites
+## Project structure
 
-- A Linux server (VPS) you control.
-- **Python 3.11+**.
-- The **Claude Code CLI** installed and logged in to your Pro/Max subscription
-  (this is how the bot reaches Claude on your subscription).
-- A Telegram account.
+| File | Responsibility |
+|---|---|
+| `bot.py` | Entry point: wiring, middleware, long polling, graceful shutdown. |
+| `config.py` | `.env` → `Settings` (warns if `ANTHROPIC_API_KEY` is set). |
+| `handlers.py` | aiogram router: commands, text/photo/document routing, callbacks, the `/` menu. |
+| `engine.py` | `ClaudeSession` over the Agent SDK — **all** SDK code lives here (incl. the sandbox launcher). |
+| `sessions.py` | `SessionManager`: per-session worker, the chaining queue, `/stop`, usage accounting. |
+| `streamer.py` | Live reply: native `sendMessageDraft` streaming in DM, code-block rendering, usage footer. |
+| `permissions.py` | `PermissionGate`: the code-mode Allow/Deny approval gate. |
+| `access.py` | Middleware: allowlist (drops non-allowed updates) + per-user language resolution. |
+| `allowlist.py` | JSON-backed access store: levels, expiry, token caps; owner always allowed; fail-closed. |
+| `db.py` | `aiosqlite` state: sessions, usage, conversation log, key-value store. |
+| `i18n.py` | Localization table + `t(key, lang, …)`; `en` canonical, `ru` translation. |
+| `markup.py` | Telegram formatting: Markdown→HTML, 4096-safe splitting, long-output-as-file. |
+| `usage.py` | Formatters for the 5h / 7d subscription windows. |
+| `deploy/` | `tg-bot.service` (systemd unit) and `sandbox-claude.sh` (bubblewrap launcher). |
 
----
-
-## Part A — Telegram setup (step by step, first-timer friendly)
-
-You only need a bot token and your numeric id — **no group, Topics, or admin
-rights**. You talk to the bot in a private chat (DM).
-
-### 1. Create the bot and get its token
-
-1. Open a chat with **[@BotFather](https://t.me/BotFather)**.
-2. Send `/newbot`. Choose a display name, then a username ending in `bot`.
-3. BotFather replies with a **token** like `123456789:AAE...`. Keep it secret —
-   it goes into `.env` as `TELEGRAM_BOT_TOKEN`.
-
-### 2. Find your numeric Telegram id (`OWNER_ID`)
-
-1. Message **[@userinfobot](https://t.me/userinfobot)** — it replies with your
-   **Id** (a number). That's `OWNER_ID`.
-2. (You can also send the running bot `/whoami` once it's up.)
-
-### 3. Say hello
-
-Open a **private chat** with your bot and send `/start`. Create sessions with
-`/newchat` or `/newcode` (or `/new` to pick), and switch between them with
-`/sessions`. No group, Topics, or admin setup is involved.
-
-### Do I need Telegram Premium?
-
-**No.** Creating bots and using inline buttons are free. Premium only adds
-unrelated perks this bot doesn't use.
+Tasks are tracked in [`TODO.md`](TODO.md); contributor rules in
+[`AGENTS.md`](AGENTS.md) and [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ---
 
-## Part B — Server setup
+## Requirements & dependencies
 
-### 1. Install & log in the Claude Code CLI (subscription auth)
+- A **Linux server (VPS)** you control, **Python 3.11+**, and a **Telegram account**.
+- The **Claude Code CLI** (`claude`), logged in to your Pro/Max subscription
+  (`claude setup-token`).
+- Python packages — installed by `pip install -r requirements.txt`:
+
+  | Package | Purpose |
+  |---|---|
+  | `aiogram==3.28.2` | Telegram Bot API framework (async, long polling). |
+  | `claude-agent-sdk==0.2.101` | Drives the `claude` CLI on your subscription. |
+  | `aiosqlite==0.22.1` | Async SQLite for per-session state and usage. |
+  | `python-dotenv==1.2.2` | Loads `.env`. |
+
+- Optional: the **`bubblewrap`** package (e.g. `apt install bubblewrap`) for the
+  code sandbox; **`pytest`** + **`ruff`** (`requirements-dev.txt`) for development.
+
+---
+
+## 1. Telegram setup
+
+1. In **[@BotFather](https://t.me/BotFather)** send `/newbot`, pick a name and a
+   `…bot` username; copy the **token** → `.env` as `TELEGRAM_BOT_TOKEN`.
+2. Get your numeric id from **[@userinfobot](https://t.me/userinfobot)** → `.env`
+   as `OWNER_ID` (or send the running bot `/whoami`).
+3. Open a **DM** with your bot and send `/start`.
+
+(Telegram Premium is not required.)
+
+## 2. Server setup
+
+**Install & log in the Claude Code CLI (subscription auth):**
 
 ```bash
 claude setup-token     # stores Pro/Max subscription credentials (headless-friendly)
 claude --version       # should print a version
 ```
 
-> **Do not set `ANTHROPIC_API_KEY`.** If present, Claude Code would switch to
-> paid API billing. The bot strips it from the environment it hands to Claude,
-> and warns at startup if it's set — but keep it unset to be safe.
+> **Do not set `ANTHROPIC_API_KEY`** — it would switch Claude Code to paid API
+> billing. The bot strips it from the environment it hands to Claude and warns at
+> startup, but keep it unset.
 
-### 2. Install the bot
+**Install the bot:**
 
 ```bash
 git clone git@github.com:haritos90/claude-tg-bot.git
 cd claude-tg-bot
-
-python3 -m venv .venv
-. .venv/bin/activate
+python3 -m venv .venv && . .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### 3. Configure `.env` and the allowlist
+**Configure:**
 
 ```bash
-cp .env.example .env
-cp allowlist.example.json allowlist.json
+cp .env.example .env                       # fill TELEGRAM_BOT_TOKEN + OWNER_ID
+cp allowlist.example.json allowlist.json   # add any users besides yourself
 ```
 
-Edit `.env`:
+`.env` has two required keys (`TELEGRAM_BOT_TOKEN`, `OWNER_ID`); the rest
+(`DEFAULT_MODEL`, `BASE_WORKDIR`, `DB_PATH`, `ALLOWLIST_PATH`, and the optional
+sandbox flags `SANDBOX_CODE` / `SANDBOX_UID` — see **Security & isolation**) have
+sensible defaults.
 
-```ini
-TELEGRAM_BOT_TOKEN=123456789:AAE...   # from BotFather (step A1)
-OWNER_ID=123456789                    # your numeric id (step A5)
-DEFAULT_MODEL=claude-opus-4-8         # opus | sonnet | haiku also accepted
-BASE_WORKDIR=./workdirs               # code-mode working dirs, one per session
-DB_PATH=./bot.db                      # SQLite state
-ALLOWLIST_PATH=./allowlist.json       # who may use the bot (gitignored)
-# Do NOT add ANTHROPIC_API_KEY — this bot runs on your subscription.
-```
-
-`allowlist.json` (gitignored) lists everyone allowed besides the owner — see
-**Access control** below.
-
-### 4. Run
+**Run:**
 
 ```bash
 . .venv/bin/activate
 python bot.py
 ```
 
-Open a DM with your bot and send `/start`; create a session with `/newchat` or
-`/newcode` and say hello. `/help` lists every command.
+Open a DM, `/start`, create a session with `/newchat` or `/newcode`, and say
+hello. `/help` lists every command.
 
 ---
 
 ## Access control
 
-The bot only answers the **owner** (`OWNER_ID`) and users on the **allowlist**.
-Everyone else is dropped before any handler runs.
+The bot answers only the **owner** (`OWNER_ID`) and users on the **allowlist**;
+every other update is dropped before any handler runs (fail-closed — a
+missing/corrupt `allowlist.json` means owner-only, never everyone).
 
-`allowlist.json` (gitignored, never committed):
+Each allowed user has a **level** (`chat` = chat mode only, or `code` = chat +
+code), an optional **expiry** date, and an optional **token cap** (a cumulative
+budget across their sessions). Manage it from Telegram (owner only): `/allow
+<id|@user>`, `/deny`, `/level`, `/expire`, `/limit`, `/users`.
 
-```json
-{ "ids": [123456789], "usernames": ["someuser"] }
-```
-
-- **Numeric ids are authoritative** and never change — prefer them.
-- **Usernames** are a convenience and are matched case-insensitively without the
-  `@`. They can be hijacked if a username is ever freed, so when a user first
-  matches by username the bot **pins their numeric id** into `allowlist.json`
-  automatically.
-- The owner is always allowed, even if the file is missing or empty (the bot
-  **fails closed** — a corrupt/empty file means "owner only", never "everyone").
-
-Manage the list from Telegram (owner only): `/allow <id|@user>`,
-`/deny <id|@user>`, `/users`. Get your own id with `/whoami`.
+Numeric ids are authoritative; a `@username` grant is **pinned to its numeric id**
+on the user's first message (usernames can be hijacked if freed). `allowlist.json`
+is gitignored — see [`allowlist.example.json`](allowlist.example.json) for the
+format.
 
 ---
 
 ## Commands
 
-| Command | What it does |
-|---|---|
-| `/help`, `/start` | Show the command reference. |
-| `/new`, `/newchat`, `/newcode` | Create a new isolated session (chat or code). `/new` shows a chooser. |
-| `/sessions` | Browse / search / switch / ⭐-favorite / delete your sessions. |
-| `/rename <name>` | Rename the current session. |
-| `/mode` | Show this session's engine (chat or code — **fixed at creation**). |
-| `/model <id>` | Model for this session (`opus` / `sonnet` / `haiku` or a full id). |
-| `/cwd <path>` | (code) Working directory; relative paths resolve under `BASE_WORKDIR`. |
-| `/permissions ask\|auto-edits\|plan\|yolo` | Code-mode approval policy. `ask` = inline Allow/Deny (default). |
-| `/auto on\|off` | (owner) Run code-mode tools without asking, like a local Claude Code session. |
-| `/usage off\|footer\|pinned\|both` | (owner) Ambient 5h/7d subscription usage display. |
-| `/history`, `/recap` | Export the full transcript / show the last exchange. |
-| `/language [ru\|en]` | Choose the bot's interface language (or tap to pick). |
-| `/settings` | Inline menu: model, permissions, streaming, memory, language… |
-| `/reset` | Clear this session's context (drops context **and** warm cache). |
-| `/stop` | Interrupt the run in progress in this session. |
-| `/status` | Mode, model, cwd, queue, cache timer, subscription limits, token totals. |
-| `/whoami` | Your numeric id + username. |
-| `/allow`, `/deny`, `/users` | Owner-only: manage the allowlist. |
+The full set lives in the tap-to-open Telegram menu (descriptions localized;
+code-only commands are hidden from chat-level users, owner commands from everyone
+else). Plain text goes straight to the current session's Claude.
 
-Plain text goes straight to the current session's Claude; the reply streams back
-into your chat.
+| Group | Commands |
+|---|---|
+| **Sessions** | `/newchat` `/newcode` `/sessions` `/rename` |
+| **Run** | `/status` `/stop` `/retry` `/reset` |
+| **Tuning** | `/model` `/effort` `/fork` `/memory` · *(code)* `/permissions` `/files` `/export` `/maxturns` |
+| **Info** | `/recap` `/history` `/usage` `/context` `/queue` `/clearqueue` |
+| **Meta** | `/settings` `/language` `/help` `/whoami` |
+| **Owner** | `/auto` `/allow` `/deny` `/users` `/level` `/expire` `/limit` `/sandbox` |
 
 ---
 
-## Saving subscription limits
+## Security & isolation
 
-Watch `/usage` and `/status`: reuse the 5-minute prompt cache (chain follow-ups
-before the timer expires), keep one project per session, and right-size the model
-with `/model`. The owner keeps personal limit-saving habits in a local,
-gitignored `CLAUDE.md`; shared project conventions are in `AGENTS.md`.
+- **Access** is owner + allowlist, fail-closed; the bot token and `allowlist.json`
+  are gitignored and never logged. **Subscription only** — no API key, no
+  per-token billing.
+- **Code mode is effectively a shell on your server.** It runs as the bot's user,
+  with dangerous tools (Bash/Write/Edit) gated behind an explicit Allow/Deny tap
+  (or `/auto on`).
+- **Isolation is still in progress — grant `code` level only to people you fully
+  trust.** Without the optional sandbox, a code-level user is as powerful as the
+  bot's user: they can read any file that user can (including secrets) and use the
+  network.
+- **Optional sandbox** (`SANDBOX_CODE=1`, **off by default, in development**)
+  wraps each code session's `claude` in a
+  [bubblewrap](https://github.com/containers/bubblewrap) jail — unprivileged uid,
+  filesystem confined to the session workdir, env wiped (requires the
+  `bubblewrap` package). It limits the *filesystem* blast radius, **but is not yet
+  a complete jail:** the subscription token is currently injected into the jail
+  and the network is open, so a determined user could still read or exfiltrate it.
+  The full design — a **credential broker** so the token never enters the jail, a
+  **network egress allowlist**, per-session secrets, and DoS limits — is tracked
+  as **#119 in [`TODO.md`](TODO.md)** and not yet built. The owner can toggle
+  isolation per session with `/sandbox on|off`.
+
+Report vulnerabilities privately — see [`SECURITY.md`](SECURITY.md).
+
+---
+
+## Data, privacy & trust
+
+Everything happens on **your server** — there is no external database.
+
+- **What's stored, and where.** Per-session state, **conversation transcripts**
+  (used by `/recap` and `/history`), and token usage live in the SQLite DB
+  (`bot.db`). Code sessions also keep their files under `BASE_WORKDIR/<session>`,
+  and Claude's own resume state under the bot user's `~/.claude/projects`. All of
+  it sits on the host's disk.
+- **The server operator can read all of it.** Whoever runs the bot (root / the
+  service user) can open `bot.db` and the workdirs — i.e. **every user's
+  conversations and files**. So anyone you share access with is trusting **you, the
+  operator**, with their session content; share accordingly and keep the host
+  secured. (`bot.db`, `workdirs/`, and `*.log` are gitignored, so they're never
+  committed — but they do live on the server.)
+- **Separate from claude.ai.** These run as local Claude Code / Agent-SDK sessions,
+  so they **do not appear in your claude.ai web/app chat history** — that list only
+  shows conversations made in the claude.ai apps. The requests still go through
+  Anthropic on your subscription (they count against your limits and are subject to
+  Anthropic's terms), they're just not surfaced as claude.ai chats.
 
 ---
 
 ## Run it 24/7 with systemd
 
-A unit file is in [`deploy/tg-bot.service`](deploy/tg-bot.service). Edit the
-paths and `User`, then:
+[`deploy/tg-bot.service`](deploy/tg-bot.service) — edit the paths and `User`, then:
 
 ```bash
 sudo cp deploy/tg-bot.service /etc/systemd/system/claude-tg-bot.service
@@ -245,26 +270,22 @@ sudo systemctl enable --now claude-tg-bot
 journalctl -u claude-tg-bot -f
 ```
 
-> The service must run as the **same user** that ran `claude setup-token`, so it
-> can read the subscription credentials from that user's home directory.
+> Run the service as the **same user** that ran `claude setup-token`, so it can
+> read the subscription credentials from that user's home directory.
 
 ---
 
-## Security
+## Saving subscription limits
 
-- The only access control is the owner + allowlist; every other update is dropped
-  before any handler. **Keep your bot token and `allowlist.json` private.**
-- Secrets and identities live only in `.env` and `allowlist.json` (both
-  gitignored). They are never committed or logged.
-- **Code mode is effectively a shell on your server.** It runs as your service
-  user, scoped to a per-session working directory, with dangerous tools gated
-  behind an explicit Allow/Deny tap. Treat the approval prompts seriously, and
-  use `/permissions yolo` only when you really mean it.
+Watch `/usage` and `/status`: chain follow-ups within the 5-minute prompt cache,
+keep one project per session, and right-size the model with `/model`. The owner's
+personal limit-saving notes live in a local, gitignored `CLAUDE.md`; shared
+conventions in `AGENTS.md`.
 
 ---
 
-## Legal Notice
+## Legal
 
-This software is intended for personal, development, and research use. You are
-solely responsible for how you use it and must comply with applicable laws and
-with the Anthropic and Telegram terms of service.
+For personal, development, and research use. You are solely responsible for how
+you use it and must comply with applicable laws and with the Anthropic and
+Telegram terms of service. MIT licensed — see [`LICENSE`](LICENSE).
