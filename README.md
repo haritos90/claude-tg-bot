@@ -15,10 +15,6 @@ Everything runs on your **Claude Pro/Max subscription** via the
 [Claude Agent SDK](https://docs.claude.com/en/api/agent-sdk/overview) — **no
 Anthropic API key, no per-token billing.**
 
-> **Streaming:** in a DM the reply streams in live via Telegram message drafts
-> (`sendMessageDraft`; no Premium needed). The older group/Topics path still
-> exists in the code but is dormant — **DM is the supported mode.**
-
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 ![Python](https://img.shields.io/badge/python-3.11%2B-blue)
 
@@ -26,6 +22,8 @@ Anthropic API key, no per-token billing.**
 
 ## Features
 
+- **Streaming:** uses native Telegram streaming tailored for generative AI tools
+  (Telegram only supports it for DMs now).
 - **Isolated sessions** — each is its own Claude session (context, working dir,
   resume id), chat **or** code, fixed at creation; nothing leaks between them
   (see **One subscription, isolated memory** below). Browse / switch / rename /
