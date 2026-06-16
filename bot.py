@@ -16,7 +16,7 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 
 from config import load_settings
-from db import init_db, close_db
+from db import init_db, close_db, migrate_workdirs_to_sid
 from allowlist import Allowlist
 from access import AllowlistMiddleware, LanguageMiddleware
 from permissions import PermissionGate
@@ -54,6 +54,14 @@ async def main() -> None:
     # Persistent per-thread state. init_db expects a string path.
     await init_db(str(settings.db_path))
     logger.info("Database initialised at %s", settings.db_path)
+
+    # #140: one-time, idempotent rename of per-session workdirs from the raw
+    # numeric thread_id to the stable public sid. Runs every startup (a no-op
+    # once migrated); a hiccup here must never block the bot from starting.
+    with contextlib.suppress(Exception):
+        n = await migrate_workdirs_to_sid(str(settings.base_workdir))
+        if n:
+            logger.info("Migrated %d session workdir(s) to sid-based names (#140)", n)
 
     # The bot uses HTML parse mode by default; the markup helpers emit HTML.
     bot = Bot(

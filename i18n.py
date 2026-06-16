@@ -166,7 +166,7 @@ CATALOG: dict[str, dict[str, str]] = {
             "start a 🟩 code session (type is fixed for the session's life)\n"
             "/sessions — browse / search / switch; tap 🗑 to delete one\n"
             "/rename &lt;name&gt; — rename the current session\n"
-            "/reset — clear the current session · /stop — stop the current reply\n"
+            "/reset — clear the current session (the running reply has a Stop button)\n"
             "/status — current session info · /context — context-window usage\n"
             "\n"
             "<b>Settings:</b>\n"
@@ -209,7 +209,7 @@ CATALOG: dict[str, dict[str, str]] = {
             "создать 🟩 код-сессию (тип фиксируется на всё время сессии)\n"
             "/sessions — обзор / поиск / переключение; 🗑 чтобы удалить\n"
             "/rename &lt;имя&gt; — переименовать текущую сессию\n"
-            "/reset — очистить текущую сессию · /stop — остановить текущий ответ\n"
+            "/reset — очистить текущую сессию (у идущего ответа есть кнопка Стоп)\n"
             "/status — сведения о сессии · /context — использование окна контекста\n"
             "\n"
             "<b>Настройки:</b>\n"
@@ -293,6 +293,37 @@ CATALOG: dict[str, dict[str, str]] = {
     "settings.row_usage": {"en": "📊 Usage: {val} ▸", "ru": "📊 Использование: {val} ▸"},
     "settings.row_streaming": {"en": "Streaming: {val}", "ru": "Стриминг: {val}"},
     "settings.row_memory": {"en": "Big memory: {val}", "ru": "Большая память: {val}"},
+    # #140-fix: dedicated max_turns label (was reusing settings.row_model, which
+    # rendered TWO "🧠 Model" rows in the registry-driven /settings hub).
+    "settings.row_maxturns": {"en": "🔁 Max turns: {val} ▸", "ru": "🔁 Лимит ходов: {val} ▸"},
+    # #138: sandbox is OWNER-ONLY and hidden from non-owners in /settings.
+    "settings.row_sandbox": {"en": "📦 Sandbox: {val} ▸", "ru": "📦 Песочница: {val} ▸"},
+    # #138 PART 2: the registry-driven, scope-tabbed /settings hub.
+    "settings.tab_session": {"en": "📍 This session", "ru": "📍 Эта сессия"},
+    "settings.tab_user": {"en": "👤 My defaults", "ru": "👤 Мои умолчания"},
+    "settings.tab_global": {"en": "🌍 Global", "ru": "🌍 Глобально"},
+    # Short source badges shown next to a resolved value (which scope supplies it).
+    "settings.badge_session": {"en": "this session", "ru": "эта сессия"},
+    "settings.badge_user": {"en": "my default", "ru": "моё умолчание"},
+    "settings.badge_global": {"en": "global default", "ru": "глобально"},
+    "settings.v2_header": {
+        "en": "⚙️ <b>Settings</b> · {tab}\nTap a setting to change it.",
+        "ru": "⚙️ <b>Настройки</b> · {tab}\nНажмите настройку, чтобы изменить её.",
+    },
+    # One hub row: name, resolved value, and the badge of its source scope.
+    "settings.v2_row": {
+        "en": "{name}: {val} · {badge} ▸",
+        "ru": "{name}: {val} · {badge} ▸",
+    },
+    "settings.v2_pick": {
+        "en": "⚙️ <b>{name}</b>\nPick a value.",
+        "ru": "⚙️ <b>{name}</b>\nВыберите значение.",
+    },
+    "settings.val_default": {"en": "default", "ru": "по умолчанию"},
+    "settings.denied": {
+        "en": "Not allowed.",
+        "ru": "Недоступно.",
+    },
 
     # -- session create / switch / rename / delete -------------------------- #
     "session.created": {
@@ -350,8 +381,10 @@ CATALOG: dict[str, dict[str, str]] = {
     "sessions.head_search": {"en": " · search “{kw}”", "ru": " · поиск «{kw}»"},
     "sessions.head_total": {"en": " · {total} total", "ru": " · всего {total}"},
     "sessions.row": {
-        "en": "<code>{sid}</code> {icon} {name} — <b>{mode}</b> · {date}{mark}",
-        "ru": "<code>{sid}</code> {icon} {name} — <b>{mode}</b> · {date}{mark}",
+        # #136: dropped the leading <code>{sid}</code> — the public id is noise to
+        # the user; the list now leads with the icon + name.
+        "en": "{icon} <b>{name}</b> — {mode} · {date}{mark}",
+        "ru": "{icon} <b>{name}</b> — {mode} · {date}{mark}",
     },
     "sessions.row_stats": {
         "en": "    {reqs} msgs · {toks} tok",
@@ -448,10 +481,11 @@ CATALOG: dict[str, dict[str, str]] = {
     },
 
     # -- /files (read-only working-dir tree; #100) -------------------------- #
-    "files.header": {"en": "📂 <code>{dir}</code>", "ru": "📂 <code>{dir}</code>"},
+    # #136: show the session NAME, not the host path (was <code>{dir}</code>).
+    "files.header": {"en": "📂 <b>{name}</b>", "ru": "📂 <b>{name}</b>"},
     "files.empty": {
-        "en": "📂 <code>{dir}</code> — empty or not created yet.",
-        "ru": "📂 <code>{dir}</code> — пусто или ещё не создана.",
+        "en": "📂 <b>{name}</b> — no files yet.",
+        "ru": "📂 <b>{name}</b> — пока нет файлов.",
     },
 
     # -- /export (zip the code-session working dir) ------------------------- #
@@ -476,6 +510,16 @@ CATALOG: dict[str, dict[str, str]] = {
         "ru": "🧪 Песочница для этой сессии: <b>{state}</b> · глобально SANDBOX_CODE: "
               "<b>{glob}</b>.\n<code>/sandbox on|off</code> — запускать эту код-сессию "
               "с изоляцией или без (тест владельца).",
+    },
+    # #138 PART 2: sandbox shown with its RESOLVED value + the scope badge that
+    # supplies it (replaces the confusing two-value sandbox.show line).
+    "sandbox.show_scoped": {
+        "en": "🧪 Sandbox: <b>{state}</b> <i>({scope})</i>.\n"
+              "<code>/sandbox on|off</code> — run this code session with or without "
+              "isolation (owner test).",
+        "ru": "🧪 Песочница: <b>{state}</b> <i>({scope})</i>.\n"
+              "<code>/sandbox on|off</code> — запускать эту код-сессию с изоляцией "
+              "или без (тест владельца).",
     },
     "sandbox.set_on": {
         "en": "🧪 Sandbox <b>on</b> for this session — code runs isolated.{note}",
@@ -1165,10 +1209,10 @@ CATALOG: dict[str, dict[str, str]] = {
     "queue.cancelled_toast": {"en": "Cancelled.", "ru": "Отменено."},
     "queue.already_running": {"en": "Already running.", "ru": "Уже выполняется."},
     "queue.cleared": {
-        "en": "Cleared {n} queued message(s). The current run keeps going — use "
-              "<code>/stop</code> to halt it.",
+        "en": "Cleared {n} queued message(s). The current run keeps going — tap "
+              "the Stop button on the live reply to halt it.",
         "ru": "Очищено сообщений в очереди: {n}. Текущий запуск продолжается — "
-              "используйте <code>/stop</code>, чтобы остановить его.",
+              "нажмите кнопку Стоп под идущим ответом, чтобы остановить его.",
     },
     "queue.clear_error": {
         "en": "Could not clear the queue: <code>{err}</code>",
@@ -1289,8 +1333,10 @@ CATALOG: dict[str, dict[str, str]] = {
         "ru": "Ошибка оплаты. Проверьте статус подписки.",
     },
     "err.rate_limit": {
-        "en": "Rate limit reached. Please try again later.",
-        "ru": "Достигнут лимит запросов. Попробуйте позже.",
+        "en": "Subscription limit reached — the usage window is exhausted. "
+              "Please try again after it resets.",
+        "ru": "Достигнут лимит подписки — окно использования исчерпано. "
+              "Попробуйте снова после его сброса.",
     },
     "err.invalid_request": {
         "en": "Invalid request to the model.",
@@ -1315,6 +1361,9 @@ CATALOG: dict[str, dict[str, str]] = {
     "usage.status.ok": {"en": "OK", "ru": "OK"},
     "usage.status.high": {"en": "⚠ high", "ru": "⚠ высокое"},
     "usage.status.limited": {"en": "⛔ limited", "ru": "⛔ лимит"},
+    # #135/#137: neutral marker for a present-but-unrecognized window status — we no
+    # longer assert "OK" for a state we don't actually understand.
+    "usage.status.unknown": {"en": "—", "ru": "—"},
     "usage.left": {"en": "{pct}% left", "ru": "осталось {pct}%"},
     "usage.resets": {"en": "resets {when}", "ru": "сброс через {when}"},
     "usage.reset_hm": {"en": "{h}h{m}m", "ru": "{h}ч{m}м"},
@@ -1328,69 +1377,79 @@ CATALOG: dict[str, dict[str, str]] = {
     "usage.label.overage": {"en": "overage", "ru": "перерасход"},
 
     # -- command-menu descriptions (setMyCommands) -------------------------- #
-    "cmd.new": {"en": "➕ New chat session", "ru": "➕ Новая сессия (чат)"},
-    "cmd.code": {"en": "🟩 Upgrade this session to code", "ru": "🟩 Повысить сессию до кода"},
-    "cmd.chat": {"en": "💬 Downgrade this session to chat", "ru": "💬 Понизить сессию до чата"},
-    "cmd.newchat": {"en": "💬 New chat session", "ru": "💬 Новая чат-сессия"},
-    "cmd.newcode": {"en": "🟩 New code session", "ru": "🟩 Новая код-сессия"},
-    "cmd.sessions": {
-        "en": "Browse / switch / delete sessions",
-        "ru": "Обзор / переключение / удаление сессий",
-    },
-    "cmd.rename": {"en": "Rename the current session", "ru": "Переименовать текущую сессию"},
-    "cmd.status": {"en": "Current session info", "ru": "Сведения о текущей сессии"},
-    "cmd.stop": {"en": "Stop the current reply", "ru": "Остановить текущий ответ"},
-    "cmd.retry": {"en": "Re-run the last prompt", "ru": "Повторить последний запрос"},
-    "cmd.clear": {"en": "Clear the session context", "ru": "Очистить контекст сессии"},
-    "cmd.reset": {"en": "Clear the session context (alias of /clear)", "ru": "Очистить контекст (синоним /clear)"},
-    "cmd.model": {
-        "en": "Switch model: opus | sonnet | haiku",
-        "ru": "Сменить модель: opus | sonnet | haiku",
-    },
-    "cmd.effort": {"en": "Reasoning depth: low … max", "ru": "Глубина рассуждений: low … max"},
-    "cmd.fork": {
-        "en": "Branch this session into a new one",
-        "ru": "Ответвить эту сессию в новую",
-    },
-    "cmd.memory": {
-        "en": "1M context window (chat): on | off",
-        "ru": "Окно контекста 1M (чат): on | off",
-    },
-    "cmd.permissions": {
-        "en": "Code tool policy: ask | auto-edits | plan",
-        "ru": "Политика инструментов кода: ask | auto-edits | plan",
-    },
-    "cmd.cwd": {"en": "Working directory (code sessions)", "ru": "Рабочая папка (код-сессии)"},
-    "cmd.dirs": {"en": "Extra code directories", "ru": "Доп. папки для кода"},
-    "cmd.files": {"en": "Browse the working-dir tree (code)", "ru": "Дерево рабочей папки (код)"},
-    "cmd.export": {"en": "Export working-dir files as .zip (code)", "ru": "Экспорт файлов рабочей папки (.zip, код)"},
-    "cmd.sandbox": {"en": "Toggle this code session's sandbox (owner)", "ru": "Песочница код-сессии вкл/выкл (владелец)"},
-    "cmd.maxturns": {"en": "Cap agentic turns (code)", "ru": "Лимит агентных ходов (код)"},
-    "cmd.recap": {"en": "Show the last exchange", "ru": "Показать последний обмен"},
-    "cmd.history": {
-        "en": "Export this session's transcript",
-        "ru": "Выгрузить расшифровку этой сессии",
-    },
-    "cmd.usage": {"en": "Subscription-usage display", "ru": "Показ использования подписки"},
-    "cmd.context": {"en": "Context-window usage", "ru": "Использование окна контекста"},
-    "cmd.queue": {"en": "Show the pending-prompt queue", "ru": "Показать очередь запросов"},
-    "cmd.clearqueue": {"en": "Clear the pending queue", "ru": "Очистить очередь"},
-    "cmd.stream": {"en": "Live streaming: on | off", "ru": "Живой стриминг: on | off"},
-    "cmd.settings": {"en": "Open the settings menu", "ru": "Открыть меню настроек"},
-    "cmd.tools": {"en": "Configure this session's tools", "ru": "Настроить инструменты сессии"},
-    "cmd.language": {"en": "Choose the interface language", "ru": "Выбрать язык интерфейса"},
-    "cmd.help": {"en": "Show help", "ru": "Показать справку"},
-    "cmd.whoami": {"en": "Show your id and username", "ru": "Показать ваш id и username"},
-    "cmd.auto": {
-        "en": "Run code tools without asking (owner)",
-        "ru": "Запускать инструменты кода без вопросов (владелец)",
-    },
-    "cmd.allow": {"en": "Allow a user (owner)", "ru": "Разрешить пользователя (владелец)"},
-    "cmd.deny": {"en": "Remove a user (owner)", "ru": "Удалить пользователя (владелец)"},
-    "cmd.users": {"en": "List allowed users (owner)", "ru": "Список пользователей (владелец)"},
-    "cmd.level": {"en": "Set a user's access level (owner)", "ru": "Уровень доступа (владелец)"},
-    "cmd.expire": {"en": "Set a user's access expiry (owner)", "ru": "Срок доступа (владелец)"},
-    "cmd.limit": {"en": "Top up a user's token grant (owner)", "ru": "Пополнить лимит токенов (владелец)"},
+    # #139: the command-menu descriptions are now the SINGLE SOURCE OF TRUTH in
+    # commands.py (the COMMANDS registry, Cmd.label["en"/"ru"]). The cmd.* rows
+    # below are SUPERSEDED for the menu and commented out (kept for audit/revert)
+    # so a command name + one-liner is defined exactly once per language. To edit
+    # a menu description, edit the matching Cmd.label in commands.py.
+    #
+    # was — replaced for #139 (now in commands.py COMMANDS registry). Note:
+    # cmd.stop / cmd.stream were stale (those handlers are commented out) and are
+    # intentionally NOT carried over; cmd.cwd / cmd.dirs / cmd.reset had no live
+    # handler and were dead — also dropped.
+    # "cmd.new": {"en": "➕ New chat session", "ru": "➕ Новая сессия (чат)"},
+    # "cmd.code": {"en": "🟩 Upgrade this session to code", "ru": "🟩 Повысить сессию до кода"},
+    # "cmd.chat": {"en": "💬 Downgrade this session to chat", "ru": "💬 Понизить сессию до чата"},
+    # "cmd.newchat": {"en": "💬 New chat session", "ru": "💬 Новая чат-сессия"},
+    # "cmd.newcode": {"en": "🟩 New code session", "ru": "🟩 Новая код-сессия"},
+    # "cmd.sessions": {
+    #     "en": "Browse / switch / delete sessions",
+    #     "ru": "Обзор / переключение / удаление сессий",
+    # },
+    # "cmd.rename": {"en": "Rename the current session", "ru": "Переименовать текущую сессию"},
+    # "cmd.status": {"en": "Current session info", "ru": "Сведения о текущей сессии"},
+    # "cmd.stop": {"en": "Stop the current reply", "ru": "Остановить текущий ответ"},
+    # "cmd.retry": {"en": "Re-run the last prompt", "ru": "Повторить последний запрос"},
+    # "cmd.clear": {"en": "Clear the session context", "ru": "Очистить контекст сессии"},
+    # "cmd.reset": {"en": "Clear the session context (alias of /clear)", "ru": "Очистить контекст (синоним /clear)"},
+    # "cmd.model": {
+    #     "en": "Switch model: opus | sonnet | haiku",
+    #     "ru": "Сменить модель: opus | sonnet | haiku",
+    # },
+    # "cmd.effort": {"en": "Reasoning depth: low … max", "ru": "Глубина рассуждений: low … max"},
+    # "cmd.fork": {
+    #     "en": "Branch this session into a new one",
+    #     "ru": "Ответвить эту сессию в новую",
+    # },
+    # "cmd.memory": {
+    #     "en": "1M context window (chat): on | off",
+    #     "ru": "Окно контекста 1M (чат): on | off",
+    # },
+    # "cmd.permissions": {
+    #     "en": "Code tool policy: ask | auto-edits | plan",
+    #     "ru": "Политика инструментов кода: ask | auto-edits | plan",
+    # },
+    # "cmd.cwd": {"en": "Working directory (code sessions)", "ru": "Рабочая папка (код-сессии)"},
+    # "cmd.dirs": {"en": "Extra code directories", "ru": "Доп. папки для кода"},
+    # "cmd.files": {"en": "Browse the working-dir tree (code)", "ru": "Дерево рабочей папки (код)"},
+    # "cmd.export": {"en": "Export working-dir files as .zip (code)", "ru": "Экспорт файлов рабочей папки (.zip, код)"},
+    # "cmd.sandbox": {"en": "Toggle this code session's sandbox (owner)", "ru": "Песочница код-сессии вкл/выкл (владелец)"},
+    # "cmd.maxturns": {"en": "Cap agentic turns (code)", "ru": "Лимит агентных ходов (код)"},
+    # "cmd.recap": {"en": "Show the last exchange", "ru": "Показать последний обмен"},
+    # "cmd.history": {
+    #     "en": "Export this session's transcript",
+    #     "ru": "Выгрузить расшифровку этой сессии",
+    # },
+    # "cmd.usage": {"en": "Subscription-usage display", "ru": "Показ использования подписки"},
+    # "cmd.context": {"en": "Context-window usage", "ru": "Использование окна контекста"},
+    # "cmd.queue": {"en": "Show the pending-prompt queue", "ru": "Показать очередь запросов"},
+    # "cmd.clearqueue": {"en": "Clear the pending queue", "ru": "Очистить очередь"},
+    # "cmd.stream": {"en": "Live streaming: on | off", "ru": "Живой стриминг: on | off"},
+    # "cmd.settings": {"en": "Open the settings menu", "ru": "Открыть меню настроек"},
+    # "cmd.tools": {"en": "Configure this session's tools", "ru": "Настроить инструменты сессии"},
+    # "cmd.language": {"en": "Choose the interface language", "ru": "Выбрать язык интерфейса"},
+    # "cmd.help": {"en": "Show help", "ru": "Показать справку"},
+    # "cmd.whoami": {"en": "Show your id and username", "ru": "Показать ваш id и username"},
+    # "cmd.auto": {
+    #     "en": "Run code tools without asking (owner)",
+    #     "ru": "Запускать инструменты кода без вопросов (владелец)",
+    # },
+    # "cmd.allow": {"en": "Allow a user (owner)", "ru": "Разрешить пользователя (владелец)"},
+    # "cmd.deny": {"en": "Remove a user (owner)", "ru": "Удалить пользователя (владелец)"},
+    # "cmd.users": {"en": "List allowed users (owner)", "ru": "Список пользователей (владелец)"},
+    # "cmd.level": {"en": "Set a user's access level (owner)", "ru": "Уровень доступа (владелец)"},
+    # "cmd.expire": {"en": "Set a user's access expiry (owner)", "ru": "Срок доступа (владелец)"},
+    # "cmd.limit": {"en": "Top up a user's token grant (owner)", "ru": "Пополнить лимит токенов (владелец)"},
 }
 
 

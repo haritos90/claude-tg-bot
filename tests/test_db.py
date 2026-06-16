@@ -26,7 +26,34 @@ def test_allocate_dm_session_negative_key_and_mode():
         assert code < 0 and chat < 0 and code != chat
         sc, sh = await db.get_thread(code), await db.get_thread(chat)
         assert sc.mode == "code" and sh.mode == "chat"
-        assert sc.cwd.endswith(str(code))  # per-session working dir
+        # #140: per-session working dir is named by the public sid, not the key.
+        # was: assert sc.cwd.endswith(str(code))
+        assert sc.cwd.endswith(db.session_sid(code))  # per-session working dir
+        assert sh.cwd.endswith(db.session_sid(chat))
+        await db.close_db()
+
+    _run(_t)
+
+
+def test_user_default_roundtrip_and_clear():
+    """#138 USER-scope storage: set/get a per-user default (JSON-encoded in kv),
+    None clears it, and a garbled value degrades to None."""
+    async def _t():
+        await db.init_db(tempfile.mktemp(suffix=".db"))
+        assert await db.get_user_default(7, "model") is None
+        await db.set_user_default(7, "model", "claude-sonnet-4-6")
+        assert await db.get_user_default(7, "model") == "claude-sonnet-4-6"
+        # Non-string JSON values round-trip too (bool/int).
+        await db.set_user_default(7, "memory", True)
+        assert await db.get_user_default(7, "memory") is True
+        # Isolated per uid.
+        assert await db.get_user_default(8, "model") is None
+        # Clearing deletes the row → back to None.
+        await db.set_user_default(7, "model", None)
+        assert await db.get_user_default(7, "model") is None
+        # Garbled raw value degrades to None.
+        await db.set_kv("user_default:7:bad", "{not json")
+        assert await db.get_user_default(7, "bad") is None
         await db.close_db()
 
     _run(_t)
