@@ -2194,6 +2194,60 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             i18n.t("usage.set", lang, name=arg, help=i18n.t(f"usage.help.{arg}", lang)),
         )
 
+    # ---- /codesplit (owner): each fenced code block as its OWN message --------
+    # Workaround while Telegram mobile lacks a per-code-block "copy" button (desktop
+    # has one): sending each block as a separate message makes long-press → Copy
+    # grab the whole snippet. Owner-toggleable so it's trivial to turn OFF once the
+    # mobile clients gain the copy button. Global rendering setting (#codesplit).
+    def _codesplit_kb(cur: bool, lang: str) -> InlineKeyboardMarkup:
+        B = InlineKeyboardButton
+        return InlineKeyboardMarkup(inline_keyboard=[[
+            B(text=("✓ " if cur else "") + i18n.onoff(True, lang), callback_data="csm:on"),
+            B(text=("✓ " if not cur else "") + i18n.onoff(False, lang), callback_data="csm:off"),
+        ]])
+
+    @router.message(Command("codesplit"))
+    async def cmd_codesplit(message: Message) -> None:
+        """Owner: toggle whether each fenced code block is sent as its OWN message
+        (easy mobile copy) or kept inline. Global; persisted; next-reply effect."""
+        lang = _lang(message)
+        if not _is_owner(message):
+            await reply(message, i18n.t("codesplit.owner_only", lang))
+            return
+        cur = bool(getattr(sessions, "split_code_messages", True))
+        arg = _command_arg(message).strip().lower()
+        if arg in ("on", "off"):
+            await sessions.set_split_code_messages(arg == "on")
+            await reply(message, i18n.t("codesplit.set", lang, state=i18n.onoff(arg == "on", lang)))
+            return
+        with contextlib.suppress(Exception):
+            await bot.send_message(
+                message.chat.id,
+                i18n.t("codesplit.show", lang, state=i18n.onoff(cur, lang)),
+                parse_mode="HTML",
+                reply_markup=_codesplit_kb(cur, lang),
+            )
+
+    @router.callback_query(F.data.startswith("csm:"))
+    async def on_codesplit_cb(cb: CallbackQuery) -> None:
+        """Apply a /codesplit toggle tap (owner-only — it is a global setting)."""
+        lang = _lang(cb)
+        if not (cb.from_user and cb.from_user.id == settings.owner_id):
+            with contextlib.suppress(Exception):
+                await cb.answer(i18n.t("codesplit.owner_only", lang))
+            return
+        val = (cb.data or "csm:on").split(":", 1)[1] == "on"
+        await sessions.set_split_code_messages(val)
+        if cb.message is not None:
+            with contextlib.suppress(Exception):
+                await cb.message.edit_text(
+                    i18n.t("codesplit.show", lang, state=i18n.onoff(val, lang)),
+                    parse_mode="HTML",
+                    reply_markup=_codesplit_kb(val, lang),
+                )
+        with contextlib.suppress(Exception):
+            await cb.answer(i18n.t("settings.saved", lang))
+
     # /stop command REMOVED 2026-06-15 (owner request) — the ⏹ Stop is an inline
     # BUTTON on the live control message (streamer + on_stop_cb), so a typed command
     # is redundant. Kept commented per the project convention; restore by uncommenting

@@ -49,7 +49,9 @@ def escape_html(s: str) -> str:
 # --------------------------------------------------------------------------- #
 # Markdown -> Telegram HTML
 # --------------------------------------------------------------------------- #
-# Telegram HTML supports: b, i, code, pre, a, s, u.
+# Telegram HTML supports: b, i, u, s, code, pre, a, tg-spoiler, and blockquote
+# (including <blockquote expandable>). See the README "Message formatting" section
+# and the Telegram docs linked there for the full tag list + nesting rules.
 # Strategy: HTML-escape EVERYTHING first, then re-apply a small, safe subset of
 # Markdown by operating on the already-escaped text. Because the source has been
 # escaped, any user-supplied ``<`` / ``>`` / ``&`` cannot form rogue tags; the
@@ -78,6 +80,20 @@ _PH_RE = re.compile(r"\x00PH(\d+)\x00")
 _TABLE_SEP_RE = re.compile(
     r"^[ \t]*\|?[ \t]*:?-{2,}:?[ \t]*(?:\|[ \t]*:?-{2,}:?[ \t]*)+\|?[ \t]*$"
 )
+
+# --- modern rich formatting (Telegram "rich message formatting options") ------ #
+# ~~strikethrough~~ (GitHub). Guarded so the tildes of a ``~~~`` code fence (which
+# is stashed before this runs anyway) can never be mistaken for strikethrough.
+_STRIKE_RE = re.compile(r"(?<!~)~~(?!~)([^\n]+?)(?<!~)~~(?!~)")
+# ||spoiler|| (Discord/GitHub). Conservative — requires non-space inner edges so a
+# logical-or like ``a || b`` (spaces around it) is never read as a spoiler.
+_SPOILER_RE = re.compile(r"(?<!\|)\|\|(?!\|)(?=\S)([^\n]+?)(?<=\S)\|\|(?!\|)")
+# A blockquote line AFTER escaping (``>`` became ``&gt;``), optional single space.
+_QUOTE_LINE_RE = re.compile(r"^&gt;[ \t]?(.*)$")
+# A run of ``> `` lines longer than this collapses to <blockquote expandable> so a
+# long quote doesn't flood the chat; shorter runs stay an always-open <blockquote>.
+# Set to None to never collapse (every quote stays open). See README.
+EXPANDABLE_BLOCKQUOTE_MIN_LINES: int | None = 10
 
 
 def _table_disp_len(s: str) -> int:
@@ -236,13 +252,52 @@ def _latex_to_unicode(s: str) -> str:
     return s
 
 
+def _blockquotes_to_html(text: str) -> str:
+    """Group runs of markdown ``> `` lines into Telegram <blockquote> blocks.
+
+    Operates on already-escaped text (so ``>`` is ``&gt;``) AFTER code/tables are
+    stashed, so a ``>`` inside code is never touched. Telegram blockquotes can't
+    nest, so each run is flattened into ONE block; inline styles inside it are
+    applied by the later bold/italic/strike/spoiler passes (those are allowed
+    inside a blockquote). A run longer than EXPANDABLE_BLOCKQUOTE_MIN_LINES becomes
+    a collapsible <blockquote expandable>.
+    """
+    if "&gt;" not in text:
+        return text
+    lines = text.split("\n")
+    out: list[str] = []
+    i, n = 0, len(lines)
+    while i < n:
+        m = _QUOTE_LINE_RE.match(lines[i])
+        if m is None:
+            out.append(lines[i])
+            i += 1
+            continue
+        inner = [m.group(1)]
+        j = i + 1
+        while j < n:
+            mj = _QUOTE_LINE_RE.match(lines[j])
+            if mj is None:
+                break
+            inner.append(mj.group(1))
+            j += 1
+        threshold = EXPANDABLE_BLOCKQUOTE_MIN_LINES
+        expandable = threshold is not None and len(inner) > threshold
+        tag = "<blockquote expandable>" if expandable else "<blockquote>"
+        out.append(tag + "\n".join(inner) + "</blockquote>")
+        i = j
+    return "\n".join(out)
+
+
 def md_to_html(text: str) -> str:
     """Convert a SAFE subset of Markdown to Telegram HTML.
 
     Supported: fenced code blocks, inline code, **bold**/__bold__,
-    *italic*/_italic_. Everything is HTML-escaped first, so the output is always
-    valid for ``parse_mode="HTML"``. If anything goes wrong we fall back to a
-    fully-escaped plain string so a message is never lost.
+    *italic*/_italic_, ~~strikethrough~~, ||spoiler||, and ``> `` block quotes
+    (a long run collapses to <blockquote expandable>). Everything is HTML-escaped
+    first, so the output is always valid for ``parse_mode="HTML"``. If anything
+    goes wrong we fall back to a fully-escaped plain string so a message is never
+    lost.
     """
     if not text:
         return ""
@@ -311,13 +366,23 @@ def md_to_html(text: str) -> str:
 
         escaped = _LINK_RE.sub(_link_sub, escaped)
 
+        # 3d2) Block quotes: group ``> `` line runs into <blockquote> (long runs
+        #     collapse to <blockquote expandable>). Done after code/tables are
+        #     stashed (so quotes inside code are untouched) and before the inline
+        #     passes (which then style the quote's contents — allowed inside it).
+        escaped = _blockquotes_to_html(escaped)
+
         # 3e) LaTeX → Unicode on the remaining (non-code) text (#51). Code spans
         #     are already stashed as placeholders, so they are never touched.
         escaped = _latex_to_unicode(escaped)
 
-        # 4) Bold then italic. Bold first so ** is consumed before * italic.
+        # 4) Inline styles. Bold first so ** is consumed before * italic; then
+        #    ~~strike~~ and ||spoiler||; italic last (its single * / _ is the most
+        #    fragile). All of these may nest and may sit inside a <blockquote>.
         escaped = _BOLD_STAR_RE.sub(r"<b>\1</b>", escaped)
         escaped = _BOLD_USCORE_RE.sub(r"<b>\1</b>", escaped)
+        escaped = _STRIKE_RE.sub(r"<s>\1</s>", escaped)
+        escaped = _SPOILER_RE.sub(r"<tg-spoiler>\1</tg-spoiler>", escaped)
         escaped = _ITALIC_STAR_RE.sub(r"<i>\1</i>", escaped)
         escaped = _ITALIC_USCORE_RE.sub(r"<i>\1</i>", escaped)
 

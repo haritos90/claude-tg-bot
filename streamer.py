@@ -111,6 +111,7 @@ class Streamer:
         frame_interval: float | None = None,
         base_step: int | None = None,
         use_drafts: bool = False,
+        split_code_messages: bool = True,
     ) -> None:
         self.bot = bot
         self.chat_id = chat_id
@@ -123,6 +124,10 @@ class Streamer:
         # guard here so a stray call in a group can never try (and fail) drafts.
         # start() probes once and falls back to the write-head if drafts error.
         self.use_drafts = bool(use_drafts) and chat_id > 0
+        # Whether finish() isolates each fenced code block into its OWN message
+        # (default — easy mobile copy); owner-toggleable via /codesplit. Off →
+        # code stays inline in the reply.
+        self._split_code_messages = bool(split_code_messages)
         # Drafts stream at a fixed, flood-safe cadence; Telegram animates the newly
         # appended characters between updates (the native letter-by-letter effect).
         self._draft_interval = _DRAFT_INTERVAL
@@ -658,7 +663,11 @@ class Streamer:
 
         # Drop empty code boxes (a hard-cut over-long fence renders to a blank
         # <pre></pre>); keep at least one chunk so an empty turn still shows "…".
-        chunks = [c for c in self._render_message_chunks(full_text) if not markup.is_empty_render(c)] or ["…"]
+        # Per the global /codesplit toggle: isolate each fenced code block into its
+        # own message (default — easy mobile copy), or render inline as size-split
+        # chunks. Both drop empty code boxes; keep one chunk so an empty turn shows "…".
+        _render = self._render_message_chunks if self._split_code_messages else self._render_chunks
+        chunks = [c for c in _render(full_text) if not markup.is_empty_render(c)] or ["…"]
 
         # Append the footer to the last chunk when it fits, else a trailing message.
         footer_as_message = False

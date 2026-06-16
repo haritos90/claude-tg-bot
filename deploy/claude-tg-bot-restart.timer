@@ -1,0 +1,18 @@
+# Optional timer for claude-tg-bot-restart.service — a daily clean restart.
+# See that .service file for the rationale and install steps.
+#
+# OnCalendar is in the system timezone. 04:00 is a low-traffic hour; the
+# RandomizedDelaySec spreads it a little. Persistent=true runs a missed restart
+# after downtime. Adjust the schedule to taste (e.g. `OnCalendar=*-*-* */12:00:00`
+# for every 12 hours if stale-auth bites sooner).
+
+[Unit]
+Description=Daily clean restart of the Claude Telegram Bot
+
+[Timer]
+OnCalendar=*-*-* 04:00:00
+RandomizedDelaySec=300
+Persistent=true
+
+[Install]
+WantedBy=timers.target

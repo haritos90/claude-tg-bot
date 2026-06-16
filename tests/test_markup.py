@@ -164,3 +164,45 @@ def test_md_table_to_pre_aligns_and_preserves_cyrillic():
     assert "<pre>" in html and "</pre>" in html
     assert "Бета" in html and "да" in html and "нет" in html
     assert "|" in html  # column separators present
+
+
+# --- modern rich formatting (strikethrough / spoiler / blockquote) ----------- #
+def test_md_strikethrough():
+    assert markup.md_to_html("this is ~~gone~~ now") == "this is <s>gone</s> now"
+    # A ``~~~`` code fence must NOT be eaten by the ~~strike~~ rule.
+    html = markup.md_to_html("~~~js\nconst a = 1;\n~~~")
+    assert "<pre>" in html and "<s>" not in html
+
+
+def test_md_spoiler():
+    assert markup.md_to_html("the answer is ||42||") == "the answer is <tg-spoiler>42</tg-spoiler>"
+    # A spaced logical-or must NOT be mistaken for a spoiler.
+    assert markup.md_to_html("a || b") == "a || b"
+
+
+def test_md_blockquote_basic():
+    html = markup.md_to_html("> hello\n> world")
+    assert html == "<blockquote>hello\nworld</blockquote>"
+    assert "&gt;" not in html  # the > markers are consumed, not left literal
+
+
+def test_md_blockquote_inline_styles_inside():
+    # Inline styles are applied INSIDE the quote (allowed by Telegram).
+    html = markup.md_to_html("> **bold** and `code`")
+    assert html.startswith("<blockquote>") and html.endswith("</blockquote>")
+    assert "<b>bold</b>" in html and "<code>code</code>" in html
+
+
+def test_md_blockquote_expandable_when_long():
+    long_quote = "\n".join(f"> line {i}" for i in range(15))  # > threshold (10)
+    html = markup.md_to_html(long_quote)
+    assert html.startswith("<blockquote expandable>")
+    short_quote = "\n".join(f"> line {i}" for i in range(3))
+    assert markup.md_to_html(short_quote).startswith("<blockquote>")
+
+
+def test_blockquote_not_applied_inside_code_fence():
+    # A ``>`` inside a fenced code block stays literal text in <pre>, not a quote.
+    html = markup.md_to_html("```\n> not a quote\n```")
+    assert "<blockquote" not in html
+    assert "&gt; not a quote" in html  # preserved (escaped) inside the code box

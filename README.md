@@ -86,6 +86,43 @@ users. (The shared limit pool is also why per-user **token caps** exist — see
 
 ---
 
+## Message formatting
+
+Claude replies in Markdown; the bot renders it to **Telegram HTML**
+(`parse_mode="HTML"`) in [`markup.py`](markup.py) before sending. Telegram supports
+only a small tag set, so the renderer maps the Markdown a model commonly emits onto
+Telegram's [rich message formatting][tg-fmt] and escapes everything else — a message
+is never lost, since any parse error falls back to plain escaped text.
+
+Rendered styles:
+
+- **Inline:** **bold** (`**`/`__`), *italic* (`*`/`_`), ~~strikethrough~~ (`~~`),
+  `inline code`, and ||spoiler|| (`||…||`, shown blurred until tapped).
+- **Code blocks:** fenced blocks become `<pre><code class="language-…">` with a
+  language label and a **Copy** button (Telegram **Desktop** copies the whole block
+  in one click; **mobile** has no per-block copy button yet — a tap only selects a
+  word). So each fenced block is also sent as its **own message**, making
+  *long-press → Copy* grab the whole snippet on mobile. The owner can toggle this with
+  **`/codesplit on|off`** (off keeps code inline in the reply) for when the mobile
+  clients gain a copy button.
+- **Block quotes:** `> …` lines become `<blockquote>`; a long run collapses into an
+  expandable `<blockquote expandable>` so it doesn't flood the chat (threshold:
+  `markup.EXPANDABLE_BLOCKQUOTE_MIN_LINES`).
+- **Other:** headings (`#`) → bold lines; links `[text](url)` → `<a>`; tables → a
+  column-aligned monospace grid (Telegram HTML has no `<table>`); LaTeX → Unicode
+  (`\frac{1}{2}` → `1/2`, `x^2` → `x²`), since Telegram can't render math.
+
+Messages are split to stay within Telegram's **4096-character** limit — raw text is
+split on line boundaries *before* rendering, so a tag is never cut in half — and
+very long output is delivered as a `.md` file instead of many chunks.
+
+Telegram reference: [Rich message formatting options][tg-fmt] · [HTML style][tg-html].
+
+[tg-fmt]: https://core.telegram.org/bots/api#rich-message-formatting-options
+[tg-html]: https://core.telegram.org/bots/api#html-style
+
+---
+
 ## Project structure
 
 | File | Responsibility |
@@ -101,7 +138,7 @@ users. (The shared limit pool is also why per-user **token caps** exist — see
 | `allowlist.py` | JSON-backed access store: levels, expiry, token caps; owner always allowed; fail-closed. |
 | `db.py` | `aiosqlite` state: sessions, usage, conversation log, key-value store. |
 | `i18n.py` | Localization table + `t(key, lang, …)`; `en` canonical, `ru` translation. |
-| `markup.py` | Telegram formatting: Markdown→HTML, 4096-safe splitting, long-output-as-file. |
+| `markup.py` | Telegram formatting: Markdown→HTML (bold/italic/strike/spoiler/quotes/code), 4096-safe splitting, long-output-as-file. See **Message formatting**. |
 | `usage.py` | Formatters for the 5h / 7d subscription windows. |
 | `deploy/` | `tg-bot.service` (systemd unit) and `sandbox-claude.sh` (bubblewrap launcher). |
 
@@ -281,17 +318,41 @@ Everything happens on **your server** — there is no external database.
 
 ## Run it 24/7 with systemd
 
-[`deploy/tg-bot.service`](deploy/tg-bot.service) — edit the paths and `User`, then:
+[`deploy/tg-bot.service`](deploy/tg-bot.service) supervises the bot so it survives
+crashes, reboots, and Telegram outages.
+
+**Quick install:** `sudo deploy/install-systemd.sh` — it adapts the unit to your
+checkout path/user, stops any manual copy, then enables + starts the service (add
+`--with-timer` to also enable the daily restart). Or do it by hand — edit the
+paths/`User`, then:
 
 ```bash
 sudo cp deploy/tg-bot.service /etc/systemd/system/claude-tg-bot.service
 sudo systemctl daemon-reload
+pkill -f 'python bot\.py$'            # stop any manual copy first (avoid a 409)
 sudo systemctl enable --now claude-tg-bot
 journalctl -u claude-tg-bot -f
 ```
 
-> Run the service as the **same user** that ran `claude setup-token`, so it can
-> read the subscription credentials from that user's home directory.
+Resilience built in:
+
+- **`Restart=always` + `StartLimitIntervalSec=0`** — respawns on any crash/exit and
+  on boot, and never gives up (a long Telegram outage just keeps retrying until the
+  network path is back).
+- **Connection watchdog** (`Type=notify` + `WatchdogSec=180`, driven by
+  [`watchdog.py`](watchdog.py)) — the bot pings systemd only after a *successful*
+  Telegram probe, so if it can't reach Telegram for ~3 minutes (connection dropped or
+  polling wedged) systemd force-restarts it. This auto-recovers an outage instead of
+  leaving the process dead.
+- **Optional daily restart** —
+  [`deploy/claude-tg-bot-restart.{service,timer}`](deploy/) add a clean daily restart
+  as insurance against slow leaks / stale long-lived `claude` auth. Enable with
+  `sudo systemctl enable --now claude-tg-bot-restart.timer`.
+
+Restart after a code change with `sudo systemctl restart claude-tg-bot` (never a
+second manual `python bot.py` — two pollers per token → 409). Run the service as the
+**same user** that ran `claude setup-token`, so it can read the subscription
+credentials from that user's home.
 
 ---
 

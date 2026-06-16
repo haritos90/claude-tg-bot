@@ -1,0 +1,22 @@
+# Optional: periodic restart of the Claude Telegram Bot (belt-and-suspenders).
+#
+# The main unit already self-heals on crashes (Restart=always) and on a dropped
+# Telegram connection (Type=notify + WatchdogSec). This adds a periodic CLEAN
+# restart as insurance against slow leaks and a known stale long-lived `claude`
+# subprocess (auth can go stale after several hours → 401; a clean restart clears it).
+#
+# Install (pairs with claude-tg-bot-restart.timer):
+#   sudo cp deploy/claude-tg-bot-restart.service /etc/systemd/system/
+#   sudo cp deploy/claude-tg-bot-restart.timer   /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now claude-tg-bot-restart.timer
+#
+# `try-restart` only restarts the bot if it is currently running, so this never
+# starts a bot you deliberately stopped.
+
+[Unit]
+Description=Periodic clean restart of the Claude Telegram Bot
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/systemctl try-restart claude-tg-bot.service

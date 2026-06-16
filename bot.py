@@ -14,6 +14,7 @@ import sys
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
+from aiogram.exceptions import TelegramNetworkError
 
 from config import load_settings
 from db import init_db, close_db, migrate_workdirs_to_sid
@@ -22,6 +23,7 @@ from access import AllowlistMiddleware, LanguageMiddleware
 from permissions import PermissionGate
 from sessions import SessionManager
 from handlers import build_router, setup_commands
+import watchdog
 
 logger = logging.getLogger("bot")
 
@@ -98,20 +100,36 @@ async def main() -> None:
     dp.message.outer_middleware(language_mw)
     dp.callback_query.outer_middleware(language_mw)
 
+    wd_task: asyncio.Task | None = None
     try:
-        try:
-            me = await bot.get_me()
-        except Exception:
-            logger.error(
-                "Failed to authenticate with Telegram — check TELEGRAM_BOT_TOKEN"
-            )
-            raise
-        logger.info("Authorized as @%s (id=%s)", me.username, me.id)
+        # Mark the service "up" to systemd IMMEDIATELY (sd_notify READY=1) and start
+        # the watchdog BEFORE any network I/O — so a slow/flaky Telegram link at
+        # startup can't stall readiness and trip a Type=notify start-timeout restart
+        # loop (seen 2026-06-16). The watchdog then governs ongoing reachability and
+        # force-restarts only after a PROLONGED outage, never a startup blip. No-op
+        # when not under systemd.
+        watchdog.ready()
+        wd_task = asyncio.create_task(watchdog.run(bot))
 
-        # Populate the Telegram "/" command menu; failures are non-fatal. The
-        # owner also gets the owner-only admin commands in their private chat.
+        # Identify the bot (nice log + early bad-token detection). A network blip
+        # here is NOT fatal — polling retries on its own — but a real auth error
+        # (or any non-network failure) still propagates and stops the bot.
+        try:
+            me = await bot.get_me(request_timeout=15)
+            logger.info("Authorized as @%s (id=%s)", me.username, me.id)
+        except (TelegramNetworkError, asyncio.TimeoutError) as exc:
+            logger.warning(
+                "Startup get_me network issue (%s); continuing — polling will retry.",
+                exc,
+            )
+
+        # Populate the Telegram "/" command menu; best-effort AND time-bounded so a
+        # slow Telegram can't hang startup before polling begins. The owner also
+        # gets the owner-only admin commands in their private chat.
         with contextlib.suppress(Exception):
-            await setup_commands(bot, owner_id=settings.owner_id)
+            await asyncio.wait_for(
+                setup_commands(bot, owner_id=settings.owner_id), timeout=30
+            )
 
         # Only the update types we actually handle are requested from Telegram.
         await dp.start_polling(
@@ -120,6 +138,11 @@ async def main() -> None:
         )
     finally:
         logger.info("Shutting down...")
+        # Stop the watchdog first so it cannot ping systemd during teardown.
+        if wd_task is not None:
+            wd_task.cancel()
+            with contextlib.suppress(BaseException):
+                await wd_task
         # Disconnect live Claude sessions (cancel workers + close the claude CLI
         # subprocesses) BEFORE closing the DB, so an in-flight turn's best-effort
         # writes are not aimed at a closed connection. Best-effort: a teardown
