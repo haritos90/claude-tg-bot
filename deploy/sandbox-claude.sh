@@ -71,6 +71,22 @@ if [ -n "${SBX_STATE:-}" ] && [ -d "$SBX_STATE" ]; then
   args+=(--bind "$SBX_STATE" /home/sbx/.claude/projects)
 fi
 
+# #136: make the jail ROOT read-only AFTER all binds are set up. bwrap's implicit
+# root is a writable tmpfs, so an agent writing to a stray absolute path it imagined
+# (e.g. /Users/<name>, ~/foo resolved oddly) "succeeded" into throwaway jail space —
+# the file then vanished and was invisible to /files & export ("why didn't it write
+# to the workdir?"). With the root read-only, such writes FAIL LOUDLY ("Read-only
+# file system") and the agent retries in the cwd. The workdir bind, /tmp, /home/sbx
+# tmpfs and SBX_STATE bind stay writable (they were mounted before this remount).
+args+=(--remount-ro /)
+
+# #137: tighten the file-creation mask so the agent's outputs (written as the
+# unprivileged uid) are owner-only — 0600 files / 0700 dirs — not world/group
+# readable. Inherited across exec into the jailed process. The bot (root) still
+# reads them for /files + export (root bypasses the mode); other LOCAL non-root
+# users no longer can. Pair with the host-side chmod 0700 on the workdir (engine).
+umask 077
+
 # Resource limit (#116): cap the process count to blunt a fork-bomb DoS from
 # sandboxed code (per-uid, so shared across concurrent sandboxed sessions).
 ulimit -u 512 2>/dev/null || true

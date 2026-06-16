@@ -1,0 +1,527 @@
+# Bot Menu, Commands & Settings — Reference
+
+Reference documentation for the Telegram bot's menus, commands, and the
+settings/access-control model. It describes the canonical structure every menu
+follows so that all surfaces stay consistent. Audience: the deployer/owner and
+contributors. This is a living reference (a likely basis for a future wiki), not
+a task list — open work is tracked in `TODO.md`.
+
+Conventions used below:
+
+- **EN / RU** — every command and menu item carries both its English and Russian
+  label (the bot is bilingual; EN is canonical, RU is the translation).
+- **Access** — 🟢 *chat+* (any allowlisted user + owner) · 🟦 *code* (code-level
+  users + owner) · 👑 *owner* (owner only). A non-allowlisted user cannot reach
+  the bot at all, so the floor is *chat+*.
+- Keyboard mock-ups are shown as tables: **one table row = one row of buttons**;
+  a label spanning the whole width is written in the first cell and marked
+  `▮ full width`.
+
+---
+
+## 1. Menu design guidelines
+
+These rules apply to **every** menu. New menus must follow them; existing ones
+are aligned to them over time.
+
+### 1.1 Button labels
+
+- **Keep labels short.** A label competes for a narrow phone screen. Target
+  **≤ 16 characters** for a button that shares its row with others, and
+  **≤ ~24 characters** for a full-width button. Longer text wraps or is truncated
+  with `…` on small devices.
+- **One leading emoji, then a space, then the word(s).** Never more than one
+  emoji per label. The emoji is the scannable anchor (see §1.3).
+- **Value rows** use the pattern `«<emoji> <Name>: <value> ▸»` — the trailing
+  `▸` signals "opens a sub-menu/picker". A bare toggle shows the current state
+  instead (e.g. `«Big memory: on»`).
+- **Localized.** The visible text comes from the locale catalog; the same button
+  is `«✏️ Rename»` / `«✏️ Переименовать»`. Slugs and callback tokens stay ASCII.
+
+### 1.2 Layout by menu type
+
+The number of buttons per row depends on label length and menu purpose:
+
+| Menu type | Buttons per row | Why |
+|---|---|---|
+| **Lists** (sessions, users) | **1 per row**, full width | the label is a name and needs the full width; the row *is* the item |
+| **Setting rows** (the settings hub) | **1 per row**, full width | each row is `«Name: value ▸»` — too long to pair |
+| **Actions with text labels** | **2 per row** | e.g. `Recap | Status`, `Rename | Favorite` |
+| **Actions, short or emoji-only** | **2–3 per row** | e.g. `◂ Prev | Next ▸`, pickers |
+| **Choice pickers** (model, effort, language) | **3 per row** | choices are short words |
+| **Confirmations** | **2 per row** | `Confirm | Cancel` |
+| **Navigation/footer** (search, close, new) | **2–3 per row**, last row | global actions grouped at the bottom |
+
+Hard limits to respect: an inline keyboard may have many buttons, but **on mobile
+only 2–3 text buttons per row stay readable**. Put the primary action first
+(top-left), destructive actions (🗑) on their own row paired with `◂ Back`, and
+`✖ Close` last.
+
+### 1.3 Emoji vocabulary
+
+One concept = one emoji, used identically on every surface. The canonical set:
+
+| Emoji | Concept | | Emoji | Concept |
+|---|---|---|---|---|
+| 💬 | chat session | | 🔍 | search |
+| 🟩 | code session | | ✖ | close |
+| ➕ | new / add | | ◂ ▸ | back / forward · "opens" |
+| 🗂 | sessions list | | ✅ | switch / allow / confirm |
+| ⚙️ | settings | | ⛔ | deny |
+| 🧠 | model | | ⏹ | stop |
+| ⚡ | effort | | 🍴 | fork |
+| 🔐 | permissions | | 📋 | recap |
+| 🔁 | max turns | | ℹ️ | status |
+| 🗄 | memory / context | | ✏️ | rename |
+| 🧪 | sandbox | | 📄 | transcript / export text |
+| 🌐 | language | | 📦 | export files (zip) |
+| 📊 | usage / day limit | | ⭐ ☆ | favorite / unfavorite |
+| 🧰 | tools | | 🗑 | delete / remove |
+| 👥 | users | | ⏳ | access expiry |
+| 👑 | owner / admin | | 📅 | week limit |
+| 🚀 | auto-approve on | | ♾ | unlimited |
+
+Notes: **🧠 is reserved for *model*** and **🗄 for *memory/context*** (these two
+must not share an icon); **🧪 is *sandbox*** and **📦 is *file export*** (kept
+distinct). The settings hub and the user-admin cards use the same icon for the
+same concept.
+
+### 1.4 Menu lifecycle & dismissal
+
+A menu is a single editable message. It must never pile up stale copies in the
+chat.
+
+- **Navigation within a menu edits the *same* message** (tab switch, open a
+  picker, go back) — no new message is sent.
+- **Applying a value edits the message in place** and shows a short toast
+  (`✓ Saved`). The keyboard re-renders with the new value/✓ mark.
+- **Close deletes the menu message.** If deletion fails (too old), edit it to a
+  short "closed" line so no live keyboard is left behind.
+- **An action that posts content** (recap, transcript, export) sends the content
+  and then **re-posts the menu at the bottom and deletes the previous menu
+  message**, so there is always exactly one live menu and it is reachable without
+  scrolling.
+- **One live menu per surface.** Opening `/settings` or `/sessions` again replaces
+  rather than stacks.
+
+### 1.5 Arguments & input capture
+
+Telegram **sends a tapped command immediately**, with no opportunity to append
+arguments, and ~90% of use is on a phone. Therefore:
+
+- **There are no optional arguments.** A command is either **argument-free** or it
+  takes a **mandatory** argument.
+- **Argument-free commands** act immediately, or open a picker when the input is a
+  fixed set of choices (model, effort, language, permissions, usage, …).
+- **Commands that need free text** (a name, a date, a token amount, a user id)
+  **prompt and capture the user's *next* message** as the argument, with
+  **`/cancel`** to abort. They never fail with a "usage:" error on an empty
+  argument.
+- **Fixed-choice input is always a picker, never typed.** Free-text input is
+  always next-message capture. (Typing `«/model opus»` still works as a power-user
+  shortcut, but the menu path never requires it.)
+
+### 1.6 The Telegram command list (the "/" menu)
+
+Telegram's command list (the blue **menu** button / typing `/`) is only practical
+for the **first few entries** — on a phone the top **1–3** are one tap away and
+roughly the top 5 are reachable before scrolling becomes tedious. Consequences:
+
+- **Commands are registered in frequency order**, most-used first, so the menu
+  button surfaces what matters (see the ranking in §2).
+- **Keep the prominent set small.** The everyday trio — `/new`, `/sessions`,
+  `/settings` — sits at the very top. Rarer commands remain fully usable by typing
+  and through the inline menus, but are not relied on from the menu button.
+- **The list is filtered by role.** A chat-level user's `/` menu omits code-only
+  and owner-only commands; the owner's private chat adds the owner block at the
+  end (§1.8).
+
+### 1.7 Chat and code sessions are one thing
+
+A **chat** session and a **code** session are the *same* session with different
+**available tools**, **context size**, and **privileges** — not two separate
+products. A session is born as chat and is promoted/demoted in place (`/code`,
+`/chat`), carrying its conversation across.
+
+Consequences for menus and settings:
+
+- **Every chat setting is also relevant to code.** Settings are presented
+  uniformly for both.
+- **Some settings are code-only** and are explicitly flagged as such (they need a
+  working directory or the agent toolset): permissions, max turns, tools,
+  sandbox, the file commands. These rows simply do not appear in a chat session.
+- The settings hub and pickers look identical in both; code merely shows
+  additional, clearly-marked rows.
+
+### 1.8 Admin parity
+
+**The owner sees the same menus as everyone else.** Owner-only controls are
+**appended at the end** of the relevant menu rather than living in a separate
+admin app:
+
+- In the **settings hub**, the owner sees the standard rows, then a `🌍 Global`
+  scope tab and owner-only rows (e.g. 🧪 Sandbox, 📊 Usage display) and a final
+  `👥 Users` entry.
+- In any menu, owner-only buttons are the **last** rows, above `✖ Close`.
+
+This keeps one mental model: admin features are an *extension* of the user menu,
+positioned consistently at the bottom.
+
+---
+
+## 2. Commands — ranked by frequency
+
+Commands are listed most-used first; this is also the order they are registered in
+Telegram's `/` menu (§1.6). Each command shows its EN and RU menu label, how it is
+invoked, its argument behaviour (§1.5), and access (§0 legend).
+
+### Tier A — Everyday (top of the "/" menu)
+
+| Command | EN label | RU label | Args | Access |
+|---|---|---|---|---|
+| `/new` | ➕ New session (starts as chat) | ➕ Новая сессия (создаётся как чат) | prompts for a name (capture) | 🟢 |
+| `/sessions` | Browse / switch / delete sessions | Обзор / переключение / удаление сессий | none → opens browser | 🟢 |
+| `/settings` | Open the settings menu | Открыть меню настроек | none → opens hub | 🟢 |
+
+### Tier B — Common
+
+| Command | EN label | RU label | Args | Access |
+|---|---|---|---|---|
+| `/code` | 🟩 Upgrade this session to code | 🟩 Повысить сессию до кода | none | 🟦 |
+| `/chat` | 💬 Downgrade this session to chat | 💬 Понизить сессию до чата | none | 🟢 |
+| `/clear` (alias `/reset`) | Clear the session context | Очистить контекст сессии | none | 🟢 |
+| `/retry` | Re-run the last prompt | Повторить последний запрос | none | 🟢 |
+| `/status` | Current session info | Сведения о текущей сессии | none | 🟢 |
+
+### Tier C — Occasional (mostly reached via the settings hub or session menu)
+
+| Command | EN label | RU label | Args | Access |
+|---|---|---|---|---|
+| `/model` | Switch model: opus \| sonnet \| haiku | Сменить модель: opus \| sonnet \| haiku | none → picker | 🟢 |
+| `/effort` | Reasoning depth: low … max | Глубина рассуждений: low … max | none → picker | 🟢 (`max` gated) |
+| `/memory` | 1M context window (chat): on \| off | Окно контекста 1M (чат): on \| off | none → toggle | 🟢 |
+| `/language` | Choose the interface language | Выбрать язык интерфейса | none → picker | 🟢 |
+| `/context` | Context-window usage | Использование окна контекста | none | 🟢 |
+| `/queue` | Show the pending-prompt queue | Показать очередь запросов | none | 🟢 |
+| `/clearqueue` | Clear the pending queue | Очистить очередь | none | 🟢 |
+| `/rename` | Rename the current session | Переименовать текущую сессию | prompts for a name (capture) | 🟢 |
+| `/recap` | Show the last exchange | Показать последний обмен | none | 🟢 |
+| `/history` | Export this session's transcript | Выгрузить расшифровку этой сессии | none | 🟢 |
+| `/fork` | Branch this session into a new one | Ответвить эту сессию в новую | none | 🟢 |
+
+### Tier D — Code-only (🟦)
+
+| Command | EN label | RU label | Args | Access |
+|---|---|---|---|---|
+| `/files` | Browse the working-dir tree (code) | Дерево рабочей папки (код) | none | 🟦 |
+| `/export` | Export working-dir files as .zip (code) | Экспорт файлов рабочей папки (.zip, код) | none | 🟦 |
+| `/maxturns` | Cap agentic turns (code) | Лимит агентных ходов (код) | none → picker | 🟦 |
+| `/permissions` | Code tool policy: ask \| auto-edits \| plan | Политика инструментов кода: ask \| auto-edits \| plan | none → picker | 🟦 (`full-access` 👑) |
+| `/tools` | Configure this session's tools | Настроить инструменты сессии | none → grid | 🟦 |
+
+### Tier E — Meta & secondary
+
+| Command | EN label | RU label | Args | Access |
+|---|---|---|---|---|
+| `/help` (`/start`) | Show help | Показать справку | none | 🟢 |
+| `/whoami` | Show your id and username | Показать ваш id и username | none | 🟢 |
+| `/usage` | Subscription-usage display | Показ использования подписки | none → picker | 🟢 view · 👑 change |
+| `/cancel` | Cancel a pending prompt-capture | Отменить ввод аргумента | none | 🟢 |
+| `/newchat` | 💬 New chat session | 💬 Новая чат-сессия | prompts for a name | 🟢 |
+| `/newcode` | 🟩 New code session | 🟩 Новая код-сессия | prompts for a name | 🟦 |
+| `/mode` | Switch session type (alias of /code, /chat) | Сменить тип сессии (синоним /code, /chat) | none | 🟢 |
+
+### Tier F — Owner (👑, appended to the owner's menu only)
+
+| Command | EN label | RU label | Args | Access |
+|---|---|---|---|---|
+| `/users` | List allowed users (owner) | Список пользователей (владелец) | none → cards | 👑 |
+| `/allow` | Allow a user (owner) | Разрешить пользователя (владелец) | prompts (capture) | 👑 |
+| `/deny` | Remove a user (owner) | Удалить пользователя (владелец) | prompts (capture) | 👑 |
+| `/level` | Set a user's access level (owner) | Уровень доступа (владелец) | prompts (capture) | 👑 |
+| `/expire` | Set a user's access expiry (owner) | Срок доступа (владелец) | prompts (capture) | 👑 |
+| `/limit` | Top up a user's token grant (owner) | Пополнить лимит токенов (владелец) | prompts (capture) | 👑 |
+| `/auto` | Run code tools without asking (owner) | Запускать инструменты кода без вопросов (владелец) | none → toggle | 👑 |
+| `/sandbox` | Toggle this code session's sandbox (owner) | Песочница код-сессии вкл/выкл (владелец) | none → toggle | 👑 |
+
+> **Not commands:** a plain message is a prompt to the current session; a photo,
+> PDF, or text/code file uses its caption as the prompt. Messages sent while a
+> reply is running are queued and run next in the same session.
+
+---
+
+## 3. Menu surfaces — how they appear in Telegram
+
+Each surface below shows its keyboard as a layout table (one table row = one
+keyboard row) plus a reference of labels and access.
+
+### 3.1 The "/" command menu
+
+Rendered by Telegram from the registered command list, filtered by role and shown
+in frequency order. A chat-level user sees Tiers A–C + E (minus code-only); a
+code-level user adds Tier D; the owner adds Tier F at the end.
+
+| `/` menu (phone, top entries) |
+|---|
+| `/new` — ➕ New session (starts as chat) |
+| `/sessions` — Browse / switch / delete sessions |
+| `/settings` — Open the settings menu |
+| `/code` — 🟩 Upgrade this session to code |
+| `/chat` — 💬 Downgrade this session to chat |
+| … (remaining commands, scrollable) |
+
+### 3.2 The settings hub (`/settings`)
+
+One hub with **scope tabs** at the top; one full-width row per setting (§1.2).
+Owner-only rows and the `🌍 Global` tab are appended at the end (§1.8). Code-only
+rows appear only in a code session (§1.7).
+
+| Settings hub — keyboard | (col 2) |
+|---|---|
+| 📍 This session | 👤 My defaults · 🌍 Global (👑) |
+| 🧠 Model: opus · this session ▸ | ▮ full width |
+| ⚡ Effort: high ▸ | ▮ full width |
+| 🔐 Permissions: ask ▸ *(code)* | ▮ full width |
+| 🔁 Max turns: unlimited ▸ *(code)* | ▮ full width |
+| 🗄 Big memory: off | ▮ full width |
+| 🧪 Sandbox: on ▸ *(owner)* | ▮ full width |
+| 🌐 Language: English ▸ | ▮ full width |
+| 🧰 Tools ▸ *(code)* | ▮ full width |
+| 📊 Usage display ▸ *(owner)* | ▮ full width |
+| 👥 Users ▸ *(owner)* | ▮ full width |
+| ✖ Close | ▮ full width |
+
+| Tab / row | EN | RU | Access |
+|---|---|---|---|
+| Tab | 📍 This session · 👤 My defaults · 🌍 Global | 📍 Эта сессия · 👤 Мои умолчания · 🌍 Глобально | 🟢 / 🟢 / 👑 |
+| Model | 🧠 Model: {value} ▸ | 🧠 Модель: {value} ▸ | 🟢 |
+| Effort | ⚡ Effort: {value} ▸ | ⚡ Усилие: {value} ▸ | 🟢 (`max` gated) |
+| Permissions | 🔐 Permissions: {value} ▸ | 🔐 Права: {value} ▸ | 🟦 |
+| Max turns | 🔁 Max turns: {value} ▸ | 🔁 Лимит ходов: {value} ▸ | 🟦 |
+| Big memory | 🗄 Big memory: {on/off} | 🗄 Большая память: {вкл/выкл} | 🟢 |
+| Sandbox | 🧪 Sandbox: {value} ▸ | 🧪 Песочница: {value} ▸ | 👑 |
+| Language | 🌐 Language: {name} ▸ | 🌐 Язык: {name} ▸ | 🟢 |
+| Tools | 🧰 Tools ▸ | 🧰 Инструменты ▸ | 🟦 |
+| Usage display | 📊 Usage display ▸ | 📊 Использование ▸ | 👑 |
+| Users | 👥 Users ▸ | 👥 Пользователи ▸ | 👑 |
+| Close | ✖ Close | ✖ Закрыть | 🟢 |
+
+A value row opens a **picker** (3 choices per row, §1.2) with a ✓ on the current
+value and a `◂ Back` that returns to this hub. A bool row toggles in place. The
+scope badge next to a value (`this session` / `my default` / `global default`)
+names where the effective value comes from (§4).
+
+### 3.3 The sessions browser (`/sessions`)
+
+A list — **one session per row** (§1.2), favorites first and marked. Tapping a
+session opens its action menu. Global actions are grouped in the footer.
+
+| Sessions browser — keyboard | (col 2) |
+|---|---|
+| ⭐ 💬 My chat session | ▮ full width |
+| 🟩 Build script | ▮ full width |
+| … | |
+| ◂ Prev | Next ▸ |
+| 💬 New chat | 🟩 New code *(code)* |
+| 🔍 Search | ✖ Close |
+
+| Session action menu — keyboard | (col 2) |
+|---|---|
+| ✅ Switch | ▮ full width |
+| 🟩 Convert to code *(code)* / 💬 Convert to chat | ▮ full width |
+| 📋 Recap | ℹ️ Status |
+| ✏️ Rename | ⭐ Favorite / ☆ Unfavorite |
+| 📄 Transcript | 📦 Export files *(code)* |
+| 🗑 Delete | ◂ Back |
+
+| Button | EN | RU | Access |
+|---|---|---|---|
+| Switch | ✅ Switch | ✅ Переключиться | 🟢 |
+| Convert to code | 🟩 Convert to code | 🟩 Сделать кодом | 🟦 |
+| Convert to chat | 💬 Convert to chat | 💬 Сделать чатом | 🟢 |
+| Recap | 📋 Recap | 📋 Сводка | 🟢 |
+| Status | ℹ️ Status | ℹ️ Статус | 🟢 |
+| Rename | ✏️ Rename | ✏️ Переименовать | 🟢 |
+| Favorite | ⭐ Favorite / ☆ Unfavorite | ⭐ В избранное / ☆ Из избранного | 🟢 |
+| Transcript | 📄 Transcript | 📄 Транскрипт | 🟢 |
+| Export files | 📦 Export files | 📦 Экспорт файлов | 🟦 |
+| Delete | 🗑 Delete | 🗑 Удалить | 🟢 |
+| Back | ◂ Back | ◂ Назад | 🟢 |
+| New chat / code | 💬 New chat · 🟩 New code | 💬 Новый чат · 🟩 Новый код | 🟢 / 🟦 |
+| Search / Close | 🔍 Search · ✖ Close | 🔍 Поиск · ✖ Закрыть | 🟢 |
+
+### 3.4 User-admin cards (👑)
+
+Opened from the settings hub `👥 Users` entry. The list shows one user per row
+(owner first); tapping one opens that user's card. Per §1.8 these are the deepest
+owner-only surface. They are where the owner sets each user's **access exceptions**
+and **resource quotas** (§4).
+
+| User card — keyboard | (col 2) |
+|---|---|
+| Level: chat → code | ▮ full width |
+| 🧠 Memory: on | ⚡ Max effort: off |
+| 🧰 Tools: all | ⏳ Set expiry… |
+| 📊 Day limit… | 📅 Week limit… |
+| ♾ Clear limits | 🗑 Remove access |
+| ◂ Users | ✖ Close |
+
+| Button | EN | RU |
+|---|---|---|
+| Level | Level: {level} → {next} | Уровень: {level} → {next} |
+| Memory | 🧠 Memory: {state} | 🧠 Память: {state} |
+| Max effort | ⚡ Max effort: {state} | ⚡ Max effort: {state} |
+| Tools | 🧰 Tools: {value} | 🧰 Инструменты: {value} |
+| Expiry | ⏳ Set expiry… | ⏳ Срок доступа… |
+| Day / Week limit | 📊 Day limit… · 📅 Week limit… | 📊 Лимит/день… · 📅 Лимит/неделя… |
+| Clear limits | ♾ Clear limits | ♾ Снять лимиты |
+| Remove | 🗑 Remove access → 🗑 Yes, remove | 🗑 Убрать доступ → 🗑 Да, убрать |
+| Add | ➕ Add user | ➕ Добавить |
+| Back | ◂ Users | ◂ Пользователи |
+
+### 3.5 Choice pickers
+
+Pickers present a fixed set of short choices, **3 per row** (§1.2), ✓ on the
+current value, `◂ Back` to the parent. Used by `/model`, `/effort`, `/language`,
+`/permissions`, `/usage`, `/maxturns`, and the equivalent settings-hub rows.
+
+| Effort picker — keyboard | | |
+|---|---|---|
+| low | medium | high |
+| xhigh | ✓ max | default |
+| ◂ Back | | |
+
+| Picker | Choices | Access |
+|---|---|---|
+| Model | opus · sonnet · haiku | 🟢 |
+| Effort | low · medium · high · xhigh · max · default | 🟢 (`max` gated) |
+| Permissions | ask · auto-edits · plan · full-access | 🟦 (`full-access` 👑) |
+| Usage display | off · footer · pinned · both | 👑 |
+| Max turns | 10 · 25 · 50 · 100 · unlimited | 🟦 |
+| Language | (each supported locale) | 🟢 |
+
+### 3.6 Ephemeral menus
+
+Short-lived keyboards attached to a specific message.
+
+| Surface | Buttons (EN / RU) | Access |
+|---|---|---|
+| Queue | ✖ Cancel {i} / ✖ Отменить {i} · 🗑 Clear all / 🗑 Очистить всё | 🟢 |
+| Live reply | ⏹ Stop / ⏹ Стоп | 🟢 (own run) |
+| Permission request | ✅ Allow / ✅ Разрешить · ⛔ Deny / ⛔ Запретить | 👑 |
+
+---
+
+## 4. Settings & access-control model
+
+This is the single mechanism by which the **owner** governs what each user may see
+and change — for every option uniformly (model, effort, permissions, tools,
+memory, language, …) and for gated capabilities (use code mode, use `max` effort,
+use `full-access`, use a given tool). Instead of bespoke per-command logic, each
+option is **one row** in a master matrix, and effective values are **computed**,
+not stored.
+
+### 4.1 Concept
+
+Each option is fully described by three things the owner controls:
+
+1. **Global value** — the default, and the live value for everyone who has not
+   overridden it.
+2. **Base access level** — what all users get by default: *Hidden*, *Read-only*,
+   or *Delegated*.
+3. **Exceptions** — the users who differ from the base (e.g. delegated to a few
+   named users while hidden from the rest).
+
+Above these sit fixed rules, identical for all options.
+
+### 4.2 Table 1 — Access levels (the master dictionary)
+
+| Level | User sees it | User can change it | Value for the user | Owner's global edits affect the user |
+|---|---|---|---|---|
+| **Hidden** | no | no | global (silently) | yes, always |
+| **Read-only** | yes | no | global | yes, always |
+| **Delegated** | yes | yes — own default + per session | own value (session → own default); until set, global | only until the user sets their own; after that, no |
+
+This is the ladder: *grant it → let them use it · otherwise read-only · otherwise
+they never see it.*
+
+### 4.3 Table 2 — Where a value comes from (resolution order)
+
+| Priority | Layer | Set by | Counts when |
+|---|---|---|---|
+| 1 (highest) | session value | user | option is *Delegated* and the user set a value in this session |
+| 2 | user's personal default | user | option is *Delegated* and the user set a personal default |
+| 3 (base) | global | owner | always |
+
+There is **no "owner sets a value for a specific user" layer** — if an option is
+delegated, the user owns its value. The owner controls the *rules*, not the
+values.
+
+### 4.4 Table 3 — What the owner can and cannot do
+
+| Owner action | Allowed? |
+|---|---|
+| Change **global** (default for all; applies immediately to all sessions) | yes, anytime |
+| Change an option's **access level** (Hidden / Read-only / Delegated) | yes, anytime |
+| Change the **exceptions list** (who it is delegated to) | yes, anytime |
+| Change a **user's personal default** | no |
+| Change the **value in a specific session** | no |
+| **Override** a user's value while the option is delegated to them | no |
+
+Principle: **global is both the default and the live value** for everyone who has
+not overridden it — change it and it applies instantly to every session that
+relies on it. The owner manages rules and global, never reaches into a user's
+values or an individual session. "Taking it back" = lowering the access level →
+the effective value immediately falls back to global for all of that user's
+sessions.
+
+### 4.5 Table 4 — Master settings matrix
+
+One row per option. *Applies to* marks code-only options (§1.7). *Base access* and
+*Exceptions* are the owner's controls; *Global* is the current default.
+
+| Option | Type / values | Global | Applies to | Base access | Exceptions / gates |
+|---|---|---|---|---|---|
+| `model` | enum: opus, sonnet, haiku | opus | all | Delegated | — |
+| `effort` | enum: low, medium, high, xhigh, max, default | high | all | Delegated | `max`: delegated only to granted users |
+| `permission_mode` | enum: ask, auto-edits, plan, full-access | ask | code | Delegated | `full-access`: owner only |
+| `max_turns` | int 1–1000, or unlimited | unlimited | code | Delegated | — |
+| `big_memory` | bool | off | all | Delegated | — |
+| `streaming` | bool | on | all | Read-only | (native streaming is always on) |
+| `sandbox` | bool | on | code | Hidden | owner: Delegated |
+| `language` | enum: supported locales | en | all (UI) | Delegated | — |
+| `usage_display` | enum: off, footer, pinned, both | footer | account-wide | Read-only | owner: Delegated |
+| `tools` | multi-select (chat: web tools; code: full toolset) | all on | all (universe varies by type) | Delegated | per-user tool allow-list |
+
+Reading the columns:
+
+- **Base access** is what all users get by default — *Hidden*, *Read-only*, or
+  *Delegated*.
+- **Exceptions** are who differs, written as `level: users`. Empty = the same for
+  everyone. This is how "given to all" vs "given to some" is expressed:
+  *given to all* → base *Delegated*, no exceptions; *given to some* → base *Hidden*
+  (or *Read-only*) with an exception `Delegated: …`.
+
+**Resource quotas are a separate axis.** Per-user token caps (day/week) and access
+expiry are *limits*, not option values; they live on the user-admin card (§3.4)
+and are not part of this matrix.
+
+### 4.6 Standing rules
+
+These are baked into the standard (and could be flipped if ever decided
+otherwise):
+
+- **Soft revoke.** Lowering an option's access keeps the user's stored values but
+  stops counting them — the effective value falls back to global. Restoring access
+  brings the user's values back. Nothing is deleted.
+- **Start of a delegated option.** Until the user sets their own value, they ride
+  the current global (and follow the owner's edits to it). For full isolation from
+  the moment of delegation, snapshot global into the user's personal default at
+  delegation time.
+- **Derived, not stored.** Effective values are **computed on each prompt** from
+  the matrix — base access + exceptions for this user, then global → user default →
+  per-session value (keyed by session id). No per-session "actual value" is
+  persisted. The only stored data is: the owner's **global values + access levels +
+  exceptions**, each user's **personal defaults**, and each session's **explicit
+  overrides**. Because nothing effective is cached, any change the owner makes
+  applies from the user's very next prompt.

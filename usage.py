@@ -109,7 +109,16 @@ def window_str(info, lang: str = "en") -> str:
         # No number yet (typical when the window is far from full): show the
         # window status instead of a meaningless "(n/a)".
         key = _STATUS_KEY.get(str(status))
-        body = i18n.t(key, lang) if key else (i18n.t("usage.status.ok", lang) if status else "")
+        if key:
+            body = i18n.t(key, lang)
+        elif status:
+            # #135/#137: an unknown-but-present status used to fall back to
+            # "OK" — which over-asserts (we'd show "5h OK" for a state we don't
+            # actually understand). Show a neutral marker; only an explicit
+            # 'allowed' (via _STATUS_KEY) ever renders "OK".
+            body = i18n.t("usage.status.unknown", lang)
+        else:
+            body = ""
         out = f"{label} {body}".strip()
 
     # The reset countdown only matters when usage is actually constrained — show

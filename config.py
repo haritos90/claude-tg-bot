@@ -35,10 +35,13 @@ class Settings:
     base_workdir: Path
     db_path: Path
     allowlist_path: Path
-    # Per-code-session sandbox (#104). OFF by default — when on, each code
+    # Per-code-session sandbox (#104). ON by default (#136) — when on, each code
     # session's `claude` runs in a bubblewrap jail: unprivileged uid, confined to
     # its workdir, credential injected read-only. See deploy/sandbox-claude.sh.
-    sandbox_code: bool = False
+    # was `= False` (opt-in) — flipped to default-on for #136 so a code session
+    # can only write inside its own workdir (the agent was creating files outside
+    # it, e.g. an imagined /Users/<name> home, when running un-jailed as root).
+    sandbox_code: bool = True
     sandbox_uid: int = 65534          # the unprivileged uid/gid the jail drops to
     sandbox_allow_exec: bool = True   # True = perm "7" (exec ok); False = "6" (noexec workdir)
     # Extra prompt keyword triggers to neutralize, ON TOP of the built-in defaults
@@ -104,9 +107,13 @@ def load_settings() -> Settings:
         ) from exc
 
     default_model = os.environ.get("DEFAULT_MODEL", DEFAULT_MODEL).strip() or DEFAULT_MODEL
+    # Resolve to an ABSOLUTE path (#136): the per-session cwd is derived from this
+    # and passed to the sandbox launcher (which binds it + derives SBX_STATE from
+    # it). A relative base made SBX_STATE relative-to-the-jail-cwd and broke
+    # session-state persistence. was: Path(os.environ.get(...) or DEFAULT)
     base_workdir = Path(
         os.environ.get("BASE_WORKDIR", DEFAULT_BASE_WORKDIR).strip() or DEFAULT_BASE_WORKDIR
-    )
+    ).resolve()
     db_path = Path(
         os.environ.get("DB_PATH", DEFAULT_DB_PATH).strip() or DEFAULT_DB_PATH
     )
@@ -124,7 +131,7 @@ def load_settings() -> Settings:
             return default
         return raw.strip().lower() in ("1", "true", "yes", "on")
 
-    sandbox_code = _flag("SANDBOX_CODE", False)
+    sandbox_code = _flag("SANDBOX_CODE", True)  # #136: default-on (was False)
     try:
         sandbox_uid = int(os.environ.get("SANDBOX_UID", "65534").strip() or "65534")
     except ValueError:

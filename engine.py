@@ -11,6 +11,7 @@ no API key is present. We therefore strip those vars from the child env.
 
 import os
 import re
+import logging
 import contextlib
 import shutil
 from dataclasses import dataclass
@@ -26,6 +27,33 @@ from claude_agent_sdk import (
     TextBlock,
     ToolUseBlock,
 )
+
+logger = logging.getLogger(__name__)
+
+# #137: signatures used to classify a failed-startup / failed-turn from the CLI's
+# real stderr (captured via the ClaudeAgentOptions.stderr callback). Conservative
+# phrasing only, so we never mis-flag an unrelated error.
+_RESUME_LOST_RE = re.compile(r"No conversation found with session ID", re.I)
+_LIMIT_RE = re.compile(
+    r"usage limit|rate.?limit|reached your (usage )?limit|"
+    r"5-?hour limit|7-?day limit|limit (?:will )?reset|resets? at",
+    re.I,
+)
+
+
+def _classify_stderr(text: str) -> str | None:
+    """Map captured CLI stderr to a known failure class, or None if unrecognized.
+
+    'resume_lost' -> a stale --resume id (recoverable: retry without resume).
+    'rate_limit'  -> the subscription window is exhausted (NOT recoverable here).
+    """
+    if not text:
+        return None
+    if _RESUME_LOST_RE.search(text):
+        return "resume_lost"
+    if _LIMIT_RE.search(text):
+        return "rate_limit"
+    return None
 
 # Short, friendly system prompt for chat mode. Chat now ships the read-only web
 # research tools (see _build_options), so the prompt tells the model it CAN browse
@@ -159,6 +187,10 @@ class EngineEvent:
     rate: object | None = None
     error_key: str | None = None
     error_detail: str | None = None
+    # #137: True when this error means the subscription window is exhausted, so the
+    # consumer can flip the usage display to "limited" instead of leaving a stale
+    # "OK" (the rate EVENTS keep saying allowed even after the account limit hits).
+    limit_hit: bool = False
 
 
 # Map the SDK's AssistantMessage.error enum values to readable messages. These
@@ -276,10 +308,28 @@ class ClaudeSession:
         # options.resume so a freshly-built client continues the prior session.
         self.session_id: str | None = resume_session_id
         self.client: ClaudeSDKClient | None = None
+        # #137: rolling buffer of the child CLI's stderr (filled by _on_stderr, wired
+        # via ClaudeAgentOptions.stderr). The SDK only pipes the child's stderr when
+        # this callback is set — otherwise a non-zero exit raised a ProcessError whose
+        # detail was the literal "Check stderr output for details", and the REAL line
+        # (e.g. "No conversation found with session ID …", or a limit message) leaked
+        # to the bot's own stderr/log instead of reaching the user.
+        self._stderr_lines: list[str] = []
         # Set by interrupt() so run() can tell a deliberate /stop apart from a
         # real failure: when interrupting, any exception out of receive_response()
         # is an expected end, not an error to surface. Reset at the start of run().
         self._interrupted = False
+
+    def _on_stderr(self, line: str) -> None:
+        """SDK stderr callback (#137). Append-only, no I/O / await — it runs on the
+        SDK's reader-task loop. Keep only the last ~50 lines (the tail carries the
+        actual error)."""
+        self._stderr_lines.append(line)
+        del self._stderr_lines[:-50]
+
+    def _stderr_text(self) -> str:
+        """The captured CLI stderr tail (#137), for surfacing the real error."""
+        return "\n".join(self._stderr_lines[-8:]).strip()
 
     def _build_env(self) -> dict[str, str]:
         """Copy the current env, strip API-key vars (force subscription auth), and
@@ -362,6 +412,10 @@ class ClaudeSession:
             "setting_sources": ["user"] if self.global_memory else [],
             "include_partial_messages": True,  # enable text-delta streaming
             "env": env,
+            # #137: capture the child CLI's stderr so a startup/turn failure surfaces
+            # the REAL reason (stale resume id, limit, bwrap error) instead of the
+            # SDK's generic "Check stderr output for details". was: no stderr key.
+            "stderr": self._on_stderr,
         }
         if self.session_id:
             common["resume"] = self.session_id
@@ -439,8 +493,52 @@ class ClaudeSession:
                 if self.mode == "code" and self.sandbox:
                     # Persistent per-session claude state dir for the jail (#115).
                     os.makedirs(f"{self.cwd}.sbxstate", exist_ok=True)
-            self.client = ClaudeSDKClient(self._build_options())
-            await self.client.connect()
+                # #137: lock the workdir (+ its sbxstate) to the owner only. The
+                # sandboxed CLI writes as uid 65534 with the inherited 0022 umask, so
+                # outputs landed 0644 / dirs 0755 — world-readable on the host. 0700
+                # keeps a session's files off-limits to other local users.
+                with contextlib.suppress(OSError):
+                    os.chmod(self.cwd, 0o700)
+                    if self.mode == "code" and self.sandbox:
+                        os.chmod(f"{self.cwd}.sbxstate", 0o700)
+            # was: assign self.client THEN connect() — replaced for #137
+            #   self.client = ClaudeSDKClient(self._build_options())
+            #   await self.client.connect()
+            # If connect() (or even the constructor) raised, self.client was left
+            # non-None but unconnected; the next turn's `self.client is None` check
+            # was False, so it skipped reconnect and every later query()/
+            # receive_response() hit an unconnected client → "Not connected. Call
+            # connect() first." until a process restart. Build into a LOCAL, connect
+            # it, and only publish to self.client AFTER connect() succeeds; tear the
+            # half-built client down on any failure so the next turn reconnects clean.
+            #
+            # #137: a STALE --resume id ("No conversation found with session ID …",
+            # which is what produced the reported exit-1 startup failure) is
+            # recoverable — drop the dead id and retry ONCE with a fresh session, so
+            # the user just keeps going instead of being wedged. Only retry on that
+            # exact signature; never on a limit/auth/billing failure.
+            for attempt in (1, 2):
+                self._stderr_lines.clear()
+                client = ClaudeSDKClient(self._build_options())
+                try:
+                    await client.connect()
+                except BaseException as exc:
+                    with contextlib.suppress(Exception):
+                        await client.disconnect()
+                    if (
+                        attempt == 1
+                        and self.session_id
+                        and _classify_stderr(self._stderr_text()) == "resume_lost"
+                    ):
+                        logger.warning(
+                            "resume id %s not found — retrying without resume",
+                            self.session_id,
+                        )
+                        self.session_id = None
+                        continue
+                    raise exc
+                self.client = client
+                return
 
     async def _send_query(self, prompt: str, attachments: list | None) -> None:
         """Send the user turn to the connected client.
@@ -493,12 +591,33 @@ class ClaudeSession:
         try:
             await self._ensure_client()
         except Exception as exc:  # connection / spawn failures
-            yield EngineEvent(
-                kind="error",
-                text=f"Failed to start session: {exc}",
-                error_key="err.start_failed",
-                error_detail=str(exc),
-            )
+            # _ensure_client already tore down its half-built local client, but be
+            # defensive in case a connected client survived a later failure path:
+            # drop it so the NEXT turn rebuilds + reconnects instead of reusing a
+            # dead handle (#137 — the "Not connected" loop).
+            await self._drop_client()
+            # #137: prefer the REAL captured CLI stderr over the SDK's generic
+            # "Command failed … Check stderr output for details", and classify it so
+            # the user sees a meaningful, localized message. was: error_detail=str(exc).
+            detail = self._stderr_text() or str(exc)
+            if detail != str(exc):
+                logger.warning("session start failed: %s", detail)
+            kind = _classify_stderr(detail)
+            if kind == "rate_limit":
+                yield EngineEvent(
+                    kind="error",
+                    text="Subscription limit reached. Please try again later.",
+                    error_key="err.rate_limit",
+                    error_detail=detail,
+                    limit_hit=True,
+                )
+            else:
+                yield EngineEvent(
+                    kind="error",
+                    text=f"Failed to start session: {detail}",
+                    error_key="err.start_failed",
+                    error_detail=detail,
+                )
             return
 
         running_text = ""
@@ -521,11 +640,29 @@ class ClaudeSession:
                 # --- Assistant message: text blocks + tool-use blocks ---
                 if isinstance(msg, AssistantMessage):
                     if getattr(msg, "error", None):
+                        # Auth/billing errors arrive HERE as an in-band
+                        # AssistantMessage.error (e.g. "authentication_failed"), NOT
+                        # as a connect/stream exception — so, unlike the other two
+                        # error paths, this one never dropped the client. A long-lived
+                        # `claude` subprocess holding a now-stale OAuth token (the
+                        # access token expired mid-run, or the owner re-logged in and
+                        # rewrote ~/.claude/.credentials.json) would then repeat the
+                        # 401 on EVERY following turn until a manual bot restart. Drop
+                        # the client for the credential-class errors so the next turn
+                        # rebuilds a fresh subprocess that re-reads the refreshed
+                        # credentials and self-heals — no restart needed. (The proper
+                        # central fix is the #119 broker: it owns token injection +
+                        # OAuth refresh so a single subprocess never goes stale.)
+                        if str(msg.error) in ("authentication_failed", "billing_error"):
+                            await self._drop_client()
                         yield EngineEvent(
                             kind="error",
                             text=_error_message(msg.error),
                             error_key=_error_key(msg.error),
                             error_detail=str(msg.error),
+                            # #137: a mid-turn rate_limit means the window is spent —
+                            # let the consumer flip the usage display to "limited".
+                            limit_hit=(str(msg.error) == "rate_limit"),
                         )
                         # An errored assistant message is terminal for this turn.
                         return
@@ -577,12 +714,31 @@ class ClaudeSession:
             # the final answer (no spurious "Execution error" line).
             if self._interrupted:
                 return
-            yield EngineEvent(
-                kind="error",
-                text=f"Execution error: {exc}",
-                error_key="err.exec_error",
-                error_detail=str(exc),
-            )
+            # The transport may be wedged after a query()/receive_response()
+            # failure (e.g. the CLI subprocess died mid-turn). Drop the client so
+            # the next turn reconnects cleanly rather than replaying the error on a
+            # dead handle (#137 — "Not connected. Call connect() first.").
+            await self._drop_client()
+            # #137: surface the real CLI stderr + classify (limit vs generic), same
+            # as the connect-time path. was: error_detail=str(exc) only.
+            detail = self._stderr_text() or str(exc)
+            if detail != str(exc):
+                logger.warning("turn failed: %s", detail)
+            if _classify_stderr(detail) == "rate_limit":
+                yield EngineEvent(
+                    kind="error",
+                    text="Subscription limit reached. Please try again later.",
+                    error_key="err.rate_limit",
+                    error_detail=detail,
+                    limit_hit=True,
+                )
+            else:
+                yield EngineEvent(
+                    kind="error",
+                    text=f"Execution error: {detail}",
+                    error_key="err.exec_error",
+                    error_detail=detail,
+                )
 
     async def context_usage(self):
         """Return raw SDK context-window usage, or None if unavailable.
@@ -611,12 +767,24 @@ class ClaudeSession:
             with contextlib.suppress(Exception):
                 await self.client.interrupt()
 
+    async def _drop_client(self) -> None:
+        """Disconnect and forget the current client (best-effort).
+
+        Shared teardown for failure paths in run(): after a connect/query/stream
+        failure the handle may be unusable, so we disconnect (suppressing errors)
+        and set self.client = None so _ensure_client rebuilds + reconnects on the
+        next turn. Per-thread rec.lock (sessions.py) serializes turns for a given
+        session, so this never races a concurrent run() on the same client.
+        """
+        client, self.client = self.client, None
+        if client:
+            with contextlib.suppress(Exception):
+                await client.disconnect()
+
     async def aclose(self) -> None:
         """Disconnect and drop the underlying client."""
-        if self.client:
-            with contextlib.suppress(Exception):
-                await self.client.disconnect()
-            self.client = None
+        # was: inline disconnect + self.client = None — replaced for #137
+        await self._drop_client()
 
     def set_model(self, model: str) -> None:
         """Update the model, applied on the next client build.

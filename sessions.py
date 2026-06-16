@@ -26,6 +26,7 @@ import db
 import i18n
 import markup  # noqa: F401  (kept for symmetry / future formatting helpers)
 import usage
+import settings_schema
 from engine import ClaudeSession
 from streamer import Streamer, resolve_speed
 from permissions import PermissionGate
@@ -119,6 +120,11 @@ class SessionManager:
         # skip the DB write and pinned-message edit when a rate event repeats
         # data we already recorded (see _run_one's rate_limit branch).
         self._last_rate_sig: tuple | None = None
+        # #137: True while we are showing a SYNTHESIZED "limited" five_hour window
+        # (set when a turn fails on the subscription limit — the rate EVENTS keep
+        # reporting "allowed", so we fabricate the limited state). Cleared on the
+        # next successful turn so the honest display self-heals.
+        self._synth_limit: bool = False
 
     # ------------------------------------------------------------------ records
 
@@ -131,8 +137,15 @@ class SessionManager:
         return rec
 
     def _default_cwd(self, thread_id: int) -> str:
-        """Per-thread working directory: BASE_WORKDIR/<thread_id>."""
-        return str(Path(self.settings.base_workdir) / str(thread_id))
+        """Per-thread working directory: BASE_WORKDIR/<sid> (#140).
+
+        Named by the stable PUBLIC session id (session_sid) rather than the raw
+        thread_id so the on-disk name matches the id shown in /sessions / exports
+        and never leaks the internal numbering.
+        """
+        # was: return str(Path(self.settings.base_workdir) / str(thread_id))
+        #      — replaced for #140 (sid-named workdirs)
+        return str(Path(self.settings.base_workdir) / db.session_sid(thread_id))
 
     # --------------------------------------------------------------- session mgmt
 
@@ -147,6 +160,22 @@ class SessionManager:
             return bool(self.allowlist.global_memory_of(owner_uid, None))
         except Exception:
             return False
+
+    def _resolve_sandbox(self, state: db.ThreadState) -> bool:
+        """Whether THIS session's code `claude` runs in the bubblewrap jail (#138).
+
+        Routed through the unified settings registry so the confusing global-vs-
+        session model has ONE source of truth and the negative per-session override
+        (no_sandbox) inversion lives inside the adapter, not here. The registry walk
+        SESSION→USER→GLOBAL is exactly equivalent to the old expression
+        ``settings.sandbox_code and not state.no_sandbox`` (see the unit test).
+        USER scope is unused at the session layer (no preloaded user-defaults), so
+        it falls through to GLOBAL == settings.sandbox_code unless the session set
+        no_sandbox (→ False).
+        """
+        ctx = settings_schema.make_ctx(state=state, settings=self.settings)
+        value, _scope = settings_schema.resolve(settings_schema.get("sandbox"), ctx)
+        return bool(value)
 
     def _resolve_tool_cap(self, state: db.ThreadState):
         """The per-user TOOL CAP (owner-set) for this session's OWNER, or None =
@@ -198,7 +227,10 @@ class SessionManager:
             max_turns=state.max_turns,
             add_dirs=state.add_dirs,
             fork=state.fork_pending,
-            sandbox=self.settings.sandbox_code and not state.no_sandbox,
+            # was: sandbox=self.settings.sandbox_code and not state.no_sandbox
+            #      — routed through the unified settings registry for #138 so the
+            #      global-vs-session sandbox model has one source of truth.
+            sandbox=self._resolve_sandbox(state),
             sandbox_uid=self.settings.sandbox_uid,
             sandbox_allow_exec=self.settings.sandbox_allow_exec,
             extra_blocked_keywords=getattr(self.settings, "extra_blocked_keywords", None),
@@ -508,8 +540,40 @@ class SessionManager:
                         msg = ev.text or i18n.t("session.unknown_error", _elang)
                     if not running_text:
                         running_text = f"⚠️ {msg}"
+                    # #137: a turn that fails on the subscription limit never emits a
+                    # rate_limit EVENT (those keep saying "allowed"), so the usage
+                    # display would stay a misleading "5h OK". Fabricate a 'rejected'
+                    # five_hour window so the footer/pin honestly read "5h ⛔ limited"
+                    # until the next successful turn clears it (below).
+                    if getattr(ev, "limit_hit", False):
+                        prev = self.rate_by_type.get("five_hour")
+                        self.rate_by_type["five_hour"] = SimpleNamespace(
+                            status="rejected",
+                            resets_at=getattr(prev, "resets_at", None),
+                            rate_limit_type="five_hour",
+                            utilization=getattr(prev, "utilization", None),
+                        )
+                        self._synth_limit = True
+                        self._last_rate_sig = self._rate_signature()
+                        with contextlib.suppress(Exception):
+                            await self._persist_rate()
+                        with contextlib.suppress(Exception):
+                            await db.append_rate_history("five_hour", None, "rejected")
+                        with contextlib.suppress(Exception):
+                            await self.update_pinned()
                 elif kind == "result":
                     had_result = True
+                    # #137: a successful turn proves the window isn't blocking — drop
+                    # any fabricated "limited" five_hour we set on a prior failure so
+                    # the honest display self-heals (real rate events repopulate it).
+                    if self._synth_limit:
+                        self._synth_limit = False
+                        self.rate_by_type.pop("five_hour", None)
+                        self._last_rate_sig = self._rate_signature()
+                        with contextlib.suppress(Exception):
+                            await self._persist_rate()
+                        with contextlib.suppress(Exception):
+                            await self.update_pinned()
                     # When we have already posted segments, the only NEW text is the
                     # current (last) burst in running_text — do NOT reuse ev.text,
                     # which for a multi-tool turn can repeat earlier segments.

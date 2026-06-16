@@ -20,7 +20,9 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import inspect
 import io
+import re
 import shutil
 import time
 import zipfile
@@ -39,10 +41,12 @@ from aiogram.types import (
     Message,
 )
 
+import commands
 import db
 import engine
 import i18n
 import markup
+import settings_schema as ss
 import usage
 from allowlist import normalize_date
 
@@ -107,35 +111,28 @@ PERM_MODE_TO_NAME: dict[str, str] = {v: k for k, v in PERM_NAME_TO_MODE.items()}
 
 
 # Commands advertised to Telegram via setMyCommands, ordered MOST-USED FIRST so
-# the menu reads top-to-bottom by how often you reach for each one. Everything
-# the bot does is here (not just a short palette) so it's all discoverable by
-# tapping the menu — no need to remember typed commands. Descriptions are
-# localized (the "cmd.<name>" l10n rows); owner-only admin commands live in
-# _OWNER_COMMAND_NAMES and are shown only to the owner (chat scope).
-_COMMAND_NAMES: list[str] = [
-    # — most used: create / switch / CONFIGURE. /settings is the hub for all tuning
-    #   (model, tools, permissions, memory, usage, language, users…), so the pure
-    #   config commands are dropped from this menu — still typeable, just not in the
-    #   way (owner request 2026-06-15: navigate from /settings, not a wall of cmds). —
-    "new", "sessions", "settings", "rename",
-    # — run control + type switch (#133: /code upgrades, /chat downgrades) —
-    "status", "code", "chat", "clear",
-    # — session content / files —
-    "recap", "history", "files", "export",
-    # — advanced run options —
-    "fork", "maxturns", "context", "queue", "clearqueue", "retry",
-    # — meta —
-    "help", "whoami",
-]
-
-# Owner-only admin commands, appended after the shared list in the owner's
-# private-chat command scope only. Allowlisted non-owners never see these.
-_OWNER_COMMAND_NAMES: list[str] = ["auto", "allow", "deny", "users", "level", "expire", "limit", "sandbox"]
-
-# Code-mode-only commands — omitted from a chat-level user's command menu (#102) so
-# they don't see commands they can't use. (Enforcement is in the handlers; this
-# only declutters the menu. The owner's chat scope still shows everything.)
-_CODE_COMMAND_NAMES: list[str] = ["code", "files", "export", "permissions", "maxturns"]
+# the menu reads top-to-bottom by how often you reach for each one. Everything in
+# the menu is discoverable by tapping it — no need to remember typed commands.
+#
+# #139: names + descriptions + scope now live in ONE place — commands.py (the
+# COMMANDS registry). These module-level lists are DERIVED from it so they can't
+# drift across languages or surfaces. The literal arrays below are commented out
+# (kept for audit/revert); replaced by commands.menu_slugs()/code_slugs()/
+# owner_slugs(). Descriptions come from Cmd.label[lang], not the cmd.* i18n rows.
+#
+# was — replaced for #139:
+# _COMMAND_NAMES: list[str] = [
+#     "new", "sessions", "settings", "rename",
+#     "status", "code", "chat", "clear",
+#     "recap", "history", "files", "export",
+#     "fork", "maxturns", "context", "queue", "clearqueue", "retry",
+#     "help", "whoami",
+# ]
+# _OWNER_COMMAND_NAMES: list[str] = ["auto", "allow", "deny", "users", "level", "expire", "limit", "sandbox"]
+# _CODE_COMMAND_NAMES: list[str] = ["code", "files", "export", "permissions", "maxturns"]
+_COMMAND_NAMES: list[str] = commands.menu_slugs()
+_OWNER_COMMAND_NAMES: list[str] = commands.owner_slugs()
+_CODE_COMMAND_NAMES: list[str] = commands.code_slugs()
 
 
 def _chat_command_names() -> list[str]:
@@ -144,11 +141,21 @@ def _chat_command_names() -> list[str]:
 
 
 def _build_commands(names: list[str], lang: str) -> list[BotCommand]:
-    """Build a BotCommand list with descriptions in the given locale."""
-    return [
-        BotCommand(command=name, description=i18n.t(f"cmd.{name}", lang))
-        for name in names
-    ]
+    """Build a BotCommand list with descriptions in the given locale.
+
+    #139: the description is now sourced from the COMMANDS registry
+    (Cmd.label[lang]), the single source of truth, rather than the cmd.* i18n
+    rows. Falls back to English if a locale is somehow absent.
+    """
+    # was — replaced for #139 (cmd.* i18n lookup):
+    # return [BotCommand(command=name, description=i18n.t(f"cmd.{name}", lang)) for name in names]
+    by = commands.by_slug()
+    out: list[BotCommand] = []
+    for name in names:
+        cmd = by.get(name)
+        desc = cmd.label.get(lang) or cmd.label["en"] if cmd else name
+        out.append(BotCommand(command=name, description=desc))
+    return out
 
 
 async def setup_commands(bot, owner_id: int | None = None) -> None:
@@ -161,6 +168,10 @@ async def setup_commands(bot, owner_id: int | None = None) -> None:
     never appear for anyone else. A scoped list REPLACES (not appends to) the
     default for that scope, so we send the combined list explicitly per locale.
     """
+    # #139: fail loudly at startup if the command registry (commands.py) has
+    # drifted from the live @router handlers or is missing a locale, so the
+    # menu/help/handler surfaces can't silently diverge again.
+    commands.assert_commands_consistent(languages=tuple(i18n.LANGUAGES))
     # Default scope (everyone except the owner): the CHAT-level set — code-mode-only
     # commands are omitted so a chat-only user doesn't see commands they can't use
     # (#102). The owner's private chat (below) overrides this with the full set.
@@ -335,13 +346,16 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
     async def _ensure_state(message: Message):
         """Ensure a ThreadState row exists for this session; return it.
 
-        The default working directory is per-session: BASE_WORKDIR/<session_key>,
+        The default working directory is per-session: BASE_WORKDIR/<sid> (#140),
         so each session's code-mode work is isolated from every other session's
         files. (DM sessions are created by allocate_dm_session, which sets the same
-        per-key cwd; this path only fires for a brand-new key.)
+        per-sid cwd; this path only fires for a brand-new key — e.g. a supergroup
+        topic or General(0).)
         """
         key = await _session_key(message)
-        default_cwd = str(settings.base_workdir / str(key))
+        # #140: name the per-session workdir by the stable public sid, not the raw
+        # key. was: default_cwd = str(settings.base_workdir / str(key))
+        default_cwd = str(settings.base_workdir / db.session_sid(key))
         return await db.ensure_thread(
             key, message.chat.id, settings.default_model, default_cwd
         )
@@ -480,22 +494,30 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
 
     @router.message(Command("settings"))
     async def cmd_settings(message: Message) -> None:
-        """Open the inline settings menu for this topic."""
+        """Open the inline settings hub for this session.
+
+        #138 PART 2: /settings now opens the REGISTRY-DRIVEN, scope-tabbed hub
+        (This session / My defaults / Global) — see ``_send_ss_hub``. The old
+        single-page builder (``_settings_keyboard("main", …)``) is kept for the
+        Tools grid + Users admin SUB-pages it still serves (st:nav:tools/users),
+        which the new hub links to; only the entry point changed.
+        """
         await _ensure_state(message)
         key = await _session_key(message)
         lang = _lang(message)
-        vals = await _gather_vals(key, lang)
-        send_kwargs: dict = {}
-        if message.message_thread_id:
-            send_kwargs["message_thread_id"] = message.message_thread_id
+        uid = message.from_user.id if message.from_user else None
+        uname = message.from_user.username if message.from_user else None
+        # was (the bespoke single page) — replaced for #138 PART 2:
+        # vals = await _gather_vals(key, lang)
+        # send_kwargs: dict = {}
+        # if message.message_thread_id:
+        #     send_kwargs["message_thread_id"] = message.message_thread_id
+        # await bot.send_message(
+        #     message.chat.id, _settings_text(vals, lang), parse_mode="HTML",
+        #     reply_markup=_settings_keyboard("main", vals, _is_owner(message), lang),
+        #     **send_kwargs)
         try:
-            await bot.send_message(
-                message.chat.id,
-                _settings_text(vals, lang),
-                parse_mode="HTML",
-                reply_markup=_settings_keyboard("main", vals, _is_owner(message), lang),
-                **send_kwargs,
-            )
+            await _send_ss_hub(message.chat.id, key, uid, uname, lang)
         except Exception as exc:
             await reply(
                 message,
@@ -556,6 +578,261 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             # Confirm a "set" choice with a small toast so the tap is acknowledged
             # (owner request — selecting e.g. a usage mode now visibly confirms).
             await cb.answer(i18n.t("settings.saved", lang) if verb == "set" else None)
+        except Exception:
+            with contextlib.suppress(Exception):
+                await cb.answer(i18n.t("common.error", _lang(cb)))
+
+    # ---------------------------------------------- generic settings v2 (#138)
+    # The registry-driven, scope-tabbed /settings hub. It reuses the resolver +
+    # role gate from settings_schema so visibility/edit are decided in ONE place,
+    # and supersedes the bespoke per-setting wiring above where it maps cleanly.
+
+    def _role_of(uid: int | None, uname: str | None) -> ss.Role:
+        """The acting user's registry Role (owner / code / chat)."""
+        is_owner = uid is not None and uid == settings.owner_id
+        level = None if is_owner else allowlist.level_of(uid, uname)
+        return ss.role_for(is_owner, level)
+
+    async def _build_ss_ctx(key: int, uid: int | None, role: ss.Role) -> ss.Ctx:
+        """Build a resolution Ctx for the bound session, preloading the USER-scope
+        defaults (incl. the locale from its own kv store) so resolve() stays sync."""
+        try:
+            state = await db.get_thread(key)
+        except Exception:
+            state = None
+        user_defaults: dict = {}
+        if uid is not None:
+            for skey in ss.SETTINGS:
+                with contextlib.suppress(Exception):
+                    user_defaults[skey] = await db.get_user_default(uid, skey)
+            # Language lives in its OWN kv store, not the generic user_default kv.
+            with contextlib.suppress(Exception):
+                lang_pref = await db.get_user_lang(uid)
+                if lang_pref is not None:
+                    user_defaults["language"] = lang_pref
+        return ss.make_ctx(state=state, user_id=uid, role=role,
+                           settings=settings, allowlist=allowlist,
+                           user_defaults=user_defaults)
+
+    def _visible_tabs(role: ss.Role) -> list:
+        """Scope tabs this role may see. Non-owners never get the Global tab."""
+        tabs = [ss.Scope.SESSION, ss.Scope.USER]
+        if role >= ss.Role.OWNER:
+            tabs.append(ss.Scope.GLOBAL)
+        return tabs
+
+    def _ss_text(scope, role: ss.Role, lang: str) -> str:
+        """Header for the active scope tab."""
+        return i18n.t("settings.v2_header", lang,
+                      tab=i18n.t(_scope_tab_key(scope), lang))
+
+    def _ss_hub_keyboard(scope, ctx: ss.Ctx, role: ss.Role, lang: str) -> InlineKeyboardMarkup:
+        """Tabbed hub keyboard for the active scope: a tab row, then one row per
+        visible setting (resolved value + source badge + control affordance), then
+        the bespoke Tools / Users links and Close."""
+        B = InlineKeyboardButton
+        rows: list[list[InlineKeyboardButton]] = []
+        # Tab row (mark the active tab).
+        tab_row = []
+        for sc in _visible_tabs(role):
+            label = i18n.t(_scope_tab_key(sc), lang)
+            tab_row.append(B(text=(f"• {label}" if sc == scope else label),
+                             callback_data=f"sx:tab:{_SCOPE_CODE[sc]}"))
+        rows.append(tab_row)
+        # One row per visible setting at this scope.
+        for setting in ss.settings_for_scope(scope, role):
+            # No setter for this scope (e.g. GLOBAL language) → skip (read-only-only).
+            if setting.set.get(scope) is None:
+                continue
+            # #138-fix: on the SESSION tab show the effective resolved value; on the
+            # USER/GLOBAL tabs show what THAT scope contributes (or inherits from
+            # below) — resolve() would wrongly surface a session override here.
+            value, src = ss.resolve_from(setting, ctx, scope)
+            name = _setting_name(setting, lang)
+            vlabel = _setting_value_label(setting, value, lang)
+            badge = _scope_badge(src, lang)
+            text = i18n.t("settings.v2_row", lang, name=name, val=vlabel, badge=badge)
+            sc_code = _SCOPE_CODE[scope]
+            if setting.type is bool:
+                cb = f"sx:tog:{sc_code}:{setting.key}"
+            else:
+                cb = f"sx:nav:{sc_code}:{setting.key}"
+            rows.append([B(text=text, callback_data=cb)])
+        # Bespoke pages stay their own; link them from the SESSION tab only.
+        if scope == ss.Scope.SESSION:
+            rows.append([B(text=i18n.t("settings.row_tools", lang), callback_data="st:nav:tools")])
+            if role >= ss.Role.OWNER:
+                rows.append([B(text=i18n.t("settings.row_users", lang), callback_data="st:nav:users")])
+        rows.append([B(text=i18n.t("btn.close", lang), callback_data="sx:close")])
+        return InlineKeyboardMarkup(inline_keyboard=rows)
+
+    def _ss_picker_keyboard(setting, scope, ctx: ss.Ctx, lang: str,
+                            may_max: bool = True) -> InlineKeyboardMarkup:
+        """Choice picker for one fixed-choice setting at a scope (#101 convention).
+        ``may_max`` hides the gated `max` effort level from users not allowed it
+        (the apply path still enforces it for a forged tap)."""
+        B = InlineKeyboardButton
+        # #138-fix: mark the value held at THIS scope (chain from it), not the
+        # cross-scope resolved one, so the picker's ✓ matches the tab.
+        value, _ = ss.resolve_from(setting, ctx, scope)
+        cur_label = _setting_value_label(setting, value, lang)
+        sc_code = _SCOPE_CODE[scope]
+        choices = _setting_choice_labels(setting, lang)
+        if setting.key == "effort" and not may_max:
+            choices = [(v, lbl) for v, lbl in choices if v != "max"]
+        btns = [B(text=_mark(label, cur_label),
+                  callback_data=f"sx:set:{sc_code}:{setting.key}:{cbval}")
+                for cbval, label in choices]
+        rows = [btns[i:i + 3] for i in range(0, len(btns), 3)]
+        rows.append([B(text=i18n.t("btn.back", lang), callback_data=f"sx:tab:{sc_code}")])
+        return InlineKeyboardMarkup(inline_keyboard=rows)
+
+    async def _ss_apply(setting, scope, raw_val, ctx: ss.Ctx, role: ss.Role,
+                        uid: int | None, uname: str | None, key: int) -> bool:
+        """Apply a tap AFTER re-checking edit_role + scope authorization server-side.
+
+        Returns True if the value was written. A guest/non-owner tapping an
+        owner-only or global control (forged callback) is REJECTED here — the button
+        is never authorization (#138, AGENTS §2)."""
+        # 1. The setting itself must be editable by this role.
+        if not setting.can_edit(role):
+            return False
+        # 2. The GLOBAL scope is owner-only regardless of the setting's edit_role.
+        if scope == ss.Scope.GLOBAL and role < ss.Role.OWNER:
+            return False
+        # 3. There must be a setter for this scope.
+        setter = setting.set.get(scope)
+        if setter is None:
+            return False
+        # 4. Per-setting extra gates that the role matrix alone doesn't cover.
+        if setting.key == "effort" and raw_val == "max" and not _may_max_effort(uid, uname):
+            return False
+        # 5. Coerce the callback string into the stored value.
+        value = _coerce_ss_value(setting, raw_val)
+        # Setters may be sync (GLOBAL model/sandbox mutate config in-process) or
+        # async (db writes) — await only when the call returned an awaitable.
+        result = setter(ctx, value)
+        if inspect.isawaitable(result):
+            await result
+        # Language has side effects (locale cache + per-chat menu); model/effort/etc.
+        # need the live SDK client rebuilt for a SESSION change to take effect now.
+        if setting.key == "language" and value:
+            i18n.remember_lang(uid, value)
+            with contextlib.suppress(Exception):
+                await _apply_user_menu(uid, uid, uname, value)
+        elif scope == ss.Scope.SESSION:
+            await _rebuild_session(key)
+        return True
+
+    def _coerce_ss_value(setting, raw_val):
+        """Map a picker/toggle callback token into the value the setter stores."""
+        if setting.type is bool:
+            return raw_val if isinstance(raw_val, bool) else (raw_val == "on")
+        if setting.key == "model":
+            return MODEL_ALIASES.get(raw_val, raw_val)
+        if setting.key == "permission_mode":
+            return PERM_NAME_TO_MODE.get(raw_val, raw_val)
+        if setting.key == "effort":
+            return None if raw_val in ("default", "none", "reset") else raw_val
+        if setting.key == "max_turns":
+            if raw_val in ("default", "none", "off", "0", "unlimited"):
+                return None
+            try:
+                return int(raw_val)
+            except (TypeError, ValueError):
+                return None
+        return raw_val
+
+    async def _send_ss_hub(chat_id: int, key: int, uid: int | None, uname: str | None,
+                           lang: str, scope=ss.Scope.SESSION, edit_msg=None) -> None:
+        """Render (or re-render) the tabbed hub at ``scope``."""
+        role = _role_of(uid, uname)
+        if scope not in _visible_tabs(role):
+            scope = ss.Scope.SESSION  # bounce a forged/stale Global tab to session
+        ctx = await _build_ss_ctx(key, uid, role)
+        text = _ss_text(scope, role, lang)
+        kb = _ss_hub_keyboard(scope, ctx, role, lang)
+        if edit_msg is not None:
+            with contextlib.suppress(Exception):
+                await edit_msg.edit_text(text, parse_mode="HTML", reply_markup=kb)
+            return
+        await bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=kb)
+
+    @router.callback_query(F.data.startswith("sx:"))
+    async def on_settings_v2_cb(cb: CallbackQuery) -> None:
+        """Drive the registry-based settings hub: tab switch / picker / apply."""
+        try:
+            parts = (cb.data or "").split(":")
+            verb = parts[1] if len(parts) > 1 else ""
+            msg = cb.message
+            if msg is None:
+                await cb.answer()
+                return
+            key = await _callback_key(cb)
+            lang = _lang(cb)
+            uid = cb.from_user.id if cb.from_user else None
+            uname = cb.from_user.username if cb.from_user else None
+            role = _role_of(uid, uname)
+
+            if verb == "close":
+                try:
+                    await msg.delete()
+                except Exception:
+                    with contextlib.suppress(Exception):
+                        await msg.edit_text(i18n.t("settings.closed", lang))
+                await cb.answer()
+                return
+
+            if verb == "tab":
+                scope = _CODE_SCOPE.get(parts[2] if len(parts) > 2 else "s", ss.Scope.SESSION)
+                await _send_ss_hub(msg.chat.id, key, uid, uname, lang, scope, edit_msg=msg)
+                await cb.answer()
+                return
+
+            if verb == "nav" and len(parts) >= 4:
+                scope = _CODE_SCOPE.get(parts[2], ss.Scope.SESSION)
+                setting = ss.SETTINGS.get(parts[3])
+                # Gate: must be viewable, and the Global tab is owner-only.
+                if (setting is None or not setting.can_view(role)
+                        or (scope == ss.Scope.GLOBAL and role < ss.Role.OWNER)):
+                    await cb.answer(i18n.t("common.error", lang))
+                    return
+                ctx = await _build_ss_ctx(key, uid, role)
+                with contextlib.suppress(Exception):
+                    await msg.edit_text(
+                        i18n.t("settings.v2_pick", lang, name=_setting_name(setting, lang)),
+                        parse_mode="HTML",
+                        reply_markup=_ss_picker_keyboard(
+                            setting, scope, ctx, lang, may_max=_may_max_effort(uid, uname)))
+                await cb.answer()
+                return
+
+            if verb in ("set", "tog") and len(parts) >= 4:
+                scope = _CODE_SCOPE.get(parts[2], ss.Scope.SESSION)
+                setting = ss.SETTINGS.get(parts[3])
+                if setting is None:
+                    await cb.answer(i18n.t("common.error", lang))
+                    return
+                ctx = await _build_ss_ctx(key, uid, role)
+                if verb == "tog":
+                    # #138-fix: flip the value held at THIS scope (chain from it),
+                    # so toggling on the "my defaults" tab doesn't invert a session
+                    # override and write the result to the user-default scope.
+                    value, _ = ss.resolve_from(setting, ctx, scope)
+                    raw_val = not bool(value)  # flip the scope-local bool
+                else:
+                    raw_val = parts[4] if len(parts) > 4 else ""
+                ok = await _ss_apply(setting, scope, raw_val, ctx, role, uid, uname, key)
+                if not ok:
+                    # Forged / unauthorized tap, or a gated choice (e.g. max effort).
+                    await cb.answer(i18n.t("settings.denied", lang), show_alert=True)
+                    return
+                lang = _lang(cb)  # a language change updates the acting locale
+                await _send_ss_hub(msg.chat.id, key, uid, uname, lang, scope, edit_msg=msg)
+                await cb.answer(i18n.t("settings.saved", lang))
+                return
+
+            await cb.answer()
         except Exception:
             with contextlib.suppress(Exception):
                 await cb.answer(i18n.t("common.error", _lang(cb)))
@@ -835,12 +1112,12 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         kb_rows: list[list[InlineKeyboardButton]] = []
         for r in rows:
             name = _session_name(r)
-            sid = db.session_sid(r["thread_id"])
+            # #136: no sid shown in the list (was `sid = db.session_sid(...)`).
             reqs, toks = await _session_stats(r["thread_id"])
             mark = i18n.t("sessions.current_mark", lang) if r["thread_id"] == current_key else ""
             icon = mode_glyph(r["mode"])
             lines.append(i18n.t(
-                "sessions.row", lang, sid=sid, icon=icon,
+                "sessions.row", lang, icon=icon,
                 name=markup.escape_html(name), mode=i18n.mode_word(r["mode"], lang),
                 date=_fmt_date(r["created_at"]), mark=mark,
             ))
@@ -970,11 +1247,16 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         # Transcript export right in the menu (owner request — don't hide it in the
         # /history command); works for chat + code. Code sessions also get the
         # working-dir zip below.
-        rows.append([B(text=i18n.t("btn.transcript", lang), callback_data=f"ses:hist:{key}")])
+        # #136: pack the content + nav rows two-per-line instead of one button per
+        # row. was: transcript / export_files / delete / back each on its own row.
+        content_row = [B(text=i18n.t("btn.transcript", lang), callback_data=f"ses:hist:{key}")]
         if st.mode == "code":
-            rows.append([B(text=i18n.t("btn.export_files", lang), callback_data=f"ses:exfiles:{key}")])
-        rows.append([B(text=i18n.t("btn.delete", lang), callback_data=f"ses:del:{key}")])
-        rows.append([B(text=i18n.t("btn.back", lang), callback_data="ses:pg:0")])
+            content_row.append(B(text=i18n.t("btn.export_files", lang), callback_data=f"ses:exfiles:{key}"))
+        rows.append(content_row)
+        rows.append([
+            B(text=i18n.t("btn.delete", lang), callback_data=f"ses:del:{key}"),
+            B(text=i18n.t("btn.back", lang), callback_data="ses:pg:0"),
+        ])
         kb = InlineKeyboardMarkup(inline_keyboard=rows)
         return text, kb
 
@@ -994,7 +1276,10 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         """Zip the session's working directory into an in-memory archive. Returns
         (BufferedInputFile, None) or (None, error_key) — capped to keep the upload
         within Telegram's bot limit."""
-        root = settings.base_workdir / str(key)
+        # #140: the workdir is named by the public sid, not the raw key — match it
+        # (the zip FILENAME already uses the sid from #136).
+        # was: root = settings.base_workdir / str(key)  — replaced for #140
+        root = settings.base_workdir / db.session_sid(key)
         files = [p for p in root.rglob("*") if p.is_file()] if root.exists() else []
         if not files:
             return None, "export.empty"
@@ -1012,7 +1297,9 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         data = buf.getvalue()
         if len(data) > 49 * 1024 * 1024:
             return None, "export.too_big"
-        return BufferedInputFile(data, filename=f"session-{abs(key)}-files.zip"), None
+        # #136: name the archive by the public sid, not the raw internal id, so the
+        # download doesn't leak the numbering. was: f"session-{abs(key)}-files.zip".
+        return BufferedInputFile(data, filename=f"session-{db.session_sid(key)}-files.zip"), None
 
     @router.message(Command("sessions"))
     async def cmd_sessions(message: Message) -> None:
@@ -1171,14 +1458,21 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                         await cb.answer(i18n.t("access.code_denied", lang), show_alert=True)
                         return
                     await db.set_dm_current(cb.from_user.id, key)
-                    # Quick actions on the switch card: Recap + Export (#95).
+                    # Quick actions on the switch card: Recap + Transcript (#95).
+                    # #136: was btn.export — it's the same ses:hist transcript as the
+                    # options menu, so use the same label to avoid two names for one
+                    # thing.
                     quick = InlineKeyboardMarkup(inline_keyboard=[[
                         InlineKeyboardButton(text=i18n.t("btn.recap", lang), callback_data=f"ses:recap:{key}"),
-                        InlineKeyboardButton(text=i18n.t("btn.export", lang), callback_data=f"ses:hist:{key}"),
+                        InlineKeyboardButton(text=i18n.t("btn.transcript", lang), callback_data=f"ses:hist:{key}"),
                     ]])
                     with contextlib.suppress(Exception):
                         await bot.send_message(chat_id, await _session_card(key, lang),
                                                parse_mode="HTML", reply_markup=quick)
+                    # #136: close the now-stale options menu the Switch button came
+                    # from so it doesn't linger above the switch card.
+                    with contextlib.suppress(Exception):
+                        await msg.delete()
                 await cb.answer(i18n.t("common.switched", lang))
                 return
             if verb == "fav" and len(parts) > 2 and is_dm:
@@ -1227,11 +1521,15 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                     deleted = await db.delete_dm_session(uid, key)
                 if deleted:
                     with contextlib.suppress(Exception):
-                        wd = settings.base_workdir / str(key)
+                        # #140: workdirs are named by the public sid, not the raw
+                        # key. was: wd = settings.base_workdir / str(key)
+                        #          sbx = settings.base_workdir / f"{key}.sbxstate"
+                        sid = db.session_sid(key)
+                        wd = settings.base_workdir / sid
                         if wd.exists():
                             shutil.rmtree(wd, ignore_errors=True)
                         # Sandbox persistent state dir (#115), if any.
-                        sbx = settings.base_workdir / f"{key}.sbxstate"
+                        sbx = settings.base_workdir / f"{sid}.sbxstate"
                         if sbx.exists():
                             shutil.rmtree(sbx, ignore_errors=True)
                     # If the deleted session was current, switch to the most recent
@@ -1686,21 +1984,27 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             await reply(message, i18n.t("common.code_only", lang))
             return
         root = Path(state.cwd)
+        # #136: show the SESSION NAME, never the host path. The real cwd
+        # (./workdirs/<id>) leaked the internal numbering and that the dir lives
+        # above a shared parent — the user only owns "their" workspace. The path is
+        # never surfaced now; only the files they create inside it.
+        ws_name = markup.escape_html(state.name or _default_session_name(state.mode, lang))
         if not root.exists():
-            await reply(message, i18n.t("files.empty", lang, dir=markup.escape_html(str(root))))
+            await reply(message, i18n.t("files.empty", lang, name=ws_name))
             return
         tree = _build_tree(root)
         body = (
-            f"{i18n.t('files.header', lang, dir=markup.escape_html(str(root)))}\n"
+            f"{i18n.t('files.header', lang, name=ws_name)}\n"
             f"<pre>{markup.escape_html(tree)}</pre>"
         )
         if len(body) <= markup.SAFE_LIMIT:
             await reply(message, body)
         else:
             # A big tree won't fit a message (and splitting <pre> breaks tags) —
-            # deliver it as a plain-text document instead.
+            # deliver it as a plain-text document instead. was: f"{root}\n\n{tree}"
+            # (leaked the host path) — header uses the session name now.
             with contextlib.suppress(Exception):
-                doc = markup.as_document(f"{root}\n\n{tree}", "files.txt")
+                doc = markup.as_document(f"{state.name or ''}\n\n{tree}".strip(), "files.txt")
                 await bot.send_document(chat_id=message.chat.id, document=doc)
 
     @router.message(Command("export"))
@@ -1738,10 +2042,21 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         key = await _session_key(message)
         arg = _command_arg(message).lower()
         if arg not in ("on", "off"):
-            isolated = settings.sandbox_code and not state.no_sandbox
-            await reply(message, i18n.t("sandbox.show", lang,
-                                        state=i18n.onoff(isolated, lang),
-                                        glob=i18n.onoff(settings.sandbox_code, lang)))
+            # #138 PART 2: show the RESOLVED sandbox value WITH the scope badge that
+            # supplies it ("on (this session)" / "off (global default)") — resolving
+            # the owner's "Sandbox for this session: on · global SANDBOX_CODE: on"
+            # confusion. Routed through the registry resolver so it stays consistent
+            # with the /settings hub. was (the confusing two-value line):
+            # isolated = settings.sandbox_code and not state.no_sandbox
+            # await reply(message, i18n.t("sandbox.show", lang,
+            #                             state=i18n.onoff(isolated, lang),
+            #                             glob=i18n.onoff(settings.sandbox_code, lang)))
+            uid = message.from_user.id if message.from_user else None
+            sctx = await _build_ss_ctx(key, uid, _role_of(uid, None))
+            value, src = ss.resolve(ss.SETTINGS["sandbox"], sctx)
+            await reply(message, i18n.t("sandbox.show_scoped", lang,
+                                        state=i18n.onoff(bool(value), lang),
+                                        scope=_scope_badge(src, lang)))
             return
         # /sandbox on → isolate (no_sandbox=False); off → raw (no_sandbox=True).
         await db.set_no_sandbox(key, arg == "off")
@@ -3264,6 +3579,92 @@ def _settings_keyboard(
             rows.append([B(text=i18n.t("settings.row_admin", lang), callback_data="st:nav:admin")])
         rows.append([B(text=i18n.t("btn.close", lang), callback_data="st:close")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# --------------------------------------------------------------- #138 PART 2
+# Generic, REGISTRY-DRIVEN /settings UI (settings_schema). Three scope tabs —
+# "This session" / "My defaults" / "Global" — gated by the role matrix: non-owners
+# never see the Global tab nor the owner-only rows (sandbox, global model). Each
+# visible Setting renders as one row showing its RESOLVED value + a badge of WHICH
+# scope supplies it, with an inline control (picker for a fixed choice, on/off
+# toggle for a bool). callback_data stays compact:
+#   sx:hub            — the tabbed hub (defaults to the session tab)
+#   sx:tab:<sc>       — switch scope tab        (sc = s|u|g)
+#   sx:nav:<sc>:<key> — open a choice picker for one setting
+#   sx:tog:<sc>:<key> — toggle a bool setting
+#   sx:set:<sc>:<key>:<val> — apply a value (edit_role RE-CHECKED server-side)
+#   sx:close
+# This SUPERSEDES the bespoke per-setting wiring where it maps cleanly (model /
+# effort / permissions / memory / sandbox / language); the Tools grid and the
+# Users admin remain their own pages, linked from the hub (NOT folded in).
+_SCOPE_CODE = {ss.Scope.SESSION: "s", ss.Scope.USER: "u", ss.Scope.GLOBAL: "g"}
+_CODE_SCOPE = {v: k for k, v in _SCOPE_CODE.items()}
+
+
+def _scope_tab_key(scope) -> str:
+    """i18n key for a scope tab's label."""
+    return {
+        ss.Scope.SESSION: "settings.tab_session",
+        ss.Scope.USER: "settings.tab_user",
+        ss.Scope.GLOBAL: "settings.tab_global",
+    }[scope]
+
+
+def _setting_name(setting, lang: str) -> str:
+    """The bare display name for a registry setting, derived from its ``name_key``
+    row by dropping the trailing value-placeholder + chevron (e.g. "🧠 Model: {val}
+    ▸" → "🧠 Model", "🌐 Language: {name} ▸" → "🌐 Language"). The row keys carry a
+    `{val}`/`{name}` slot for the OLD single-page menu; here we only want the label."""
+    raw = i18n.t(setting.name_key, lang)
+    # Drop a trailing ": {placeholder}" and any trailing " ▸" chevron.
+    raw = re.sub(r":?\s*\{[^}]*\}\s*▸?\s*$", "", raw)
+    return raw.rstrip(" ▸").strip()
+
+
+def _scope_badge(scope, lang: str) -> str:
+    """A short localized badge naming WHICH scope currently supplies a value."""
+    return i18n.t({
+        ss.Scope.SESSION: "settings.badge_session",
+        ss.Scope.USER: "settings.badge_user",
+        ss.Scope.GLOBAL: "settings.badge_global",
+    }[scope], lang)
+
+
+def _setting_value_label(setting, value, lang: str) -> str:
+    """Human label for a resolved value: bool → on/off; model id → friendly alias;
+    None → the localized 'default'/'unlimited'; else the raw value."""
+    if value is None:
+        if setting.key == "max_turns":
+            return i18n.t("maxturns.unlimited", lang)
+        return i18n.t("settings.val_default", lang)
+    if setting.type is bool:
+        return i18n.onoff(bool(value), lang)
+    if setting.key == "model":
+        return MODEL_ID_TO_ALIAS.get(value, value)
+    if setting.key == "permission_mode":
+        return PERM_MODE_TO_NAME.get(value, value)
+    if setting.key == "language":
+        return i18n.lang_name(value)
+    return str(value)
+
+
+def _setting_choice_labels(setting, lang: str) -> list[tuple[str, str]]:
+    """[(callback_value, button_label)] for a fixed-choice setting's picker."""
+    if setting.key == "model":
+        return [(a, a) for a in ("opus", "sonnet", "haiku")]
+    if setting.key == "effort":
+        return [(lv, lv) for lv in EFFORT_LEVELS] + [("default", i18n.t("settings.val_default", lang))]
+    if setting.key == "permission_mode":
+        return [(PERM_MODE_TO_NAME.get(m, m), PERM_MODE_TO_NAME.get(m, m))
+                for m in ("default", "acceptEdits", "plan", "bypassPermissions")]
+    if setting.key == "language":
+        return [(code, i18n.lang_name(code)) for code in i18n.LANGUAGES]
+    if setting.key == "max_turns":
+        # A free integer in /maxturns; the hub offers sensible presets + unlimited.
+        return [("10", "10"), ("25", "25"), ("50", "50"), ("100", "100"),
+                ("default", i18n.t("maxturns.unlimited", lang))]
+    # Fallback: render the raw choices.
+    return [(str(c), str(c)) for c in (setting.choices or ())]
 
 
 _SPARK_CHARS = "▁▂▃▄▅▆▇█"

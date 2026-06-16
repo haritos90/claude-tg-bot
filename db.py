@@ -11,11 +11,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
+import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import aiosqlite
+
+logger = logging.getLogger("db")
 
 # Module-level connection + serialization lock. Set by init_db().
 _conn: aiosqlite.Connection | None = None
@@ -813,7 +817,11 @@ async def allocate_dm_session(
             (str(seq),),
         )
         key = -seq
-        cwd = str(Path(base_workdir) / str(key))
+        # #140: name the workdir by the stable PUBLIC sid, not the raw numeric
+        # key, so the directory matches the id shown in /sessions and the export
+        # filename and never leaks the internal numbering on disk.
+        # was: cwd = str(Path(base_workdir) / str(key))  — replaced for #140
+        cwd = str(Path(base_workdir) / session_sid(key))
         session_mode = "code" if mode == "code" else "chat"
         await conn.execute(
             "INSERT INTO threads (thread_id, chat_id, mode, model, cwd, "
@@ -838,6 +846,45 @@ async def get_dm_current(user_id: int) -> int | None:
 async def set_dm_current(user_id: int, key: int) -> None:
     """Set the user's current DM session key."""
     await set_kv(f"dm_current:{user_id}", str(key))
+
+
+# --------------------------------------------------------------------------- #
+# Per-USER default settings (#138)
+# --------------------------------------------------------------------------- #
+# The USER scope of the unified settings registry (settings_schema.py): a user's
+# personal default for a setting, applied to their FUTURE sessions when the session
+# itself has no explicit (SESSION-scope) value. Stored generically in `kv` under
+# ``user_default:{uid}:{key}`` as a JSON-encoded value, so no schema migration is
+# needed and any new registry key works without a column. Precedence is enforced by
+# settings_schema.resolve(): SESSION → USER → GLOBAL → built-in default.
+def _user_default_key(uid: int, key: str) -> str:
+    return f"user_default:{uid}:{key}"
+
+
+async def get_user_default(uid: int, key: str):
+    """Return this user's personal default for ``key`` (the USER scope), or None if
+    unset. Stored JSON-encoded in `kv`; a garbled value degrades to None (unset)."""
+    raw = await get_kv(_user_default_key(uid, key))
+    if raw is None:
+        return None
+    try:
+        return json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+
+
+async def set_user_default(uid: int, key: str, value) -> None:
+    """Set (value JSON-encoded) or clear (value is None → delete the row) this
+    user's personal default for ``key``. Clearing makes the USER scope fall through
+    to GLOBAL/default in resolve()."""
+    kvkey = _user_default_key(uid, key)
+    if value is None:
+        conn = _require_conn()
+        async with _lock:
+            await conn.execute("DELETE FROM kv WHERE key = ?", (kvkey,))
+            await conn.commit()
+        return
+    await set_kv(kvkey, json.dumps(value))
 
 
 async def get_user_lang(user_id: int) -> str | None:
@@ -881,6 +928,91 @@ async def delete_dm_session(user_id: int, key: int) -> bool:
         await conn.execute("DELETE FROM messages WHERE thread_id = ?", (key,))
         await conn.commit()
     return removed > 0
+
+
+async def migrate_workdirs_to_sid(base_workdir: str) -> int:
+    """One-time, idempotent rename of per-session workdirs from the raw numeric
+    thread_id to the stable PUBLIC sid (#140).
+
+    Historically a session's working directory was ``base_workdir/<thread_id>``
+    (and its sandbox state ``base_workdir/<thread_id>.sbxstate``). #140 names them
+    by ``session_sid(thread_id)`` instead so on-disk names match the id shown in
+    /sessions and never leak the internal numbering. For every thread row we:
+
+      * compute old = base_workdir/<thread_id>, new = base_workdir/<sid>;
+      * if old != new and old exists and new does NOT, os.rename(old, new) and,
+        if present, rename "old.sbxstate" -> "new.sbxstate";
+      * UPDATE the row's cwd column to the new ABSOLUTE path.
+
+    Rows already migrated (cwd basename already == sid) are skipped, so this is
+    safe to run on every startup. Returns the number of rows migrated; never
+    raises for an individual row (logs and continues) so a single bad dir can't
+    block the rest.
+    """
+    conn = _require_conn()
+    base = Path(base_workdir)
+    migrated = 0
+    async with _lock:
+        cur = await conn.execute("SELECT thread_id, cwd FROM threads")
+        rows = await cur.fetchall()
+        await cur.close()
+        for row in rows:
+            thread_id = int(row["thread_id"])
+            sid = session_sid(thread_id)
+            cur_cwd = row["cwd"]
+            # Already on the new scheme (the stored cwd ends in the sid) — skip.
+            if cur_cwd and os.path.basename(os.path.normpath(cur_cwd)) == sid:
+                continue
+            old = base / str(thread_id)
+            new = base / sid
+            if old == new:
+                continue
+            try:
+                # Rename the dir (+ its .sbxstate sidecar) if it still lives at the
+                # OLD numeric name and the sid name is free.
+                if old.exists() and not new.exists():
+                    os.rename(old, new)
+                    old_sbx = Path(f"{old}.sbxstate")
+                    new_sbx = Path(f"{new}.sbxstate")
+                    if old_sbx.exists() and not new_sbx.exists():
+                        os.rename(old_sbx, new_sbx)
+                    logger.info(
+                        "Migrated workdir for thread %s: %s -> %s", thread_id, old, new
+                    )
+                elif old.exists() and new.exists():
+                    # Both present (e.g. a half-finished prior run) — don't clobber
+                    # the new dir; the cwd realignment below settles it.
+                    logger.warning(
+                        "Workdir migration: both %s and %s exist for thread %s; "
+                        "kept new dir, realigned cwd only",
+                        old,
+                        new,
+                        thread_id,
+                    )
+                # In EVERY case the canonical dir is now the sid path, so realign the
+                # stored cwd whenever it still differs. #140-fix: this UPDATE must
+                # also bump `migrated` so the guarded commit below isn't skipped — the
+                # realign-only branches previously updated cwd but left migrated=0, so
+                # `if migrated: commit()` dropped the change and it re-ran forever.
+                # Also covers a crash BETWEEN a prior rename and its commit (old gone,
+                # new exists, cwd still stale) and a never-started session (no dir yet).
+                if cur_cwd != str(new):
+                    await conn.execute(
+                        "UPDATE threads SET cwd = ? WHERE thread_id = ?",
+                        (str(new), thread_id),
+                    )
+                    migrated += 1
+            except OSError as exc:
+                logger.warning(
+                    "Workdir migration failed for thread %s (%s -> %s): %s",
+                    thread_id,
+                    old,
+                    new,
+                    exc,
+                )
+        if migrated:
+            await conn.commit()
+    return migrated
 
 
 async def close_db() -> None:
