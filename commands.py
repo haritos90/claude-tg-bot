@@ -54,62 +54,88 @@ class Cmd:
 
 
 # One row per REAL command. Menu order (in_menu rows, top-to-bottom) is the order
-# here, reconciled from the old _COMMAND_NAMES list. Reconciliation notes:
+# here. #155: rows are FREQUENCY-RANKED to match menu.md §2 (Tier A → F), because
+# Telegram only surfaces the top ~5 on mobile — the everyday trio (/new, /sessions,
+# /settings) sits at the very top, rarer commands scroll below. Notes:
 #   - /stop and /stream handlers are commented out → omitted entirely so they
 #     can't reappear in the menu or /help (was in cmd.stop / cmd.stream + help).
-#   - /new label reconciled: it is born as a CHAT session (#133), wording aligned
-#     across en/ru (was "New chat session" / "Новая сессия (чат)").
-#   - scope "code"/"owner" reproduces the old _CODE_/_OWNER_ arrays; in_menu
-#     reproduces the old _COMMAND_NAMES membership.
+#   - The common Tier-C settings (/model, /effort, /memory, /language) are now
+#     in_menu=True so the "/" menu reflects menu.md §3.1 (a chat user sees Tiers
+#     A–C+E); they ALSO live in the /settings hub (the inline path is canonical).
+#   - scope "code"/"owner" reproduces the old _CODE_/_OWNER_ arrays; the owner
+#     block order follows menu.md §2 Tier F.
 COMMANDS: tuple[Cmd, ...] = (
-    # — most used: create / switch / configure —
+    # — Tier A · everyday (top of the "/" menu) —
     Cmd("new", {"en": "➕ New session (starts as chat)",
                 "ru": "➕ Новая сессия (создаётся как чат)"}, help_group="sessions"),
     Cmd("sessions", {"en": "Browse / switch / delete sessions",
                      "ru": "Обзор / переключение / удаление сессий"}, help_group="sessions"),
     Cmd("settings", {"en": "Open the settings menu",
                      "ru": "Открыть меню настроек"}, help_group="settings"),
-    Cmd("rename", {"en": "Rename the current session",
-                   "ru": "Переименовать текущую сессию"}, help_group="sessions"),
-    # — run control + type switch (#133: /code upgrades, /chat downgrades) —
-    Cmd("status", {"en": "Current session info",
-                   "ru": "Сведения о текущей сессии"}, help_group="sessions"),
+    # — Tier B · common (run control + type switch; #133: /code upgrades, /chat downgrades) —
     Cmd("code", {"en": "🟩 Upgrade this session to code",
                  "ru": "🟩 Повысить сессию до кода"}, scope="code", help_group="code"),
     Cmd("chat", {"en": "💬 Downgrade this session to chat",
                  "ru": "💬 Понизить сессию до чата"}, help_group="code"),
     Cmd("clear", {"en": "Clear the session context",
                   "ru": "Очистить контекст сессии"}, aliases=("reset",), help_group="sessions"),
-    # — session content / files —
-    Cmd("recap", {"en": "Show the last exchange",
-                  "ru": "Показать последний обмен"}, help_group="sessions"),
-    Cmd("history", {"en": "Export this session's transcript",
-                    "ru": "Выгрузить расшифровку этой сессии"}, help_group="sessions"),
-    Cmd("files", {"en": "Browse the working-dir tree (code)",
-                  "ru": "Дерево рабочей папки (код)"}, scope="code", help_group="code"),
-    Cmd("export", {"en": "Export working-dir files as .zip (code)",
-                   "ru": "Экспорт файлов рабочей папки (.zip, код)"}, scope="code", help_group="code"),
-    # — advanced run options —
-    Cmd("fork", {"en": "Branch this session into a new one",
-                 "ru": "Ответвить эту сессию в новую"}, help_group="sessions"),
-    Cmd("maxturns", {"en": "Cap agentic turns (code)",
-                     "ru": "Лимит агентных ходов (код)"}, scope="code", help_group="code"),
+    Cmd("retry", {"en": "Re-run the last prompt",
+                  "ru": "Повторить последний запрос"}, help_group="run"),
+    Cmd("status", {"en": "Current session info",
+                   "ru": "Сведения о текущей сессии"}, help_group="sessions"),
+    # — Tier C · occasional · settings (pickers/toggles; also in the /settings hub) —
+    Cmd("model", {"en": "Switch model: opus | sonnet | haiku",
+                  "ru": "Сменить модель: opus | sonnet | haiku"}, help_group="settings"),
+    Cmd("effort", {"en": "Reasoning depth: low … max",
+                   "ru": "Глубина рассуждений: low … max"}, help_group="settings"),
+    Cmd("memory", {"en": "1M context window (chat): on | off",
+                   "ru": "Окно контекста 1M (чат): on | off"}, help_group="settings"),
+    Cmd("language", {"en": "Choose the interface language",
+                     "ru": "Выбрать язык интерфейса"}, help_group="settings"),
+    # — Tier C · occasional · run + session content —
     Cmd("context", {"en": "Context-window usage",
                     "ru": "Использование окна контекста"}, help_group="run"),
     Cmd("queue", {"en": "Show the pending-prompt queue",
                   "ru": "Показать очередь запросов"}, help_group="run"),
     Cmd("clearqueue", {"en": "Clear the pending queue",
                        "ru": "Очистить очередь"}, help_group="run"),
-    Cmd("retry", {"en": "Re-run the last prompt",
-                  "ru": "Повторить последний запрос"}, help_group="run"),
-    # — meta —
+    Cmd("rename", {"en": "Rename the current session",
+                   "ru": "Переименовать текущую сессию"}, help_group="sessions"),
+    Cmd("recap", {"en": "📋 Recap the session in one line",
+                  "ru": "📋 Краткая сводка сессии в одну строку"}, help_group="sessions"),
+    Cmd("last", {"en": "Show the last exchange (verbatim)",
+                 "ru": "Показать последний обмен (как есть)"}, help_group="sessions"),
+    Cmd("history", {"en": "Export this session's transcript",
+                    "ru": "Выгрузить расшифровку этой сессии"}, help_group="sessions"),
+    Cmd("fork", {"en": "Branch this session into a new one",
+                 "ru": "Ответвить эту сессию в новую"}, help_group="sessions"),
+    # — Tier D · code-only —
+    Cmd("files", {"en": "Browse the working-dir tree (code)",
+                  "ru": "Дерево рабочей папки (код)"}, scope="code", help_group="code"),
+    Cmd("export", {"en": "Export working-dir files as .zip (code)",
+                   "ru": "Экспорт файлов рабочей папки (.zip, код)"}, scope="code", help_group="code"),
+    Cmd("maxturns", {"en": "Cap agentic turns (code)",
+                     "ru": "Лимит агентных ходов (код)"}, scope="code", help_group="code"),
+    Cmd("permissions", {"en": "Code tool policy: ask | auto-edits | plan",
+                        "ru": "Политика инструментов кода: ask | auto-edits | plan"},
+        scope="code", in_menu=False, help_group="code"),
+    Cmd("tools", {"en": "Configure this session's tools",
+                  "ru": "Настроить инструменты сессии"},
+        scope="code", in_menu=False, help_group="code"),
+    # — Tier E · meta —
     Cmd("help", {"en": "Show help", "ru": "Показать справку"}, help_group="meta"),
     Cmd("whoami", {"en": "Show your id and username",
                    "ru": "Показать ваш id и username"}, help_group="meta"),
 
-    # — registered handlers that are NOT in the menu (reachable via /settings,
-    #   or typeable-only). scope="code" keeps the per-user-menu derivation honest
-    #   even though in_menu is False. —
+    # — Tier E · secondary: registered handlers kept OUT of the menu (typeable, or
+    #   reached via the inline menus). scope="code" keeps the per-user-menu
+    #   derivation honest even though in_menu is False. —
+    Cmd("usage", {"en": "Subscription-usage display",
+                  "ru": "Показ использования подписки"},
+        in_menu=False, help_group="settings"),
+    Cmd("cancel", {"en": "Cancel a pending prompt-capture",
+                   "ru": "Отменить ввод аргумента"},
+        in_menu=False, help_group="meta"),
     Cmd("newchat", {"en": "💬 New chat session", "ru": "💬 Новая чат-сессия"},
         in_menu=False, help_group="sessions"),
     Cmd("newcode", {"en": "🟩 New code session", "ru": "🟩 Новая код-сессия"},
@@ -117,54 +143,28 @@ COMMANDS: tuple[Cmd, ...] = (
     Cmd("mode", {"en": "Switch session type (alias of /code, /chat)",
                  "ru": "Сменить тип сессии (синоним /code, /chat)"},
         in_menu=False, help_group="code"),
-    Cmd("model", {"en": "Switch model: opus | sonnet | haiku",
-                  "ru": "Сменить модель: opus | sonnet | haiku"},
-        in_menu=False, help_group="settings"),
-    Cmd("effort", {"en": "Reasoning depth: low … max",
-                   "ru": "Глубина рассуждений: low … max"},
-        in_menu=False, help_group="settings"),
-    Cmd("memory", {"en": "1M context window (chat): on | off",
-                   "ru": "Окно контекста 1M (чат): on | off"},
-        in_menu=False, help_group="settings"),
-    Cmd("permissions", {"en": "Code tool policy: ask | auto-edits | plan",
-                        "ru": "Политика инструментов кода: ask | auto-edits | plan"},
-        scope="code", in_menu=False, help_group="code"),
-    Cmd("tools", {"en": "Configure this session's tools",
-                  "ru": "Настроить инструменты сессии"},
-        scope="code", in_menu=False, help_group="code"),
-    Cmd("usage", {"en": "Subscription-usage display",
-                  "ru": "Показ использования подписки"},
-        in_menu=False, help_group="settings"),
-    Cmd("language", {"en": "Choose the interface language",
-                     "ru": "Выбрать язык интерфейса"},
-        in_menu=False, help_group="settings"),
-    Cmd("cancel", {"en": "Cancel a pending prompt-capture",
-                   "ru": "Отменить ввод аргумента"},
-        in_menu=False, help_group="meta"),
     Cmd("close", {"en": "Close (delete) the current session",
                   "ru": "Закрыть (удалить) текущую сессию"},
         in_menu=False, help_group="sessions"),
 
-    # — owner-only admin (scope="owner"); appended after the shared list in the
-    #   owner's private-chat command scope only. in_menu=False keeps them out of
-    #   the shared menu; they are added explicitly for the owner. —
-    # #140-fix: keep the prior owner-menu order (sandbox LAST, after the user-admin
-    # commands) — the registry order drives owner_slugs(), and moving sandbox up
-    # reshuffled the owner's appended menu block.
-    Cmd("auto", {"en": "Run code tools without asking (owner)",
-                 "ru": "Запускать инструменты кода без вопросов (владелец)"},
+    # — Tier F · owner-only admin (scope="owner"); appended after the shared list
+    #   in the owner's private-chat command scope only (menu.md §1.8). in_menu=False
+    #   keeps them out of the shared menu; they are added explicitly for the owner.
+    #   Order follows menu.md §2 Tier F (users first, sandbox last). —
+    Cmd("users", {"en": "List allowed users (owner)", "ru": "Список пользователей (владелец)"},
         scope="owner", in_menu=False, help_group="owner"),
     Cmd("allow", {"en": "Allow a user (owner)", "ru": "Разрешить пользователя (владелец)"},
         scope="owner", in_menu=False, help_group="owner"),
     Cmd("deny", {"en": "Remove a user (owner)", "ru": "Удалить пользователя (владелец)"},
-        scope="owner", in_menu=False, help_group="owner"),
-    Cmd("users", {"en": "List allowed users (owner)", "ru": "Список пользователей (владелец)"},
         scope="owner", in_menu=False, help_group="owner"),
     Cmd("level", {"en": "Set a user's access level (owner)", "ru": "Уровень доступа (владелец)"},
         scope="owner", in_menu=False, help_group="owner"),
     Cmd("expire", {"en": "Set a user's access expiry (owner)", "ru": "Срок доступа (владелец)"},
         scope="owner", in_menu=False, help_group="owner"),
     Cmd("limit", {"en": "Top up a user's token grant (owner)", "ru": "Пополнить лимит токенов (владелец)"},
+        scope="owner", in_menu=False, help_group="owner"),
+    Cmd("auto", {"en": "Run code tools without asking (owner)",
+                 "ru": "Запускать инструменты кода без вопросов (владелец)"},
         scope="owner", in_menu=False, help_group="owner"),
     Cmd("codesplit", {"en": "Code blocks as separate messages: on | off (owner)",
                       "ru": "Блоки кода отдельными сообщениями: on | off (владелец)"},

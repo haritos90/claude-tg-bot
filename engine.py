@@ -283,9 +283,10 @@ class ClaudeSession:
         # tools regardless of what that user toggles per session.
         self.tool_cap = list(tool_cap) if tool_cap is not None else None
         # Per-user GLOBAL MEMORY (owner-granted opt-out of isolation): when on, this
-        # session loads setting_sources=["user"] (~/.claude settings + the user
-        # CLAUDE.md / memory) instead of []. Relaxes the per-session isolation
-        # invariant for that user only; OFF by default.
+        # session INJECTS the owner's ~/.claude/CLAUDE.md (+ memory) CONTENT into the
+        # system prompt (_global_memory_block), keeping setting_sources=[] so
+        # settings.json (permissions/env) is NEVER loaded (#130). Relaxes the
+        # per-session isolation invariant for that user only; OFF by default.
         self.global_memory = bool(global_memory)
         # Prompt keyword triggers to neutralize: the built-in DEFAULT_KEYWORD_TRIGGERS
         # plus any deployer extras (BLOCKED_PROMPT_KEYWORDS). Compiled once per session.
@@ -388,28 +389,73 @@ class ClaudeSession:
             result = [t for t in result if t in cap]
         return result
 
+    def _global_memory_text(self) -> str:
+        """Read the owner's GLOBAL memory — ``~/.claude/CLAUDE.md`` plus any
+        ``~/.claude/memory/*.md`` — as a single string for DIRECT system-prompt
+        injection (#130). Returns "" when none exists or on any read error. This
+        REPLACES widening ``setting_sources=["user"]`` so ``settings.json``
+        (permissions / env) is never loaded. Read on each build so edits to the
+        owner's memory take effect on the next rebuild."""
+        base = os.path.expanduser("~/.claude")
+        parts: list[str] = []
+        cmd = os.path.join(base, "CLAUDE.md")
+        try:
+            if os.path.isfile(cmd):
+                with open(cmd, encoding="utf-8") as fh:
+                    parts.append(fh.read().strip())
+        except OSError:
+            pass
+        mem_dir = os.path.join(base, "memory")
+        try:
+            if os.path.isdir(mem_dir):
+                for name in sorted(os.listdir(mem_dir)):
+                    if not name.endswith(".md"):
+                        continue
+                    try:
+                        with open(os.path.join(mem_dir, name), encoding="utf-8") as fh:
+                            parts.append(fh.read().strip())
+                    except OSError:
+                        pass
+        except OSError:
+            pass
+        return "\n\n".join(p for p in parts if p)
+
+    def _global_memory_block(self) -> str:
+        """The owner's global memory wrapped as an injectable system-prompt section
+        (#130), or "" when global memory is off / there is nothing to inject."""
+        if not self.global_memory:
+            return ""
+        mem = self._global_memory_text()
+        if not mem:
+            return ""
+        return (
+            "\n\n# Owner global memory (from ~/.claude/CLAUDE.md)\n"
+            "The deployer has shared these personal instructions and notes with this "
+            "session — treat them as standing guidance:\n\n" + mem
+        )
+
     def _build_options(self) -> ClaudeAgentOptions:
         """Construct ClaudeAgentOptions for the current mode/model/cwd."""
         env = self._build_env()
+        mem_block = self._global_memory_block()
 
         common: dict = {
             "model": self.model,
             # Isolation: pass [] (NOT None) so the CLI loads NO user/project/local
             # settings and NO CLAUDE.md. In this SDK version None means "load all
-            # filesystem sources" — the opposite of what we want. When the owner
-            # grants a user GLOBAL MEMORY, load the "user" source instead so the
-            # owner's ~/.claude (CLAUDE.md / memory) is in scope — a deliberate,
-            # per-user relaxation of the isolation invariant.
+            # filesystem sources" — the opposite of what we want.
             #
-            # BLAST RADIUS (#130, audit): "user" also loads ~/.claude/settings.json,
-            # whose permissions.allow rules can AUTO-allow tools the bot keeps out of
-            # allowed_tools (bypassing the can_use_tool gate) and whose env can be
-            # merged into the child (a settings ANTHROPIC_API_KEY would survive the
-            # _build_env pop and flip billing). Owner-gated + off by default, and the
-            # owner's settings.json has none today — but the proper fix (inject
-            # CLAUDE.md directly instead of widening setting_sources) is #130. Until
-            # then, only grant to fully-trusted users; the card warns.
-            "setting_sources": ["user"] if self.global_memory else [],
+            # #130 FIX: GLOBAL MEMORY no longer widens setting_sources to ["user"].
+            # "user" ALSO loaded ~/.claude/settings.json — whose permissions.allow
+            # could AUTO-allow tools the bot keeps out of allowed_tools (bypassing the
+            # can_use_tool gate) and whose env could merge a settings ANTHROPIC_API_KEY
+            # into the child (flipping billing, the #1 hard rule). Instead we keep
+            # setting_sources=[] ALWAYS and INJECT the owner's CLAUDE.md / memory
+            # CONTENT directly into the system prompt (_global_memory_block + the
+            # chat/code branches below) — the memory reaches the model WITHOUT ever
+            # loading settings.json. Also works under the sandbox (the jail's HOME has
+            # no ~/.claude), where setting_sources=["user"] silently read nothing.
+            "setting_sources": [],
             "include_partial_messages": True,  # enable text-delta streaming
             "env": env,
             # #137: capture the child CLI's stderr so a startup/turn failure surfaces
@@ -434,6 +480,13 @@ class ClaudeSession:
                 self._enable_sandbox(common)
             code_tools = self._resolve_tools(CODE_TOOLS)
             code_extra: dict = {}
+            if mem_block:
+                # #130: inject the owner's CLAUDE.md/memory as an ADDITIVE append to
+                # the default Claude Code preset (keeps the full agent prompt intact),
+                # instead of loading it via setting_sources=["user"] (+ settings.json).
+                code_extra["system_prompt"] = {
+                    "type": "preset", "preset": "claude_code", "append": mem_block,
+                }
             if self.big_memory:
                 # #133: big_memory is the unified 1M-context toggle for BOTH modes now
                 # (chat applies it below) — was unconditional for code. NOTE #134: the
@@ -469,7 +522,9 @@ class ClaudeSession:
             # Big-memory topics get the 1M context window in chat too.
             chat_extra["betas"] = ["context-1m-2025-08-07"]
         return ClaudeAgentOptions(
-            system_prompt=CHAT_SYSTEM_PROMPT,
+            # #130: append the owner's CLAUDE.md/memory directly (mem_block is "" when
+            # global memory is off or empty), instead of loading it via setting_sources.
+            system_prompt=CHAT_SYSTEM_PROMPT + mem_block,
             # Chat now runs in the per-session workdir too (#133), so its conversation
             # transcript lives in the SAME project as code mode — that's what lets a
             # session upgrade chat→code (or back) and keep one continuous conversation.

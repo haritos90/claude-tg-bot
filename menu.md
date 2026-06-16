@@ -213,7 +213,8 @@ Conventions legend).
 | `/queue` | Show the pending-prompt queue | Показать очередь запросов | none | 🟢 |
 | `/clearqueue` | Clear the pending queue | Очистить очередь | none | 🟢 |
 | `/rename` | Rename the current session | Переименовать текущую сессию | prompts for a name (capture) | 🟢 |
-| `/recap` | Show the last exchange | Показать последний обмен | none | 🟢 |
+| `/recap` | 📋 Recap the session in one line (AI) | 📋 Краткая сводка сессии в одну строку (ИИ) | none → runs a model turn | 🟢 |
+| `/last` | Show the last exchange (verbatim) | Показать последний обмен (как есть) | none | 🟢 |
 | `/history` | Export this session's transcript | Выгрузить расшифровку этой сессии | none | 🟢 |
 | `/fork` | Branch this session into a new one | Ответвить эту сессию в новую | none | 🟢 |
 
@@ -348,16 +349,24 @@ session opens its action menu. Global actions are grouped in the footer.
 | 💬 New chat | 🟩 New code *(code)* |
 | 🔍 Search | ✖ Close |
 
-**Table 13 — Session action menu keyboard.**
+**Table 13 — Session action menu keyboard** *(code session shown).*
 
 | Session action menu — keyboard | (col 2) |
 |---|---|
 | ✅ Switch | ▮ full width |
-| 🟩 Convert to code *(code)* / 💬 Convert to chat | ▮ full width |
-| 📋 Recap | ℹ️ Status |
+| 📋 Recap *(AI, one line)* | ℹ️ Status |
 | ✏️ Rename | ⭐ Favorite / ☆ Unfavorite |
-| 📄 Transcript | 📦 Export files *(code)* |
+| 📄 Transcript | ▮ full width |
+| 💬 Convert to chat | 📦 Export files *(code)* |
 | 🗑 Delete | ◂ Back |
+
+**Convert / Export pairing.** 🟩/💬 *Convert* no longer takes a full-width high
+row: it sits LOW and pairs with another action. In a **code** session it pairs with
+📦 *Export files* (`💬 Convert to chat | 📦 Export files`); in a **chat** session
+there is no Export, so 🟩 *Convert to code* pairs with 📄 *Transcript*
+(`📄 Transcript | 🟩 Convert to code`) and appears only if the session owner has
+code access. **📋 Recap runs the AI one-line recap** (a model turn); the verbatim
+last prompt+reply is the `/last` command, not a menu button.
 
 **Table 14 — Session action buttons.**
 
@@ -366,7 +375,7 @@ session opens its action menu. Global actions are grouped in the footer.
 | Switch | ✅ Switch | ✅ Переключиться | 🟢 |
 | Convert to code | 🟩 Convert to code | 🟩 Сделать кодом | 🟦 |
 | Convert to chat | 💬 Convert to chat | 💬 Сделать чатом | 🟢 |
-| Recap | 📋 Recap | 📋 Сводка | 🟢 |
+| Recap | 📋 Recap *(AI one-line recap — runs a model turn)* | 📋 Сводка *(сводка от ИИ — запускает ход модели)* | 🟢 |
 | Status | ℹ️ Status | ℹ️ Статус | 🟢 |
 | Rename | ✏️ Rename | ✏️ Переименовать | 🟢 |
 | Favorite | ⭐ Favorite / ☆ Unfavorite | ⭐ В избранное / ☆ Из избранного | 🟢 |
@@ -382,15 +391,16 @@ session opens its action menu. Global actions are grouped in the footer.
 Opened from the settings hub `👥 Users` entry. The list shows one user per row
 (owner first); tapping one opens that user's card. Per §1.8 these are the deepest
 owner-only surface. They are where the owner sets each user's **access exceptions**
-and **resource quotas** (§4).
+(the **🔑 Access** sub-page — per §4) and **resource quotas**.
 
 **Table 15 — User card keyboard.**
 
 | User card — keyboard | (col 2) |
 |---|---|
 | Level: chat → code | ▮ full width |
-| 🧠 Memory: on | ⚡ Max effort: off |
-| 🧰 Tools: all | ⏳ Set expiry… |
+| 🗄 Memory: on | ⚡ Max effort: off |
+| 🧰 Tools: all | 🔑 Access |
+| ⏳ Set expiry… | ▮ full width |
 | 📊 Day limit… | 📅 Week limit… |
 | ♾ Clear limits | 🗑 Remove access |
 | ◂ Users | ✖ Close |
@@ -400,15 +410,29 @@ and **resource quotas** (§4).
 | Button | EN | RU |
 |---|---|---|
 | Level | Level: {level} → {next} | Уровень: {level} → {next} |
-| Memory | 🧠 Memory: {state} | 🧠 Память: {state} |
+| Memory | 🗄 Memory: {state} | 🗄 Память: {state} |
 | Max effort | ⚡ Max effort: {state} | ⚡ Max effort: {state} |
 | Tools | 🧰 Tools: {value} | 🧰 Инструменты: {value} |
+| Access | 🔑 Access | 🔑 Доступ |
 | Expiry | ⏳ Set expiry… | ⏳ Срок доступа… |
 | Day / Week limit | 📊 Day limit… · 📅 Week limit… | 📊 Лимит/день… · 📅 Лимит/неделя… |
 | Clear limits | ♾ Clear limits | ♾ Снять лимиты |
 | Remove | 🗑 Remove access → 🗑 Yes, remove | 🗑 Убрать доступ → 🗑 Да, убрать |
 | Add | ➕ Add user | ➕ Добавить |
 | Back | ◂ Users | ◂ Пользователи |
+
+**🔑 Access sub-page (per-user exceptions).** Tapping **🔑 Access** opens one row per
+option showing that user's effective access — their **exception** if set, else
+*base: <the global base>*. Tapping an option offers **Base (inherit) · Delegated ·
+Read-only · Hidden**. This is how *"give it to only some users"* is expressed:
+**leave the base Hidden, then delegate per user here.**
+
+> **Worked example — delegate 🗄 Big memory to specific users.** Big memory's base
+> access is **Hidden** (Table 23), so by default no one but the owner sees it. To
+> grant it to a chosen user: **👥 Users → tap the user → 🔑 Access → 🗄 Big memory →
+> Delegated**. That user now sees and toggles big memory; everyone else still has it
+> hidden. (If you previously changed its **Global** base to Read-only, set it back to
+> **Hidden** on 🌍 Global → 🗄 Big memory → 🔑 Base access first.)
 
 ### 3.5 Choice pickers
 

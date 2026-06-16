@@ -149,23 +149,23 @@ These are SDK/Telegram traps that already bit us. Re-check them before editing
 
 ### Agent SDK (claude-agent-sdk 0.2.101) — all SDK code is in `engine.py`
 
-- **Isolation is `setting_sources=[]`, NOT `None`.** In this SDK, `None` means
-  "load ALL filesystem settings" (user + project, including any `CLAUDE.md`) — the
-  *opposite* of isolation. Pass `[]` (empty list) to load nothing. **One sanctioned
-  exception:** per-user GLOBAL MEMORY — when the owner grants a user `global_memory`
-  (the per-user card / `allowlist.global_memory_of`), that user's sessions load
-  `["user"]` (the owner's `~/.claude` settings + `CLAUDE.md`/memory) instead of `[]`.
-  It is owner-gated and OFF by default; `sessions._resolve_global_memory` resolves it
-  for the session OWNER (`created_by`), and the engine flips `setting_sources`
-  accordingly. Granting it to a NON-owner exposes the owner's `~/.claude` to that
-  user — deliberate, and the per-user card warns about it. **Blast-radius caveat
-  (#130, audit):** `["user"]` ALSO loads `~/.claude/settings.json`, whose
-  `permissions.allow` rules can auto-allow tools the bot keeps out of `allowed_tools`
-  (bypassing the `can_use_tool` gate) and whose `env` can be merged into the child (a
-  settings `ANTHROPIC_API_KEY` would survive the `_build_env` pop and flip billing).
-  So: trusted users only, keep secrets/allow-rules out of `~/.claude/settings.json`,
-  and the proper fix (inject `CLAUDE.md` directly instead of widening
-  `setting_sources`) is tracked as **#130**.
+- **Isolation is `setting_sources=[]`, NOT `None`, ALWAYS.** In this SDK, `None`
+  means "load ALL filesystem settings" (user + project, including any `CLAUDE.md`) —
+  the *opposite* of isolation. Pass `[]` (empty list) to load nothing. **#130 fix:**
+  `setting_sources` is now **`[]` unconditionally** — GLOBAL MEMORY no longer widens
+  it to `["user"]`. The old widening also loaded `~/.claude/settings.json`, whose
+  `permissions.allow` could auto-allow tools the bot keeps out of `allowed_tools`
+  (bypassing the `can_use_tool` gate) and whose `env` could merge a settings
+  `ANTHROPIC_API_KEY` into the child (flip billing). Instead, per-user GLOBAL MEMORY
+  (owner-granted via the per-user card / `allowlist.global_memory_of`, resolved for
+  the session OWNER by `sessions._resolve_global_memory`, OFF by default) **injects
+  the owner's `~/.claude/CLAUDE.md` + `~/.claude/memory/*.md` CONTENT directly** into
+  the system prompt — `engine._global_memory_block` (chat: appended to
+  `CHAT_SYSTEM_PROMPT`; code: the `claude_code` preset's `append`). So the memory
+  reaches the model **without ever loading `settings.json`**, and it works under the
+  sandbox too (where the jail HOME has no `~/.claude`, so `["user"]` read nothing).
+  Granting it to a NON-owner still exposes the owner's CLAUDE.md content to that user
+  — deliberate, owner-gated, and the per-user card warns.
 - **Permission gating hinges on `tools` vs `allowed_tools`.** `allowed_tools` is
   the **auto-allow** list — those tools execute *without ever calling*
   `can_use_tool`. So dangerous tools must live in `tools` (the callable universe)
@@ -360,9 +360,46 @@ These are SDK/Telegram traps that already bit us. Re-check them before editing
   table is keyed by `thread_id` only (no user column), so the per-user total is
   `db.get_user_usage_tokens(uid)` = `SUM(input+output) JOIN threads WHERE
   threads.chat_id = :uid` (DM `chat_id == user_id`). The token-quota gate and the
-  chat-vs-code **level** gate both run pre-turn in `handlers._access_block` (called
-  from `on_text` / `_submit`); both exempt the owner. The per-user `level`,
-  `expires_at`, and `token_grant` live in the `allowlist.py` v2 record map.
+  chat-vs-code **level** gate both run pre-turn in `handlers._access_block` (now
+  `_access_block(uid, uname, lang, key)` — takes the identity directly so callback
+  handlers like the AI-recap button gate too); both exempt the owner. The per-user
+  `level`, `expires_at`, and `token_grant` live in the `allowlist.py` v2 record map.
+
+### Settings hub + access model (`settings_schema.py` / `handlers.py`)
+
+- **One settings hub: the registry-driven `sx:` hub.** `/settings` opens the
+  scope-tabbed hub (📍 session / 👤 my defaults / 🌍 global), and Tools / Usage /
+  Users are `sx:` sub-pages that return to it. The OLD flat `st:` hub is RETIRED —
+  `on_settings_cb` is a thin shim that bounces stale `st:` buttons to the hub; the
+  old `_settings_keyboard` / `_settings_text` / `_settings_apply` / `_gather_vals`
+  builders are dead-in-place (kept for revert, #141). Don't wire new menus to `st:`.
+- **Settings slash commands are thin entry points (#145/#146).** `/model` `/effort`
+  `/permissions` `/maxturns` `/language` open the SAME hub picker via
+  `_send_setting_picker`; `/memory` `/sandbox` `/auto` toggle in place. There is one
+  code path per setting — don't reintroduce a parallel `pm:`/`pe:`/`lang:` picker.
+- **Access model is DERIVED, not stored (#151, menu.md §4).** Each option has an
+  owner-set BASE access — `Access.HIDDEN` / `READONLY` / `DELEGATED`
+  (`settings_schema.BASE_ACCESS_DEFAULTS` per Table 23; owner overrides in
+  `db.get/set_access_override`, per-user exceptions in
+  `allowlist.access_of`/`set_access_exception`). A setting is VISIBLE iff
+  `role >= view_role` AND access != HIDDEN; EDITABLE iff `role >= edit_role` AND
+  access == DELEGATED (`ss.can_view_setting` / `can_edit_setting`); the owner is
+  always DELEGATED. Value resolution honours access — `ss.resolve_effective` only
+  counts a user's session/user value when DELEGATED, else GLOBAL (soft revoke).
+  These resolvers are SYNC: `_build_ss_ctx` preloads `access_base` + the user's
+  `access_exceptions` into the `Ctx`. **Derived at CONSUMPTION too (#161/151c):**
+  `sessions._effective_settings(state)` resolves the effective model / effort /
+  permission_mode / max_turns / big_memory for the session OWNER via
+  `resolve_effective` and `_build_session`/`_get_session` build the SDK client from
+  those — so soft-revoke binds at run time, not just in the hub (a stale override for
+  a now-Read-only/Hidden option falls back to global). It also enforces the capability
+  gates (151d): ungranted `max` effort downgrades to `xhigh`, non-owner
+  `full-access` (bypassPermissions) reverts to `default`. **Still separate:** the
+  chat-vs-code `level` gate (allowlist) and per-tool `tool_cap` are NOT yet folded
+  into the `Access` matrix (tracked under #161/151d).
+- **Code-only rows are gated by SESSION MODE, not user level (menu.md §1.7).**
+  `ss.CODE_ONLY` (permission_mode / max_turns / sandbox) + `_ss_code_blocked` hide
+  those rows on the session tab of a *chat* session even for a code-level user.
 
 ### Sandbox (#104 — optional, OFF by default, STILL IN PROGRESS)
 

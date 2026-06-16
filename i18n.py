@@ -146,98 +146,56 @@ CATALOG: dict[str, dict[str, str]] = {
     },
 
     # -- /help, /start ------------------------------------------------------ #
-    "help.text": {
+    # #148: /help is GENERATED from the command registry (commands.COMMANDS, grouped
+    # by help_group) so it can't drift from the menu. i18n carries only the intro
+    # blurb, the per-group headers, and the footer; the command lines come from the
+    # registry labels. (The old hand-written help.text command list is retired.)
+    "help.intro": {
         "en": (
             "<b>Your personal Claude &amp; Claude Code in Telegram</b>\n"
             "\n"
             "The bot keeps <b>named sessions</b> you switch between — each fully "
-            "isolated (histories never cross). A session is either <b>💬 chat</b> "
-            "(a plain conversation) or <b>🟩 code</b> (a Claude Code agent with "
-            "tools and its own working directory). The type is fixed when you "
-            "create the session.\n"
+            "isolated (histories never cross). A session is born a <b>💬 chat</b> and "
+            "can be promoted to <b>🟩 code</b> (a Claude Code agent with tools and a "
+            "working directory) with /code, and back with /chat — the conversation "
+            "carries across.\n"
             "\n"
-            "Just send a message to talk in the current session; messages sent "
-            "while a reply runs are queued and run next in the SAME session "
-            "(context + prompt cache preserved). Send a <b>photo</b>, <b>PDF</b>, "
-            "or <b>text/code file</b> and the caption becomes the prompt.\n"
-            "\n"
-            "<b>Sessions:</b>\n"
-            "/newchat &lt;name&gt; — start a 💬 chat session · /newcode &lt;name&gt; — "
-            "start a 🟩 code session (type is fixed for the session's life)\n"
-            "/sessions — browse / search / switch; tap 🗑 to delete one\n"
-            "/rename &lt;name&gt; — rename the current session\n"
-            "/reset — clear the current session (the running reply has a Stop button)\n"
-            "/status — current session info · /context — context-window usage\n"
-            "\n"
-            "<b>Settings:</b>\n"
-            "/settings — tap-to-change menu (model, permissions, memory, usage, …)\n"
-            "/language — choose the bot's interface language\n"
-            "/model &lt;opus|sonnet|haiku&gt; — model for this session\n"
-            "/memory &lt;on|off&gt; — 1M context window for a chat session\n"
-            "/usage &lt;off|footer|pinned|both&gt; — how subscription usage is shown\n"
-            "\n"
-            "<b>Code mode:</b>\n"
-            "/auto &lt;on|off&gt; — run tools without asking (owner) · /permissions — policy\n"
-            "/files — browse the session's working-directory tree (read-only)\n"
-            "\n"
-            "<b>Run control:</b>\n"
-            "/queue · /clearqueue — the pending-prompt queue · /retry — re-run last prompt\n"
-            "\n"
-            "<b>Owner:</b> /allow, /deny, /users — manage access · /whoami — your id\n"
-            "\n"
-            "With <code>/auto on</code> code-mode tools run without asking; "
-            "otherwise dangerous tools (Bash, Write, Edit) ask for an inline "
-            "Allow/Deny tap."
+            "Just send a message to talk in the current session; messages sent while a "
+            "reply runs are queued and run next in the SAME session. Send a <b>photo</b>, "
+            "<b>PDF</b>, or <b>text/code file</b> and the caption becomes the prompt."
         ),
         "ru": (
             "<b>Ваш личный Claude и Claude Code в Telegram</b>\n"
             "\n"
-            "Бот хранит <b>именованные сессии</b>, между которыми вы "
-            "переключаетесь — каждая полностью изолирована (истории не "
-            "пересекаются). Сессия бывает либо <b>💬 чат</b> (обычный разговор), "
-            "либо <b>🟩 код</b> (агент Claude Code с инструментами и собственной "
-            "рабочей папкой). Тип задаётся при создании сессии и не меняется.\n"
+            "Бот хранит <b>именованные сессии</b>, между которыми вы переключаетесь — "
+            "каждая полностью изолирована (истории не пересекаются). Сессия создаётся "
+            "как <b>💬 чат</b> и может быть повышена до <b>🟩 кода</b> (агент Claude Code "
+            "с инструментами и рабочей папкой) командой /code и обратно командой /chat — "
+            "разговор переносится.\n"
             "\n"
-            "Просто отправьте сообщение, чтобы говорить в текущей сессии; "
-            "сообщения, отправленные пока идёт ответ, ставятся в очередь и "
-            "выполняются следующими в ТОЙ ЖЕ сессии (контекст и кэш промпта "
-            "сохраняются). Отправьте <b>фото</b>, <b>PDF</b> или "
-            "<b>текстовый/кодовый файл</b> — подпись станет запросом.\n"
-            "\n"
-            "<b>Сессии:</b>\n"
-            "/newchat &lt;имя&gt; — создать 💬 чат-сессию · /newcode &lt;имя&gt; — "
-            "создать 🟩 код-сессию (тип фиксируется на всё время сессии)\n"
-            "/sessions — обзор / поиск / переключение; 🗑 чтобы удалить\n"
-            "/rename &lt;имя&gt; — переименовать текущую сессию\n"
-            "/reset — очистить текущую сессию (у идущего ответа есть кнопка Стоп)\n"
-            "/status — сведения о сессии · /context — использование окна контекста\n"
-            "\n"
-            "<b>Настройки:</b>\n"
-            "/settings — меню изменений в одно касание (модель, права, память, "
-            "использование, …)\n"
-            "/language — выбрать язык интерфейса бота\n"
-            "/model &lt;opus|sonnet|haiku&gt; — модель для этой сессии\n"
-            "/memory &lt;on|off&gt; — окно контекста 1M для чат-сессии\n"
-            "/usage &lt;off|footer|pinned|both&gt; — как показывать использование "
-            "подписки\n"
-            "\n"
-            "<b>Режим кода:</b>\n"
-            "/auto &lt;on|off&gt; — запускать инструменты без вопросов (владелец) · "
-            "/permissions — политика\n"
-            "/files — дерево рабочей папки сессии (только чтение)\n"
-            "\n"
-            "<b>Управление запуском:</b>\n"
-            "/queue · /clearqueue — очередь ожидающих запросов · /retry — "
-            "повторить последний запрос\n"
-            "\n"
-            "<b>Владелец:</b> /allow, /deny, /users — управление доступом · "
-            "/whoami — ваш id\n"
-            "\n"
-            "При <code>/auto on</code> инструменты режима кода запускаются без "
-            "вопросов; иначе опасные инструменты (Bash, Write, Edit) спрашивают "
-            "подтверждение через кнопки Разрешить/Запретить."
+            "Просто отправьте сообщение в текущую сессию; сообщения во время ответа "
+            "ставятся в очередь и выполняются следующими в ТОЙ ЖЕ сессии. Отправьте "
+            "<b>фото</b>, <b>PDF</b> или <b>текстовый/кодовый файл</b> — подпись станет запросом."
         ),
     },
+    "help.footer": {
+        "en": (
+            "Open <b>/settings</b> to change model, effort, permissions and more. In "
+            "code mode, dangerous tools (Bash, Write, Edit) ask for an inline "
+            "Allow/Deny tap unless full-access is on."
+        ),
+        "ru": (
+            "Откройте <b>/settings</b>, чтобы менять модель, усилие, права и другое. В "
+            "режиме кода опасные инструменты (Bash, Write, Edit) спрашивают "
+            "подтверждение, если не включён полный доступ."
+        ),
+    },
+    "help.group_sessions": {"en": "<b>Sessions</b>", "ru": "<b>Сессии</b>"},
+    "help.group_settings": {"en": "<b>Settings</b>", "ru": "<b>Настройки</b>"},
+    "help.group_run": {"en": "<b>Run control</b>", "ru": "<b>Управление запуском</b>"},
+    "help.group_code": {"en": "<b>Code mode</b>", "ru": "<b>Режим кода</b>"},
+    "help.group_meta": {"en": "<b>Meta</b>", "ru": "<b>Прочее</b>"},
+    "help.group_owner": {"en": "<b>Owner</b>", "ru": "<b>Владелец</b>"},
 
     # -- /language ---------------------------------------------------------- #
     "lang.title": {
@@ -291,13 +249,42 @@ CATALOG: dict[str, dict[str, str]] = {
     "settings.saved": {"en": "✓ Saved", "ru": "✓ Сохранено"},
     "settings.row_perm": {"en": "🔐 Permissions: {val} ▸", "ru": "🔐 Права: {val} ▸"},
     "settings.row_usage": {"en": "📊 Usage: {val} ▸", "ru": "📊 Использование: {val} ▸"},
+    # #147: bare name for the usage-display picker title (sx: hub sub-page).
+    "settings.usage_name": {"en": "📊 Usage display", "ru": "📊 Использование"},
+    # #141: header for the per-session Tools grid ported onto the sx: hub.
+    "settings.tools_title": {
+        "en": "🧰 <b>Tools</b>\nToggle the tools this session may use.",
+        "ru": "🧰 <b>Инструменты</b>\nВключите инструменты, доступные этой сессии.",
+    },
+    # #151 access model (menu.md §4): owner option-admin page + access levels.
+    "settings.access_delegated": {"en": "Delegated", "ru": "Делегировано"},
+    "settings.access_readonly": {"en": "Read-only", "ru": "Только чтение"},
+    "settings.access_hidden": {"en": "Hidden", "ru": "Скрыто"},
+    "settings.opt_value": {"en": "📝 Global value: {val} ▸", "ru": "📝 Глобальное значение: {val} ▸"},
+    "settings.opt_access": {"en": "🔑 Base access: {val} ▸", "ru": "🔑 Базовый доступ: {val} ▸"},
+    "settings.opt_title": {
+        "en": "⚙️ <b>{name}</b>\nSet the global value and who may see/change it.",
+        "ru": "⚙️ <b>{name}</b>\nЗадайте глобальное значение и кто может видеть/менять его.",
+    },
+    "settings.acc_title": {
+        "en": "🔑 <b>{name} — access</b>\nDelegated: users change it · Read-only: they "
+              "see it · Hidden: they don't. Per-user exceptions live on the user card.",
+        "ru": "🔑 <b>{name} — доступ</b>\nДелегировано: пользователи меняют · Только "
+              "чтение: видят · Скрыто: нет. Исключения по пользователю — в карточке.",
+    },
+    "settings.ro_toast": {
+        "en": "Read-only — the owner hasn't delegated this setting to you.",
+        "ru": "Только чтение — владелец не делегировал вам эту настройку.",
+    },
     "settings.row_streaming": {"en": "Streaming: {val}", "ru": "Стриминг: {val}"},
-    "settings.row_memory": {"en": "Big memory: {val}", "ru": "Большая память: {val}"},
+    # #154: 🗄 is the canonical memory/context emoji (🧠 is reserved for MODEL).
+    "settings.row_memory": {"en": "🗄 Big memory: {val}", "ru": "🗄 Большая память: {val}"},
     # #140-fix: dedicated max_turns label (was reusing settings.row_model, which
     # rendered TWO "🧠 Model" rows in the registry-driven /settings hub).
     "settings.row_maxturns": {"en": "🔁 Max turns: {val} ▸", "ru": "🔁 Лимит ходов: {val} ▸"},
     # #138: sandbox is OWNER-ONLY and hidden from non-owners in /settings.
-    "settings.row_sandbox": {"en": "📦 Sandbox: {val} ▸", "ru": "📦 Песочница: {val} ▸"},
+    # #154: 🧪 is the canonical sandbox emoji (📦 is reserved for file export).
+    "settings.row_sandbox": {"en": "🧪 Sandbox: {val} ▸", "ru": "🧪 Песочница: {val} ▸"},
     # #138 PART 2: the registry-driven, scope-tabbed /settings hub.
     "settings.tab_session": {"en": "📍 This session", "ru": "📍 Эта сессия"},
     "settings.tab_user": {"en": "👤 My defaults", "ru": "👤 Мои умолчания"},
@@ -333,12 +320,13 @@ CATALOG: dict[str, dict[str, str]] = {
               "Отправьте сообщение, чтобы начать · /rename — переименовать · "
               "/sessions — переключиться.",
     },
-    "session.new_pick": {
-        "en": "Create a new session — pick the type (it's fixed for the "
-              "session's life):\n{tagline_chat}\n{tagline_code}",
-        "ru": "Создать новую сессию — выберите тип (он фиксируется на всё время "
-              "сессии):\n{tagline_chat}\n{tagline_code}",
-    },
+    # #143: session.new_pick is DEAD — the /new chat/code chooser was removed in
+    # #133 (every session is born a chat and is promotable via /code), and its
+    # on_new_cb handler is commented out. Row removed (restore alongside the chooser).
+    # "session.new_pick": {
+    #     "en": "Create a new session — pick the type ...:\n{tagline_chat}\n{tagline_code}",
+    #     "ru": "Создать новую сессию — выберите тип ...:\n{tagline_chat}\n{tagline_code}",
+    # },
     "session.renamed": {
         "en": "Session renamed to <b>{name}</b>.",
         "ru": "Сессия переименована в <b>{name}</b>.",
@@ -1023,9 +1011,24 @@ CATALOG: dict[str, dict[str, str]] = {
     },
     "usercard.not_found": {"en": "User not found.", "ru": "Пользователь не найден."},
     "usercard.btn_level": {"en": "Level: {level} → {next}", "ru": "Уровень: {level} → {next}"},
-    "usercard.btn_memory": {"en": "🧠 Memory: {state}", "ru": "🧠 Память: {state}"},
+    # #154: 🗄 for memory/context (🧠 is reserved for MODEL across all surfaces).
+    "usercard.btn_memory": {"en": "🗄 Memory: {state}", "ru": "🗄 Память: {state}"},
     "usercard.btn_maxeffort": {"en": "⚡ Max effort: {state}", "ru": "⚡ Max effort: {state}"},
     "usercard.btn_tools": {"en": "🧰 Tools: {val}", "ru": "🧰 Инструменты: {val}"},
+    # #151: per-user access EXCEPTIONS (menu.md §3.4/§4).
+    "usercard.btn_access": {"en": "🔑 Access", "ru": "🔑 Доступ"},
+    "usercard.access_header": {
+        "en": "🔑 <b>Access for</b> <code>{who}</code>\nPer-option access for this user "
+              "— an EXCEPTION overrides the global base. Tap an option to change it.",
+        "ru": "🔑 <b>Доступ для</b> <code>{who}</code>\nДоступ к опциям для этого "
+              "пользователя — ИСКЛЮЧЕНИЕ переопределяет базу. Нажмите опцию, чтобы изменить.",
+    },
+    "usercard.access_base": {"en": "base: {val}", "ru": "база: {val}"},
+    "usercard.access_base_opt": {"en": "Base (inherit)", "ru": "База (наследовать)"},
+    "usercard.access_opt_title": {
+        "en": "🔑 <b>{name}</b>\nAccess for this user (Base = follow the global base).",
+        "ru": "🔑 <b>{name}</b>\nДоступ для пользователя (База = по глобальной базе).",
+    },
     "usercard.btn_expiry": {"en": "⏳ Set expiry…", "ru": "⏳ Срок доступа…"},
     "usercard.btn_day": {"en": "📊 Day limit…", "ru": "📊 Лимит/день…"},
     "usercard.btn_week": {"en": "📅 Week limit…", "ru": "📅 Лимит/неделя…"},
@@ -1130,23 +1133,29 @@ CATALOG: dict[str, dict[str, str]] = {
     "context.usage": {"en": "Usage: <code>{pct}%</code>", "ru": "Заполнено: <code>{pct}%</code>"},
 
     # -- /recap, /history --------------------------------------------------- #
+    # Model-facing instruction for the AI /recap (one-line session recap). Localized
+    # so the recap comes back in the user's UI language (the model mirrors it).
+    "recap.prompt": {
+        "en": "Recap our conversation so far in one short sentence.",
+        "ru": "Кратко изложи нашу беседу одним коротким предложением.",
+    },
     "recap.empty": {
         "en": "No conversation logged yet in this session.",
         "ru": "В этой сессии ещё нет записанного разговора.",
     },
     "recap.empty_has_context": {
         "en": "No transcript is saved for this session yet — earlier turns predate "
-              "transcript logging, so /recap and /history can't replay them, but the "
+              "transcript logging, so /last and /history can't replay them, but the "
               "model may still recall them from its own context. New messages are saved "
               "from now on.",
         "ru": "Для этой сессии ещё нет сохранённой расшифровки — ранние сообщения были "
-              "до ведения журнала, поэтому /recap и /history не могут их показать, но "
+              "до ведения журнала, поэтому /last и /history не могут их показать, но "
               "модель всё ещё может помнить их из своего контекста. Новые сообщения "
               "сохраняются с этого момента.",
     },
     "recap.header": {
-        "en": "<b>Recap — last exchange</b>",
-        "ru": "<b>Сводка — последний обмен</b>",
+        "en": "<b>Last exchange</b>",
+        "ru": "<b>Последний обмен</b>",
     },
     "recap.you": {"en": "<b>You:</b>", "ru": "<b>Вы:</b>"},
     "recap.claude": {"en": "<b>Claude:</b>", "ru": "<b>Claude:</b>"},
