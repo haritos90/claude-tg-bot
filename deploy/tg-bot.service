@@ -1,59 +1,79 @@
-# systemd unit for the Claude Telegram Bot.
+# systemd unit for the Claude Telegram Bot — reliable 24/7 with auto-restart.
 #
-# Install:
+# Install (run as root; adjust paths/User to your install — the values below match
+# the reference deployment at /root/claude/claude-tg-bot running as root):
 #   sudo cp deploy/tg-bot.service /etc/systemd/system/claude-tg-bot.service
 #   sudo systemctl daemon-reload
+#   pkill -f 'python bot\.py$'              # stop any manual copy (avoid a 409)
 #   sudo systemctl enable --now claude-tg-bot
 #   journalctl -u claude-tg-bot -f
 #
-# IMPORTANT: run as the SAME user that ran `claude setup-token`, so the service
-# can read the Claude subscription credentials from that user's home directory.
-# Edit User, WorkingDirectory, and the ExecStart path to match your install.
+# IMPORTANT: run as the SAME user that ran `claude setup-token`, so the service can
+# read the subscription credentials from that user's ~/.claude. Never set
+# ANTHROPIC_API_KEY here — this bot runs on the Pro/Max subscription.
 #
-# NOTE: every path below (User, WorkingDirectory, ExecStart, ReadWritePaths,
-# the home `.claude` dir) is an EXAMPLE — edit them all to match your install.
+# RESILIENCE (why this survives a Telegram outage like the one on 2026-06-16):
+#   * Restart=always + RestartSec=5      → respawns on ANY exit/crash, and on boot.
+#   * StartLimitIntervalSec=0            → never gives up restarting (a long outage
+#                                          just keeps retrying until the path is back).
+#   * Type=notify + WatchdogSec=180      → the in-app watchdog (watchdog.py) pings
+#                                          systemd ONLY after a successful Telegram
+#                                          probe; if the bot can't reach Telegram for
+#                                          ~3 min (connection dropped / poll wedged),
+#                                          the pings stop and systemd force-restarts it.
+# Optional belt-and-suspenders: a daily restart timer — see
+# deploy/claude-tg-bot-restart.{service,timer}.
 
 [Unit]
 Description=Claude Telegram Bot (private Telegram frontend to Claude / Claude Code)
 After=network-online.target
 Wants=network-online.target
+# Never stop auto-restarting, even after many rapid failures (survive long outages).
+StartLimitIntervalSec=0
 
 [Service]
-Type=simple
-User=claude
-WorkingDirectory=/opt/claude-tg-bot
-ExecStart=/opt/claude-tg-bot/.venv/bin/python /opt/claude-tg-bot/bot.py
+Type=notify
+NotifyAccess=main
+# Force a restart if the bot stops being able to reach Telegram for this long. The
+# app sends sd_notify(WATCHDOG=1) on each successful probe (watchdog.py); WatchdogSec
+# must be >= ~2x the probe cadence so a couple of misses fit the window.
+WatchdogSec=180
+# Generous start timeout — the bot sends READY=1 immediately (before any network
+# I/O), so this is only a backstop; a flaky link at startup must not cause a
+# start-timeout restart loop.
+TimeoutStartSec=300
+TimeoutStopSec=60
 
-# Reads .env from WorkingDirectory via python-dotenv.
-# Do NOT set ANTHROPIC_API_KEY here — this bot runs on the subscription.
+User=root
+WorkingDirectory=/root/claude/claude-tg-bot
+ExecStart=/root/claude/claude-tg-bot/.venv/bin/python /root/claude/claude-tg-bot/bot.py
+
+# .env is read from WorkingDirectory by python-dotenv. systemd does NOT inherit a
+# login PATH/HOME — set them so the (bundled) claude CLI + its ~/.claude creds are
+# found. HOME must be the user that ran `claude setup-token`.
 Environment=PYTHONUNBUFFERED=1
-# REQUIRED: systemd does not inherit your login PATH/HOME, so without these the
-# spawned `claude` CLI is not found (it lives in ~/.local/bin) and its
-# subscription credentials (~/.claude) are not located — runs then fail. Set HOME
-# to the service user's home and put ~/.local/bin on PATH. Match the user below.
-Environment=HOME=/home/claude
-Environment=PATH=/home/claude/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=HOME=/root
+Environment=PATH=/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 Restart=always
 RestartSec=5
+# Raise if big code-mode runs get OOM-killed.
+MemoryMax=2G
 
-# Hardening / sandboxing (loosen if it interferes with the claude CLI
-# credential store).
-NoNewPrivileges=true
-ProtectSystem=strict
-# CRITICAL: ProtectHome=read-only + ReadWritePaths must keep the user's
-# ~/.claude dir writable, or the claude CLI cannot read/refresh the
-# subscription credentials and the login silently breaks. ReadWritePaths must
-# ALSO include WorkingDirectory (for bot.db + the per-topic workdirs).
-# Replace /home/claude/.claude and /opt/claude-tg-bot with YOUR paths.
-ProtectHome=read-only
-ReadWritePaths=/opt/claude-tg-bot /home/claude/.claude
-PrivateTmp=true
-ProtectKernelTunables=true
-ProtectControlGroups=true
-RestrictSUIDSGID=true
-# Cap RSS at 1G. Raise this if big code-mode runs get OOM-killed.
-MemoryMax=1G
+# --- optional hardening (defense-in-depth) --------------------------------- #
+# Enable incrementally and VERIFY a CODE-mode session still works afterwards — the
+# bubblewrap sandbox (SANDBOX_CODE) needs user namespaces. On this host `bwrap` is
+# NOT setuid and unprivileged userns is enabled, so NoNewPrivileges is safe; keep
+# ~/.claude writable for the subscription creds, and the workdir writable for bot.db
+# + per-session workdirs. Uncomment after testing.
+# NoNewPrivileges=true
+# ProtectSystem=strict
+# ProtectHome=read-only
+# ReadWritePaths=/root/claude/claude-tg-bot /root/.claude
+# PrivateTmp=true
+# ProtectKernelTunables=true
+# ProtectControlGroups=true
+# RestrictSUIDSGID=true
 
 [Install]
 WantedBy=multi-user.target

@@ -1,28 +1,26 @@
 # Bot Menu, Commands & Settings — Reference
 
-Reference documentation for the Telegram bot's menus, commands, and the
-settings/access-control model. It describes the canonical structure every menu
-follows so that all surfaces stay consistent. Audience: the deployer/owner and
-contributors. This is a living reference (a likely basis for a future wiki), not
-a task list — open work is tracked in `TODO.md`.
+Specification of the bot's menus, commands, and settings/access-control model —
+the canonical structure every surface conforms to. Audience: deployer/owner and
+contributors. Open work: `TODO.md`.
 
-Conventions used below:
+**Conventions.**
 
-- **EN / RU** — every command and menu item carries both its English and Russian
-  label (the bot is bilingual; EN is canonical, RU is the translation).
-- **Access** — 🟢 *chat+* (any allowlisted user + owner) · 🟦 *code* (code-level
-  users + owner) · 👑 *owner* (owner only). A non-allowlisted user cannot reach
-  the bot at all, so the floor is *chat+*.
-- Keyboard mock-ups are shown as tables: **one table row = one row of buttons**;
-  a label spanning the whole width is written in the first cell and marked
-  `▮ full width`.
+- **EN / RU** — every command and item carries both labels; EN is canonical, RU
+  is the translation.
+- **Access** — 🟢 *chat+* (any allowlisted user + owner) · 🟦 *code* (code-level +
+  owner) · 👑 *owner*. Non-allowlisted users cannot reach the bot; the floor is
+  *chat+*.
+- **Keyboard tables** — one table row = one row of buttons; a full-width label
+  sits in the first cell, marked `▮ full width`.
+- **Tables are numbered** (`Table N`, sequential) for cross-reference.
 
 ---
 
 ## 1. Menu design guidelines
 
-These rules apply to **every** menu. New menus must follow them; existing ones
-are aligned to them over time.
+These rules apply to **every** menu. New menus follow them; existing ones are
+aligned over time.
 
 ### 1.1 Button labels
 
@@ -40,7 +38,9 @@ are aligned to them over time.
 
 ### 1.2 Layout by menu type
 
-The number of buttons per row depends on label length and menu purpose:
+Buttons per row depends on label length and menu purpose.
+
+**Table 1 — Buttons per row, by menu type.**
 
 | Menu type | Buttons per row | Why |
 |---|---|---|
@@ -59,7 +59,9 @@ only 2–3 text buttons per row stay readable**. Put the primary action first
 
 ### 1.3 Emoji vocabulary
 
-One concept = one emoji, used identically on every surface. The canonical set:
+One concept = one emoji, used identically on every surface.
+
+**Table 2 — Emoji vocabulary (canonical set).**
 
 | Emoji | Concept | | Emoji | Concept |
 |---|---|---|---|---|
@@ -171,11 +173,13 @@ positioned consistently at the bottom.
 
 ## 2. Commands — ranked by frequency
 
-Commands are listed most-used first; this is also the order they are registered in
-Telegram's `/` menu (§1.6). Each command shows its EN and RU menu label, how it is
-invoked, its argument behaviour (§1.5), and access (§0 legend).
+Most-used first — also the registration order in Telegram's `/` menu (§1.6). Each
+row gives the EN/RU label, invocation, argument behaviour (§1.5), and access (the
+Conventions legend).
 
 ### Tier A — Everyday (top of the "/" menu)
+
+**Table 3 — Tier A · everyday commands.**
 
 | Command | EN label | RU label | Args | Access |
 |---|---|---|---|---|
@@ -184,6 +188,8 @@ invoked, its argument behaviour (§1.5), and access (§0 legend).
 | `/settings` | Open the settings menu | Открыть меню настроек | none → opens hub | 🟢 |
 
 ### Tier B — Common
+
+**Table 4 — Tier B · common commands.**
 
 | Command | EN label | RU label | Args | Access |
 |---|---|---|---|---|
@@ -194,6 +200,8 @@ invoked, its argument behaviour (§1.5), and access (§0 legend).
 | `/status` | Current session info | Сведения о текущей сессии | none | 🟢 |
 
 ### Tier C — Occasional (mostly reached via the settings hub or session menu)
+
+**Table 5 — Tier C · occasional commands.**
 
 | Command | EN label | RU label | Args | Access |
 |---|---|---|---|---|
@@ -211,6 +219,8 @@ invoked, its argument behaviour (§1.5), and access (§0 legend).
 
 ### Tier D — Code-only (🟦)
 
+**Table 6 — Tier D · code-only commands.**
+
 | Command | EN label | RU label | Args | Access |
 |---|---|---|---|---|
 | `/files` | Browse the working-dir tree (code) | Дерево рабочей папки (код) | none | 🟦 |
@@ -220,6 +230,8 @@ invoked, its argument behaviour (§1.5), and access (§0 legend).
 | `/tools` | Configure this session's tools | Настроить инструменты сессии | none → grid | 🟦 |
 
 ### Tier E — Meta & secondary
+
+**Table 7 — Tier E · meta & secondary commands.**
 
 | Command | EN label | RU label | Args | Access |
 |---|---|---|---|---|
@@ -233,6 +245,8 @@ invoked, its argument behaviour (§1.5), and access (§0 legend).
 
 ### Tier F — Owner (👑, appended to the owner's menu only)
 
+**Table 8 — Tier F · owner commands.**
+
 | Command | EN label | RU label | Args | Access |
 |---|---|---|---|---|
 | `/users` | List allowed users (owner) | Список пользователей (владелец) | none → cards | 👑 |
@@ -242,6 +256,7 @@ invoked, its argument behaviour (§1.5), and access (§0 legend).
 | `/expire` | Set a user's access expiry (owner) | Срок доступа (владелец) | prompts (capture) | 👑 |
 | `/limit` | Top up a user's token grant (owner) | Пополнить лимит токенов (владелец) | prompts (capture) | 👑 |
 | `/auto` | Run code tools without asking (owner) | Запускать инструменты кода без вопросов (владелец) | none → toggle | 👑 |
+| `/codesplit` | Code blocks as separate messages: on/off (owner) | Блоки кода отдельными сообщениями: on/off (владелец) | none → toggle | 👑 |
 | `/sandbox` | Toggle this code session's sandbox (owner) | Песочница код-сессии вкл/выкл (владелец) | none → toggle | 👑 |
 
 > **Not commands:** a plain message is a prompt to the current session; a photo,
@@ -261,6 +276,8 @@ Rendered by Telegram from the registered command list, filtered by role and show
 in frequency order. A chat-level user sees Tiers A–C + E (minus code-only); a
 code-level user adds Tier D; the owner adds Tier F at the end.
 
+**Table 9 — The "/" command menu (top entries).**
+
 | `/` menu (phone, top entries) |
 |---|
 | `/new` — ➕ New session (starts as chat) |
@@ -276,6 +293,8 @@ One hub with **scope tabs** at the top; one full-width row per setting (§1.2).
 Owner-only rows and the `🌍 Global` tab are appended at the end (§1.8). Code-only
 rows appear only in a code session (§1.7).
 
+**Table 10 — Settings hub keyboard.**
+
 | Settings hub — keyboard | (col 2) |
 |---|---|
 | 📍 This session | 👤 My defaults · 🌍 Global (👑) |
@@ -283,13 +302,15 @@ rows appear only in a code session (§1.7).
 | ⚡ Effort: high ▸ | ▮ full width |
 | 🔐 Permissions: ask ▸ *(code)* | ▮ full width |
 | 🔁 Max turns: unlimited ▸ *(code)* | ▮ full width |
-| 🗄 Big memory: off | ▮ full width |
+| 🗄 Big memory: off *(granted)* | ▮ full width |
 | 🧪 Sandbox: on ▸ *(owner)* | ▮ full width |
 | 🌐 Language: English ▸ | ▮ full width |
 | 🧰 Tools ▸ *(code)* | ▮ full width |
 | 📊 Usage display ▸ *(owner)* | ▮ full width |
 | 👥 Users ▸ *(owner)* | ▮ full width |
 | ✖ Close | ▮ full width |
+
+**Table 11 — Settings hub rows.**
 
 | Tab / row | EN | RU | Access |
 |---|---|---|---|
@@ -298,7 +319,7 @@ rows appear only in a code session (§1.7).
 | Effort | ⚡ Effort: {value} ▸ | ⚡ Усилие: {value} ▸ | 🟢 (`max` gated) |
 | Permissions | 🔐 Permissions: {value} ▸ | 🔐 Права: {value} ▸ | 🟦 |
 | Max turns | 🔁 Max turns: {value} ▸ | 🔁 Лимит ходов: {value} ▸ | 🟦 |
-| Big memory | 🗄 Big memory: {on/off} | 🗄 Большая память: {вкл/выкл} | 🟢 |
+| Big memory | 🗄 Big memory: {on/off} | 🗄 Большая память: {вкл/выкл} | 🟢 (granted) |
 | Sandbox | 🧪 Sandbox: {value} ▸ | 🧪 Песочница: {value} ▸ | 👑 |
 | Language | 🌐 Language: {name} ▸ | 🌐 Язык: {name} ▸ | 🟢 |
 | Tools | 🧰 Tools ▸ | 🧰 Инструменты ▸ | 🟦 |
@@ -316,6 +337,8 @@ names where the effective value comes from (§4).
 A list — **one session per row** (§1.2), favorites first and marked. Tapping a
 session opens its action menu. Global actions are grouped in the footer.
 
+**Table 12 — Sessions browser keyboard.**
+
 | Sessions browser — keyboard | (col 2) |
 |---|---|
 | ⭐ 💬 My chat session | ▮ full width |
@@ -325,6 +348,8 @@ session opens its action menu. Global actions are grouped in the footer.
 | 💬 New chat | 🟩 New code *(code)* |
 | 🔍 Search | ✖ Close |
 
+**Table 13 — Session action menu keyboard.**
+
 | Session action menu — keyboard | (col 2) |
 |---|---|
 | ✅ Switch | ▮ full width |
@@ -333,6 +358,8 @@ session opens its action menu. Global actions are grouped in the footer.
 | ✏️ Rename | ⭐ Favorite / ☆ Unfavorite |
 | 📄 Transcript | 📦 Export files *(code)* |
 | 🗑 Delete | ◂ Back |
+
+**Table 14 — Session action buttons.**
 
 | Button | EN | RU | Access |
 |---|---|---|---|
@@ -357,6 +384,8 @@ Opened from the settings hub `👥 Users` entry. The list shows one user per row
 owner-only surface. They are where the owner sets each user's **access exceptions**
 and **resource quotas** (§4).
 
+**Table 15 — User card keyboard.**
+
 | User card — keyboard | (col 2) |
 |---|---|
 | Level: chat → code | ▮ full width |
@@ -365,6 +394,8 @@ and **resource quotas** (§4).
 | 📊 Day limit… | 📅 Week limit… |
 | ♾ Clear limits | 🗑 Remove access |
 | ◂ Users | ✖ Close |
+
+**Table 16 — User card buttons.**
 
 | Button | EN | RU |
 |---|---|---|
@@ -385,11 +416,15 @@ Pickers present a fixed set of short choices, **3 per row** (§1.2), ✓ on the
 current value, `◂ Back` to the parent. Used by `/model`, `/effort`, `/language`,
 `/permissions`, `/usage`, `/maxturns`, and the equivalent settings-hub rows.
 
+**Table 17 — Effort picker keyboard (example).**
+
 | Effort picker — keyboard | | |
 |---|---|---|
 | low | medium | high |
 | xhigh | ✓ max | default |
 | ◂ Back | | |
+
+**Table 18 — Choice pickers.**
 
 | Picker | Choices | Access |
 |---|---|---|
@@ -404,6 +439,8 @@ current value, `◂ Back` to the parent. Used by `/model`, `/effort`, `/language
 
 Short-lived keyboards attached to a specific message.
 
+**Table 19 — Ephemeral menus.**
+
 | Surface | Buttons (EN / RU) | Access |
 |---|---|---|
 | Queue | ✖ Cancel {i} / ✖ Отменить {i} · 🗑 Clear all / 🗑 Очистить всё | 🟢 |
@@ -414,12 +451,11 @@ Short-lived keyboards attached to a specific message.
 
 ## 4. Settings & access-control model
 
-This is the single mechanism by which the **owner** governs what each user may see
-and change — for every option uniformly (model, effort, permissions, tools,
-memory, language, …) and for gated capabilities (use code mode, use `max` effort,
-use `full-access`, use a given tool). Instead of bespoke per-command logic, each
-option is **one row** in a master matrix, and effective values are **computed**,
-not stored.
+One mechanism by which the **owner** governs what each user may see and change,
+uniformly for every option (model, effort, permissions, tools, memory, language,
+…) and for gated capabilities (code mode, `max` effort, `full-access`, a given
+tool). Each option is **one row** in a master matrix (Table 23); effective values
+are **computed per prompt**, not stored.
 
 ### 4.1 Concept
 
@@ -434,7 +470,9 @@ Each option is fully described by three things the owner controls:
 
 Above these sit fixed rules, identical for all options.
 
-### 4.2 Table 1 — Access levels (the master dictionary)
+### 4.2 Access levels
+
+**Table 20 — Access levels (the master dictionary).**
 
 | Level | User sees it | User can change it | Value for the user | Owner's global edits affect the user |
 |---|---|---|---|---|
@@ -445,7 +483,9 @@ Above these sit fixed rules, identical for all options.
 This is the ladder: *grant it → let them use it · otherwise read-only · otherwise
 they never see it.*
 
-### 4.3 Table 2 — Where a value comes from (resolution order)
+### 4.3 Value resolution order
+
+**Table 21 — Where a value comes from (resolution order).**
 
 | Priority | Layer | Set by | Counts when |
 |---|---|---|---|
@@ -457,7 +497,9 @@ There is **no "owner sets a value for a specific user" layer** — if an option 
 delegated, the user owns its value. The owner controls the *rules*, not the
 values.
 
-### 4.4 Table 3 — What the owner can and cannot do
+### 4.4 Owner capabilities
+
+**Table 22 — What the owner can and cannot do.**
 
 | Owner action | Allowed? |
 |---|---|
@@ -475,10 +517,12 @@ values or an individual session. "Taking it back" = lowering the access level �
 the effective value immediately falls back to global for all of that user's
 sessions.
 
-### 4.5 Table 4 — Master settings matrix
+### 4.5 Master settings matrix
 
 One row per option. *Applies to* marks code-only options (§1.7). *Base access* and
 *Exceptions* are the owner's controls; *Global* is the current default.
+
+**Table 23 — Master settings matrix.**
 
 | Option | Type / values | Global | Applies to | Base access | Exceptions / gates |
 |---|---|---|---|---|---|
@@ -486,11 +530,12 @@ One row per option. *Applies to* marks code-only options (§1.7). *Base access* 
 | `effort` | enum: low, medium, high, xhigh, max, default | high | all | Delegated | `max`: delegated only to granted users |
 | `permission_mode` | enum: ask, auto-edits, plan, full-access | ask | code | Delegated | `full-access`: owner only |
 | `max_turns` | int 1–1000, or unlimited | unlimited | code | Delegated | — |
-| `big_memory` | bool | off | all | Delegated | — |
-| `streaming` | bool | on | all | Read-only | (native streaming is always on) |
+| `big_memory` | bool | off | all | Hidden | Delegated: granted users |
+| `streaming` | bool | on | all | Hidden | native streaming always-on (no user toggle) |
 | `sandbox` | bool | on | code | Hidden | owner: Delegated |
 | `language` | enum: supported locales | en | all (UI) | Delegated | — |
 | `usage_display` | enum: off, footer, pinned, both | footer | account-wide | Read-only | owner: Delegated |
+| `code_split` | bool | on | all (rendering) | Read-only | owner: Delegated — toggle `/codesplit` (send each code block as its own message for easy mobile copy) |
 | `tools` | multi-select (chat: web tools; code: full toolset) | all on | all (universe varies by type) | Delegated | per-user tool allow-list |
 
 Reading the columns:

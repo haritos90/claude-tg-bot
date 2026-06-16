@@ -770,6 +770,28 @@ CATALOG: dict[str, dict[str, str]] = {
         "ru": "показывать и строку, и закреплённое сообщение",
     },
 
+    # -- /codesplit (owner: each code block as its own message) ------------- #
+    "codesplit.owner_only": {
+        "en": "Only the owner can change message formatting.",
+        "ru": "Менять форматирование сообщений может только владелец.",
+    },
+    "codesplit.show": {
+        "en": "🧩 Each code block as its own message: <b>{state}</b>.\n"
+              "<b>on</b> — every fenced code block is sent as a separate message, so "
+              "long-press → Copy grabs the whole snippet (handy on mobile, which has "
+              "no per-block copy button). <b>off</b> — code stays inline in the reply.\n"
+              "Tap to change:",
+        "ru": "🧩 Каждый блок кода — отдельным сообщением: <b>{state}</b>.\n"
+              "<b>вкл</b> — каждый блок кода отправляется отдельным сообщением, поэтому "
+              "долгое нажатие → Копировать берёт весь фрагмент (удобно на телефоне, где "
+              "нет кнопки копирования у блока). <b>выкл</b> — код остаётся внутри ответа.\n"
+              "Нажмите, чтобы изменить:",
+    },
+    "codesplit.set": {
+        "en": "🧩 Each code block as its own message: <b>{state}</b>.",
+        "ru": "🧩 Каждый блок кода — отдельным сообщением: <b>{state}</b>.",
+    },
+
     # -- /stop -------------------------------------------------------------- #
     "stop.error": {
         "en": "Error while stopping: {err}",

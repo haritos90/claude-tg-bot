@@ -107,6 +107,9 @@ class SessionManager:
         self.rate_by_type: dict[str, object] = {}
         # Usage display: one of "off", "footer", "pinned", "both".
         self.usage_mode: str = "footer"
+        # Global rendering toggle (/codesplit, owner): send each fenced code block
+        # as its own message (default — easy mobile copy) vs inline. Persisted.
+        self.split_code_messages: bool = True
         # Reveal pacing for the dormant write-head (groups). Fixed at "normal":
         # the caret + its /settings speed page were retired (#59, #60), so this is
         # no longer user-configurable. DM streaming is native drafts (Telegram-
@@ -383,6 +386,7 @@ class SessionManager:
                     frame_interval=interval,
                     base_step=step,
                     use_drafts=use_drafts,
+                    split_code_messages=self.split_code_messages,
                 )
                 rec.streamer = streamer
                 try:
@@ -909,6 +913,13 @@ class SessionManager:
             else:
                 self.usage_mode = "footer"
 
+        # Code-block message-splitting toggle (/codesplit). Default ON; only an
+        # explicit "0"/"off" disables it.
+        with contextlib.suppress(Exception):
+            raw = await db.get_kv("split_code_messages")
+            if raw is not None:
+                self.split_code_messages = str(raw).lower() not in ("0", "off", "false", "")
+
         # Main chat id.
         with contextlib.suppress(Exception):
             raw = await db.get_kv("main_chat_id")
@@ -947,6 +958,13 @@ class SessionManager:
         await db.set_kv("usage_mode", mode)
         if mode in {"pinned", "both"}:
             await self.update_pinned()
+
+    async def set_split_code_messages(self, on: bool) -> None:
+        """Set + persist whether each fenced code block is sent as its own message
+        (the /codesplit toggle). Takes effect on the next reply (read at Streamer
+        build time), so no restart is needed."""
+        self.split_code_messages = bool(on)
+        await db.set_kv("split_code_messages", "1" if on else "0")
 
     def usage_footer(self, lang: str = "en") -> str:
         """Footer line appended to a finished reply when footer display is on."""
