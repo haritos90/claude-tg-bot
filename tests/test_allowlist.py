@@ -140,3 +140,39 @@ def test_normalize_date():
     assert al.normalize_date("never") is None
     assert al.normalize_date("garbage") is None
     assert al.normalize_date("2026-07-01T12:00:00") == "2026-07-01"
+
+
+# --- per-user ACCESS exceptions (#151, menu.md §4) ------------------------- #
+
+def test_access_exception_set_get_clear(tmp_path):
+    """An owner can set/clear a per-user, per-option access exception; the owner
+    themselves always has none (full access)."""
+    p = tmp_path / "a.json"
+    a = al.Allowlist(p, OWNER)
+    a.add("123", level="code")
+    assert a.access_of(123, None) == {}                       # none by default
+    assert a.set_access_exception("123", "memory", "delegated") is True
+    assert a.access_of(123, None) == {"memory": "delegated"}
+    # a second option, and an invalid level is ignored.
+    a.set_access_exception("123", "model", "readonly")
+    a.set_access_exception("123", "effort", "bogus")
+    got = a.access_of(123, None)
+    assert got == {"memory": "delegated", "model": "readonly"}
+    # clearing one removes just it; survives a reload from disk.
+    assert a.set_access_exception("123", "memory", None) is True
+    a2 = al.Allowlist(p, OWNER)
+    assert a2.access_of(123, None) == {"model": "readonly"}
+    # owner has no exceptions; setting on a missing target fails.
+    assert a.access_of(OWNER, None) == {}
+    assert a.set_access_exception("404", "model", "hidden") is False
+
+
+def test_access_exception_persisted_in_describe(tmp_path):
+    """describe() surfaces the access map (feeds the per-user card)."""
+    p = tmp_path / "a.json"
+    a = al.Allowlist(p, OWNER)
+    a.add("55", level="chat")
+    a.set_access_exception("55", "sandbox", "delegated")
+    d = a.describe("55")
+    assert d is not None and d["access"] == {"sandbox": "delegated"}
+    assert a.describe(str(OWNER))["access"] == {}

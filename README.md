@@ -39,13 +39,21 @@ Anthropic API key, no per-token billing.**
   the bot; each allowed user has a **level** (chat or code), an optional
   **expiry**, and optional rolling **token limits** (day/week). The list lives in a
   gitignored `allowlist.json`.
-- **Full owner control from Telegram** — `/settings` is the hub for everything, no
-  server access needed. Open **👥 Users** and tap a person to set their **access**
-  (chat vs **code**), **expiry**, rolling **token limits** (day/week), **global
-  memory**, **max-effort**, and **which tools** they may use — plus their **usage
-  stats** — all from one card. Each session's tools are also configurable per-session
-  (`/tools` or `/settings → Tools`): WebSearch/WebFetch for chat, the full agent
-  toolset for code.
+- **Full owner control from Telegram** — `/settings` is one **scope-tabbed hub**
+  (📍 This session · 👤 My defaults · 🌍 Global) for everything, no server access
+  needed. Open **👥 Users** and tap a person to set their **access** (chat vs
+  **code**), **expiry**, rolling **token limits** (day/week), **global memory**,
+  **max-effort**, **which tools** they may use, and **per-option access exceptions**
+  — plus their **usage stats** — all from one card. Each session's tools are also
+  configurable per-session (`/tools` or `/settings → Tools`): WebSearch/WebFetch for
+  chat, the full agent toolset for code.
+- **Owner-configurable access model** — every setting (model, effort, permissions,
+  memory, sandbox, language, …) has an owner-set **base access**: *Delegated* (the
+  user sees and changes it), *Read-only* (sees it, can't change), or *Hidden* (never
+  sees it; rides the global default). Set the base on the **🌍 Global** tab and make
+  **per-user exceptions** on the user card. Effective values are **derived per
+  prompt** (session → personal default → global), so a change applies on the next
+  message with nothing to migrate.
 - **Approvals & auto mode** — in code mode Bash/Write/Edit pause for an inline
   **Allow / Deny** tap; `/auto on` (owner) runs everything without asking.
   `/permissions` switches ask / auto-edits / plan / full-access.
@@ -246,14 +254,20 @@ The full set lives in the tap-to-open Telegram menu (descriptions localized;
 code-only commands are hidden from chat-level users, owner commands from everyone
 else). Plain text goes straight to the current session's Claude.
 
+Commands are registered **most-used first** (Telegram surfaces the top few on
+mobile); `/new`, `/sessions`, `/settings` sit at the very top. Fixed-choice commands
+open an inline **picker**; commands needing free text prompt for your next message
+(with `/cancel`). The `/help` text is generated from this same registry, so it never
+drifts.
+
 | Group | Commands |
 |---|---|
-| **Sessions** | `/new` `/code` (upgrade) `/chat` (downgrade) `/sessions` `/rename` |
-| **Run** | `/status` `/stop` `/retry` `/reset` |
-| **Tuning** | `/model` `/effort` `/fork` `/memory` · *(code)* `/permissions` `/files` `/export` `/maxturns` |
-| **Info** | `/recap` `/history` `/usage` `/context` `/queue` `/clearqueue` |
-| **Meta** | `/settings` `/language` `/help` `/whoami` |
-| **Owner** | `/auto` `/allow` `/deny` `/users` `/level` `/expire` `/limit` `/sandbox` |
+| **Sessions** | `/new` `/code` (upgrade) `/chat` (downgrade) `/sessions` `/rename` `/fork` `/clear` (alias `/reset`) |
+| **Run** | `/status` `/retry` `/context` `/queue` `/clearqueue` |
+| **Tuning** | `/model` `/effort` `/memory` `/language` · *(code)* `/permissions` `/files` `/export` `/maxturns` `/tools` |
+| **Recap & export** | `/recap` (AI one-line recap) `/last` (verbatim last exchange) `/history` (transcript) |
+| **Meta** | `/settings` `/usage` `/help` `/whoami` |
+| **Owner** | `/users` `/allow` `/deny` `/level` `/expire` `/limit` `/auto` `/codesplit` `/sandbox` |
 
 ---
 
@@ -298,7 +312,7 @@ Report vulnerabilities privately — see [`SECURITY.md`](SECURITY.md).
 Everything happens on **your server** — there is no external database.
 
 - **What's stored, and where.** Per-session state, **conversation transcripts**
-  (used by `/recap` and `/history`), and token usage live in the SQLite DB
+  (used by `/last` and `/history`), and token usage live in the SQLite DB
   (`bot.db`). Code sessions also keep their files under `BASE_WORKDIR/<session>`,
   and Claude's own resume state under the bot user's `~/.claude/projects`. All of
   it sits on the host's disk.

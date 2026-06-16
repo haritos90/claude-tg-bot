@@ -41,7 +41,7 @@ header rows. Columns:
 - **Closed** — `| ID | Theme | Title | Resolution |`
 - **Deferred** — `| ID | Pri | Eff | Theme | Title | Reason |`
 
-**Next free ID:** 160
+**Next free ID:** 162
 
 ---
 
@@ -60,25 +60,8 @@ Not started; promote to Open when picked up.
 | ID | Pri | Eff | Theme | Title |
 |---|---|---|---|---|
 | 119 | P1 | XL | security | Fully-contained sandbox (e2e): credential broker + egress allowlist + per-session isolation + DoS limits |
-| 130 | P2 | M | security | Global memory: inject CLAUDE.md directly instead of `setting_sources=["user"]` (don't load settings.json permissions/env) |
 | 134 | P2 | S | observability | `big_memory` 1M-context beta is IGNORED under the subscription (custom betas are API-key-only) — verify + document/rework |
 | 135 | P2 | M | observability | Subscription usage shows just "5h OK" far from the limit — surface the real % used (Claude Code `/usage` shows e.g. 49%) via the account usage source the SDK rate-events don't expose |
-| 141 | P1 | M | ux | Unify the two parallel `/settings` menus — retire the old flat `st:` hub, keep only the registry-driven scope-tabbed `sx:` hub (see menu.md §2.3) |
-| 142 | P1 | S | ux | "Back" from settings sub-pages (Tools/Users/Usage) drops into the DEPRECATED old menu (`st:nav:main`/`admin`) instead of the new hub — the "another menu pops up" bug |
-| 143 | P3 | XS | ux | Orphaned `/new` chat/code chooser: `on_new_cb` (`new:` callback) + `session.new_pick` i18n string are dead code |
-| 144 | P2 | S | ux | A "Streaming" toggle resurfaces in the new `/settings` hub though `/stream` is retired (native streaming always-on) |
-| 145 | P2 | M | ux | Inconsistent quick-command UX (#101): some setting commands open a picker, others only print text + require a typed arg |
-| 146 | P2 | S | ux | Duplicate entry points / code paths per setting (language ×3, model & effort ×2) — consolidate on the hub picker |
-| 147 | P2 | XS | ux | `/usage` display has no inline entry from the new hub (only the old Admin submenu or the typed command) |
-| 148 | P2 | M | docs | `/help` text drifted from the command registry — generate it from `commands.COMMANDS` (group by `help_group`) |
-| 149 | P3 | XS | docs | Session-creation model inconsistent across surfaces — `/new` vs `/newchat`/`/newcode` wording in `/help` + labels/docstrings |
-| 150 | P3 | S | ux | Three names for one action: `/auto` = `/permissions full-access` = SDK `bypassPermissions` — make naming consistent |
-| 151 | P1 | XL | features | Owner-configurable access model for every option/capability: per-setting global value + base access (Hidden/Read-only/Delegated) + per-user exceptions; effective values DERIVED per prompt, not stored (menu.md §4) |
-| 152 | P2 | M | ux | Menu lifecycle/dismissal standard — menus must not linger in chat (edit-in-place / delete-on-close / move-to-bottom after posting content); audit all menus (menu.md §1.4) |
-| 153 | P2 | S | ux | Argument-capture standard — no optional args; mandatory free-text args captured via the next message (+ /cancel), fixed-choice always a picker; audit all commands (menu.md §1.5) |
-| 154 | P3 | S | ux | Unified emoji vocabulary — one emoji per concept across all surfaces; resolve collisions (🧠 model vs memory, 📦 sandbox vs export); align commands.py + i18n.py (menu.md §1.3) |
-| 155 | P2 | S | ux | Frequency-ranked `/` command menu — register commands most-used first (Telegram surfaces only the top ~5 on mobile); keep the prominent set to ~3 (menu.md §1.6 / §2) |
-| 156 | P2 | M | ux | Admin menu mirrors the user menu — owner sees the same menus with owner-only controls appended at the END of each menu, not a separate admin UI (menu.md §1.8) |
 
 ### Details
 
@@ -238,24 +221,6 @@ allowlist (CONNECT proxy + cgroup-nftables hard block) · 119d per-session
 user-supplied service creds (`/secret`) · 119e DoS hardening (cgroup mem/CPU +
 seccomp).
 
-**#130 — global memory: inject CLAUDE.md directly, not via `setting_sources=["user"]`** (P2 · M · security)
-
-The #121 audit found that per-user GLOBAL MEMORY (#122) loads the `"user"` source,
-which pulls in `~/.claude/settings.json` — not just CLAUDE.md/memory. That settings
-file can carry `permissions.allow` rules (auto-allow tools the bot deliberately keeps
-OUT of `allowed_tools`, bypassing the `can_use_tool` gate) and an `env` block (a
-settings `ANTHROPIC_API_KEY` survives `engine._build_env`'s pop and can flip a user's
-turns to paid billing — the #1 hard rule). Owner-gated + OFF by default + the owner's
-settings.json has none today, so no active leak — but the blast radius exceeds the
-"reads your ~/.claude" framing.
-
-Fix: stop widening `setting_sources`. When `global_memory` is on, READ the owner's
-memory files (`~/.claude/CLAUDE.md` + the memory dir) and inject their content
-directly — chat: append to the system prompt; code: via an additive system-prompt
-preset — keeping `setting_sources=[]` so settings.json (permissions/env) is never
-loaded. Verify the memory actually reaches the model in both modes. Until then:
-trusted users only; the card + AGENTS/engine document the caveat.
-
 **#134 — big_memory 1M beta ignored under subscription** (P2 · S · observability)
 
 The CLI logs "Custom betas are only available for API key users. Ignoring provided
@@ -266,174 +231,6 @@ whether 1M is reachable another way under subscription; otherwise relabel big_me
 as "durable context" only (drop the 1M claim in `/status`, help, AGENTS, README) so it
 isn't misleading.
 
-**#141 — unify the two parallel `/settings` menus** (P1 · M · ux)
-
-`/settings` opens the registry-driven scope-tabbed hub (`sx:`, `_send_ss_hub` /
-`on_settings_v2_cb`, `settings_schema.py`), but the OLD flat hub (`st:`,
-`_settings_keyboard` / `on_settings_cb`) was never retired. Its `main`/`model`/
-`effort`/`perm`/`lang` pages are dead code (no entry point) yet still fully built;
-its `tools`/`users`/`admin`/`usage` pages are STILL live (the new hub links to
-`st:nav:tools` / `st:nav:users`). One parameter → two differently-styled menus.
-Fix: keep only the `sx:` hub; port Tools / Usage / Users onto it as sub-pages with
-Back → the hub (see #142); delete the dead `_settings_keyboard` pages + their i18n
-(`settings.header`, `settings.perm_seg`, `_settings_text`). See `menu.md` §2.3 /
-§4.1–4.2.
-
-**#142 — Back from settings sub-pages drops into the DEPRECATED old menu** (P1 · S · ux)
-
-The literal "another menu pops up". New hub → «🧰 Tools» (`st:nav:tools`) → «Назад»
-= `st:nav:main` → the OLD flat settings page. Same via «👥 Users»
-(`st:nav:users`) → «◂ Settings» = `st:nav:admin` → old Admin → Back = `st:nav:main`.
-Fix the back targets in `_settings_keyboard` (tools/users/admin/usage) +
-`_users_keyboard` to re-open `_send_ss_hub` instead of `st:nav:main` / `st:nav:admin`.
-Quick win even before the full unification (#141).
-
-**#143 — orphaned `/new` chat/code chooser** (P3 · XS · ux)
-
-`on_new_cb` (callback `new:`) + the i18n string `session.new_pick` are dead: since
-#133 `/new` always creates a chat (no chooser), and the `/sessions` browser emits
-`ses:new:chat` / `ses:new:code` (handled by `on_sessions_cb`), not `new:`. Nothing
-emits `new:`. Remove `on_new_cb` + `session.new_pick` (comment-out per convention),
-or rewire if a chooser is actually wanted.
-
-**#144 — Streaming toggle resurfaces in the new hub** (P2 · S · ux)
-
-`stream_enabled` is in `settings_schema.SETTINGS` + `PAGE_ORDER` with
-`view_role=CHAT`, so the new `/settings` hub renders a «Streaming: on/off» toggle —
-even though `/stream` was retired (native streaming always-on) and the old menu's
-streaming row was deliberately commented out (`_settings_keyboard`). Decide: drop
-`stream_enabled` from the registry/PAGE_ORDER (recommended), or truly re-enable
-`/stream`. menu.md ❓DECISION 2.3-a.
-
-**#145 — inconsistent quick-command UX (#101 convention)** (P2 · M · ux)
-
-Fixed-choice setting commands should ALL open an inline picker. Today only
-`/model`, `/effort`, `/language` do (pickers `pm:` / `pe:` / `lang:`);
-`/permissions`, `/usage`, `/memory`, `/maxturns`, `/sandbox`, `/auto` only print
-text and require a typed argument. Make them consistent: no-arg → open the matching
-`/settings` row picker; with-arg → apply directly. menu.md ❓DECISION 2.3-b.
-
-**#146 — duplicate entry points / code paths per setting** (P2 · S · ux)
-
-Same value reachable via several distinct callbacks: language = `/language`
-(`lang:`) + old `st:set:lang` + new `sx:…:language` (3 paths); model & effort =
-standalone `pm:` / `pe:` pickers + new hub (2 paths). Consolidate: the slash
-commands become thin entry points that open the corresponding hub row picker
-(depends on #141). Removes drift between paths.
-
-**#147 — `/usage` display has no inline entry from the new hub** (P2 · XS · ux)
-
-The usage-mode picker (off/footer/pinned/both) lives only in the old
-`st:nav:admin → st:nav:usage` submenu, unreachable from the `sx:` hub — so only the
-typed `/usage <mode>` works inline. Add a «📊 Usage display» row to the hub
-(owner-only), folding usage into the unified settings (part of #141).
-
-**#148 — `/help` drifted from the command registry** (P2 · M · docs)
-
-`i18n.help.text` is hand-maintained and out of sync with `commands.COMMANDS`: it
-foregrounds `/newchat` / `/newcode` / `/reset` and omits many live commands
-(`/effort`, `/maxturns`, `/fork`, `/recap`, `/history`, `/export`, `/tools`,
-`/sandbox`, `/level`, `/expire`, `/limit`). Generate `/help` from the registry
-(group by `Cmd.help_group`, EN+RU from `Cmd.label`) so help can't diverge from the
-menu. The startup consistency check only catches REMOVED commands lingering, not
-missing coverage.
-
-**#149 — session-creation model inconsistent across surfaces** (P3 · XS · docs)
-
-The `/`-menu + `commands.py` say `/new` is the way (born chat, upgrade via `/code`,
-#133), but `/help` and the `cmd_newchat` / `cmd_newcode` docstrings still present
-the old immutable-type model ("type is fixed for the session's life"). Align the
-wording (help text, docstrings, labels). Pairs with #148.
-
-**#150 — three names for "run tools without asking"** (P3 · S · ux)
-
-`/auto on` = `/permissions full-access` = SDK `bypassPermissions` — three surfaces,
-one concept. Pick a single canonical name and make `/auto`, `/permissions`, and the
-settings `permission_mode` row present it consistently (e.g. `/auto` documented
-everywhere as just a shortcut for the full-access policy).
-
-**#151 — owner-configurable, derived access model for every option/capability** (P1 · XL · features)
-
-The centerpiece (full spec in `menu.md` §4). Replace the bespoke, per-command
-access logic (owner-only checks, code-level checks, `may_max_effort`,
-`full_access_owner_only`, per-user tool caps, …) with ONE uniform mechanism that
-governs both setting VALUES (model, effort, permission_mode, max_turns, big_memory,
-language, tools, …) and gated CAPABILITIES (use code mode, use `max` effort, use
-`full-access`, use a given tool). Each option is one row in a master matrix.
-
-Model (menu.md §4.1–4.6). The owner controls three things per option: (1) the
-**global value** (default + live value for anyone who hasn't overridden it),
-(2) the **base access level** — *Hidden* / *Read-only* / *Delegated*, (3) a
-**per-user exceptions** list (who differs from the base). Fixed rules for all
-options: value resolution **session → user-default → global**; owner never sets a
-user's value or a session's value (if delegated, the user owns the value); **soft
-revoke** (lowering access keeps but stops counting the user's stored values, so
-the effective value falls back to global; restoring brings them back — nothing is
-deleted); a delegated option starts on live global until the user sets their own
-(optionally snapshot global into the user default at delegation for isolation).
-
-Implementation shape. Make effective values **DERIVED, not stored**: compute on
-each prompt from the matrix — base access + exceptions for this user, then
-global → user default → per-session override (keyed by session id). Persist only:
-(a) the owner's global values + access levels + exceptions, (b) each user's
-personal defaults, (c) each session's explicit overrides. Do **not** persist a
-per-session "actual value", so any owner change applies from the user's very next
-prompt with no migration/refresh. Storage: a global-config table + a per-user
-overrides/exceptions table + the existing per-session override columns, addressed
-by session id. Resource quotas (token caps, expiry) stay a SEPARATE owner-only
-axis (limits, not values) on the user card — out of this matrix.
-
-Builds on / supersedes the settings work: depends on #141 (single hub) and #146
-(one path per setting); generalizes `settings_schema.py` (Scope/Role → the
-3-level access + exceptions) and the per-user admin (#120) into the exceptions
-layer. Split when picking up: 151a data model + resolver (derived `effective(user,
-session, option)`), 151b owner UI to set base-access + exceptions per option,
-151c migrate each existing gate onto it, 151d remove the bespoke checks.
-
-**#152 — menu lifecycle / dismissal standard** (P2 · M · ux)
-
-Menus currently linger in the chat history (stale keyboards scroll up). Standard
-(menu.md §1.4): navigation edits the SAME message; applying a value edits in place
-+ toast; Close deletes the message (fallback: edit to a "closed" line, no live
-keyboard left); an action that posts content re-posts the menu at the bottom and
-deletes the previous one; exactly one live menu per surface. Audit settings,
-sessions, pickers, queue, user cards. Broader than the specific back-target bug
-(#142).
-
-**#153 — argument-capture standard (no optional args)** (P2 · S · ux)
-
-Telegram sends a tapped command immediately and use is mobile-first, so a command
-must be either argument-free or take a MANDATORY arg captured via the next message
-(prompt + `/cancel`); fixed-choice input is always a picker, never typed; no
-command relies on inline optional args or errors with a "usage:" line on empty
-input (menu.md §1.5). Audit every command and align (related to #145, which is the
-picker half).
-
-**#154 — unified emoji vocabulary** (P3 · S · ux)
-
-Adopt one emoji per concept across all surfaces (menu.md §1.3). Resolve current
-collisions: 🧠 is used for BOTH model (`settings.row_model`) and memory
-(`usercard.btn_memory`) — reserve 🧠 for model, use 🗄 for memory/context; 📦 is
-used for BOTH sandbox (`settings.row_sandbox`) and file export — reserve 📦 for
-export, 🧪 for sandbox. Align labels in `commands.py` + `i18n.py`.
-
-**#155 — frequency-ranked `/` command menu** (P2 · S · ux)
-
-Telegram's command menu is only practical for the first few entries on mobile, so
-register commands in usage-frequency order (most-used first) and keep the prominent
-set to ~3 (the everyday trio `/new`, `/sessions`, `/settings` at the very top); the
-rest stay typeable + reachable via inline menus (menu.md §1.6, ranking in §2).
-Reorder the `commands.COMMANDS` registry accordingly (it already drives
-`setup_commands`).
-
-**#156 — admin menu mirrors the user menu** (P2 · M · ux)
-
-The owner should see the SAME menus as users, with owner-only controls appended at
-the END of each menu (the `🌍 Global` tab + owner rows in settings; owner buttons
-as the last rows above Close), not a separate admin surface (menu.md §1.8). Audit
-the settings hub, user cards, and any owner-gated menu so admin features read as an
-extension of the user menu, consistently positioned at the bottom.
-
 ---
 
 ## Closed
@@ -442,6 +239,25 @@ Title-only history.
 
 | ID | Theme | Title | Resolution | Release notes |
 |---|---|---|---|---|
+| 130 | security | Global memory: inject CLAUDE.md directly, not setting_sources=["user"] | `setting_sources` is now `[]` UNCONDITIONALLY; global memory injects the owner's ~/.claude/CLAUDE.md (+ memory/*.md) CONTENT into the system prompt instead (`engine._global_memory_block` — chat appends to CHAT_SYSTEM_PROMPT, code uses the claude_code preset `append`). settings.json (permissions/env) is never loaded; also works under the sandbox. Unit-tested (tests/test_engine.py). | |
+| 161 | features | Access model #151 follow-up (151c/151d) | 151c shipped: `sessions._effective_settings` resolves model/effort/permission_mode/max_turns/big_memory through the access model at session-build, so soft-revoke binds at CONSUMPTION (not just the hub). 151d: `max` effort + `full-access` are enforced on the effective values (ungranted→downgraded). Re-modelling the already-working chat/code `level` + per-tool `tool_cap` gates as Access-matrix entries was deemed low-value (no behaviour change) and left as-is. Unit-tested. | |
+| 141 | ux | Unify the two parallel /settings menus | Retired the flat `st:` hub; `/settings` opens only the registry `sx:` hub, with Tools / Usage / Users ported on as sub-pages. `on_settings_cb` is now a stale-button shim; the old page builders are dead-in-place (kept for revert). | |
+| 142 | ux | Back from settings sub-pages dropped into the deprecated menu | Sub-page Back re-opens the unified `sx:` hub (`sx:tab:s`) instead of `st:nav:main`/`admin`. | |
+| 143 | ux | Orphaned /new chat/code chooser | `on_new_cb` + `session.new_pick` commented out — nothing emits `new:` since #133. | |
+| 144 | ux | Streaming toggle resurfaces in the new hub | Removed `stream_enabled` from the settings registry + PAGE_ORDER (native streaming is always-on). | |
+| 145 | ux | Inconsistent quick-command UX (#101) | Fixed-choice commands open the hub picker; `/memory` `/sandbox` `/auto` toggle in place — no typed closed-option-set args. | |
+| 146 | ux | Duplicate entry points / code paths per setting | Slash commands route to ONE `sx:` picker via `_send_setting_picker`; the standalone pm:/pe:/lang: pickers are superseded (left live as stale-button handlers). | |
+| 147 | ux | /usage has no inline entry from the new hub | Added an owner-only 📊 Usage display row → `sx:usage` picker on the hub. | |
+| 148 | docs | /help drifted from the command registry | `/help` is GENERATED from `commands.COMMANDS` (grouped by `help_group`, role-filtered); i18n keeps only the intro/footer/group headers. | |
+| 149 | docs | Session-creation model inconsistent across surfaces | Corrected the new-session docstrings + generated help intro (born chat, `/code` upgrades); removed the stale `session.new_pick`. | |
+| 150 | ux | Three names for run-tools-without-asking | full-access is owner-only everywhere (hidden + apply-gated in the hub picker); `/auto` is the documented shortcut for the full-access policy. | |
+| 151 | features | Owner-configurable, derived access model | Shipped 151a/151b + hub enforcement: `Access` (Hidden/Read-only/Delegated) base (Table 23 defaults, owner-overridable) + per-user exceptions; derived `effective_access`/`resolve_effective`; owner Global-tab option-admin + per-user access card; unit-tested. Consumption-time derivation + capability-gate fold-in split to #161. | |
+| 152 | ux | Menu lifecycle / dismissal standard | Hub / pickers / cards edit in place; Close deletes (fallback to a 'closed' line); content actions repost the menu at the bottom; one live menu per surface. | |
+| 153 | ux | Argument-capture standard (no optional args) | Fixed-choice → inline pickers; free-text → next-message capture (+ `/cancel`); no command relies on optional inline args or a usage-error on empty input. | |
+| 154 | ux | Unified emoji vocabulary | Resolved collisions: 🧠 model, 🗄 memory/context, 🧪 sandbox, 📦 export — aligned across i18n.py + commands.py. | |
+| 155 | ux | Frequency-ranked / command menu | `commands.COMMANDS` reordered to menu.md §2 (trio first); common Tier-C settings (`/model` `/effort` `/memory` `/language`) surfaced in the menu. | |
+| 156 | ux | Admin menu mirrors the user menu | Owner controls are appended LAST (Usage + Users hub rows, the 🌍 Global tab, the owner command block) — no separate admin app. | |
+| 160 | ux | /recap→/last split, AI recap, session-menu layout | `/last` shows the verbatim last exchange (old `/recap`); `/recap` + the 📋 Recap button generate an AI one-line recap (a model turn, access-gated); Convert-to-code/chat moved down to pair with Export. | |
 | 1 | core | aiogram long-polling skeleton, owner allowlist, SQLite per-thread state, topic-as-session routing | Delivered: `bot.py` long polling, `access.AllowlistMiddleware`, `db.py` per-thread SQLite, `handlers.thread_key` routing (0 = General). Running. | |
 | 2 | engine | chat + code modes via Agent SDK on the subscription; per-thread isolation | Delivered in `engine.py`: `ClaudeSession`, `setting_sources=[]`, API-key-stripped child env, own cwd + `resume`; verified subscription-only (no API key). | |
 | 3 | ux | Claude-Code-style streaming — write-head + tool-status | `streamer.py` rewritten to a typewriter write-head: `update()` buffers text, a frame loop reveals it progressively and slides a rotating braille caret to the frontier (runs while buffered, spins in place when caught up / before the first token). Live tool-status, chunked/`.md` flush. Evaluated native `sendMessageDraft` — private-chat-only (`TEXTDRAFT_PEER_INVALID` in groups), unusable in the supergroup; write-head kept. See AGENTS §5 + #39. | |

@@ -60,6 +60,52 @@ class Role(enum.IntEnum):
     OWNER = 3
 
 
+class Access(enum.Enum):
+    """Owner-controlled per-option, per-user access level (#151, menu.md §4.2).
+
+    The ladder: *grant it → let them use it · otherwise read-only · otherwise they
+    never see it.* This LAYERS ON TOP of the structural ``view_role``/``edit_role``
+    gate (which encodes code-level / owner-only capability): a setting is VISIBLE iff
+    ``role >= view_role`` AND access != HIDDEN; EDITABLE iff ``role >= edit_role`` AND
+    access == DELEGATED.
+
+    * ``HIDDEN``    — user never sees it; rides the global value silently.
+    * ``READONLY``  — user sees it but can't change it; value is global.
+    * ``DELEGATED`` — user sees AND changes it (own default + per session); their own
+      value counts (session → user default → global), until set they ride global.
+    """
+
+    HIDDEN = "hidden"
+    READONLY = "readonly"
+    DELEGATED = "delegated"
+
+
+# Default BASE access per option (menu.md Table 23). Absent ⇒ DELEGATED. The owner
+# can override any of these at runtime (stored in db; preloaded into Ctx.access_base)
+# and can add per-user EXCEPTIONS (allowlist; preloaded into Ctx.access_exceptions).
+BASE_ACCESS_DEFAULTS: dict[str, Access] = {
+    "model": Access.DELEGATED,
+    "effort": Access.DELEGATED,           # `max` further gated (allow_max_effort)
+    "permission_mode": Access.DELEGATED,  # `full-access` is owner-only
+    "max_turns": Access.DELEGATED,
+    "memory": Access.HIDDEN,              # big_memory: owner delegates to granted users
+    "sandbox": Access.HIDDEN,            # owner delegates
+    "language": Access.DELEGATED,
+    "usage_display": Access.READONLY,    # account-wide; owner delegates
+    "tools": Access.DELEGATED,
+}
+
+
+def _coerce_access(v) -> Optional[Access]:
+    """Map a stored string / Access to an Access (or None when unrecognized)."""
+    if isinstance(v, Access):
+        return v
+    try:
+        return Access(str(v).strip().lower())
+    except (ValueError, AttributeError):
+        return None
+
+
 @dataclass
 class Ctx:
     """The small context the adapters/resolver read.
@@ -161,6 +207,65 @@ def resolve_from(setting: "Setting", ctx: Ctx, start: Scope) -> tuple[Any, Scope
         if value is not None:
             return value, scope
     return setting.default, Scope.GLOBAL
+
+
+# --------------------------------------------------------------------------- #
+# Access model (#151, menu.md §4) — owner-configured, DERIVED per prompt.
+# --------------------------------------------------------------------------- #
+def effective_access(setting: "Setting", ctx: "Ctx") -> Access:
+    """The owner-configured access of ``setting`` for ctx's user (#151, menu.md §4.2).
+
+    Resolution: OWNER is always DELEGATED (manages global + rules, edits own values
+    freely). Otherwise per-user EXCEPTION (``ctx.access_exceptions``) → owner's BASE
+    override (``ctx.access_base``) → the built-in default (``BASE_ACCESS_DEFAULTS``)
+    → DELEGATED. Both dicts are preloaded into the Ctx (kept sync for the hot path)."""
+    if ctx.role >= Role.OWNER:
+        return Access.DELEGATED
+    exc = getattr(ctx, "access_exceptions", None)
+    if isinstance(exc, dict):
+        a = _coerce_access(exc.get(setting.key))
+        if a is not None:
+            return a
+    base = getattr(ctx, "access_base", None)
+    if isinstance(base, dict):
+        a = _coerce_access(base.get(setting.key))
+        if a is not None:
+            return a
+    return BASE_ACCESS_DEFAULTS.get(setting.key, Access.DELEGATED)
+
+
+def can_view_setting(setting: "Setting", ctx: "Ctx") -> bool:
+    """Visible iff the role passes the structural gate AND access != HIDDEN (#151)."""
+    return setting.can_view(ctx.role) and effective_access(setting, ctx) != Access.HIDDEN
+
+
+def can_edit_setting(setting: "Setting", ctx: "Ctx") -> bool:
+    """Editable iff the role passes the structural gate AND access == DELEGATED (#151).
+    Re-checked server-side in every apply path — a button is never authorization."""
+    return setting.can_edit(ctx.role) and effective_access(setting, ctx) == Access.DELEGATED
+
+
+def configured_base_access(setting: "Setting", ctx: "Ctx") -> Access:
+    """The owner-CONFIGURED base access for ``setting`` (the owner's override → the
+    built-in default), independent of who is viewing — feeds the owner's access
+    editor (#151, menu.md §4.4). Distinct from ``effective_access`` (which returns
+    DELEGATED for the owner viewing their own values)."""
+    base = getattr(ctx, "access_base", None)
+    if isinstance(base, dict):
+        a = _coerce_access(base.get(setting.key))
+        if a is not None:
+            return a
+    return BASE_ACCESS_DEFAULTS.get(setting.key, Access.DELEGATED)
+
+
+def resolve_effective(setting: "Setting", ctx: "Ctx") -> tuple[Any, Scope]:
+    """The DERIVED effective value honoring access (#151 soft-revoke, menu.md §4.6):
+    when the user is DELEGATED the value walks SESSION → USER → GLOBAL; otherwise
+    ONLY the global value counts (the user's stored session/user overrides are kept
+    but no longer counted, so lowering access falls back to global immediately)."""
+    if effective_access(setting, ctx) == Access.DELEGATED:
+        return resolve(setting, ctx)
+    return resolve_from(setting, ctx, Scope.GLOBAL)
 
 
 # --------------------------------------------------------------------------- #
@@ -395,24 +500,28 @@ SETTINGS: dict[str, Setting] = {
             Scope.USER: _user_setter("memory"),
         },
     ),
-    "stream_enabled": Setting(
-        key="stream_enabled",
-        type=bool,
-        choices=(True, False),
-        default=True,
-        scopes=(Scope.SESSION, Scope.USER),
-        view_role=Role.CHAT,
-        edit_role=Role.CHAT,
-        name_key="settings.row_streaming",
-        get={
-            Scope.SESSION: _session_attr_get("stream_enabled"),
-            Scope.USER: _bool_user_get("stream_enabled"),
-        },
-        set={
-            Scope.SESSION: _session_attr_setter("set_stream_enabled"),
-            Scope.USER: _user_setter("stream_enabled"),
-        },
-    ),
+    # #144: the Streaming toggle is RETIRED — native Telegram sendMessageDraft
+    # streaming is always-on (no user toggle; AGENTS §5), and /stream is gone. The
+    # registry row is removed so the /settings hub no longer renders it. The
+    # ThreadState.stream_enabled column + db setter are kept (harmless) for revert.
+    # "stream_enabled": Setting(
+    #     key="stream_enabled",
+    #     type=bool,
+    #     choices=(True, False),
+    #     default=True,
+    #     scopes=(Scope.SESSION, Scope.USER),
+    #     view_role=Role.CHAT,
+    #     edit_role=Role.CHAT,
+    #     name_key="settings.row_streaming",
+    #     get={
+    #         Scope.SESSION: _session_attr_get("stream_enabled"),
+    #         Scope.USER: _bool_user_get("stream_enabled"),
+    #     },
+    #     set={
+    #         Scope.SESSION: _session_attr_setter("set_stream_enabled"),
+    #         Scope.USER: _user_setter("stream_enabled"),
+    #     },
+    # ),
     "max_turns": Setting(
         key="max_turns",
         type=int,
@@ -495,10 +604,25 @@ def get(key: str) -> Setting:
     return SETTINGS[key]
 
 
-# The order settings appear on a scope page (stable, most-used first).
+# Settings that ONLY apply to a CODE session (menu.md §1.7 / Table 23 "Applies to:
+# code") — they need a working directory or the agent toolset. The /settings hub
+# hides these rows on the SESSION tab when the bound session is a chat, gating on
+# the session MODE (not the user's level): a code-level user in a chat session
+# should not see Permissions / Max turns / Sandbox. (The USER/GLOBAL tabs still
+# show them as defaults for future code sessions.)
+CODE_ONLY: frozenset[str] = frozenset({"permission_mode", "max_turns", "sandbox"})
+
+
+def is_code_only(key: str) -> bool:
+    """Whether ``key`` is a code-session-only setting (menu.md §1.7)."""
+    return key in CODE_ONLY
+
+
+# The order settings appear on a scope page (stable, most-used first). Matches
+# menu.md §3.2 Table 10 row order. (#144: "stream_enabled" removed — retired.)
 PAGE_ORDER: tuple[str, ...] = (
     "model", "effort", "permission_mode", "max_turns",
-    "memory", "stream_enabled", "sandbox", "language",
+    "memory", "sandbox", "language",
 )
 
 
@@ -536,11 +660,17 @@ def settings_for_scope(scope: "Scope", role: Role) -> list["Setting"]:
 
 
 def make_ctx(state=None, user_id=None, role=Role.GUEST, settings=None,
-             allowlist=None, user_defaults=None) -> Ctx:
+             allowlist=None, user_defaults=None, access_base=None,
+             access_exceptions=None) -> Ctx:
     """Build a resolution context. ``user_defaults`` (optional) is a preloaded
-    {key: value} dict feeding the synchronous USER-scope getters."""
+    {key: value} dict feeding the synchronous USER-scope getters. ``access_base``
+    (owner's per-option BASE overrides) and ``access_exceptions`` (this user's
+    per-option exceptions) feed the synchronous access resolver (#151)."""
     ctx = Ctx(state=state, user_id=user_id, role=role, settings=settings,
               allowlist=allowlist)
     # Attach the optional preloaded user-defaults for the synchronous USER getters.
     ctx.user_defaults = user_defaults if isinstance(user_defaults, dict) else {}
+    # #151: preloaded access config (owner base overrides + this user's exceptions).
+    ctx.access_base = access_base if isinstance(access_base, dict) else {}
+    ctx.access_exceptions = access_exceptions if isinstance(access_exceptions, dict) else {}
     return ctx

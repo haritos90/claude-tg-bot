@@ -388,8 +388,11 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
 
     # ------------------------------------------------------------------ settings
 
+    # --- RETIRED (#141): the old flat-hub helpers below (_gather_vals +
+    # _settings_apply) are DEAD — /settings opens the registry sx: hub and the st:
+    # handler is a stale-button shim. Kept in place for revert; nothing calls them.
     async def _gather_vals(key: int, lang: str = "en") -> dict:
-        """Current settings for the menu (per-thread state + global prefs)."""
+        """Current settings for the menu (per-thread state + global prefs). RETIRED (#141)."""
         try:
             state = await db.get_thread(key)
         except Exception:
@@ -478,44 +481,39 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
 
     @router.message(Command("tools"))
     async def cmd_tools(message: Message) -> None:
-        """Open the per-session Tools page — toggle each tool on/off (#129). Chat
-        shows the web research tools; code shows the full agent toolset."""
+        """Open the per-session Tools page — toggle each tool on/off (#129/#141).
+        Chat shows the web research tools; code shows the full agent toolset. Back
+        returns to the unified /settings hub (the old st: tools page is retired)."""
         await _ensure_state(message)
         key = await _session_key(message)
         lang = _lang(message)
-        vals = await _gather_vals(key, lang)
+        try:
+            state = await db.get_thread(key)
+        except Exception:
+            state = None
         try:
             await bot.send_message(
-                message.chat.id, _settings_text(vals, lang), parse_mode="HTML",
-                reply_markup=_settings_keyboard("tools", vals, _is_owner(message), lang),
+                message.chat.id, i18n.t("settings.tools_title", lang), parse_mode="HTML",
+                reply_markup=_ss_tools_keyboard(state, lang),
             )
         except Exception as exc:
             await reply(message, i18n.t("settings.open_error", lang, err=markup.escape_html(str(exc))))
 
     @router.message(Command("settings"))
     async def cmd_settings(message: Message) -> None:
-        """Open the inline settings hub for this session.
+        """Open the unified, scope-tabbed settings hub for this session.
 
-        #138 PART 2: /settings now opens the REGISTRY-DRIVEN, scope-tabbed hub
-        (This session / My defaults / Global) — see ``_send_ss_hub``. The old
-        single-page builder (``_settings_keyboard("main", …)``) is kept for the
-        Tools grid + Users admin SUB-pages it still serves (st:nav:tools/users),
-        which the new hub links to; only the entry point changed.
-        """
+        #138/#141: /settings opens the REGISTRY-DRIVEN hub (This session / My
+        defaults / Global) — see ``_send_ss_hub``. Model / Effort / Permissions /
+        Max turns / Memory / Sandbox / Language are registry rows; Tools, Usage
+        (owner) and Users (owner) are ``sx:`` sub-pages that return to this hub.
+        The old flat ``st:`` hub is retired (``on_settings_cb`` is now a thin
+        stale-button shim)."""
         await _ensure_state(message)
         key = await _session_key(message)
         lang = _lang(message)
         uid = message.from_user.id if message.from_user else None
         uname = message.from_user.username if message.from_user else None
-        # was (the bespoke single page) — replaced for #138 PART 2:
-        # vals = await _gather_vals(key, lang)
-        # send_kwargs: dict = {}
-        # if message.message_thread_id:
-        #     send_kwargs["message_thread_id"] = message.message_thread_id
-        # await bot.send_message(
-        #     message.chat.id, _settings_text(vals, lang), parse_mode="HTML",
-        #     reply_markup=_settings_keyboard("main", vals, _is_owner(message), lang),
-        #     **send_kwargs)
         try:
             await _send_ss_hub(message.chat.id, key, uid, uname, lang)
         except Exception as exc:
@@ -526,17 +524,21 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
 
     @router.callback_query(F.data.startswith("st:"))
     async def on_settings_cb(cb: CallbackQuery) -> None:
-        """Handle taps on the settings menu (navigate / toggle / set)."""
+        """#141: the OLD flat settings hub is RETIRED — /settings now opens the
+        registry-driven ``sx:`` hub, with Tools / Usage / Users ported onto it as
+        sub-pages. This is a thin compatibility shim catching STALE ``st:`` buttons
+        left in old chat messages: ``st:close`` deletes the menu; anything else
+        bounces to the unified hub. The old page builders (``_settings_keyboard`` /
+        ``_settings_text`` / ``_settings_apply`` / ``_gather_vals`` / ``_onoff_label``)
+        are RETIRED in place — dead (nothing calls them), kept for revert (#141)."""
         try:
-            parts = (cb.data or "").split(":")
-            verb = parts[1] if len(parts) > 1 else ""
             msg = cb.message
             if msg is None:
                 await cb.answer()
                 return
-            key = await _callback_key(cb)
+            data = cb.data or ""
+            verb = data.split(":")[1] if ":" in data else ""
             lang = _lang(cb)
-            is_owner = bool(cb.from_user) and cb.from_user.id == settings.owner_id
             if verb == "close":
                 try:
                     await msg.delete()
@@ -545,39 +547,11 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                         await msg.edit_text(i18n.t("settings.closed", lang))
                 await cb.answer()
                 return
-            if verb == "nav":
-                page = parts[2] if len(parts) > 2 else "main"
-                if page == "users":
-                    # Admin hub: render the per-user list IN this settings message —
-                    # its usr:* buttons take over, and "◂ Settings" (st:nav:main)
-                    # returns here. Owner-only; a guest tap falls back to main.
-                    if is_owner:
-                        snap = allowlist.snapshot()
-                        with contextlib.suppress(Exception):
-                            await msg.edit_text(
-                                "\n".join(await _users_text(snap, lang)), parse_mode="HTML",
-                                reply_markup=_users_keyboard(snap, lang))
-                        await cb.answer()
-                        return
-                    page = "main"
-                if page == "admin" and not is_owner:
-                    page = "main"  # Admin submenu is owner-only
-            else:
-                page = await _settings_apply(
-                    key, verb, parts[2:], is_owner, cb.from_user.id
-                )
-            # A language change updates this user's locale — re-render in it.
-            lang = _lang(cb)
-            vals = await _gather_vals(key, lang)
-            with contextlib.suppress(Exception):
-                await msg.edit_text(
-                    _settings_text(vals, lang),
-                    parse_mode="HTML",
-                    reply_markup=_settings_keyboard(page, vals, is_owner, lang),
-                )
-            # Confirm a "set" choice with a small toast so the tap is acknowledged
-            # (owner request — selecting e.g. a usage mode now visibly confirms).
-            await cb.answer(i18n.t("settings.saved", lang) if verb == "set" else None)
+            key = await _callback_key(cb)
+            uid = cb.from_user.id if cb.from_user else None
+            uname = cb.from_user.username if cb.from_user else None
+            await _send_ss_hub(msg.chat.id, key, uid, uname, lang, edit_msg=msg)
+            await cb.answer()
         except Exception:
             with contextlib.suppress(Exception):
                 await cb.answer(i18n.t("common.error", _lang(cb)))
@@ -595,7 +569,9 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
 
     async def _build_ss_ctx(key: int, uid: int | None, role: ss.Role) -> ss.Ctx:
         """Build a resolution Ctx for the bound session, preloading the USER-scope
-        defaults (incl. the locale from its own kv store) so resolve() stays sync."""
+        defaults (incl. the locale from its own kv store) AND the #151 access config
+        (owner base overrides + this user's exceptions) so resolve()/effective_access()
+        stay synchronous on the hot path."""
         try:
             state = await db.get_thread(key)
         except Exception:
@@ -610,9 +586,18 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 lang_pref = await db.get_user_lang(uid)
                 if lang_pref is not None:
                     user_defaults["language"] = lang_pref
+        # #151: owner's per-option base-access overrides + this user's exceptions.
+        access_base: dict = {}
+        with contextlib.suppress(Exception):
+            access_base = await db.get_access_overrides()
+        access_exceptions: dict = {}
+        if uid is not None:
+            with contextlib.suppress(Exception):
+                access_exceptions = allowlist.access_of(uid, None)
         return ss.make_ctx(state=state, user_id=uid, role=role,
                            settings=settings, allowlist=allowlist,
-                           user_defaults=user_defaults)
+                           user_defaults=user_defaults, access_base=access_base,
+                           access_exceptions=access_exceptions)
 
     def _visible_tabs(role: ss.Role) -> list:
         """Scope tabs this role may see. Non-owners never get the Global tab."""
@@ -626,10 +611,20 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         return i18n.t("settings.v2_header", lang,
                       tab=i18n.t(_scope_tab_key(scope), lang))
 
+    def _ss_code_blocked(setting, scope, ctx: ss.Ctx) -> bool:
+        """Hide a CODE-ONLY setting on the SESSION tab when the bound session is a
+        chat (menu.md §1.7) — gated on the session MODE, not the user's level, so a
+        code-level user in a chat session doesn't see Permissions / Max turns / Sandbox."""
+        if scope != ss.Scope.SESSION or not ss.is_code_only(setting.key):
+            return False
+        return getattr(ctx.state, "mode", None) != "code"
+
     def _ss_hub_keyboard(scope, ctx: ss.Ctx, role: ss.Role, lang: str) -> InlineKeyboardMarkup:
         """Tabbed hub keyboard for the active scope: a tab row, then one row per
         visible setting (resolved value + source badge + control affordance), then
-        the bespoke Tools / Users links and Close."""
+        the bespoke Tools page and the owner-only Usage / Users rows LAST (menu.md
+        §1.8), then Close. All sub-pages are sx:-namespaced and return to this hub
+        (#141/#142 — the old st: flat hub is retired)."""
         B = InlineKeyboardButton
         rows: list[list[InlineKeyboardButton]] = []
         # Tab row (mark the active tab).
@@ -639,30 +634,63 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             tab_row.append(B(text=(f"• {label}" if sc == scope else label),
                              callback_data=f"sx:tab:{_SCOPE_CODE[sc]}"))
         rows.append(tab_row)
+        # The GLOBAL tab is the owner's ACCESS-CONFIG surface (#151): it lists EVERY
+        # registry option (so base access is settable for ALL of them, even ones with
+        # no global VALUE scope like effort/max_turns). SESSION/USER list the options
+        # storable at that scope.
+        if scope == ss.Scope.GLOBAL:
+            setting_list = [ss.SETTINGS[k] for k in ss.PAGE_ORDER
+                            if k in ss.SETTINGS and ss.SETTINGS[k].can_view(role)]
+        else:
+            setting_list = ss.settings_for_scope(scope, role)
         # One row per visible setting at this scope.
-        for setting in ss.settings_for_scope(scope, role):
-            # No setter for this scope (e.g. GLOBAL language) → skip (read-only-only).
-            if setting.set.get(scope) is None:
+        for setting in setting_list:
+            # On SESSION/USER a setting needs a setter for this scope; the GLOBAL row
+            # is the value/access admin page, so no per-scope setter is required.
+            if scope != ss.Scope.GLOBAL and setting.set.get(scope) is None:
                 continue
+            # Code-only rows don't appear in a chat session (menu.md §1.7).
+            if _ss_code_blocked(setting, scope, ctx):
+                continue
+            # #151 access model: HIDDEN settings don't appear; READ-ONLY show but
+            # can't be changed; DELEGATED are fully editable. (Owner is always full;
+            # the GLOBAL tab is owner-only so every option is visible there.)
+            if scope != ss.Scope.GLOBAL and not ss.can_view_setting(setting, ctx):
+                continue
+            editable = ss.can_edit_setting(setting, ctx)
             # #138-fix: on the SESSION tab show the effective resolved value; on the
-            # USER/GLOBAL tabs show what THAT scope contributes (or inherits from
-            # below) — resolve() would wrongly surface a session override here.
-            value, src = ss.resolve_from(setting, ctx, scope)
+            # USER/GLOBAL tabs show what THAT scope contributes. For a non-editable
+            # (read-only) setting the user's per-scope value doesn't count, so show
+            # the access-aware effective value (global) instead (#151 soft-revoke).
+            value, src = (ss.resolve_from(setting, ctx, scope) if editable
+                          else ss.resolve_effective(setting, ctx))
             name = _setting_name(setting, lang)
             vlabel = _setting_value_label(setting, value, lang)
             badge = _scope_badge(src, lang)
             text = i18n.t("settings.v2_row", lang, name=name, val=vlabel, badge=badge)
             sc_code = _SCOPE_CODE[scope]
-            if setting.type is bool:
+            if scope == ss.Scope.GLOBAL:
+                # Owner Global tab: the row opens the option-admin page (global value
+                # + base access + per-user exceptions) — menu.md §4.4 (#151).
+                cb = f"sx:opt:{setting.key}"
+            elif not editable:
+                cb = f"sx:ro:{setting.key}"           # read-only → a "locked" toast
+            elif setting.type is bool:
                 cb = f"sx:tog:{sc_code}:{setting.key}"
             else:
                 cb = f"sx:nav:{sc_code}:{setting.key}"
             rows.append([B(text=text, callback_data=cb)])
-        # Bespoke pages stay their own; link them from the SESSION tab only.
+        # Bespoke pages (Tools grid / Usage picker / Users admin) are sx: sub-pages
+        # linked from the SESSION tab only. Tools is code-only (menu.md §1.7); the
+        # owner-only Usage + Users rows go LAST, above Close (menu.md §1.8).
         if scope == ss.Scope.SESSION:
-            rows.append([B(text=i18n.t("settings.row_tools", lang), callback_data="st:nav:tools")])
+            if getattr(ctx.state, "mode", None) == "code":
+                rows.append([B(text=i18n.t("settings.row_tools", lang), callback_data="sx:tools")])
             if role >= ss.Role.OWNER:
-                rows.append([B(text=i18n.t("settings.row_users", lang), callback_data="st:nav:users")])
+                rows.append([B(text=i18n.t("settings.row_usage", lang,
+                                           val=getattr(sessions, "usage_mode", "footer")),
+                               callback_data="sx:usage")])
+                rows.append([B(text=i18n.t("settings.row_users", lang), callback_data="sx:users")])
         rows.append([B(text=i18n.t("btn.close", lang), callback_data="sx:close")])
         return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -680,6 +708,10 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         choices = _setting_choice_labels(setting, lang)
         if setting.key == "effort" and not may_max:
             choices = [(v, lbl) for v, lbl in choices if v != "max"]
+        # full-access (bypassPermissions) disarms the approval gate → OWNER-ONLY
+        # (#150); hide it from non-owners (the apply path also rejects a forged tap).
+        if setting.key == "permission_mode" and ctx.role < ss.Role.OWNER:
+            choices = [(v, lbl) for v, lbl in choices if v not in ("full-access", "bypassPermissions")]
         btns = [B(text=_mark(label, cur_label),
                   callback_data=f"sx:set:{sc_code}:{setting.key}:{cbval}")
                 for cbval, label in choices]
@@ -694,8 +726,10 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         Returns True if the value was written. A guest/non-owner tapping an
         owner-only or global control (forged callback) is REJECTED here — the button
         is never authorization (#138, AGENTS §2)."""
-        # 1. The setting itself must be editable by this role.
-        if not setting.can_edit(role):
+        # 1. The setting must be editable by THIS user: the structural role gate AND
+        #    the #151 access model (effective access == DELEGATED). A READ-ONLY/HIDDEN
+        #    setting can't be written even by a forged callback (owner is always full).
+        if not ss.can_edit_setting(setting, ctx):
             return False
         # 2. The GLOBAL scope is owner-only regardless of the setting's edit_role.
         if scope == ss.Scope.GLOBAL and role < ss.Role.OWNER:
@@ -706,6 +740,12 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             return False
         # 4. Per-setting extra gates that the role matrix alone doesn't cover.
         if setting.key == "effort" and raw_val == "max" and not _may_max_effort(uid, uname):
+            return False
+        # full-access (bypassPermissions) disarms the code-mode approval gate, so it
+        # is OWNER-ONLY (AGENTS §2 / #150) — reject a forged tap from a code user.
+        if (setting.key == "permission_mode"
+                and raw_val in ("full-access", "bypassPermissions")
+                and role < ss.Role.OWNER):
             return False
         # 5. Coerce the callback string into the stored value.
         value = _coerce_ss_value(setting, raw_val)
@@ -757,6 +797,34 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 await edit_msg.edit_text(text, parse_mode="HTML", reply_markup=kb)
             return
         await bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=kb)
+
+    async def _send_setting_picker(chat_id: int, key: int, uid: int | None,
+                                   uname: str | None, lang: str, setting_key: str,
+                                   scope=ss.Scope.SESSION) -> bool:
+        """Open the hub PICKER for one registry setting as a NEW message (#145/#146).
+
+        The slash commands (/model, /effort, /permissions, /maxturns, /language)
+        are thin entry points to the SAME ``sx:`` picker, so there is ONE code path
+        per setting — no separate pm:/pe:/lang: keyboards to drift. Returns False
+        (so the caller can fall back) when the setting isn't viewable for this role
+        or is code-only in a chat session."""
+        role = _role_of(uid, uname)
+        setting = ss.SETTINGS.get(setting_key)
+        if setting is None or not setting.can_view(role):
+            return False
+        if scope not in setting.scopes:
+            scope = setting.scopes[0]
+        ctx = await _build_ss_ctx(key, uid, role)
+        if _ss_code_blocked(setting, scope, ctx):
+            return False
+        kb = _ss_picker_keyboard(setting, scope, ctx, lang,
+                                 may_max=_may_max_effort(uid, uname))
+        with contextlib.suppress(Exception):
+            await bot.send_message(
+                chat_id,
+                i18n.t("settings.v2_pick", lang, name=_setting_name(setting, lang)),
+                parse_mode="HTML", reply_markup=kb)
+        return True
 
     @router.callback_query(F.data.startswith("sx:"))
     async def on_settings_v2_cb(cb: CallbackQuery) -> None:
@@ -832,6 +900,139 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 await cb.answer(i18n.t("settings.saved", lang))
                 return
 
+            # ---- bespoke sx: sub-pages (Tools / Users / Usage), Back → hub (#141) ----
+            if verb == "tools":
+                # Per-session Tools grid (code-only; menu.md §1.7). Render in place.
+                state = None
+                with contextlib.suppress(Exception):
+                    state = await db.get_thread(key)
+                if getattr(state, "mode", None) != "code":
+                    await cb.answer(i18n.t("settings.denied", lang), show_alert=True)
+                    return
+                with contextlib.suppress(Exception):
+                    await msg.edit_text(i18n.t("settings.tools_title", lang), parse_mode="HTML",
+                                        reply_markup=_ss_tools_keyboard(state, lang))
+                await cb.answer()
+                return
+
+            if verb == "tooltog" and len(parts) >= 3:
+                tool = parts[2]
+                state = None
+                with contextlib.suppress(Exception):
+                    state = await db.get_thread(key)
+                mode = getattr(state, "mode", "chat")
+                universe = engine.CODE_TOOLS if mode == "code" else engine.CHAT_TOOLS
+                if mode == "code" and tool in universe:
+                    base = (state.tools_enabled if state and state.tools_enabled is not None
+                            else list(universe))
+                    enabled = {t for t in base if t in universe}
+                    enabled.discard(tool) if tool in enabled else enabled.add(tool)
+                    ordered = [t for t in universe if t in enabled]
+                    # None = the whole universe on (a tool added later defaults ON).
+                    await db.set_tools_enabled(
+                        key, None if set(ordered) == set(universe) else ordered)
+                    await _rebuild_session(key)
+                    state = await db.get_thread(key)
+                    with contextlib.suppress(Exception):
+                        await msg.edit_text(i18n.t("settings.tools_title", lang), parse_mode="HTML",
+                                            reply_markup=_ss_tools_keyboard(state, lang))
+                await cb.answer()
+                return
+
+            if verb == "users":
+                if role < ss.Role.OWNER:
+                    await cb.answer(i18n.t("settings.denied", lang), show_alert=True)
+                    return
+                snap = allowlist.snapshot()
+                with contextlib.suppress(Exception):
+                    await msg.edit_text("\n".join(await _users_text(snap, lang)), parse_mode="HTML",
+                                        reply_markup=_users_keyboard(snap, lang))
+                await cb.answer()
+                return
+
+            if verb == "usage":
+                if role < ss.Role.OWNER:
+                    await cb.answer(i18n.t("settings.denied", lang), show_alert=True)
+                    return
+                with contextlib.suppress(Exception):
+                    await msg.edit_text(
+                        i18n.t("settings.v2_pick", lang, name=i18n.t("settings.usage_name", lang)),
+                        parse_mode="HTML",
+                        reply_markup=_ss_usage_keyboard(getattr(sessions, "usage_mode", "footer"), lang))
+                await cb.answer()
+                return
+
+            if verb == "usageset" and len(parts) >= 3:
+                if role < ss.Role.OWNER:
+                    await cb.answer(i18n.t("settings.denied", lang), show_alert=True)
+                    return
+                mode_val = parts[2]
+                if mode_val in ("off", "footer", "pinned", "both"):
+                    with contextlib.suppress(Exception):
+                        await sessions.set_usage_mode(mode_val)
+                await _send_ss_hub(msg.chat.id, key, uid, uname, lang, ss.Scope.SESSION, edit_msg=msg)
+                await cb.answer(i18n.t("settings.saved", lang))
+                return
+
+            # ---- #151 access model: read-only toast + owner option-admin pages ----
+            if verb == "ro":
+                # A READ-ONLY row was tapped (the owner hasn't delegated it) — explain.
+                await cb.answer(i18n.t("settings.ro_toast", lang), show_alert=True)
+                return
+
+            if verb == "opt" and len(parts) >= 3:
+                # Owner option-admin page (Global tab): global value + base access.
+                if role < ss.Role.OWNER:
+                    await cb.answer(i18n.t("settings.denied", lang), show_alert=True)
+                    return
+                setting = ss.SETTINGS.get(parts[2])
+                if setting is None:
+                    await cb.answer(i18n.t("common.error", lang))
+                    return
+                octx = await _build_ss_ctx(key, uid, role)
+                with contextlib.suppress(Exception):
+                    await msg.edit_text(
+                        i18n.t("settings.opt_title", lang, name=_setting_name(setting, lang)),
+                        parse_mode="HTML", reply_markup=_ss_option_admin_kb(setting, octx, lang))
+                await cb.answer()
+                return
+
+            if verb == "acc" and len(parts) >= 3:
+                # Base-access picker for one option (owner).
+                if role < ss.Role.OWNER:
+                    await cb.answer(i18n.t("settings.denied", lang), show_alert=True)
+                    return
+                setting = ss.SETTINGS.get(parts[2])
+                if setting is None:
+                    await cb.answer(i18n.t("common.error", lang))
+                    return
+                octx = await _build_ss_ctx(key, uid, role)
+                with contextlib.suppress(Exception):
+                    await msg.edit_text(
+                        i18n.t("settings.acc_title", lang, name=_setting_name(setting, lang)),
+                        parse_mode="HTML", reply_markup=_ss_access_kb(setting, octx, lang))
+                await cb.answer()
+                return
+
+            if verb == "accset" and len(parts) >= 4:
+                # Apply a base-access change (owner) → re-render the option-admin page.
+                if role < ss.Role.OWNER:
+                    await cb.answer(i18n.t("settings.denied", lang), show_alert=True)
+                    return
+                okey, level = parts[2], parts[3]
+                if okey in ss.SETTINGS and level in ("hidden", "readonly", "delegated"):
+                    with contextlib.suppress(Exception):
+                        await db.set_access_override(okey, level)
+                setting = ss.SETTINGS.get(okey)
+                octx = await _build_ss_ctx(key, uid, role)
+                if setting is not None:
+                    with contextlib.suppress(Exception):
+                        await msg.edit_text(
+                            i18n.t("settings.opt_title", lang, name=_setting_name(setting, lang)),
+                            parse_mode="HTML", reply_markup=_ss_option_admin_kb(setting, octx, lang))
+                await cb.answer(i18n.t("settings.saved", lang))
+                return
+
             await cb.answer()
         except Exception:
             with contextlib.suppress(Exception):
@@ -884,16 +1085,19 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 await reply(message, i18n.t("lang.set", base, name=i18n.lang_name(base)))
                 return
             # Unknown value: fall through to the picker.
-        send_kwargs: dict = {}
-        if message.message_thread_id:
-            send_kwargs["message_thread_id"] = message.message_thread_id
+        # No/invalid arg → the unified hub picker (USER scope; #145/#146 — one code
+        # path per setting; the standalone lang: picker is retired below).
+        key = await _session_key(message)
+        uname = message.from_user.username if message.from_user else None
+        if await _send_setting_picker(message.chat.id, key, uid, uname, lang,
+                                      "language", ss.Scope.USER):
+            return
         with contextlib.suppress(Exception):
             await bot.send_message(
                 message.chat.id,
                 i18n.t("lang.title", lang, name=i18n.lang_name(lang)),
                 parse_mode="HTML",
                 reply_markup=_language_keyboard(lang),
-                **send_kwargs,
             )
 
     @router.callback_query(F.data.startswith("lang:"))
@@ -1233,10 +1437,8 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         owner_uid = st.created_by or st.chat_id
         can_code = (owner_uid == settings.owner_id) or (allowlist.level_of(owner_uid, None) == "code")
         rows = [[B(text=i18n.t("btn.switch", lang), callback_data=f"ses:sw:{key}")]]
-        if st.mode == "chat" and can_code:
-            rows.append([B(text=i18n.t("btn.upgrade_code", lang), callback_data=f"ses:up:{key}")])
-        elif st.mode == "code":
-            rows.append([B(text=i18n.t("btn.downgrade_chat", lang), callback_data=f"ses:down:{key}")])
+        # 📋 Recap is the AI one-line recap (ses:recap runs the model); the verbatim
+        # last exchange is the /last command (user request 2026-06-16).
         rows += [
             [B(text=i18n.t("btn.recap", lang), callback_data=f"ses:recap:{key}"),
              B(text=i18n.t("btn.status", lang), callback_data=f"ses:status:{key}")],
@@ -1244,15 +1446,26 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
              B(text=i18n.t("btn.unfavorite" if fav else "btn.favorite", lang),
                callback_data=f"ses:fav:{key}")],
         ]
-        # Transcript export right in the menu (owner request — don't hide it in the
-        # /history command); works for chat + code. Code sessions also get the
-        # working-dir zip below.
-        # #136: pack the content + nav rows two-per-line instead of one button per
-        # row. was: transcript / export_files / delete / back each on its own row.
-        content_row = [B(text=i18n.t("btn.transcript", lang), callback_data=f"ses:hist:{key}")]
+        # Convert (🟩 up / 💬 down) no longer takes a full-width high row (user request
+        # 2026-06-16): it moves DOWN and pairs with 📦 Export files in a code session
+        # (both code-related), or with 📄 Transcript in a chat session.
+        convert_btn = None
+        if st.mode == "chat" and can_code:
+            convert_btn = B(text=i18n.t("btn.upgrade_code", lang), callback_data=f"ses:up:{key}")
+        elif st.mode == "code":
+            convert_btn = B(text=i18n.t("btn.downgrade_chat", lang), callback_data=f"ses:down:{key}")
+        transcript_btn = B(text=i18n.t("btn.transcript", lang), callback_data=f"ses:hist:{key}")
         if st.mode == "code":
-            content_row.append(B(text=i18n.t("btn.export_files", lang), callback_data=f"ses:exfiles:{key}"))
-        rows.append(content_row)
+            # Transcript on its own; Convert paired with Export below.
+            rows.append([transcript_btn])
+            export_btn = B(text=i18n.t("btn.export_files", lang), callback_data=f"ses:exfiles:{key}")
+            rows.append([convert_btn, export_btn] if convert_btn else [export_btn])
+        else:
+            # Chat: no Export — pair Transcript with Convert (if the owner has code access).
+            content_row = [transcript_btn]
+            if convert_btn is not None:
+                content_row.append(convert_btn)
+            rows.append(content_row)
         rows.append([
             B(text=i18n.t("btn.delete", lang), callback_data=f"ses:del:{key}"),
             B(text=i18n.t("btn.back", lang), callback_data="ses:pg:0"),
@@ -1369,15 +1582,20 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 await cb.answer(i18n.t("mode.switched_toast", lang, mode=i18n.mode_word(new_mode, lang)))
                 return
             if verb == "recap" and len(parts) > 2 and is_dm:
+                # 📋 Recap → AI one-line recap of THIS session (user request
+                # 2026-06-16): run the model with the recap prompt and let it stream.
+                # The verbatim last prompt+reply is the /last command instead.
                 key = int(parts[2])
                 if await _owned_session(key, cb.from_user.id) is None:
                     await cb.answer()
                     return
-                for chunk in await _recap_messages(key, lang):
-                    with contextlib.suppress(Exception):
-                        await bot.send_message(chat_id, chunk, parse_mode="HTML")
-                await _repost_options(cb, key, lang)
-                await cb.answer()
+                blk = await _access_block(cb.from_user.id, cb.from_user.username, lang, key)
+                if blk:
+                    await cb.answer(blk, show_alert=True)
+                    return
+                await cb.answer()  # ack before the model run streams its reply
+                with contextlib.suppress(Exception):
+                    await sessions.handle_text(chat_id, key, i18n.t("recap.prompt", lang))
                 return
             if verb == "status" and len(parts) > 2 and is_dm:
                 key = int(parts[2])
@@ -1569,9 +1787,42 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
 
     # ------------------------------------------------------------------ commands
 
+    # Help groups in display order (help_group key → header i18n key). #148.
+    _HELP_GROUPS = (
+        ("sessions", "help.group_sessions"),
+        ("settings", "help.group_settings"),
+        ("run", "help.group_run"),
+        ("code", "help.group_code"),
+        ("meta", "help.group_meta"),
+        ("owner", "help.group_owner"),
+    )
+
     def _help_text(message: Message) -> str:
-        """One session-based help text (DM is the only live mode)."""
-        return i18n.t("help.text", _lang(message))
+        """Help GENERATED from the command registry (#148): intro blurb, then one
+        section per help_group with each command's localized label, filtered to the
+        user's access (chat users omit code/owner commands), then the footer. Keeps
+        /help permanently in sync with commands.COMMANDS — no hand-maintained list."""
+        lang = _lang(message)
+        uid = message.from_user.id if message.from_user else 0
+        uname = message.from_user.username if message.from_user else None
+        is_owner = uid == settings.owner_id
+        is_code = is_owner or (allowlist.level_of(uid, uname) == "code")
+        parts = [i18n.t("help.intro", lang)]
+        for gkey, hdr in _HELP_GROUPS:
+            lines = []
+            for c in commands.COMMANDS:
+                if c.help_group != gkey:
+                    continue
+                if c.scope == "owner" and not is_owner:
+                    continue
+                if c.scope == "code" and not is_code:
+                    continue
+                label = c.label.get(lang) or c.label.get("en") or c.slug
+                lines.append(f"/{c.slug} — {markup.escape_html(label)}")
+            if lines:
+                parts.append(i18n.t(hdr, lang) + "\n" + "\n".join(lines))
+        parts.append(i18n.t("help.footer", lang))
+        return "\n\n".join(parts)
 
     @router.message(CommandStart())
     async def cmd_start(message: Message) -> None:
@@ -1585,13 +1836,15 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
 
     @router.message(Command("newchat"))
     async def cmd_newchat(message: Message) -> None:
-        """Create a 💬 chat session (immutable type). Optional name: /newchat foo."""
+        """Create a 💬 chat session (promotable to code with /code; #133). Optional
+        name: /newchat foo."""
         await _ensure_state(message)
         await _do_new(message, f"chat {_command_arg(message)}".strip())
 
     @router.message(Command("newcode"))
     async def cmd_newcode(message: Message) -> None:
-        """Create a 🟩 code session (immutable type). Optional name: /newcode foo."""
+        """Create a 🟩 code session (downgradable to chat with /chat; #133). Optional
+        name: /newcode foo."""
         await _ensure_state(message)
         await _do_new(message, f"code {_command_arg(message)}".strip())
 
@@ -1603,30 +1856,34 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         await _ensure_state(message)
         await _do_new(message, _command_arg(message))
 
-    @router.callback_query(F.data.startswith("new:"))
-    async def on_new_cb(cb: CallbackQuery) -> None:
-        """Handle the /new type chooser (💬 Chat / 🟩 Code) — DM only."""
-        try:
-            mode = (cb.data or "new:chat").split(":", 1)[1]
-            if mode not in VALID_MODES:
-                mode = "chat"
-            msg = cb.message
-            if msg is None or msg.chat.type != "private":
-                await cb.answer()
-                return
-            uid = cb.from_user.id
-            lang = _lang(cb)
-            if mode == "code" and allowlist.level_of(uid, cb.from_user.username) != "code":
-                await cb.answer(i18n.t("access.code_denied", lang), show_alert=True)
-                return
-            name = _default_session_name(mode, lang)
-            await _new_dm_session(uid, mode, name)
-            with contextlib.suppress(Exception):
-                await msg.edit_text(_created_text(mode, name, lang), parse_mode="HTML")
-            await cb.answer(i18n.t("common.created", lang))
-        except Exception:
-            with contextlib.suppress(Exception):
-                await cb.answer(i18n.t("common.error", _lang(cb)))
+    # #143: the /new chat/code chooser is DEAD — since #133 /new always creates a
+    # chat (no chooser) and the /sessions browser emits ses:new:chat / ses:new:code
+    # (handled by on_sessions_cb), so NOTHING emits "new:". Handler commented out
+    # (kept for audit/revert); the session.new_pick i18n string is removed too.
+    # @router.callback_query(F.data.startswith("new:"))
+    # async def on_new_cb(cb: CallbackQuery) -> None:
+    #     """Handle the /new type chooser (💬 Chat / 🟩 Code) — DM only."""
+    #     try:
+    #         mode = (cb.data or "new:chat").split(":", 1)[1]
+    #         if mode not in VALID_MODES:
+    #             mode = "chat"
+    #         msg = cb.message
+    #         if msg is None or msg.chat.type != "private":
+    #             await cb.answer()
+    #             return
+    #         uid = cb.from_user.id
+    #         lang = _lang(cb)
+    #         if mode == "code" and allowlist.level_of(uid, cb.from_user.username) != "code":
+    #             await cb.answer(i18n.t("access.code_denied", lang), show_alert=True)
+    #             return
+    #         name = _default_session_name(mode, lang)
+    #         await _new_dm_session(uid, mode, name)
+    #         with contextlib.suppress(Exception):
+    #             await msg.edit_text(_created_text(mode, name, lang), parse_mode="HTML")
+    #         await cb.answer(i18n.t("common.created", lang))
+    #     except Exception:
+    #         with contextlib.suppress(Exception):
+    #             await cb.answer(i18n.t("common.error", _lang(cb)))
 
     @router.callback_query(F.data.startswith("pm:"))
     async def on_model_pick(cb: CallbackQuery) -> None:
@@ -1756,20 +2013,13 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         arg = _command_arg(message)
 
         if not arg:
-            # No arg → interactive picker (#99).
-            cur_alias = MODEL_ID_TO_ALIAS.get(state.model, state.model)
-            btns = [
-                InlineKeyboardButton(
-                    text=(f"✓ {a}" if a == cur_alias else a), callback_data=f"pm:{a}"
-                )
-                for a in MODEL_ALIASES
-            ]
-            await bot.send_message(
-                message.chat.id,
-                i18n.t("model.pick", lang, model=markup.escape_html(state.model)),
-                parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=[btns]),
-            )
+            # No arg → the unified hub picker (#145/#146: one code path per setting;
+            # the old standalone pm: picker is retired).
+            uid = message.from_user.id if message.from_user else None
+            uname = message.from_user.username if message.from_user else None
+            if await _send_setting_picker(message.chat.id, key, uid, uname, lang, "model"):
+                return
+            await reply(message, i18n.t("model.pick", lang, model=markup.escape_html(state.model)))
             return
 
         # Resolve a friendly alias, otherwise pass the value through unchanged.
@@ -1796,23 +2046,13 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         may_max = _may_max_effort(uid, uname)
         arg = _command_arg(message).lower().strip()
         if not arg:
-            # No arg → interactive picker (#99). Hide `max` from users not allowed
-            # to use it (the gate below still enforces it for typed input).
+            # No arg → the unified hub picker (#145/#146; the gated `max` level is
+            # hidden by _ss_picker_keyboard for users not allowed it). The old
+            # standalone pe: picker is retired.
+            if await _send_setting_picker(message.chat.id, key, uid, uname, lang, "effort"):
+                return
             cur = state.effort or "default"
-            levels = [lv for lv in EFFORT_LEVELS if lv != "max" or may_max] + ["default"]
-            btns = [
-                InlineKeyboardButton(
-                    text=(f"✓ {lv}" if lv == cur else lv), callback_data=f"pe:{lv}"
-                )
-                for lv in levels
-            ]
-            rows = [btns[i:i + 3] for i in range(0, len(btns), 3)]
-            await bot.send_message(
-                message.chat.id,
-                i18n.t("effort.pick", lang, cur=markup.escape_html(cur)),
-                parse_mode="HTML",
-                reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
-            )
+            await reply(message, i18n.t("effort.pick", lang, cur=markup.escape_html(cur)))
             return
         if arg in ("default", "reset", "none"):
             await db.set_effort(key, None)
@@ -1839,11 +2079,15 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         lang = _lang(message)
         arg = _command_arg(message).lower().strip()
         if not arg:
+            # No arg → the unified hub picker (#145/#146). Code-only (menu.md §1.7);
+            # in a chat session fall back to showing the value.
+            uid = message.from_user.id if message.from_user else None
+            uname = message.from_user.username if message.from_user else None
+            if state.mode == "code" and await _send_setting_picker(
+                    message.chat.id, key, uid, uname, lang, "max_turns"):
+                return
             cur = str(state.max_turns) if state.max_turns else i18n.t("maxturns.unlimited", lang)
-            await reply(
-                message,
-                i18n.t("maxturns.show", lang, cur=cur),
-            )
+            await reply(message, i18n.t("maxturns.show", lang, cur=cur))
             return
         if arg in ("off", "none", "0", "unlimited"):
             await db.set_max_turns(key, None)
@@ -1926,10 +2170,13 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         arg = _command_arg(message).lower()
 
         if not arg:
-            await reply(
-                message,
-                i18n.t("memory.show", lang, current=i18n.onoff(bool(state.big_memory), lang)),
-            )
+            # No arg → toggle in place (menu.md §2: "none → toggle"; #145). Was a
+            # show-only text reply that forced the user to type /memory on|off.
+            on = not bool(state.big_memory)
+            await db.set_big_memory(key, on)
+            deferred = await _rebuild_session(key)
+            note = i18n.t("common.defer_note", lang) if deferred else ""
+            await reply(message, i18n.t("memory.on" if on else "memory.off", lang, note=note))
             return
 
         if arg not in ("on", "off"):
@@ -2040,31 +2287,30 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             await reply(message, i18n.t("common.code_only", lang))
             return
         key = await _session_key(message)
-        arg = _command_arg(message).lower()
-        if arg not in ("on", "off"):
-            # #138 PART 2: show the RESOLVED sandbox value WITH the scope badge that
-            # supplies it ("on (this session)" / "off (global default)") — resolving
-            # the owner's "Sandbox for this session: on · global SANDBOX_CODE: on"
-            # confusion. Routed through the registry resolver so it stays consistent
-            # with the /settings hub. was (the confusing two-value line):
-            # isolated = settings.sandbox_code and not state.no_sandbox
-            # await reply(message, i18n.t("sandbox.show", lang,
-            #                             state=i18n.onoff(isolated, lang),
-            #                             glob=i18n.onoff(settings.sandbox_code, lang)))
-            uid = message.from_user.id if message.from_user else None
-            sctx = await _build_ss_ctx(key, uid, _role_of(uid, None))
-            value, src = ss.resolve(ss.SETTINGS["sandbox"], sctx)
-            await reply(message, i18n.t("sandbox.show_scoped", lang,
-                                        state=i18n.onoff(bool(value), lang),
-                                        scope=_scope_badge(src, lang)))
+        arg = _command_arg(message).lower().strip()
+        if arg in ("on", "off"):
+            # /sandbox on → isolate (no_sandbox=False); off → raw (no_sandbox=True).
+            await db.set_no_sandbox(key, arg == "off")
+            deferred = await _rebuild_session(key)
+            note = i18n.t("common.defer_note", lang) if deferred else ""
+            await reply(
+                message,
+                i18n.t("sandbox.set_on" if arg == "on" else "sandbox.set_off", lang, note=note),
+            )
             return
-        # /sandbox on → isolate (no_sandbox=False); off → raw (no_sandbox=True).
-        await db.set_no_sandbox(key, arg == "off")
+        # No arg → TOGGLE the effective sandbox in place (menu.md §2: "none → toggle";
+        # #145). Resolve the current value via the registry (so it matches the
+        # /settings hub) and flip it; no_sandbox is the inverse of "isolate".
+        uid = message.from_user.id if message.from_user else None
+        sctx = await _build_ss_ctx(key, uid, _role_of(uid, None))
+        value, _src = ss.resolve(ss.SETTINGS["sandbox"], sctx)
+        new_on = not bool(value)
+        await db.set_no_sandbox(key, not new_on)
         deferred = await _rebuild_session(key)
         note = i18n.t("common.defer_note", lang) if deferred else ""
         await reply(
             message,
-            i18n.t("sandbox.set_on" if arg == "on" else "sandbox.set_off", lang, note=note),
+            i18n.t("sandbox.set_on" if new_on else "sandbox.set_off", lang, note=note),
         )
 
     @router.message(Command("permissions"))
@@ -2082,6 +2328,12 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         arg = _command_arg(message).lower()
 
         if not arg:
+            # No arg → the unified hub picker (#145/#146). full-access is owner-only
+            # (hidden + apply-gated). The text list is the fallback.
+            uid = message.from_user.id if message.from_user else None
+            uname = message.from_user.username if message.from_user else None
+            if await _send_setting_picker(message.chat.id, key, uid, uname, lang, "permission_mode"):
+                return
             current = PERM_MODE_TO_NAME.get(state.permission_mode, "ask")
             lines = [
                 i18n.t("perm.current", lang, current=current),
@@ -2136,10 +2388,13 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         is_on = state.permission_mode == "bypassPermissions"
 
         if not arg:
-            await reply(
-                message,
-                i18n.t("auto.show", lang, state=i18n.onoff(is_on, lang)),
-            )
+            # No arg → toggle in place (menu.md §2: "none → toggle"; #145). Was a
+            # show-only reply that forced typing /auto on|off.
+            new_on = not is_on
+            await db.set_permission_mode(key, "bypassPermissions" if new_on else "default")
+            deferred = await _rebuild_session(key)
+            note = i18n.t("common.defer_note", lang) if deferred else ""
+            await reply(message, i18n.t("auto.on" if new_on else "auto.off", lang, note=note))
             return
         if arg not in ("on", "off"):
             await reply(message, i18n.t("auto.usage", lang))
@@ -2158,9 +2413,18 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         arg = _command_arg(message).lower()
 
         if not arg:
-            current = getattr(sessions, "usage_mode", "footer")
+            cur = getattr(sessions, "usage_mode", "footer")
+            # Owner → the unified hub usage picker (#147). Non-owner → read-only text
+            # (the display is account-wide; menu.md Table 7: 🟢 view · 👑 change).
+            if _is_owner(message):
+                with contextlib.suppress(Exception):
+                    await bot.send_message(
+                        message.chat.id,
+                        i18n.t("settings.v2_pick", lang, name=i18n.t("settings.usage_name", lang)),
+                        parse_mode="HTML", reply_markup=_ss_usage_keyboard(cur, lang))
+                return
             lines = [
-                i18n.t("usage.current", lang, current=markup.escape_html(str(current))),
+                i18n.t("usage.current", lang, current=markup.escape_html(str(cur))),
                 "",
                 i18n.t("usage.modes_header", lang),
             ]
@@ -2564,7 +2828,9 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 callback_data=f"usr:card:{name}")])
         rows.append([B(text=i18n.t("users.btn_add", lang), callback_data="usr:add")])
         rows.append([
-            B(text=i18n.t("settings.back_to", lang), callback_data="st:nav:admin"),
+            # #142: Back returns to the unified sx: hub (was st:nav:admin — the
+            # deprecated flat hub; that was the "another menu pops up" bug).
+            B(text=i18n.t("settings.back_to", lang), callback_data="sx:tab:s"),
             B(text=i18n.t("btn.close", lang), callback_data="usr:close"),
         ])
         return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -2620,7 +2886,8 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                          B(text=i18n.t("usercard.btn_maxeffort", lang, state=i18n.onoff(d.get("allow_max_effort"), lang)),
                            callback_data=f"usr:eff:{target}")])
             rows.append([B(text=i18n.t("usercard.btn_tools", lang, val=_fmt_cap(d.get("tool_cap"), lang)),
-                           callback_data=f"usr:tools:{target}")])
+                           callback_data=f"usr:tools:{target}"),
+                         B(text=i18n.t("usercard.btn_access", lang), callback_data=f"usr:acc:{target}")])
             rows.append([B(text=i18n.t("usercard.btn_expiry", lang), callback_data=f"usr:exp:{target}")])
             rows.append([B(text=i18n.t("usercard.btn_day", lang), callback_data=f"usr:rday:{target}"),
                          B(text=i18n.t("usercard.btn_week", lang), callback_data=f"usr:rweek:{target}")])
@@ -2646,6 +2913,51 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 for t in ALL_TOOLS]
         rows.append([B(text=i18n.t("btn.back", lang), callback_data=f"usr:card:{target}")])
         return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+    async def _render_user_access(target: str, lang: str):
+        """(text, keyboard) for the per-user ACCESS-exceptions sub-page (#151, menu.md
+        §3.4/§4): one row per option showing this user's effective access — their
+        EXCEPTION if set, else the owner's base for that option. Tapping opens a
+        per-option picker (Base / Delegated / Read-only / Hidden)."""
+        B = InlineKeyboardButton
+        d = allowlist.describe(target)
+        if d is None or d["kind"] == "owner":
+            return await _render_user_card(target, lang)  # owner always has full access
+        exc = d.get("access") or {}
+        base = {}
+        with contextlib.suppress(Exception):
+            base = await db.get_access_overrides()
+        who = f"@{d['username']}" if d.get("username") else str(d.get("id") or target)
+        text = i18n.t("usercard.access_header", lang, who=markup.escape_html(who))
+        rows = []
+        for skey in ss.PAGE_ORDER:
+            setting = ss.SETTINGS.get(skey)
+            if setting is None:
+                continue
+            cur = ss._coerce_access(exc.get(skey))
+            if cur is not None:
+                val = _access_label(cur, lang)
+            else:
+                base_acc = ss._coerce_access(base.get(skey)) or \
+                    ss.BASE_ACCESS_DEFAULTS.get(skey, ss.Access.DELEGATED)
+                val = i18n.t("usercard.access_base", lang, val=_access_label(base_acc, lang))
+            rows.append([B(text=f"{_setting_name(setting, lang)}: {val} ▸",
+                           callback_data=f"usr:accopt:{target}:{skey}")])
+        rows.append([B(text=i18n.t("btn.back", lang), callback_data=f"usr:card:{target}")])
+        return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+    def _user_access_picker_kb(target: str, skey: str, lang: str) -> InlineKeyboardMarkup:
+        """Per-option access picker on a user card: Base (clear) / Delegated /
+        Read-only / Hidden, then Back → the user's access sub-page (#151)."""
+        B = InlineKeyboardButton
+        opts = [("base", i18n.t("usercard.access_base_opt", lang)),
+                ("delegated", _access_label(ss.Access.DELEGATED, lang)),
+                ("readonly", _access_label(ss.Access.READONLY, lang)),
+                ("hidden", _access_label(ss.Access.HIDDEN, lang))]
+        btns = [B(text=lbl, callback_data=f"usr:accset:{target}:{skey}:{lv}") for lv, lbl in opts]
+        rows = [btns[i:i + 2] for i in range(0, len(btns), 2)]
+        rows.append([B(text=i18n.t("btn.back", lang), callback_data=f"usr:acc:{target}")])
+        return InlineKeyboardMarkup(inline_keyboard=rows)
 
     @router.message(Command("users"))
     async def cmd_users(message: Message) -> None:
@@ -2727,6 +3039,40 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 with contextlib.suppress(Exception):
                     await msg.edit_text(text, parse_mode="HTML", reply_markup=kb)
                 await cb.answer()
+                return
+            if verb == "acc":
+                # Per-user ACCESS-exceptions sub-page (#151, menu.md §3.4).
+                text, kb = await _render_user_access(target, lang)
+                with contextlib.suppress(Exception):
+                    await msg.edit_text(text, parse_mode="HTML", reply_markup=kb)
+                await cb.answer()
+                return
+            if verb == "accopt":
+                # Open the per-option access picker. target = "<target>:<option>".
+                tgt, _, skey = target.partition(":")
+                if skey not in ss.SETTINGS:
+                    await cb.answer()
+                    return
+                setting = ss.SETTINGS[skey]
+                with contextlib.suppress(Exception):
+                    await msg.edit_text(
+                        i18n.t("usercard.access_opt_title", lang,
+                               name=_setting_name(setting, lang)),
+                        parse_mode="HTML", reply_markup=_user_access_picker_kb(tgt, skey, lang))
+                await cb.answer()
+                return
+            if verb == "accset":
+                # Apply a per-user access exception. target = "<target>:<option>:<level>".
+                bits = target.split(":")
+                if len(bits) >= 3:
+                    tgt, skey, level = bits[0], bits[1], bits[2]
+                    if skey in ss.SETTINGS:
+                        allowlist.set_access_exception(
+                            tgt, skey, None if level == "base" else level)
+                    text, kb = await _render_user_access(tgt, lang)
+                    with contextlib.suppress(Exception):
+                        await msg.edit_text(text, parse_mode="HTML", reply_markup=kb)
+                await cb.answer(i18n.t("settings.saved", lang))
                 return
             if verb == "del":
                 kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -3004,14 +3350,25 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         out.append(footnote)
         return out
 
-    @router.message(Command("recap"))
-    async def cmd_recap(message: Message) -> None:
-        """Show the last exchange (your last prompt + Claude's last reply)."""
+    @router.message(Command("last"))
+    async def cmd_last(message: Message) -> None:
+        """Show the last exchange VERBATIM (your last prompt + Claude's last reply).
+        Was /recap before 2026-06-16; /recap now generates an AI one-line recap."""
         await _ensure_state(message)
         key = await _session_key(message)
         lang = _lang(message)
         for chunk in await _recap_messages(key, lang):
             await reply(message, chunk)
+
+    @router.message(Command("recap"))
+    async def cmd_recap(message: Message) -> None:
+        """Generate a one-line AI recap of the current session — the model summarizes
+        the conversation so far (like Claude Code's /recap). For the verbatim last
+        prompt+reply, use /last (user request 2026-06-16). Runs a model turn, so it
+        goes through the normal access/quota gate + streaming via _submit."""
+        await _ensure_state(message)
+        lang = _lang(message)
+        await _submit(message, i18n.t("recap.prompt", lang))
 
     async def _history_doc(key: int, lang: str):
         """Build a session's transcript as a Markdown document. Returns
@@ -3277,14 +3634,14 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
 
     # ----------------------------------------------------------- plain text
 
-    async def _access_block(message: Message, key: int) -> str | None:
+    async def _access_block(uid: int | None, uname: str | None, lang: str, key: int) -> str | None:
         """Pre-turn access gate (#102/#105). Returns an i18n denial string if the
         user may NOT run a turn right now — a chat-level user in a code session, or
         a user over their token quota — else None. The owner is exempt (level_of →
-        "code", token_grant_of → None, so neither check fires)."""
-        uid = message.from_user.id if message.from_user else 0
-        uname = message.from_user.username if message.from_user else None
-        lang = _lang(message)
+        "code", token_grant_of → None, so neither check fires). Takes the acting
+        identity directly so callback handlers (e.g. the session-menu AI recap
+        button) can gate a turn too, not only message handlers."""
+        uid = uid or 0
         st = await db.get_thread(key)
         if st is not None and st.mode == "code" and allowlist.level_of(uid, uname) != "code":
             return i18n.t("access.code_denied", lang)
@@ -3331,7 +3688,9 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             await _run_pending(action, message, text)
             return
         key = await _session_key(message)
-        block = await _access_block(message, key)
+        uid = message.from_user.id if message.from_user else 0
+        uname = message.from_user.username if message.from_user else None
+        block = await _access_block(uid, uname, _lang(message), key)
         if block:
             await reply(message, block)
             return
@@ -3348,7 +3707,9 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
     async def _submit(message: Message, text: str, attachments=None) -> None:
         """Route a turn (text + optional content blocks) into the thread session."""
         key = await _session_key(message)
-        block = await _access_block(message, key)
+        uid = message.from_user.id if message.from_user else 0
+        uname = message.from_user.username if message.from_user else None
+        block = await _access_block(uid, uname, _lang(message), key)
         if block:
             await reply(message, block)
             return
@@ -3511,10 +3872,14 @@ def _mark(name: str, current: str) -> str:
     return f"✓ {name}" if name == current else name
 
 
+# --- RETIRED (#141): the OLD flat-hub builders below (_settings_text, _onoff_label,
+# _settings_keyboard) are DEAD — the unified registry sx: hub + _ss_*_keyboard
+# helpers replaced them. Kept in place for revert; nothing in the live path calls
+# them (the st: handler is a stale-button shim). _mark above is STILL LIVE.
 def _settings_text(v: dict, lang: str = "en") -> str:
-    """The settings header showing every current value (localized). The Permissions
-    segment is shown only for code sessions (chat has no gated tools), mirroring the
-    hidden perm row — keeps the header honest on the chat/Tools surface."""
+    """The settings header showing every current value (localized). RETIRED (#141).
+    The Permissions segment is shown only for code sessions (chat has no gated
+    tools), mirroring the hidden perm row — keeps the header honest."""
     perm_line = i18n.t("settings.perm_seg", lang, perm=v["perm"]) if v.get("mode") == "code" else ""
     return i18n.t(
         "settings.header",
@@ -3719,6 +4084,76 @@ def _setting_choice_labels(setting, lang: str) -> list[tuple[str, str]]:
                 ("default", i18n.t("maxturns.unlimited", lang))]
     # Fallback: render the raw choices.
     return [(str(c), str(c)) for c in (setting.choices or ())]
+
+
+def _ss_tools_keyboard(state, lang: str = "en") -> InlineKeyboardMarkup:
+    """Per-session Tools grid for the unified hub (#129/#141): one ✅/⬜ toggle per
+    tool in the session's universe (chat → web tools, code → full toolset), then
+    Back → the hub. Replaces the old st: tools page."""
+    B = InlineKeyboardButton
+    mode = getattr(state, "mode", "chat") if state else "chat"
+    universe = engine.CODE_TOOLS if mode == "code" else engine.CHAT_TOOLS
+    enabled = getattr(state, "tools_enabled", None) if state else None
+    enabled_set = set(enabled) if enabled is not None else set(universe)
+    rows = [
+        [B(text=("✅ " if t in enabled_set else "⬜ ") + t + " · " + _tool_scope_label(t, lang),
+           callback_data=f"sx:tooltog:{t}")]
+        for t in universe
+    ]
+    rows.append([B(text=i18n.t("btn.back", lang), callback_data="sx:tab:s")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _ss_usage_keyboard(cur: str, lang: str = "en") -> InlineKeyboardMarkup:
+    """Usage-display picker for the unified hub (owner; #147): off/footer/pinned/both
+    (✓ on the current), then Back → the hub. Replaces the old st: admin→usage page."""
+    B = InlineKeyboardButton
+    btns = [B(text=_mark(m, cur), callback_data=f"sx:usageset:{m}")
+            for m in ("off", "footer", "pinned", "both")]
+    rows = [btns[i:i + 3] for i in range(0, len(btns), 3)]
+    rows.append([B(text=i18n.t("btn.back", lang), callback_data="sx:tab:s")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _access_label(access, lang: str = "en") -> str:
+    """Localized label for an Access level (Delegated / Read-only / Hidden; #151)."""
+    return i18n.t({
+        ss.Access.DELEGATED: "settings.access_delegated",
+        ss.Access.READONLY: "settings.access_readonly",
+        ss.Access.HIDDEN: "settings.access_hidden",
+    }[access], lang)
+
+
+def _ss_option_admin_kb(setting, ctx, lang: str = "en") -> InlineKeyboardMarkup:
+    """Owner OPTION-ADMIN page (Global tab → a setting; #151, menu.md §4.4): edit the
+    GLOBAL value and the BASE access (Hidden / Read-only / Delegated). Per-user
+    exceptions live on the user card (👥 Users). Back → the Global tab."""
+    B = InlineKeyboardButton
+    rows: list[list[InlineKeyboardButton]] = []
+    if setting.set.get(ss.Scope.GLOBAL) is not None:
+        gval, _ = ss.resolve_from(setting, ctx, ss.Scope.GLOBAL)
+        vlabel = _setting_value_label(setting, gval, lang)
+        cbv = (f"sx:tog:g:{setting.key}" if setting.type is bool
+               else f"sx:nav:g:{setting.key}")
+        rows.append([B(text=i18n.t("settings.opt_value", lang, val=vlabel), callback_data=cbv)])
+    acc_label = _access_label(ss.configured_base_access(setting, ctx), lang)
+    rows.append([B(text=i18n.t("settings.opt_access", lang, val=acc_label),
+                   callback_data=f"sx:acc:{setting.key}")])
+    rows.append([B(text=i18n.t("btn.back", lang), callback_data="sx:tab:g")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _ss_access_kb(setting, ctx, lang: str = "en") -> InlineKeyboardMarkup:
+    """Base-access picker for one option (owner; #151): Delegated / Read-only / Hidden
+    (✓ on the current), Back → the option-admin page."""
+    B = InlineKeyboardButton
+    cur = ss.configured_base_access(setting, ctx)
+    btns = [B(text=_mark(_access_label(a, lang), _access_label(cur, lang)),
+              callback_data=f"sx:accset:{setting.key}:{a.value}")
+            for a in (ss.Access.DELEGATED, ss.Access.READONLY, ss.Access.HIDDEN)]
+    rows = [btns]
+    rows.append([B(text=i18n.t("btn.back", lang), callback_data=f"sx:opt:{setting.key}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 _SPARK_CHARS = "▁▂▃▄▅▆▇█"

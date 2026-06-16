@@ -107,3 +107,61 @@ def test_text_full_fallback_still_adopted_when_not_segmented(monkeypatch):
     s = _make(monkeypatch, events, mode="chat")
     assert s.flushed == []
     assert s.finished_with == "just prose, no code"
+
+
+# --- #161/151c+151d: effective-settings resolution at consumption ----------- #
+
+def test_effective_settings_soft_revoke_and_capability_gates(monkeypatch):
+    """`_effective_settings` resolves through the access model (soft-revoke at
+    consumption, 151c) and applies the capability gates (151d): a non-owner's
+    read-only option falls back to global, ungranted `max` effort downgrades, and
+    `full-access` reverts to ask. The owner keeps their own values."""
+    async def _run():
+        async def _no_overrides():
+            return {}
+        async def _no_default(uid, key):
+            return None
+        monkeypatch.setattr(db, "get_access_overrides", _no_overrides)
+        monkeypatch.setattr(db, "get_user_default", _no_default)
+
+        OWNER = 999
+
+        class _AL:
+            def level_of(self, uid, uname):
+                return "code"
+            def access_of(self, uid, uname):
+                # owner has no exceptions; the user has model set to read-only.
+                return {} if uid == OWNER else {"model": "readonly"}
+            def allow_max_effort_of(self, uid, uname):
+                return uid == OWNER          # only the owner may use max effort
+            def global_memory_of(self, *a):
+                return False
+            def tool_cap_of(self, *a):
+                return None
+
+        settings = SimpleNamespace(owner_id=OWNER, default_model="claude-opus-4-8")
+        sm = sessions.SessionManager(bot=SimpleNamespace(), settings=settings,
+                                     gate=SimpleNamespace(), allowlist=_AL())
+
+        def _state(uid):
+            return SimpleNamespace(
+                thread_id=-1, chat_id=uid, created_by=uid, mode="code",
+                model="claude-haiku-4-5", effort="max",
+                permission_mode="bypassPermissions", max_turns=None, big_memory=True,
+            )
+
+        # Non-owner code user with stale overrides the owner has since restricted.
+        eff = await sm._effective_settings(_state(5))
+        assert eff["model"] == "claude-opus-4-8"        # read-only → global (soft revoke)
+        assert eff["effort"] == "xhigh"                 # max not granted → downgraded
+        assert eff["permission_mode"] == "default"      # full-access owner-only → revert
+        assert eff["big_memory"] is False               # memory Hidden by default → off
+
+        # The owner keeps their own values (always Delegated + full capability).
+        effo = await sm._effective_settings(_state(OWNER))
+        assert effo["model"] == "claude-haiku-4-5"
+        assert effo["effort"] == "max"
+        assert effo["permission_mode"] == "bypassPermissions"
+        assert effo["big_memory"] is True
+
+    asyncio.run(_run())

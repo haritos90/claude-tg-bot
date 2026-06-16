@@ -887,6 +887,37 @@ async def set_user_default(uid: int, key: str, value) -> None:
     await set_kv(kvkey, json.dumps(value))
 
 
+# --------------------------------------------------------------------------- #
+# Owner-configured per-option ACCESS overrides (#151, menu.md §4)
+# --------------------------------------------------------------------------- #
+# The owner may override an option's BASE access (Hidden / Read-only / Delegated)
+# away from its built-in default (settings_schema.BASE_ACCESS_DEFAULTS). Stored as a
+# single JSON blob in `kv` (key 'access_base') so any registry key works with no
+# schema change. Effective access is DERIVED per prompt (settings_schema), so a
+# change applies from the user's very next prompt — nothing per-user is cached here.
+async def get_access_overrides() -> dict:
+    """Return the owner's per-option base-access overrides {option: level_str}, or
+    {} when none set. A garbled blob degrades to {} (fall back to built-in defaults)."""
+    raw = await get_kv("access_base")
+    if raw is None:
+        return {}
+    try:
+        v = json.loads(raw)
+        return v if isinstance(v, dict) else {}
+    except (ValueError, TypeError):
+        return {}
+
+
+async def set_access_override(option: str, level: str | None) -> None:
+    """Set (or clear, ``level=None``) the owner's base-access override for one option."""
+    cur = await get_access_overrides()
+    if level is None:
+        cur.pop(option, None)
+    else:
+        cur[option] = level
+    await set_kv("access_base", json.dumps(cur))
+
+
 async def get_user_lang(user_id: int) -> str | None:
     """Return the user's chosen interface locale, or None if never set.
 

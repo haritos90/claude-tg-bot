@@ -114,3 +114,80 @@ def test_memory_bool_user_coercion():
     )
     value, scope = settings_schema.resolve(s, ctx)
     assert value is True and scope is Scope.USER
+
+
+# --------------------------------------------------------------------------- #
+# Access model (#151, menu.md §4)
+# --------------------------------------------------------------------------- #
+from settings_schema import Access  # noqa: E402
+
+
+def test_base_access_defaults_match_table_23():
+    """The built-in base access matches menu.md Table 23 (memory/sandbox Hidden,
+    usage Read-only, the rest Delegated)."""
+    d = settings_schema.BASE_ACCESS_DEFAULTS
+    assert d["model"] is Access.DELEGATED
+    assert d["memory"] is Access.HIDDEN
+    assert d["sandbox"] is Access.HIDDEN
+    assert d["usage_display"] is Access.READONLY
+
+
+def test_effective_access_owner_always_delegated():
+    """The owner always has full (DELEGATED) access, even to a Hidden-by-default option."""
+    mem = settings_schema.get("memory")  # default HIDDEN
+    assert settings_schema.effective_access(mem, settings_schema.make_ctx(role=Role.OWNER)) is Access.DELEGATED
+
+
+def test_effective_access_precedence_exception_over_base_over_default():
+    """exception → owner base override → built-in default (#151)."""
+    s = settings_schema.get("model")  # default DELEGATED
+    # base override → READ-ONLY.
+    ctx = settings_schema.make_ctx(role=Role.CHAT, access_base={"model": "readonly"})
+    assert settings_schema.effective_access(s, ctx) is Access.READONLY
+    # per-user exception beats the base override.
+    ctx = settings_schema.make_ctx(role=Role.CHAT, access_base={"model": "readonly"},
+                                   access_exceptions={"model": "delegated"})
+    assert settings_schema.effective_access(s, ctx) is Access.DELEGATED
+    # nothing configured → built-in default.
+    ctx = settings_schema.make_ctx(role=Role.CHAT)
+    assert settings_schema.effective_access(s, ctx) is Access.DELEGATED
+
+
+def test_can_view_edit_combine_role_and_access():
+    """Visible iff role-gate AND access != HIDDEN; editable iff role-gate AND DELEGATED."""
+    model = settings_schema.get("model")
+    ctx = settings_schema.make_ctx(role=Role.CHAT)               # default DELEGATED
+    assert settings_schema.can_view_setting(model, ctx)
+    assert settings_schema.can_edit_setting(model, ctx)
+    ctx = settings_schema.make_ctx(role=Role.CHAT, access_base={"model": "readonly"})
+    assert settings_schema.can_view_setting(model, ctx)
+    assert not settings_schema.can_edit_setting(model, ctx)
+    ctx = settings_schema.make_ctx(role=Role.CHAT, access_base={"model": "hidden"})
+    assert not settings_schema.can_view_setting(model, ctx)
+    assert not settings_schema.can_edit_setting(model, ctx)
+
+
+def test_memory_hidden_by_default_until_delegated():
+    """big_memory is Hidden by default for non-owners; an exception delegates it."""
+    mem = settings_schema.get("memory")
+    ctx = settings_schema.make_ctx(role=Role.CHAT, state=_state(big_memory=True))
+    assert not settings_schema.can_view_setting(mem, ctx)
+    ctx = settings_schema.make_ctx(role=Role.CHAT, state=_state(big_memory=True),
+                                   access_exceptions={"memory": "delegated"})
+    assert settings_schema.can_view_setting(mem, ctx)
+    assert settings_schema.can_edit_setting(mem, ctx)
+
+
+def test_resolve_effective_soft_revoke():
+    """Soft revoke: when NOT Delegated the effective value is GLOBAL, ignoring (but
+    keeping) the user's stored session/user override (#151, menu.md §4.6)."""
+    s = settings_schema.get("model")
+    settings = SimpleNamespace(default_model="claude-opus-4-8")
+    # Read-only → the session override is ignored, value falls back to global.
+    ctx = settings_schema.make_ctx(role=Role.CHAT, state=_state(model="claude-haiku-4-5"),
+                                   settings=settings, access_base={"model": "readonly"})
+    assert settings_schema.resolve_effective(s, ctx) == ("claude-opus-4-8", Scope.GLOBAL)
+    # Delegated (default) → the session override counts.
+    ctx = settings_schema.make_ctx(role=Role.CHAT, state=_state(model="claude-haiku-4-5"),
+                                   settings=settings)
+    assert settings_schema.resolve_effective(s, ctx) == ("claude-haiku-4-5", Scope.SESSION)

@@ -191,19 +191,88 @@ class SessionManager:
         except Exception:
             return None
 
-    def _build_session(self, state: db.ThreadState) -> ClaudeSession:
-        """Construct a fresh ClaudeSession for a thread from its stored state.
+    def _raw_settings(self, state: db.ThreadState) -> dict:
+        """The stored per-session values, used as the fallback when no allowlist is
+        wired (e.g. unit tests) — keeps behaviour identical to reading ``state``."""
+        return {
+            "model": state.model, "effort": state.effort,
+            "permission_mode": state.permission_mode,
+            "max_turns": state.max_turns, "big_memory": state.big_memory,
+        }
+
+    async def _effective_settings(self, state: db.ThreadState) -> dict:
+        """Resolve the EFFECTIVE setting values for this session's OWNER through the
+        access model (#151 / 151c), so soft-revoke binds at CONSUMPTION — not just in
+        the /settings hub. An option the owner set to Read-only/Hidden (or never
+        delegated) falls back to the GLOBAL default even if a stale per-session or
+        personal override is stored; only a DELEGATED option counts the user's own
+        value. Also enforces the capability gates (151d): ``max`` effort requires the
+        per-user grant, ``full-access`` (bypassPermissions) is owner-only. Falls back
+        to the raw stored values when no allowlist is wired (unit tests)."""
+        if not self.allowlist:
+            return self._raw_settings(state)
+        owner_uid = state.created_by if state.created_by else state.chat_id
+        is_owner = owner_uid is not None and owner_uid == getattr(self.settings, "owner_id", None)
+        if is_owner:
+            role = settings_schema.Role.OWNER
+        elif self.allowlist.level_of(owner_uid, None) == "code":
+            role = settings_schema.Role.CODE
+        else:
+            role = settings_schema.Role.CHAT
+        access_base: dict = {}
+        with contextlib.suppress(Exception):
+            access_base = await db.get_access_overrides()
+        access_exc: dict = {}
+        with contextlib.suppress(Exception):
+            access_exc = self.allowlist.access_of(owner_uid, None)
+        user_defaults: dict = {}
+        for skey in ("model", "effort", "permission_mode", "max_turns", "memory"):
+            with contextlib.suppress(Exception):
+                user_defaults[skey] = await db.get_user_default(owner_uid, skey)
+        ctx = settings_schema.make_ctx(
+            state=state, user_id=owner_uid, role=role, settings=self.settings,
+            allowlist=self.allowlist, user_defaults=user_defaults,
+            access_base=access_base, access_exceptions=access_exc)
+
+        def eff(key):
+            v, _ = settings_schema.resolve_effective(settings_schema.get(key), ctx)
+            return v
+
+        out = {
+            "model": eff("model") or self.settings.default_model,
+            "effort": eff("effort"),
+            "permission_mode": eff("permission_mode") or "default",
+            "max_turns": eff("max_turns"),
+            "big_memory": bool(eff("memory")),
+        }
+        # 151d — capability gates applied to the EFFECTIVE values (mirror the per-turn
+        # gate in handlers._access_block, so a revoked grant takes effect at run time).
+        if out["effort"] == "max" and not (
+                is_owner or self.allowlist.allow_max_effort_of(owner_uid, None)):
+            out["effort"] = "xhigh"
+        if out["permission_mode"] == "bypassPermissions" and not is_owner:
+            out["permission_mode"] = "default"
+        return out
+
+    def _build_session(self, state: db.ThreadState, eff: dict | None = None) -> ClaudeSession:
+        """Construct a fresh ClaudeSession for a thread from its stored state, using
+        the EFFECTIVE (access-resolved) setting values in ``eff`` (#151/151c) for
+        model / permission_mode / big_memory / effort / max_turns. Falls back to the
+        raw stored values when ``eff`` is None (no allowlist wired).
 
         Code mode gets the per-thread permission callback and resumes the stored
         code_session_id (so a rebuilt client continues the prior session). Chat
         mode runs tool-free and does not resume a code session.
         """
+        eff = eff or self._raw_settings(state)
         send_tid = _send_thread_id(state.thread_id)
         if state.mode == "code":
             # Pass send_tid (where to post) AND the unique session key (for gate
             # bookkeeping/cancellation that must not collide across DM/General).
+            # The gate uses the EFFECTIVE permission_mode (a soft-revoked full-access
+            # reverts to asking).
             can_use_tool = self.gate.make_callback(
-                state.chat_id, send_tid, state.thread_id, state.permission_mode
+                state.chat_id, send_tid, state.thread_id, eff["permission_mode"]
             )
             resume_id = state.code_session_id
         else:
@@ -217,17 +286,17 @@ class SessionManager:
 
         return ClaudeSession(
             mode=state.mode,
-            model=state.model,
+            model=eff["model"],
             cwd=state.cwd,
             can_use_tool=can_use_tool,
             resume_session_id=resume_id,
-            permission_mode=state.permission_mode,
-            big_memory=state.big_memory,
+            permission_mode=eff["permission_mode"],
+            big_memory=eff["big_memory"],
             global_memory=self._resolve_global_memory(state),
             tools_enabled=state.tools_enabled,
             tool_cap=self._resolve_tool_cap(state),
-            effort=state.effort,
-            max_turns=state.max_turns,
+            effort=eff["effort"],
+            max_turns=eff["max_turns"],
             add_dirs=state.add_dirs,
             fork=state.fork_pending,
             # was: sandbox=self.settings.sandbox_code and not state.no_sandbox
@@ -251,18 +320,22 @@ class SessionManager:
         tkey = tuple(state.tools_enabled) if state.tools_enabled is not None else None
         cap = self._resolve_tool_cap(state)
         capkey = tuple(cap) if cap is not None else None
+        # #151/151c: compare against the EFFECTIVE (access-resolved) values, not the
+        # raw stored ones — so an owner access/global change (or a revoked grant)
+        # triggers a rebuild and applies from the next message.
+        eff = await self._effective_settings(state)
         needs_rebuild = (
             rec.session is None
             or rec.mode != state.mode
-            or rec.model != state.model
+            or rec.model != eff["model"]
             or rec.cwd != state.cwd
-            or rec.permission_mode != state.permission_mode
-            or rec.big_memory != state.big_memory
+            or rec.permission_mode != eff["permission_mode"]
+            or rec.big_memory != eff["big_memory"]
             or rec.global_memory != gmem
             or rec.tools_enabled != tkey
             or rec.tool_cap != capkey
-            or rec.effort != state.effort
-            or rec.max_turns != state.max_turns
+            or rec.effort != eff["effort"]
+            or rec.max_turns != eff["max_turns"]
             or rec.add_dirs != tuple(state.add_dirs)
             or rec.fork != state.fork_pending
         )
@@ -283,17 +356,17 @@ class SessionManager:
                 rec.session = None
                 with contextlib.suppress(Exception):
                     await old.aclose()
-            rec.session = self._build_session(state)
+            rec.session = self._build_session(state, eff)
             rec.mode = state.mode
-            rec.model = state.model
+            rec.model = eff["model"]
             rec.cwd = state.cwd
-            rec.permission_mode = state.permission_mode
-            rec.big_memory = state.big_memory
+            rec.permission_mode = eff["permission_mode"]
+            rec.big_memory = eff["big_memory"]
             rec.global_memory = gmem
             rec.tools_enabled = tkey
             rec.tool_cap = capkey
-            rec.effort = state.effort
-            rec.max_turns = state.max_turns
+            rec.effort = eff["effort"]
+            rec.max_turns = eff["max_turns"]
             rec.add_dirs = tuple(state.add_dirs)
             rec.fork = state.fork_pending
             # Restore the persisted /stream preference (survives restart).

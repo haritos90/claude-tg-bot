@@ -162,6 +162,19 @@ class Allowlist:
         use) or ``None`` (no cap = the session's full default set). #131."""
         return [str(x) for x in v] if isinstance(v, list) else None
 
+    @staticmethod
+    def _norm_access(v) -> dict:
+        """Normalize a per-user ACCESS-exceptions map {option: 'hidden'|'readonly'|
+        'delegated'} (#151, menu.md §4.1). Drops unknown levels; fail-soft to {}."""
+        if not isinstance(v, dict):
+            return {}
+        out: dict = {}
+        for k, lvl in v.items():
+            s = str(lvl).strip().lower()
+            if s in ("hidden", "readonly", "delegated"):
+                out[str(k)] = s
+        return out
+
     def _norm_record(self, rec: Optional[dict]) -> dict:
         rec = rec or {}
         uname = rec.get("username")
@@ -175,6 +188,7 @@ class Allowlist:
             "global_memory": self._norm_bool(rec.get("global_memory")),
             "allow_max_effort": self._norm_bool(rec.get("allow_max_effort")),
             "tool_cap": self._norm_tool_cap(rec.get("tool_cap")),
+            "access": self._norm_access(rec.get("access")),
         }
 
     def _norm_pending(self, rec: Optional[dict]) -> dict:
@@ -187,6 +201,7 @@ class Allowlist:
             "global_memory": self._norm_bool(rec.get("global_memory")),
             "allow_max_effort": self._norm_bool(rec.get("allow_max_effort")),
             "tool_cap": self._norm_tool_cap(rec.get("tool_cap")),
+            "access": self._norm_access(rec.get("access")),
         }
 
     def _norm_owner_prefs(self, rec: Optional[dict]) -> dict:
@@ -545,6 +560,37 @@ class Allowlist:
         self._save()
         return True
 
+    def access_of(self, user_id: Optional[int], username: Optional[str]) -> dict:
+        """The user's per-option ACCESS EXCEPTIONS {option: 'hidden'|'readonly'|
+        'delegated'} (#151), or {} (use the owner's base access). The owner has no
+        exceptions — they always have full access."""
+        self._reload_if_changed()
+        if user_id is not None and user_id == self.owner_id:
+            return {}
+        rec = self._find(user_id, username)
+        return self._norm_access(rec.get("access")) if rec else {}
+
+    def set_access_exception(self, target: str, option: str, level: Optional[str]) -> bool:
+        """Set (or clear, ``level=None``) a per-user access EXCEPTION for one option
+        (#151). ``level`` is 'hidden' / 'readonly' / 'delegated'. The owner is always
+        full (no-op success). Returns True if the target exists."""
+        self._reload_if_changed()
+        if self._is_owner_target(target):
+            return True
+        rec = self._record_for_target(target)
+        if rec is None:
+            return False
+        acc = self._norm_access(rec.get("access"))
+        if level is None:
+            acc.pop(option, None)
+        else:
+            s = str(level).strip().lower()
+            if s in ("hidden", "readonly", "delegated"):
+                acc[option] = s
+        rec["access"] = acc
+        self._save()
+        return True
+
     def set_rate(self, target: str, day=_UNSET, week=_UNSET) -> bool:
         """Set/clear a user's rolling-window caps (#120). Pass ``day``/``week`` as an
         int (cap, in tokens), None (clear that window), or leave unset to keep it.
@@ -606,6 +652,7 @@ class Allowlist:
                 "global_memory": self._norm_bool(self._owner_prefs.get("global_memory")),
                 "allow_max_effort": True,
                 "tool_cap": None,
+                "access": {},
             }
         rec = self._record_for_target(target)
         if rec is None:
