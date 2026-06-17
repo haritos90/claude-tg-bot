@@ -41,7 +41,7 @@ header rows. Columns:
 - **Closed** — `| ID | Theme | Title | Resolution |`
 - **Deferred** — `| ID | Pri | Eff | Theme | Title | Reason |`
 
-**Next free ID:** 162
+**Next free ID:** 190
 
 ---
 
@@ -59,9 +59,76 @@ Not started; promote to Open when picked up.
 
 | ID | Pri | Eff | Theme | Title |
 |---|---|---|---|---|
+| 165 | P1 | M | observability | Custom per-user usage that mirrors the OFFICIAL windows (context size + chat working-time; before/after delta is unsafe under concurrency) |
+| 173 | P2 | M | ux | Make the KEYBOARD menus rich too (settings hub / user cards) for full font consistency — they still send/edit classic HTML |
+| 174 | P3 | XS | ux | Re-enable rich for CODE replies IF Telegram ever styles code blocks in rich messages (blocked on Telegram) |
 | 119 | P1 | XL | security | Fully-contained sandbox (e2e): credential broker + egress allowlist + per-session isolation + DoS limits |
-| 134 | P2 | S | observability | `big_memory` 1M-context beta is IGNORED under the subscription (custom betas are API-key-only) — verify + document/rework |
-| 135 | P2 | M | observability | Subscription usage shows just "5h OK" far from the limit — surface the real % used (Claude Code `/usage` shows e.g. 49%) via the account usage source the SDK rate-events don't expose |
+| 178 | P2 | S | reliability | Archive retention / auto-purge — delete old session bundles in `_archive/` (age/size cap) + a browser to inspect/restore/delete them |
+| 184 | P3 | S | ux | "Waking up…" placeholder when a reaped session re-spawns — if first-token latency after idle eviction proves too long, send a rich "ожидание / waking up" message immediately, then UPDATE it in place with the real answer. Owner will greenlight if the re-spawn delay is noticeable. |
+
+### Details
+
+**#178 — archive retention / auto-purge** (P2 · S · reliability · _from #177; owner ask 2026-06-17 "удаление пока не настраивать, в туду"_)
+
+#177 made session delete ARCHIVE instead of destroy: each deleted DM session is
+moved into `BASE_WORKDIR/_archive/<owner_id>/<sid>-<stamp>.tar.gz` (+ a `.json`
+sidecar with sid/key/name/deleted_at/part-sizes). Bundles accumulate forever —
+nothing prunes them yet. Build: (1) a retention policy — drop bundles older than
+N days and/or keep the archive dir under a size cap (oldest-first); run it on a
+schedule or at startup. (2) An owner-facing browser (e.g. under `/sessions` or a
+new `/archive`) to list archived sessions from the sidecars, RESTORE one (un-tar
+back to a fresh session) and DELETE one for good. Keep it owner-only. Until this
+lands, prune manually with `rm` if disk gets tight.
+
+**#165 — custom per-user usage that mirrors the OFFICIAL windows** (P1 · M · observability · _from #164; owner feedback 2026-06-16_)
+
+The owner's real subscription windows (5h / 7d) are what run out, but our per-user
+caps count only `input_tokens + output_tokens` (`db.get_user_usage_tokens`) — ignoring
+**cache** tokens, **model weight** and **context size**, so a user looks "cheap" while
+the owner's global window drains (and it makes compaction pointless). Owner's words:
+*"для пользователя он ничего не потратил, а у меня всё улетело."*
+
+**Owner ruled OUT the before/after account-delta approach** (option 2): with a heavy
+agent running in parallel, the account-% delta around one user's turn also captures the
+*other* turn's consumption → wrong attribution. So the metric must be **self-contained
+per turn**, not derived from a shared global gauge.
+
+Direction (owner ask): build a **custom usage metric that resembles the official one**
+and bills the real cost drivers, computed from this turn's own data:
+- **Context size** — `get_context_usage().totalTokens` (the dominant cost; a big
+  context is re-read every turn). Captured per turn (#167 already stores it on `rec`).
+- **Cache tokens** — `cache_read` (cheap) + `cache_creation` (dear), already in the
+  `usage` table.
+- **Model weight** — Opus ≫ Sonnet ≫ Haiku, tracking the 7d-Opus / 7d-Sonnet windows.
+- **Chat working-time** — wall-clock per turn (a long agentic run costs more); cheap to
+  record.
+Combine into a single weighted "unit" per turn, summed per user over the rolling
+windows — concurrency-safe because each turn's cost is computed only from its own
+numbers. Or a **workaround**: cap by context-size-seconds rather than tokens.
+**Owner decision needed:** the weights (model multipliers, cache/context/time coeffs)
+and which signal dominates. Not yet implemented — design only.
+
+**#174 — re-enable rich for code replies if Telegram fixes it** (P3 · XS · ux · _from #172; blocked on Telegram_)
+
+Rich messages render a ```` ```fence ```` only as plain monospace (no language label /
+syntax / copy) — verified with the owner 2026-06-17 across every variant (standalone,
+blank-line-separated, markdown vs `<pre><code>` html). So code replies use the CLASSIC
+path (`streamer._commit`/`_render_draft` guard on `"```" in full_text`). If Telegram
+later styles code blocks in rich messages, drop those guards (+ the one in
+`_commit_rich_markdown`) so code replies go rich too — then everything is rich. Cheap
+to flip; left as a watch-item.
+
+**#173 — make the KEYBOARD menus rich too** (P2 · M · ux · _from #172_)
+
+#172 made text commands rich (`reply()` → `sendRichMessage`), but the menus that carry
+an inline keyboard still use classic HTML: the `/settings` hub and the user cards open
+with `bot.send_message(reply_markup=…)` and EDIT in place with `msg.edit_text(…)` on
+navigation. `sendRichMessage` DOES accept `reply_markup`, and Bot API 10.1 added a
+`rich_message` param to `editMessageText`, so both the open and the nav-edits could go
+rich — making every surface consistent. Risk: the nav-edit path is hot (every tap) and
+the `editMessageText` rich path is new; prototype + verify the animation/markup behaves
+before switching the menus over. Until then text-commands look slightly different from
+the button menus.
 
 ### Details
 
@@ -221,16 +288,6 @@ allowlist (CONNECT proxy + cgroup-nftables hard block) · 119d per-session
 user-supplied service creds (`/secret`) · 119e DoS hardening (cgroup mem/CPU +
 seccomp).
 
-**#134 — big_memory 1M beta ignored under subscription** (P2 · S · observability)
-
-The CLI logs "Custom betas are only available for API key users. Ignoring provided
-betas" — so `betas=["context-1m-2025-08-07"]` (engine; passed for code always + chat
-when big_memory) is a NO-OP under the OAuth subscription. So `big_memory`'s 1M-window
-promise (#32/#54) is inactive today; only its durable-resume half still works. Verify
-whether 1M is reachable another way under subscription; otherwise relabel big_memory
-as "durable context" only (drop the 1M claim in `/status`, help, AGENTS, README) so it
-isn't misleading.
-
 ---
 
 ## Closed
@@ -239,6 +296,28 @@ Title-only history.
 
 | ID | Theme | Title | Resolution | Release notes |
 |---|---|---|---|---|
+| 187 | features | Outbound file send-back via an `outbox/` drop-dir | The only way to get an agent-CREATED file out was /export (zips the whole workdir). Added a per-session `outbox/` drop-dir: the agent copies a file there (`cp chart.png outbox/`) and the host delivers it to the chat after the turn, then removes it. Pieces: `engine` pre-creates `<cwd>/outbox/` in `_ensure_client` (code mode) and ALWAYS appends an `OUTBOX_INSTRUCTION` to the code system-prompt preset (alongside any owner memory) teaching the mechanism; `sessions._deliver_outbox` (called in `_worker` right after `_run_one`, OUTSIDE the turn-sem so uploads don't hold a concurrency slot) drains the dir — images → `send_photo`, else → `send_document` — with per-file size caps (5 MB image / 49 MB doc — the doc cap matches /export + the Telegram bot send limit so the agent can archive the whole workdir into outbox/ as an /export alternative) and a 10-file/turn count cap; too-big files are dropped with one aggregated note, overflow stays for the next turn. Round-trip verified under bubblewrap: the jailed uid-65534 agent writes into the root-owned 0700 workdir and the host reads/deletes the file. Chose the drop-dir (the ticket's recommended mechanism) over mtime-diff / auto-send. +3 tests, 125 green. | In a code session, ask the agent to drop a file in `outbox/` (e.g. `cp report.pdf outbox/` or save straight to `outbox/chart.png`) and it's sent to your chat as a photo/document when the turn ends — no more zipping the whole workdir with /export just to grab one chart. Or archive the whole workdir into outbox/ (`tar czf outbox/all.tar.gz --exclude=./outbox .`, up to 49 MB) to send everything at once as an /export alternative. |
+| 185 | settings | Owner can self-impose the per-user limits (for testing) | The owner was hardcoded uncapped in every allowlist getter, so it could never self-test the per-user caps. Extended the existing `_owner_prefs` map (already backing the owner's `global_memory`) to also hold `rate` / `allow_max_effort` / `tool_cap`: `_norm_owner_prefs` normalises them (defaults uncapped / max-allowed / no-cap, and a legacy prefs blob upgrades transparently on load); the three getters (`rate_of` / `allow_max_effort_of` / `tool_cap_of`) + `describe` read them for the owner; the three setters (`set_rate` / `set_allow_max_effort` / `set_tool_cap`) store them. Removed the two EXTRA max-effort owner bypasses (`_may_max_effort`, the effort-tap gate, and `sessions`'s `is_owner or …`) so a self-revoke actually downgrades the owner — the getter still defaults the owner to allowed, so default behaviour is unchanged. The owner card now shows the max-effort / tools / day / week / clear-limits buttons (still no level/expiry/access/name/remove) and the tool-cap sub-page is unlocked for the owner. Enforcement is automatic via the existing by-uid `_access_block` + effort/tool resolvers; rate caps fire on the owner's own DM turns (usage attributes by `threads.chat_id == owner_id`). Lockout-safe: the gate covers turns, NOT commands, so the owner can always re-open the card to clear a self-cap. +5 tests, 122 green. | You can now apply the same limits to yourself — daily/weekly token caps, max-effort, and a tool cap — from your own user card (👑 on /users), to see how they behave before setting them on others. Clear them anytime to go back to uncapped. |
+| 182 | settings | Per-user idle-TTL via the user card (incl. owner self) | The reaper's idle-TTL was a single global (#179). Now per-user: a `⏳ Idle` button on EVERY user card — including the owner's own card (reachable via the 👑 owner button on /users) — → arg-capture (minutes, `off`=∞/never, `default`=server default) → stored in the per-uid KV `idle_ttl_min` (works for any uid, owner included; no allowlist entry needed). `sessions._resolve_idle_ttl` reads it for the session OWNER and stamps `rec.idle_ttl` on each build; `_reap_once` honours the per-record value (≤0 = never reaped on idle; the RAM cap still applies as the hard safety). Hardcoded default 5→6 min. +1 test, 117 green. | The owner can set the idle-unload timeout per user — and on themselves (e.g. ∞ on a big-RAM box so sessions never unload) — from the user card. |
+| 181 | reliability | Nest session files under one parent — `<sid>/{work,state}` | Files were split across `<sid>` (work) + `<sid>.sbxstate` (state) siblings, plus a host transcript in `~/.claude/projects` for un-jailed sessions — three places. Now ONE parent `BASE_WORKDIR/<sid>/{work,state}`: cwd = `work/` (bound into the jail, writable); the transcript/HOME = sibling `state/` (NOT bound, so the agent can't reach it). Updated `_default_cwd` / `allocate_dm_session` / handlers `_workdir_zip`+default_cwd / `engine.SBX_STATE`+`_ensure_client`; `archive.py` bundles the whole `<sid>/`; retired the legacy `migrate_workdirs_to_sid` (its basename==sid skip-check would strip the new `/work` every startup). The 6 live sessions migrated BY HAND (dirs restructured, host/sbxstate transcripts moved into `state/` + renamed to the new cwd-encoding so `resume` survives, DB cwds bumped) after a full backup; verified no bot files remain outside `workdirs/`. Tests updated, 116 green. | Everything for a session lives in one `workdirs/<sid>/` folder; nothing outside it; deleting archives that one folder. |
+| 180 | security | Sandbox ALL sessions (chat too), not just code | Chat ran un-jailed as ROOT (only code was sandboxed). `engine._build_options` now routes the chat branch through `_enable_sandbox` and `_ensure_client` creates the jail state dir for ALL modes, so every session (chat + code, incl. the owner's) runs as unprivileged uid 65534, filesystem-confined to its workdir, root read-only, env wiped. Chat stays tool-free — the win is non-root + workdir confinement + the transcript off the host. Dropped the `/sandbox` code-only gate (`handlers.cmd_sandbox`). menu.md + README updated. Verified live: all 6 sessions jailed. | Every session — chat and code, including the owner's — runs sandboxed (non-root, confined); nothing runs as host root. |
+| 179 | reliability | Concurrency / RAM management — idle reaper + caps + queue | Each live session pinned a persistent `claude` subprocess (~400–600 MB) until restart — no cap, no eviction, so N idle users could OOM a small box (and the box had **no swap** = hard kill). Added in `sessions.py`: an **idle reaper** (`_reaper_loop`/`_reap_once`/`_evict_session`, started in `bot.main` next to the usage poller, cancelled in `aclose`) that `aclose()`s sessions idle > `IDLE_TTL_SEC` (default 900) — history persists on disk so `resume` rebuilds on the next message, nothing lost; a **live-client cap** (`MAX_LIVE_CLIENTS`, LRU eviction of idle clients); a **turn semaphore** (`MAX_CONCURRENT_TURNS`) bounding simultaneous generations, overflow turns queue with a `busy.queued` notice; **memory-pressure relief** (`MIN_FREE_MB`, evicts idle before a turn, reading `/proc/meminfo`). All four caps auto-derive from the box's RAM/CPU in `config.load_settings` (getattr-tolerant so test stubs construct). +4 tests (`test_sessions.py`), 116 green, ruff clean, deployed (Run polling confirmed, single poller). Ops alongside: 2 GB swap + journald 200M cap + 3proxy/btmp purge + `cron.daily` (freed ~2.2 GB); README gained a RAM/limits table + tunables. | The bot self-limits to the server's RAM: idle sessions release their memory (history kept), simultaneous turns are capped, and overflow turns queue instead of crashing the box. |
+| 177 | reliability | Archive deleted sessions instead of destroying them | Session delete (`ses:delok`) used to `shutil.rmtree` the workdir + `.sbxstate` and ORPHAN the transcript (it lives outside the workdir, in `~/.claude/projects/<encoded-cwd>/`). New `archive.py` `archive_session()` now MOVES all three (workdir + sbxstate + transcript) into one gzip bundle `BASE_WORKDIR/_archive/<owner_id>/<sid>-<stamp>.tar.gz` (+ a `.json` sidecar; text/jsonl compresses ~10× so disk drops) and removes the live copies — fail-safe (a write error keeps the live copies). A sid-suffix guard ensures the shared repo-root transcript dir can never be swept up. Old rmtree commented out (not deleted) per the audit convention; `import shutil` retired from handlers. +4 tests (`test_archive.py`), 112 green, ruff clean. Auto-purge/restore of archives deferred → #178. | Deleting a session no longer loses its files OR its transcript — they're compressed into cold storage; nothing is destroyed. |
+| 176 | ux | Consistent fonts: send the WHOLE reply as ONE rich message (code incl.) | Replies were inconsistent — a code reply went fully classic (smaller text, `<pre>` table grid), a no-code reply was rich (bigger). Two fixes were built: (a) a per-segment split — non-code runs RICH, each code block CLASSIC `<pre><code>` (`_commit_mixed` + `markup.split_code_blocks`/`has_code_block`, +2 tests); (b) the chosen one — **owner preferred ONE consistent rich message** (prose + tables + lists + code) over splitting into bubbles, accepting that code shows as plain **monospace** in rich (the client doesn't style `RichBlockPreformatted` yet, #174) and waiting for Telegram to fix it (then code styles with NO change). `streamer._commit` now always uses `_commit_rich_markdown`; the split path is kept un-called for a quick flip-back. Streaming is rich throughout. markup.md updated. | Every reply is one consistent rich message — native tables / lists / headings; code is monospace for now (until Telegram styles rich code), no more font jumping. |
+| 175 | ux | Global `/workingplate` on/off + native table kept in code replies | `/workingplate on\|off` (owner; tappable keyboard; persisted `working_plate` kv) globally disables the "Working…"/⏹ Stop control plate, wired through `Streamer(controllable=…)` — for A/B testing whether the plate makes generation visibly jump (a mid-stream message arrival re-renders the draft on some clients; same flag already silenced it for `/test`). Also fixed: a code-containing reply now keeps its TABLE as a NATIVE bubble (was wrongly a `<pre>` grid after #172) — `_build_sendables` always extracts native tables; the code still renders as a proper classic block inline. | Owner can switch the Working/Stop plate off to test streaming smoothness; code replies show a real code block AND a native table. |
+| 172 | ux | Stream replies ALREADY FORMATTED (no plain→rich snap) + font consistency + `/test` | Bot API 10.1 `sendRichMessageDraft` streams a partial rich message that renders formatted AS it generates (Durov's GIF), persisted by the final `sendRichMessage` — `streamer._render_draft` now streams the raw markdown via it (plain-draft fallback on error). Verified live. Owner-only **`/test`** (last in the registry, not in `/`-menu or `/help`) simulates a streamed reply (3 paragraphs + 5×5 table + x86 asm snippet) via `sessions.stream_demo`. Consistency: `reply()` now sends command replies as rich too (matches `/status`/`/userstats`/streamed answers); `/status` restructured — flags as a `<ul>` checklist, usage windows + lifetime totals as `<ul>` lists, "Usage trend" relabelled "📈 Limit trend (recent utilization %)". Friendly name now also shows in the `/users` LIST (bold, before `@username`); `/userstats` reachable from the menu via a 📊 button on the Users page (shared `_send_userstats`). | Replies generate already-formatted (no jarring switch); fonts are consistent across text commands; `/status` reads cleanly; `/test` lets the owner eyeball streaming; user stats reachable from the menu. |
+| 171 | features | Owner-assignable friendly names for users | `allowlist` entries gained `friendly_name` + `set_friendly_name` (clear with `-`/`off`); the user card has an ✏️ button → arg-capture (`usrname:<t>` → `_apply_user_value`); the name shows in the card title (`Name (@user)`) and is preferred in `/userstats`. Persists in `allowlist.json`. Unit-checked roundtrip. | The owner can label each user with a friendly name, shown in the user card and the stats table. |
+| 170 | ux | Native rich lists / checklists in our own (read-only) UI | Added `handlers.reply_rich_html` (sends `sendRichMessage` html, falls back to classic `reply()`); `/status` now renders as a native `<h3>` heading + a `<ul>` **checkbox list** for session flags (checkbox = on/off — display-only, so the interactive menus correctly stay inline-keyboard). Reusable primitive for `/help` / session cards next. | `/status` is now a clean native checklist; the pattern is ready for other read-only screens. |
+| 169 | ux | Whole reply as ONE rich message — no splitting | `streamer._commit_rich_markdown` sends the entire reply via `sendRichMessage({"markdown": …})`: the model's headings / lists / tables / code render natively, with **no char-limit split and no separate table bubbles**. Verified a 9.3k-char message renders with a "show more" button (~22 paragraphs) — so nothing needs splitting; the legacy chunk/split/table-bubble path is kept ONLY as the fallback (rich send fails). The `.md`-doc path is the last-resort size fallback. Every reply now uses the (slightly larger) rich font — consistent, and the reason owner-sent messages looked bigger than the bot's. | Replies are never chopped into pieces — one richly-formatted message, long ones collapsed behind "show more". |
+| 168 | engine | Wire `auto_compact` to real SDK compaction | Forced ON by default (the CLI default) but DISABLEABLE when the owner delegates it. `engine._build_env` sets `DISABLE_AUTO_COMPACT=1` when the effective toggle is off (verified live: flips `ContextUsageResponse.isAutoCompactEnabled` True→False); forwarded through the sandbox `--clearenv` (`deploy/sandbox-claude.sh`). Setting moved to USER-scope (a per-session bool column defaults off and would wrongly override the forced-on default). Resolved in `_effective_settings` + rebuild-detected. | Auto-compaction is on by default; the owner can let specific users turn it off. |
+| 167 | observability | Live context size in the working plate | New `ctx_status` setting (forced ON / delegate-to-disable). The context size is captured at each turn END (`session.context_usage()` — client idle, so safe) onto `rec.last_context_tokens`, and shown in the NEXT turn's "Working…" plate once ≥ 50k (`stream.context`). Avoids risky mid-stream polling. Also: owner usage in the plate + footer now shows **5h and 7d on two lines** (`usage.footer_line(sep="\n")`). | While generating, the plate shows the live context size for big sessions; owner usage is on two clean lines. |
+| 166 | ux | Live ticking hot-cache countdown | The warm-cache note now ticks DOWN once a minute (`_hot_cache_tick`: ~5 → 0, then ❄️ cold), and is cancelled + removed on the next turn (the window reset). Opt-in (the `hot_cache_timer` toggle is delegated, default off), so the per-minute edits only run for users who enabled it. | The warm-cache reminder now counts down live and clears itself when the cache cools or you reply. |
+| 164 | ux | Native Telegram tables (Bot API 10.1 `sendRichMessage`) + usage split | Supersedes #163's PNG/`<pre>` table. Bot API 10.1 `InputRichMessage.html` renders a real `<table>` (bordered/striped, `<th>`, colspan/rowspan, align/valign, `<caption>`); aiogram 3.28 has no binding so `rich_message.py` hand-declares `SendRichMessage(TelegramMethod)`. `markup.split_rich_tables` + `table_to_rich_html` route EVERY table natively (alignment from the `:--:` row, inline `<b>`/`<code>` kept); `streamer._send_rich` falls back to the `<pre>` grid on any failure (table never lost). PNG (`table_image.py`) + grid paths kept commented for revert. Usage rework: `/userstats` (owner, native table), `/limits` (user→own rolling limits, owner→real account usage), account footer gated **owner-only**, working-plate note (user limit ≥50% / owner account), **delegated** `hot_cache_timer` toggle + static post-reply warm-cache note, **hidden** owner-only `auto_compact` toggle (persist-only). DB: `hot_cache_timer`/`auto_compact` cols + `get_all_users_usage`. Verified live (probe + a 13-category rich-formatting showcase all accepted by the API). Docs: new `markup.md` + README/menu cross-refs. Follow-ups split to #165–#169. | Tables render natively and side-scroll; users see their own limits, the owner sees global usage + a per-user stats table. |
+| 163 | ux | Tables: narrow → text grid, wide → image (cards rejected) | Telegram has **no native table** (verified vs the HTML-style doc: no `<table>` tag, no `table` MessageEntity), a wide `<pre>` grid wraps off the bubble ("кривая"), and a vertical "cards" layout reads as "не таблица". So: `markup.split_image_tables` extracts WIDE tables (rendered width > `_TABLE_GRID_MAX_WIDTH`=46) and the streamer sends them as a **PNG** (`table_image.render_table_png` — DejaVuSansMono/Cyrillic, bordered, shaded bold header) via `send_photo`; NARROW tables stay aligned `<pre>` text grids inline. `streamer._commit` rewritten to emit ordered text+photo "sendables" (`_build_sendables`); cell emphasis (`**bold**`/`` `code` ``/`~~`) is stripped (a grid can't host it). Added `Pillow` dep + `table_image.py`. `_render_table_cards`/`_render_table_auto` kept (superseded — the rejected B/C card variants). Owner-approved via an in-Telegram A–E variant test. Unit-tested. Caveat: image text isn't selectable/copyable. | Wide tables now arrive as a clean table image; narrow ones stay copy-pasteable text grids. |
+| 162 | ux | Markdown tables with `+` (grid) separators rendered raw | `markup._TABLE_SEP_RE` only matched `|`-junction separator rows, so a pipe table whose under-header line used the ASCII/grid form `---+---+---` (and dropped the outer pipes) wasn't detected → the whole table leaked as raw text. Widened the junction char class to `[|+]` (data rows still split on `|`); a bare dash run (`------`, no junction) still isn't mistaken for a table. +2 markup tests (the `+`-grid table + the hr negative); README formatting bullet notes both separator styles. | Tables that use `+` grid separators now render as aligned monospace grids instead of raw text. |
+| 134 | observability | `big_memory` 1M context was a no-op under the subscription | Root cause: `betas=["context-1m-2025-08-07"]` is IGNORED under OAuth ("Custom betas are only available for API key users"). Fix: 1M is now requested via the **`[1m]` model-id suffix** (`engine._one_m_model`), not `betas` (both commented out). Verified live under THIS subscription: Opus `[1m]` works (auto-included on Max, no usage-credits, `service_tier:standard` → subscription-billed); Sonnet `[1m]` → "API Error: Usage credits required for 1M context" (PAID, off by default); Haiku has no 1M variant. So `[1m]` is applied to **Opus only** by default, widenable via env `BIG_MEMORY_1M_MODELS` for credit-enabled deployers. memory.show/on labels + AGENTS corrected to be accurate. Unit-tested (tests/test_engine.py). | big_memory now delivers the real 1M context window on Opus (Sonnet needs paid credits; Haiku unsupported). |
+| 18 | build | Public release (tag + GitHub Release notes) | Owner-confirmed done (2026-06-16). NB: no local git tag / `gh release` was visible from this checkout at close time — recorded per owner's word; re-open if a tag still needs cutting. | |
+| 135 | observability | Subscription usage showed just "5h OK" far from the limit | `usage.fetch_account_usage` GETs `/api/oauth/usage` (the source Claude Code's /usage reads) with the OAuth bearer + `anthropic-beta: oauth-2025-04-20` — the REAL per-window % even when idle (the SDK rate-events only send it near a limit). Normalized (percent→fraction, ISO→epoch) into `rate_by_type`; a 5-min poller (`sessions._usage_poll_loop`) + a refresh on /status keep the footer/pinned live (e.g. "5h 61% left · resets 2h42m"). Read-only GET, fail-soft. Unit-tested. | |
 | 130 | security | Global memory: inject CLAUDE.md directly, not setting_sources=["user"] | `setting_sources` is now `[]` UNCONDITIONALLY; global memory injects the owner's ~/.claude/CLAUDE.md (+ memory/*.md) CONTENT into the system prompt instead (`engine._global_memory_block` — chat appends to CHAT_SYSTEM_PROMPT, code uses the claude_code preset `append`). settings.json (permissions/env) is never loaded; also works under the sandbox. Unit-tested (tests/test_engine.py). | |
 | 161 | features | Access model #151 follow-up (151c/151d) | 151c shipped: `sessions._effective_settings` resolves model/effort/permission_mode/max_turns/big_memory through the access model at session-build, so soft-revoke binds at CONSUMPTION (not just the hub). 151d: `max` effort + `full-access` are enforced on the effective values (ungranted→downgraded). Re-modelling the already-working chat/code `level` + per-tool `tool_cap` gates as Access-matrix entries was deemed low-value (no behaviour change) and left as-is. Unit-tested. | |
 | 141 | ux | Unify the two parallel /settings menus | Retired the flat `st:` hub; `/settings` opens only the registry `sx:` hub, with Tools / Usage / Users ported on as sub-pages. `on_settings_cb` is now a stale-button shim; the old page builders are dead-in-place (kept for revert). | |
@@ -403,6 +482,43 @@ Parked work (revive by moving back to Backlog/Open).
 
 | ID | Pri | Eff | Theme | Title | Reason |
 |---|---|---|---|---|---|
+| 183 | P2 | L | security | Sandbox-only run mode + an owner "unrestricted" jailed user | After #119 (credential broker + egress allowlist) the un-jailed path can be dropped entirely so EVERY session is ALWAYS sandboxed (no on/off). The owner gets an "unrestricted" profile — still inside bubblewrap (NOT host root), but a jailed user with broad in-jail privileges — replacing today's root-on-host fallback. Depends on #119. |
 | 16 | P3 | L | features | optional voice-note input (transcribe → route as text) | Not supported by the SDK: no subscription-safe STT (no `ANTHROPIC_API_KEY` allowed; chat mode is tool-free). Needs an owner-chosen transcription backend (e.g. a local `faster-whisper`) before it's worth building. |
-| 18 | P3 | M | build | public release (tag + GitHub Release notes) | After the repo exists and the first version is stable |
 | 62 | P3 | L | features | "Pro" command layer — remainder: `/rewind`, `/resume`, `/mcp`, `/budget`, `/continue` | The safe subset shipped (#23). Remainder deferred per the 2026-06-14 SDK introspection: `/rewind` needs `enable_file_checkpointing` + `replay-user-messages` + `UserMessage.uuid` capture (files-only); `/mcp` conflicts with the tool-free/isolation posture (code-mode only); `/budget` (`max_budget_usd`) is likely a no-op under subscription auth; `/resume`+`/continue` are redundant with the bot's own per-session resume. |
+| 186 | P3 | XL | features | Pluggable agent backend — drive coding agents OTHER than the `claude` CLI behind one adapter | The engine is hardwired to the `claude` CLI / Agent SDK (`engine.py`). A thin agent-adapter layer (one interface for spawn / stream / tool-permission / resume) would let the same Telegram front-end drive other local coding agents. Big surface and no demand yet, and it cuts against the subscription-only + deep-sandbox focus — every backend needs its OWN auth + jail + billing story (and our P0 is subscription-only, no API key). Parked until there's a concrete second backend worth wiring; if so, the boundary to carve is the `engine.ClaudeSession` interface. |
+| 188 | P2 | M | features | Natural-language scheduled tasks — recurring cron jobs set from chat | Let a user say e.g. "каждый день в 9:00 собери GitHub trending" and have the bot register a recurring job that wakes a session, runs the prompt, and posts the result back. Needs: an NL→schedule parser, a persisted job store, a scheduler loop (APScheduler or an asyncio timer in `bot.main`, next to the reaper/usage pollers), per-user caps so a schedule can't silently drain the subscription windows, and a `/schedules` manager (list / pause / delete, arg-capture per #101). Defer until the usage-attribution (#165) and sandbox (#119) work settles — UNATTENDED runs amplify exactly the cost-attribution and blast-radius questions those tasks address. |
+| 189 | P3 | S | ux | Auto-start a FRESH session after long idle (anti context-drift) — opt-in | NOT about respawn latency (that's #184) and NOT "context isn't saved": the idea is to start CLEAN on purpose after a long gap, to avoid context-DRIFT — dragging a morning's failed-build / debugging noise into an afternoon's unrelated request via resume. Our reaper (#179) instead RESUMES the same transcript (continuous context — our default); old sessions stay retrievable via `/sessions`. So this is the INVERSE default: "after a long gap the next ask is probably a new task → start fresh, keep the old one switchable". Marginal for us — `/new` already gives a manual clean slate and we deliberately favour preserve-and-resume; the only delta is making fresh the AUTOMATIC default after long idle (opt-in, default OFF). Cheap (a last-activity timestamp check when rebuilding an evicted record). Owner-endorsed (2026-06-17) — KEEP. Must be USER-configurable: add as a **DELEGATED** setting (`settings_schema.py`) — user sees + toggles it, own default + per-session override (like `hot_cache_timer`/`language`), default OFF; owner can leave it delegated so each user opts in. Full design in Details below. |
+
+### Details
+
+**#189 — auto-fresh session after long idle (anti context-drift)** (P3 · S · ux · _from the 2026-06-17 review; owner: KEEP + make it a user-configurable (delegated) setting_)
+
+**What.** After a session has been idle longer than a threshold, the NEXT message
+starts a CLEAN session instead of resuming the stale transcript — to avoid
+context-DRIFT (a long-ago turn's failed-build / debugging noise being re-ingested into
+an unrelated new task). The previous session is NOT destroyed: it stays switchable via
+`/sessions` exactly as today, so nothing is lost — only the *active* context resets.
+
+**How it differs from neighbours.** NOT the respawn-latency placeholder (#184); NOT
+memory eviction (#179's reaper unloads from RAM but RESUMES the same transcript —
+continuous context, our default). This is the INVERSE default: fresh-on-return instead
+of resume-on-return. `/new` already gives the manual clean slate; #189 only makes
+"fresh" the AUTOMATIC behaviour after a long gap.
+
+**Setting (owner ask — delegated).** Expose as a **DELEGATED** option in
+`settings_schema.py` (`Access.DELEGATED`, per the model in [[settings-scope-role-matrix]]):
+the user SEES it and toggles it, with a per-user default + per-session override — same
+shape as `hot_cache_timer` (#166) and `language`. Default OFF, so the global
+preserve-and-resume default is unchanged. The owner keeps the usual lever: leave it
+DELEGATED so each user opts in, or flip to HIDDEN/forced if a global policy is ever
+wanted. Surface it in the `/settings` (`sx:`) hub like the other toggles. The idle
+THRESHOLD (e.g. hours) should also be tunable — either a second value or a sensible
+fixed default to start; if per-user, it's a second delegated setting.
+
+**Mechanism.** A last-activity timestamp already exists per session (the reaper uses
+it). When rebuilding a cold/evicted record in `sessions`, if the effective
+`fresh_on_idle` is ON **and** `now − last_activity > threshold`, allocate a NEW session
+(or skip `resume`) instead of resuming. Resolve the toggle through `_effective_settings`
+like the other delegated flags. Cheap; the only care is parking the old session so it
+stays switchable, and telling the user "started a fresh session (previous kept in
+/sessions)" so the reset isn't surprising.
