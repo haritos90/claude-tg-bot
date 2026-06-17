@@ -2,6 +2,7 @@
 and the render-time LaTeX→Unicode conversion (#12)."""
 
 import markup
+import table_image
 
 
 def test_escape_html():
@@ -158,12 +159,73 @@ def test_md_non_url_link_left_literal():
     assert "<a " not in markup.md_to_html("see [x](#anchor)")
 
 
-def test_md_table_to_pre_aligns_and_preserves_cyrillic():
-    md = "| A | Бета |\n|---|---|\n| 1 | да |\n| 20 | нет |"
+def test_md_table_to_pre_aligns_and_preserves_unicode():
+    md = "| A | Bêta |\n|---|---|\n| 1 | oui |\n| 20 | non |"
     html = markup.md_to_html(md)
     assert "<pre>" in html and "</pre>" in html
-    assert "Бета" in html and "да" in html and "нет" in html
+    assert "Bêta" in html and "oui" in html and "non" in html
     assert "|" in html  # column separators present
+
+
+def test_md_table_grid_separator_and_no_outer_pipes(monkeypatch):
+    """#162: a pipe table whose separator uses `+` junctions (---+---+---) and which
+    omits the outer pipes (an ASCII/grid style some models emit) must still render as a
+    <pre> grid, not leak raw. Previously _TABLE_SEP_RE only accepted `|` junctions, so
+    the whole table fell through to raw text."""
+    md = (
+        "Lang       | Compiles to          | Native ASM?\n"
+        "-----------+----------------------+--------------\n"
+        "Rust       | Machine code (LLVM)  | yes\n"
+        "Python     | CPython bytecode     | no"
+    )
+    html = markup.md_to_html(md)
+    assert "<pre>" in html and "</pre>" in html
+    assert "Machine code (LLVM)" in html and "CPython bytecode" in html
+    # The raw header/data lines must be inside ONE stashed grid, not loose text.
+    assert html.count("<pre>") == 1
+
+
+def test_hr_is_not_mistaken_for_a_table():
+    """A thematic break (a bare run of dashes, no `|`/`+` junction) must NOT be read as
+    a table separator — guards the widened #162 regex against false positives."""
+    html = markup.md_to_html("intro text\n\n------\n\nmore text")
+    assert "<pre>" not in html
+
+
+def test_split_image_tables_extracts_wide_keeps_narrow():
+    """#162: a table too wide to fit a phone as a grid is split out as a TableImage
+    (sent as a photo); a narrow table stays inline text (a <pre> grid downstream)."""
+    wide = (
+        "Lang | Intermediate representation  | Final assembler     | Runs on\n"
+        "-----+------------------------------+---------------------+----------------\n"
+        "Rust | LLVM IR                      | x86-64 / ARM        | on the CPU\n"
+        "Java | JVM bytecode                 | via JIT             | on the JVM"
+    )
+    items = markup.split_image_tables(wide)
+    imgs = [it for it in items if isinstance(it, markup.TableImage)]
+    assert len(imgs) == 1 and imgs[0].rows[0][0] == "Lang"     # header captured
+
+    narrow = "A | B\n--+--\n1 | 2"
+    items = markup.split_image_tables(narrow)
+    assert all(isinstance(it, str) for it in items)            # stays inline text
+    assert "|" in items[0]
+
+    assert markup.split_image_tables("just prose, no table") == ["just prose, no table"]
+
+
+def test_table_image_renders_png_bytes():
+    """#162: a table renders to PNG bytes (DejaVu mono, Cyrillic-safe)."""
+    png = table_image.render_table_png([["Lang", "ASM"], ["Rust", "yes"]])
+    assert isinstance(png, (bytes, bytearray)) and png[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+def test_table_cell_emphasis_stripped():
+    """#162: markdown emphasis inside cells (**b**/__b__/~~s~~/`c`) is stripped to plain
+    text — a grid/card can't host it inline, so the raw markers must not leak."""
+    md = "Name | Val\n----+----\n**Rust** | `yes`\n__Py__ | ~~no~~"
+    html = markup.md_to_html(md)
+    assert "**" not in html and "__" not in html and "~~" not in html and "`" not in html
+    assert "Rust" in html and "yes" in html and "no" in html
 
 
 # --- modern rich formatting (strikethrough / spoiler / blockquote) ----------- #
@@ -206,3 +268,85 @@ def test_blockquote_not_applied_inside_code_fence():
     html = markup.md_to_html("```\n> not a quote\n```")
     assert "<blockquote" not in html
     assert "&gt; not a quote" in html  # preserved (escaped) inside the code box
+
+
+# --- #164: NATIVE Telegram tables (Bot API 10.1 sendRichMessage) -------------
+
+def test_table_to_rich_html_basic_structure():
+    rows = [["Header 1", "Header 2"], ["Value 1", "Value 2"]]
+    html = markup.table_to_rich_html(rows)
+    assert html.startswith("<table bordered striped>")
+    assert html.endswith("</table>")
+    # First row is a header (<th>), the rest are <td>.
+    assert "<th>Header 1</th>" in html
+    assert "<th>Header 2</th>" in html
+    assert "<td>Value 1</td>" in html
+    assert "<td>Value 2</td>" in html
+    assert html.count("<tr>") == 2
+
+
+def test_table_to_rich_html_escapes_and_keeps_emphasis():
+    rows = [["Lang", "Note"], ["<b>&", "**Rust** is `fast`"]]
+    html = markup.table_to_rich_html(rows)
+    assert "&lt;b&gt;&amp;" in html            # raw < > & escaped
+    assert "<b>Rust</b>" in html               # **bold** → <b> in a native cell
+    assert "<code>fast</code>" in html         # `code` → <code>
+
+
+def test_table_to_rich_html_alignments():
+    rows = [["L", "C", "R"], ["1", "2", "3"]]
+    html = markup.table_to_rich_html(rows, ["left", "center", "right"])
+    assert '<th align="left">L</th>' in html
+    assert '<th align="center">C</th>' in html
+    assert '<td align="right">3</td>' in html
+
+
+def test_parse_table_aligns():
+    assert markup._parse_table_aligns("|:--|:-:|--:|---|") == ["left", "center", "right", None]
+
+
+def test_split_rich_tables_extracts_all_tables():
+    text = (
+        "Intro paragraph.\n\n"
+        "| A | B |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |\n\n"
+        "Outro paragraph."
+    )
+    items = markup.split_rich_tables(text)
+    tables = [it for it in items if isinstance(it, markup.RichTable)]
+    assert len(tables) == 1
+    assert tables[0].rows[0] == ["A", "B"]
+    assert tables[0].rows[-1] == ["3", "4"]
+    # Surrounding prose is preserved as plain-text runs, in order.
+    assert any(isinstance(it, str) and "Intro" in it for it in items)
+    assert any(isinstance(it, str) and "Outro" in it for it in items)
+
+
+def test_split_rich_tables_no_table_is_identity():
+    assert markup.split_rich_tables("just prose, no pipe") == ["just prose, no pipe"]
+
+
+def test_split_rich_tables_narrow_table_also_native():
+    # Unlike split_image_tables (which left narrow tables as <pre>), the native path
+    # extracts narrow tables too — every table is a RichTable now.
+    narrow = "| a | b |\n|---|---|\n| 1 | 2 |"
+    items = markup.split_rich_tables(narrow)
+    assert any(isinstance(it, markup.RichTable) for it in items)
+
+
+# --- #176: split a reply into rich (non-code) + classic (code) segments -------
+
+def test_split_code_blocks_separates_code_from_prose():
+    t = "Intro\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n```python\nx = 1\nprint(x)\n```\n\nDone."
+    segs = markup.split_code_blocks(t)
+    kinds = [k for k, _ in segs]
+    assert kinds == ["text", "code", "text"]
+    # the table stays in a TEXT segment (→ rich, native), code is its own segment
+    assert "| a | b |" in segs[0][1] and "Intro" in segs[0][1]
+    assert segs[1][1].startswith("```python") and "print(x)" in segs[1][1]
+    assert "Done." in segs[2][1]
+
+
+def test_split_code_blocks_no_code_is_single_text():
+    assert markup.split_code_blocks("just prose, no fence") == [("text", "just prose, no fence")]
+    assert markup.has_code_block("inline `code` only") is False
+    assert markup.has_code_block("```\nblock\n```") is True

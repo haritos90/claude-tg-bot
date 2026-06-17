@@ -27,6 +27,7 @@ allowlist.json
 bot.db
 bot.db-shm
 bot.db-wal
+bot.db.bak*
 workdirs/
 *.log
 

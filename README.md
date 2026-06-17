@@ -116,13 +116,22 @@ Rendered styles:
 - **Block quotes:** `> …` lines become `<blockquote>`; a long run collapses into an
   expandable `<blockquote expandable>` so it doesn't flood the chat (threshold:
   `markup.EXPANDABLE_BLOCKQUOTE_MIN_LINES`).
-- **Other:** headings (`#`) → bold lines; links `[text](url)` → `<a>`; tables → a
-  column-aligned monospace grid (Telegram HTML has no `<table>`); LaTeX → Unicode
-  (`\frac{1}{2}` → `1/2`, `x^2` → `x²`), since Telegram can't render math.
+- **Tables:** GFM `|…|` **or** grid `---+---` separators (outer pipes optional) →
+  a **native Telegram table** via Bot API 10.1 `sendRichMessage` (#164) — bordered,
+  striped, column-aligned and **side-scrollable** on the client, instead of the old
+  monospace grid / PNG image. If that (new) API call ever fails, `_send_rich` falls
+  back to a `<pre>` grid, so a table is never lost. The PNG path (`table_image.py`)
+  is kept but commented out.
+- **Other:** headings (`#`) → bold lines; links `[text](url)` → `<a>`; LaTeX →
+  Unicode (`\frac{1}{2}` → `1/2`, `x^2` → `x²`), since Telegram can't render math.
 
 Messages are split to stay within Telegram's **4096-character** limit — raw text is
 split on line boundaries *before* rendering, so a tag is never cut in half — and
 very long output is delivered as a `.md` file instead of many chunks.
+
+The **full formatting catalog** — every Telegram rich tag (headings, lists, details,
+math, media, tables…) and exactly which ones the bot emits — is documented in
+**[markup.md](markup.md)**.
 
 Telegram reference: [Rich message formatting options][tg-fmt] · [HTML style][tg-html].
 
@@ -136,17 +145,23 @@ Telegram reference: [Rich message formatting options][tg-fmt] · [HTML style][tg
 | File | Responsibility |
 |---|---|
 | `bot.py` | Entry point: wiring, middleware, long polling, graceful shutdown. |
+| `watchdog.py` | systemd liveness watchdog — `READY=1` at startup, `WATCHDOG=1` only after a successful Telegram probe, so a wedged/dropped connection triggers an auto-restart. |
 | `config.py` | `.env` → `Settings` (warns if `ANTHROPIC_API_KEY` is set). |
 | `handlers.py` | aiogram router: commands, text/photo/document routing, callbacks, the `/` menu. |
+| `commands.py` | Single source of truth for the command set + localized menu labels; `/help` and `setMyCommands` derive from it (a startup assert catches drift). |
+| `settings_schema.py` | Settings registry + resolver: each setting's type/default, its session→user→global storage tier, and the owner access model behind the `/settings` hub. |
 | `engine.py` | `ClaudeSession` over the Agent SDK — **all** SDK code lives here (incl. the sandbox launcher). |
 | `sessions.py` | `SessionManager`: per-session worker, the chaining queue, `/stop`, usage accounting. |
+| `archive.py` | Cold storage (#177): on delete, bundle a session's workdir + transcript into one gzip archive instead of destroying it. |
 | `streamer.py` | Live reply: native `sendMessageDraft` streaming in DM, code-block rendering, usage footer. |
 | `permissions.py` | `PermissionGate`: the code-mode Allow/Deny approval gate. |
 | `access.py` | Middleware: allowlist (drops non-allowed updates) + per-user language resolution. |
 | `allowlist.py` | JSON-backed access store: levels, expiry, token caps; owner always allowed; fail-closed. |
-| `db.py` | `aiosqlite` state: sessions, usage, conversation log, key-value store. |
+| `db.py` | `aiosqlite` state: sessions, usage, conversation log, key-value store (schema under **Data, privacy & trust**). |
 | `i18n.py` | Localization table + `t(key, lang, …)`; `en` canonical, `ru` translation. |
 | `markup.py` | Telegram formatting: Markdown→HTML (bold/italic/strike/spoiler/quotes/code), 4096-safe splitting, long-output-as-file. See **Message formatting**. |
+| `rich_message.py` | Hand-rolled binding for Bot API 10.1 `sendRichMessage` — native bordered/striped tables (`markup.py` builds the rich HTML). |
+| `table_image.py` | Dormant PNG-table fallback (#162), kept commented out now that tables use `sendRichMessage`. |
 | `usage.py` | Formatters for the 5h / 7d subscription windows. |
 | `deploy/` | `tg-bot.service` (systemd unit) and `sandbox-claude.sh` (bubblewrap launcher). |
 
@@ -168,9 +183,41 @@ Tasks are tracked in [`TODO.md`](TODO.md); contributor rules in
   | `claude-agent-sdk==0.2.101` | Drives the `claude` CLI on your subscription. |
   | `aiosqlite==0.22.1` | Async SQLite for per-session state and usage. |
   | `python-dotenv==1.2.2` | Loads `.env`. |
+  | `Pillow==12.2.0` | Renders the dormant PNG-table fallback (`table_image.py`); needs the system DejaVu Sans Mono font. |
 
 - Optional: the **`bubblewrap`** package (e.g. `apt install bubblewrap`) for the
   code sandbox; **`pytest`** + **`ruff`** (`requirements-dev.txt`) for development.
+
+### Resource requirements & concurrency limits
+
+Each **active session holds a live `claude` subprocess (~400–600 MB RSS)** — the
+dominant memory cost (the bot itself is ~130 MB; `opus` + a 1M context sit at the
+high end). The bot **self-limits** based on the box's RAM/CPU and **reaps idle
+sessions** — their subprocess is closed, but the transcript stays on disk and
+`resume` rebuilds it on the next message, so **no history is lost**. Rough capacity
+on Debian 12/13 (defaults auto-derived at startup):
+
+| RAM | Concurrent **active** turns | Live clients held | Notes |
+|---|---|---|---|
+| 2 GB | 2 | 2 | tight — **add 2–4 GB swap**; prefer `sonnet`/`haiku` |
+| 4 GB | 4 | ~5 | comfortable for a small group |
+| 6 GB | 6 | ~7 | |
+| 8 GB | 8 | ~11 | |
+
+Defaults ≈ `live = (RAM_MB − 900) / 550`, `turns = min(live, 2×CPU)`. Because **idle
+sessions are evicted after 15 min** (and under memory pressure), you can serve many
+more *users* than the "live clients" column — only simultaneously-**active** turns
+cost RAM. Always configure **swap** as an OOM backstop: with no swap, exhausting RAM
+is a hard kill, not a slowdown.
+
+Tunables (`.env`, all optional — sane defaults derived from the box):
+
+| Var | Default | Meaning |
+|---|---|---|
+| `MAX_LIVE_CLIENTS` | from RAM | Max simultaneously-live `claude` subprocesses (idle+busy). |
+| `MAX_CONCURRENT_TURNS` | from RAM/CPU | Max turns generating at once; overflow turns queue with a "server busy" notice. |
+| `IDLE_TTL_SEC` | `900` | Reap a session's subprocess after this many seconds idle. |
+| `MIN_FREE_MB` | `400` | Below this much free RAM, evict idle sessions before starting a turn. |
 
 ---
 
@@ -214,9 +261,11 @@ cp allowlist.example.json allowlist.json   # add any users besides yourself
 ```
 
 `.env` has two required keys (`TELEGRAM_BOT_TOKEN`, `OWNER_ID`); the rest
-(`DEFAULT_MODEL`, `BASE_WORKDIR`, `DB_PATH`, `ALLOWLIST_PATH`, and the optional
-sandbox flags `SANDBOX_CODE` / `SANDBOX_UID` — see **Security & isolation**) have
-sensible defaults.
+(`DEFAULT_MODEL`, `BASE_WORKDIR`, `DB_PATH`, `ALLOWLIST_PATH`, the optional sandbox
+flags `SANDBOX_CODE` / `SANDBOX_UID` — see **Security & isolation** — and the
+concurrency caps `MAX_LIVE_CLIENTS` / `MAX_CONCURRENT_TURNS` / `IDLE_TTL_SEC` /
+`MIN_FREE_MB` — see **Resource requirements & concurrency limits**) have sensible
+defaults.
 
 **Run:**
 
@@ -258,16 +307,17 @@ Commands are registered **most-used first** (Telegram surfaces the top few on
 mobile); `/new`, `/sessions`, `/settings` sit at the very top. Fixed-choice commands
 open an inline **picker**; commands needing free text prompt for your next message
 (with `/cancel`). The `/help` text is generated from this same registry, so it never
-drifts.
+drifts. The full command + settings **menu structure** is documented in
+**[menu.md](menu.md)**.
 
 | Group | Commands |
 |---|---|
 | **Sessions** | `/new` `/code` (upgrade) `/chat` (downgrade) `/sessions` `/rename` `/fork` `/clear` (alias `/reset`) |
-| **Run** | `/status` `/retry` `/context` `/queue` `/clearqueue` |
+| **Run** | `/status` `/retry` `/context` `/limits` (your usage) `/queue` `/clearqueue` |
 | **Tuning** | `/model` `/effort` `/memory` `/language` · *(code)* `/permissions` `/files` `/export` `/maxturns` `/tools` |
 | **Recap & export** | `/recap` (AI one-line recap) `/last` (verbatim last exchange) `/history` (transcript) |
 | **Meta** | `/settings` `/usage` `/help` `/whoami` |
-| **Owner** | `/users` `/allow` `/deny` `/level` `/expire` `/limit` `/auto` `/codesplit` `/sandbox` |
+| **Owner** | `/users` `/userstats` (usage table) `/allow` `/deny` `/level` `/expire` `/limit` `/auto` `/codesplit` `/sandbox` |
 
 ---
 
@@ -276,24 +326,43 @@ drifts.
 - **Access** is owner + allowlist, fail-closed; the bot token and `allowlist.json`
   are gitignored and never logged. **Subscription only** — no API key, no
   per-token billing.
-- **Code mode is effectively a shell on your server.** It runs as the bot's user,
-  with dangerous tools (Bash/Write/Edit) gated behind an explicit Allow/Deny tap
-  (or `/auto on`).
-- **Isolation is still in progress — grant `code` level only to people you fully
-  trust.** Without the optional sandbox, a code-level user is as powerful as the
-  bot's user: they can read any file that user can (including secrets) and use the
-  network.
-- **Optional sandbox** (`SANDBOX_CODE=1`, **off by default, in development**)
-  wraps each code session's `claude` in a
-  [bubblewrap](https://github.com/containers/bubblewrap) jail — unprivileged uid,
-  filesystem confined to the session workdir, env wiped (requires the
-  `bubblewrap` package). It limits the *filesystem* blast radius, **but is not yet
-  a complete jail:** the subscription token is currently injected into the jail
-  and the network is open, so a determined user could still read or exfiltrate it.
-  The full design — a **credential broker** so the token never enters the jail, a
-  **network egress allowlist**, per-session secrets, and DoS limits — is tracked
-  as **#119 in [`TODO.md`](TODO.md)** and not yet built. The owner can toggle
-  isolation per session with `/sandbox on|off`.
+- **Every session runs in a sandbox by default (#180).** Each session's `claude`
+  — chat AND code — runs in a [bubblewrap](https://github.com/containers/bubblewrap)
+  jail: an **unprivileged uid** (not host root), filesystem **confined to the
+  session's own workdir**, the root filesystem read-only, the bot's env wiped, and
+  the subscription credential injected read-only (requires the `bubblewrap`
+  package). Neither the agent nor the user can read or write outside that session's
+  directory. Dangerous code tools (Bash/Write/Edit) are still gated behind an
+  explicit Allow/Deny tap (or `/auto on`). The owner can toggle the jail per session
+  with `/sandbox on|off`.
+- **Not yet a complete jail — grant `code` to people you trust until #119.** The
+  subscription token is currently injected into the jail and the network is open,
+  so a determined `code`-level user could still read or exfiltrate it. The full
+  design — a **credential broker** so the token never enters the jail, a **network
+  egress allowlist**, per-session secrets, and DoS limits — is tracked as **#119 in
+  [`TODO.md`](TODO.md)** and not yet built.
+
+### Where session files live
+
+Everything for a session lives under **one parent dir** (#181) — nothing is stored
+outside it:
+
+```
+workdirs/<sid>/
+  ├── work/    ← the agent's cwd: the files it creates (bound into the jail, writable)
+  └── state/   ← the jail HOME → ~/.claude/projects: the session TRANSCRIPT. A sibling
+                 of work/, deliberately NOT bound into the jail, so the agent can't
+                 reach it (or any other session) through its own tools.
+workdirs/_archive/<owner_id>/<sid>-<stamp>.tar.gz   ← cold storage on delete (#177); auto-purged after retention (#178)
+```
+
+`<sid>` is the public session id shown in `/sessions` (never the internal id).
+Deleting a session bundles its whole `<sid>/` folder into one gzip archive and
+removes the live copies (#177) — files and transcript together, nothing lost.
+Archives older than the **retention period** are then auto-purged (#178; default
+**6 months**, owner-configurable under **`/settings → 👑 Admin → 🗄 Archive
+retention`** or the `ARCHIVE_RETENTION_DAYS` env var; choose **Never** to keep
+them forever).
 - **Hidden CLI keyword triggers are neutralized.** The bundled Claude CLI acts on
   prompt keywords like `ultrathink` (escalates reasoning effort) and `ultracode`
   (spins up multi-agent **Workflow** orchestration) — either could let any user
@@ -313,9 +382,21 @@ Everything happens on **your server** — there is no external database.
 
 - **What's stored, and where.** Per-session state, **conversation transcripts**
   (used by `/last` and `/history`), and token usage live in the SQLite DB
-  (`bot.db`). Code sessions also keep their files under `BASE_WORKDIR/<session>`,
-  and Claude's own resume state under the bot user's `~/.claude/projects`. All of
-  it sits on the host's disk.
+  (`bot.db`), across five tables:
+  - **`threads`** — one row per session (mode, model, cwd, the resumable chat/code
+    session ids, and every per-session toggle: effort, permission mode, max-turns,
+    sandbox, favorite, enabled tools, …).
+  - **`usage`** — one row per turn (input/output tokens, cache read/creation, cost);
+    per-user totals roll up by `chat_id`.
+  - **`messages`** — the conversation log feeding `/last`, `/recap`, `/history`.
+  - **`kv`** — small key-value state (current-session pointer, usage display mode,
+    per-user language, pinned-message id, access overrides, user defaults).
+  - **`rate_history`** — subscription rate-limit snapshots for the `/status` trend.
+
+  Code sessions also keep their files under `BASE_WORKDIR/<session>`, and Claude's
+  own resume state under the bot user's `~/.claude/projects`. All of it sits on the
+  host's disk. The full schema (and the additive-migration rule) is in
+  [`AGENTS.md`](AGENTS.md) → **Architecture → Data model**.
 - **The server operator can read all of it.** Whoever runs the bot (root / the
   service user) can open `bot.db` and the workdirs — i.e. **every user's
   conversations and files**. So anyone you share access with is trusting **you, the

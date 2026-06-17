@@ -12,3 +12,7 @@ aiogram==3.28.2
 claude-agent-sdk==0.2.101
 aiosqlite==0.22.1
 python-dotenv==1.2.2
+# Pillow: render wide tables as PNG images (#162 — Telegram has no native table and a
+# wide monospace grid wraps; narrow tables stay text grids). Uses the system
+# DejaVuSansMono font (Cyrillic-safe). See table_image.py.
+Pillow==12.2.0

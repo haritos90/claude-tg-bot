@@ -175,4 +175,70 @@ def test_access_exception_persisted_in_describe(tmp_path):
     a.set_access_exception("55", "sandbox", "delegated")
     d = a.describe("55")
     assert d is not None and d["access"] == {"sandbox": "delegated"}
+
+
+# --- owner SELF-imposed limits (#185, for testing the per-user caps) ------- #
+
+def test_owner_self_limits_default_uncapped(tmp_path):
+    """A fresh owner (no prefs) stays fully uncapped/allowed — the self-limits
+    only bite once explicitly set."""
+    a = al.Allowlist(tmp_path / "a.json", OWNER)
+    assert a.rate_of(OWNER, None) == {"day": None, "week": None}
+    assert a.allow_max_effort_of(OWNER, None) is True
+    assert a.tool_cap_of(OWNER, None) is None
+    d = a.describe(str(OWNER))
+    assert d["kind"] == "owner"
+    assert d["rate"] == {"day": None, "week": None}
+    assert d["allow_max_effort"] is True and d["tool_cap"] is None
+
+
+def test_owner_self_rate_cap_set_get_clear_persist(tmp_path):
+    """The owner can self-impose rolling-window token caps (so they fire on the
+    owner's OWN turns via _access_block); they persist and clear."""
+    p = tmp_path / "a.json"
+    a = al.Allowlist(p, OWNER)
+    assert a.set_rate(str(OWNER), day=500_000) is True
+    assert a.rate_of(OWNER, None) == {"day": 500_000, "week": None}
+    assert OWNER not in a.snapshot()["entries"]          # stored in owner_prefs, not an entry
+    b = al.Allowlist(p, OWNER)                            # survives a reload
+    assert b.rate_of(OWNER, None) == {"day": 500_000, "week": None}
+    assert b.set_rate(str(OWNER), day=None, week=None) is True   # clear → uncapped again
+    assert b.rate_of(OWNER, None) == {"day": None, "week": None}
+
+
+def test_owner_self_max_effort_revoke_persist(tmp_path):
+    """The owner can self-revoke max-effort (to test the effort gate) and re-grant
+    it; the choice persists across a reload."""
+    p = tmp_path / "a.json"
+    a = al.Allowlist(p, OWNER)
+    assert a.set_allow_max_effort(str(OWNER), False) is True
+    assert a.allow_max_effort_of(OWNER, None) is False
+    assert al.Allowlist(p, OWNER).allow_max_effort_of(OWNER, None) is False
+    assert a.set_allow_max_effort(str(OWNER), True) is True
+    assert a.allow_max_effort_of(OWNER, None) is True
+
+
+def test_owner_self_tool_cap_set_get_clear_persist(tmp_path):
+    """The owner can self-impose a tool cap and clear it; describe reflects it."""
+    p = tmp_path / "a.json"
+    a = al.Allowlist(p, OWNER)
+    assert a.set_tool_cap(str(OWNER), ["Read", "Grep"]) is True
+    assert a.tool_cap_of(OWNER, None) == ["Read", "Grep"]
+    assert a.describe(str(OWNER))["tool_cap"] == ["Read", "Grep"]
+    b = al.Allowlist(p, OWNER)
+    assert b.tool_cap_of(OWNER, None) == ["Read", "Grep"]
+    assert b.set_tool_cap(str(OWNER), None) is True       # clear → uncapped
+    assert b.tool_cap_of(OWNER, None) is None
+
+
+def test_owner_prefs_legacy_upgrade(tmp_path):
+    """A legacy owner_prefs carrying only global_memory upgrades transparently: the
+    new self-limit keys default to uncapped/allowed, global_memory is preserved."""
+    p = tmp_path / "a.json"
+    _write(p, {"version": 2, "owner_prefs": {"global_memory": True}, "entries": {}})
+    a = al.Allowlist(p, OWNER)
+    assert a.global_memory_of(OWNER, None) is True        # preserved
+    assert a.rate_of(OWNER, None) == {"day": None, "week": None}
+    assert a.allow_max_effort_of(OWNER, None) is True
+    assert a.tool_cap_of(OWNER, None) is None
     assert a.describe(str(OWNER))["access"] == {}

@@ -105,7 +105,7 @@ claude setup-token                   # headless subscription login (no API key)
 # smoke test — must exit 0 (no real .env needed, nothing starts polling)
 . .venv/bin/activate
 python -m py_compile *.py
-python -c "import config, db, access, allowlist, markup, streamer, permissions, engine, sessions, usage, handlers, bot"
+python -c "import config, db, i18n, access, allowlist, markup, rich_message, table_image, streamer, permissions, commands, settings_schema, engine, sessions, archive, usage, handlers, watchdog, bot"
 
 # run
 python bot.py
@@ -121,24 +121,48 @@ python bot.py
 | File | Responsibility |
 |---|---|
 | `config.py` | `.env` → `Settings`; warns (does not crash) if `ANTHROPIC_API_KEY` is set. |
-| `db.py` | `aiosqlite` per-thread state (`threads`) + token accounting (`usage`) + `kv` (usage mode, rate snapshot, pinned id, per-user `lang`). Survives restart. |
+| `db.py` | `aiosqlite` durable state (`threads` / `usage` / `messages` / `kv` / `rate_history`) — see **Data model** below. Survives restart. |
 | `i18n.py` | Localization (l10n) table + `t(key, lang, …)`; `en` canonical, `ru` translation; per-user locale cache; display helpers (`onoff`/`yesno`/`mode_word`). No I/O. |
 | `access.py` | `AllowlistMiddleware` — drops every non-allowed update. `LanguageMiddleware` — resolves + caches each allowed user's UI locale. |
 | `allowlist.py` | JSON-backed `Allowlist` (ids + usernames); owner always allowed; fail-closed; pins username→id on first contact. |
-| `markup.py` | Telegram formatting: 4096-safe splitting, Markdown→HTML (`<pre>` code blocks), long-output-as-file. |
+| `markup.py` | Telegram formatting: 4096-safe splitting, Markdown→HTML (`<pre>` code blocks), table→rich-HTML, long-output-as-file. |
+| `rich_message.py` | Hand-rolled `sendRichMessage` method (Bot API 10.1, #164) — aiogram ships no binding yet; renders native `<table>` from the HTML `markup.py` builds. |
+| `table_image.py` | Dormant PNG-table renderer (#162), kept commented out since #164 switched tables to `sendRichMessage`. |
 | `streamer.py` | Live reply: native `sendMessageDraft` streaming in DM (`segment_break` splits code-mode output into messages), caret-free write-head fallback for groups, silent intermediates, no link previews, usage footer. |
 | `permissions.py` | `PermissionGate` — `can_use_tool` → inline Allow/Deny via `asyncio.Future`. |
-| `usage.py` | Pure formatters for the 5h/7d subscription windows (footer / pinned). |
+| `commands.py` | Single source of truth for the command set + localized menu labels (#139); handlers derive their menu lists + `setMyCommands` from `COMMANDS` (a startup assert catches drift from the registered handlers). |
+| `settings_schema.py` | Settings registry + resolver (#138): each setting's type/default, its SESSION→USER→GLOBAL storage tier + adapters, and the derived owner access model (#151). |
+| `usage.py` | Formatters for the 5h/7d subscription windows (footer / pinned) + `fetch_account_usage` — the `/api/oauth/usage` GET for the real % (#135). |
 | `engine.py` | `ClaudeSession` over `ClaudeSDKClient`; **all** Agent-SDK code lives here, incl. the optional bubblewrap sandbox launcher (`_enable_sandbox`). |
 | `sessions.py` | `SessionManager` — per-thread session + serial worker + chaining queue + `/stop` + usage accumulation. |
+| `archive.py` | Cold storage (#177): `archive_session` gzip-bundles a deleted session's workdir + transcript under `BASE_WORKDIR/_archive/` instead of `rmtree` — fail-safe (live copies kept on a half-write). |
 | `handlers.py` | aiogram router: commands, text routing, permission callbacks, `setMyCommands`. |
 | `bot.py` | Entry point: wiring, middleware registration, long polling, graceful shutdown. |
+| `watchdog.py` | systemd liveness watchdog (#158): `ready()` sends `READY=1` before any network I/O; `run()` pings `WATCHDOG=1` only after a successful `get_me` probe, so a wedged/dropped Telegram link force-restarts the unit. No-op off systemd. |
 
 The Agent SDK API is pinned to `claude-agent-sdk==0.2.101`. If you bump it,
 re-introspect the message/option types before changing `engine.py`.
 
 Out-of-process helpers live in `deploy/`: `tg-bot.service` (systemd unit) and
 `sandbox-claude.sh` (the bubblewrap launcher — see the **Sandbox** gotcha in §5).
+
+### Data model
+
+All durable state lives in one SQLite DB (`DB_PATH`, default `bot.db`, WAL mode),
+created on `db.init` and migrated **forward in place** — only additive, guarded
+`ALTER TABLE … ADD COLUMN` (never a destructive rewrite/drop):
+
+| Table | Key | Holds |
+|---|---|---|
+| `threads` | `thread_id` (PK) | One row per session: `chat_id`, `mode`, `model`, `cwd`, the resumable `code_session_id` / `chat_session_id`, `name`, `created_by`, `created_at`, plus per-session toggles added by migration — `permission_mode`, `effort`, `max_turns`, `big_memory`, `favorite`, `no_sandbox`, `tools_enabled`, `stream_enabled`, `add_dirs`, `fork_pending`, `auto_compact`, `hot_cache_timer`. |
+| `usage` | `id` (PK) | One row per turn: `thread_id`, `ts`, `input_tokens`, `output_tokens`, `cache_read`, `cache_creation`, `cost_usd`. Per-USER totals roll up via `JOIN threads ON chat_id` (the table has no user column — #105). |
+| `messages` | `id` (PK) | Conversation log (`thread_id`, `ts`, `role`, `text`) feeding `/last` / `/recap` / `/history`; indexed `(thread_id, id)`. |
+| `kv` | `key` (PK) | Small key-value state: per-user current session (`dm_current:<uid>`), `dm_seq`, usage display mode, pinned-message id, per-user `lang:<uid>`, access overrides + user defaults (settings hub). |
+| `rate_history` | `id` (PK) | Append-only subscription rate-limit snapshots (`ts`, `rate_type`, `utilization`, `status`) feeding the `/status` trend. |
+
+A DM session's `thread_id` is a synthetic **negative** id (see "Sessions, identity
+& access" in §5); supergroup topics are `>= 0` (0 = General). To add session state,
+append a guarded `ADD COLUMN` in `db.init` — don't rewrite or drop a column.
 
 ---
 
@@ -192,11 +216,19 @@ These are SDK/Telegram traps that already bit us. Re-check them before editing
   via `/effort` (per-user gated — `max` is owner-granted).
 - **Subscription auth:** never set `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN`;
   the engine strips them from the child env. Their presence forces paid billing.
-- **`RateLimitInfo.utilization` is usually `None`.** The CLI sends a numeric
-  fraction only as you approach a window; far from it you get `status="allowed"`
-  with `utilization=null`. Render the status (`OK` / `⚠ high` / `⛔ limited`),
-  never a bare `(n/a)`. `resets_at` is epoch seconds; windows arrive per type
-  (`five_hour`, `seven_day`, …) and only when the CLI emits a `rate_limit_event`.
+- **`RateLimitInfo.utilization` is usually `None` — so the real % comes from the
+  account endpoint (#135).** The SDK `rate_limit_event` sends a numeric fraction only
+  as you approach a window; far from it you get `status="allowed"` with
+  `utilization=null`. So `usage.fetch_account_usage()` GETs **`/api/oauth/usage`** (the
+  source Claude Code's `/usage` reads) with the subscription OAuth bearer +
+  `anthropic-beta: oauth-2025-04-20` — a read-only GET, NOT an API key (billing
+  preserved). It reports the REAL per-window % even when idle; normalized to the
+  RateLimitInfo shape (the endpoint sends `utilization` as a **percent 0..100** and
+  `resets_at` as an **ISO string** — converted to a 0..1 fraction + epoch seconds).
+  `sessions._usage_poll_loop` refreshes `rate_by_type` from it every
+  `_USAGE_POLL_INTERVAL` (5 min) + on `/status`, so the footer/pinned show live
+  numbers; the SDK `rate_limit_event` path still updates it mid-turn. All fetches
+  fail soft (keep the prior snapshot). `resets_at` is epoch seconds downstream.
 - **Image input has no SDK type — pass the raw Anthropic block.** `ImageContent`
   in the SDK is for MCP *tool results*, not user input. To send a picture, call
   `client.query()` in its **async-iterable** form, yielding a `user` message whose
@@ -208,8 +240,13 @@ These are SDK/Telegram traps that already bit us. Re-check them before editing
 - **Sessions are durable by default.** Both modes resume their persisted session
   id (`code_session_id` / `chat_session_id`, saved every turn), so context survives
   a restart / `/stop`. `big_memory` is the 1M-context-window toggle (now for BOTH
-  modes, #133) — it no longer gates resume. NOTE (#134): the 1M beta is IGNORED under
-  the OAuth subscription, so big_memory's 1M is currently a no-op. `/reset` clears the
+  modes, #133) — it no longer gates resume. #134: 1M is requested via the **`[1m]`
+  model-id suffix** (`engine._one_m_model`), NOT the `betas` param (ignored under the
+  OAuth subscription — "Custom betas are only available for API key users"). Applied
+  to **Opus only** by default (auto-included on Max, subscription-billed); Sonnet `[1m]`
+  needs paid usage-credits (→ "Usage credits required for 1M context") and Haiku has no
+  1M, so on those big_memory has no effect. Widen via env `BIG_MEMORY_1M_MODELS`
+  (comma-separated id substrings) only if you've enabled usage-credits. `/reset` clears the
   session ids. A session's **mode is MUTABLE** (#133, reverses #53): `/code` upgrades
   a chat to code, `/chat` downgrades back. `db.switch_mode` carries the conversation
   by copying the resumable session id from the old mode's column into the new mode's;

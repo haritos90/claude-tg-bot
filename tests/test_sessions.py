@@ -8,6 +8,7 @@ text, that snapshot must NOT resurrect and re-flush it as a duplicate message.
 Async tests wrap asyncio.run (no pytest-asyncio), matching the suite convention.
 """
 import asyncio
+import time
 from types import SimpleNamespace
 
 import db
@@ -71,7 +72,7 @@ def _make(monkeypatch, events, mode="code"):
     sm = sessions.SessionManager(
         bot=SimpleNamespace(), settings=SimpleNamespace(), gate=SimpleNamespace()
     )
-    monkeypatch.setattr(sm, "usage_footer", lambda lang: "")
+    monkeypatch.setattr(sm, "usage_footer", lambda lang, chat_id=None: "")
     rec = sessions._ThreadRecord(
         session=_FakeSession(events), mode=mode, stream_enabled=True
     )
@@ -165,3 +166,178 @@ def test_effective_settings_soft_revoke_and_capability_gates(monkeypatch):
         assert effo["big_memory"] is True
 
     asyncio.run(_run())
+
+
+# --- #179: idle-client reaper / eviction ------------------------------------ #
+
+
+class _EvictSession:
+    """Minimal ClaudeSession stand-in: records that aclose() was awaited."""
+
+    def __init__(self):
+        self.closed = False
+
+    async def aclose(self):
+        self.closed = True
+
+
+def _sm_with_caps(max_live=2, idle_ttl=900, min_free=400, max_turns=2):
+    return sessions.SessionManager(
+        bot=SimpleNamespace(),
+        settings=SimpleNamespace(
+            max_live_clients=max_live, idle_ttl_sec=idle_ttl,
+            min_free_mb=min_free, max_concurrent_turns=max_turns,
+        ),
+        gate=SimpleNamespace(),
+    )
+
+
+def test_evict_session_closes_idle_and_clears_snapshot():
+    async def _run():
+        sm = _sm_with_caps()
+        sess = _EvictSession()
+        rec = sessions._ThreadRecord(session=sess, mode="code", model="m", cwd="/w")
+        sm._records[-1] = rec
+        assert await sm._evict_session(-1) is True
+        assert sess.closed is True            # aclose() awaited
+        assert rec.session is None            # client dropped
+        assert rec.mode is None and rec.cwd is None   # snapshot cleared → rebuild+resume
+    asyncio.run(_run())
+
+
+def test_evict_session_skips_busy_thread():
+    async def _run():
+        sm = _sm_with_caps()
+        sess = _EvictSession()
+        rec = sessions._ThreadRecord(session=sess, mode="code")
+        rec.worker = SimpleNamespace(done=lambda: False)   # a turn is running
+        sm._records[-1] = rec
+        assert await sm._evict_session(-1) is False
+        assert sess.closed is False           # never evict a busy session
+        assert rec.session is sess
+    asyncio.run(_run())
+
+
+def test_reap_once_evicts_over_ttl_then_enforces_cap():
+    async def _run():
+        sm = _sm_with_caps(max_live=1, idle_ttl=100)
+        now = time.monotonic()
+        old = _EvictSession()
+        r_old = sessions._ThreadRecord(session=old)
+        r_old.last_activity = now - 10_000               # idle past TTL → evicted
+        a = _EvictSession()
+        r_a = sessions._ThreadRecord(session=a)
+        r_a.last_activity = now - 5                       # idle, recent (LRU of the two)
+        b = _EvictSession()
+        r_b = sessions._ThreadRecord(session=b)
+        r_b.last_activity = now - 1                       # idle, most recent → survives cap
+        sm._records.update({-1: r_old, -2: r_a, -3: r_b})
+        await sm._reap_once()
+        assert old.closed is True             # TTL eviction
+        assert a.closed is True               # over cap=1 → LRU evicted
+        assert b.closed is False              # most-recently-active survives
+    asyncio.run(_run())
+
+
+def test_reap_respects_per_record_idle_ttl():
+    # #182: a per-user idle-TTL on the record overrides the global default — 0 = ∞.
+    async def _run():
+        sm = _sm_with_caps(max_live=10, idle_ttl=100)  # high cap → only TTL matters
+        now = time.monotonic()
+        never = _EvictSession()
+        r_never = sessions._ThreadRecord(session=never)
+        r_never.last_activity = now - 10_000
+        r_never.idle_ttl = 0                  # ∞ → never reaped on idle
+        short = _EvictSession()
+        r_short = sessions._ThreadRecord(session=short)
+        r_short.last_activity = now - 10_000
+        r_short.idle_ttl = 60                 # 60s TTL → reaped
+        sm._records.update({-1: r_never, -2: r_short})
+        await sm._reap_once()
+        assert never.closed is False          # owner set ∞ — survives idle
+        assert short.closed is True           # per-record TTL evicts
+    asyncio.run(_run())
+
+
+def test_mem_available_mb_is_positive():
+    # On the Linux test box /proc/meminfo parses to a positive MiB figure.
+    assert sessions.SessionManager._mem_available_mb() > 0
+
+
+# --- #187: outbox file send-back -------------------------------------------- #
+
+
+class _FakeBot:
+    """Records the send_photo / send_document / send_message calls _deliver_outbox makes."""
+
+    def __init__(self):
+        self.photos: list = []
+        self.docs: list = []
+        self.messages: list = []
+
+    async def send_photo(self, chat_id, photo=None, caption=None, **kw):
+        self.photos.append(getattr(photo, "filename", None))
+
+    async def send_document(self, chat_id, document=None, **kw):
+        self.docs.append(getattr(document, "filename", None))
+
+    async def send_message(self, chat_id, text, **kw):
+        self.messages.append(text)
+
+
+def _sm_with_bot(bot):
+    return sessions.SessionManager(
+        bot=bot, settings=SimpleNamespace(), gate=SimpleNamespace()
+    )
+
+
+def test_outbox_delivers_images_and_docs_then_clears(tmp_path, monkeypatch):
+    monkeypatch.setattr(sessions, "_OUTBOX_DOC_BYTES", 100)    # keep the too-big file tiny
+    cwd = tmp_path / "work"
+    outbox = cwd / "outbox"
+    outbox.mkdir(parents=True)
+    (outbox / "chart.png").write_bytes(b"img-bytes")          # image → photo
+    (outbox / "report.txt").write_bytes(b"hello")             # other → document
+    big = outbox / "huge.bin"
+    big.write_bytes(b"x" * 101)                               # over the cap → skipped + noted
+
+    bot = _FakeBot()
+    sm = _sm_with_bot(bot)
+    rec = sessions._ThreadRecord(session=SimpleNamespace(cwd=str(cwd)), mode="code")
+    asyncio.run(sm._deliver_outbox(rec, 123, None))
+
+    assert bot.photos == ["chart.png"]
+    assert bot.docs == ["report.txt"]
+    assert any("huge.bin" in m for m in bot.messages)          # too-big aggregated note
+    # every staging copy is removed (delivered ones AND the undeliverable big one)
+    assert not (outbox / "chart.png").exists()
+    assert not (outbox / "report.txt").exists()
+    assert not big.exists()
+
+
+def test_outbox_count_cap_leaves_remainder(tmp_path):
+    cwd = tmp_path / "work"
+    outbox = cwd / "outbox"
+    outbox.mkdir(parents=True)
+    total = sessions._OUTBOX_MAX_FILES + 3
+    for i in range(total):
+        (outbox / f"f{i:02d}.txt").write_bytes(b"x")
+
+    bot = _FakeBot()
+    sm = _sm_with_bot(bot)
+    rec = sessions._ThreadRecord(session=SimpleNamespace(cwd=str(cwd)), mode="code")
+    asyncio.run(sm._deliver_outbox(rec, 123, None))
+
+    assert len(bot.docs) == sessions._OUTBOX_MAX_FILES          # only the cap is sent
+    left = [p for p in outbox.iterdir() if p.is_file()]
+    assert len(left) == 3                                       # remainder stays for next turn
+    assert any("staged" in m or "outbox" in m for m in bot.messages)  # "more pending" note
+
+
+def test_outbox_no_dir_is_noop(tmp_path):
+    # A chat session (no outbox dir) drains to nothing and never touches the bot.
+    bot = _FakeBot()
+    sm = _sm_with_bot(bot)
+    rec = sessions._ThreadRecord(session=SimpleNamespace(cwd=str(tmp_path)), mode="chat")
+    asyncio.run(sm._deliver_outbox(rec, 123, None))
+    assert bot.photos == [] and bot.docs == [] and bot.messages == []

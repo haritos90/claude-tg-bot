@@ -27,9 +27,11 @@ def test_allocate_dm_session_negative_key_and_mode():
         sc, sh = await db.get_thread(code), await db.get_thread(chat)
         assert sc.mode == "code" and sh.mode == "chat"
         # #140: per-session working dir is named by the public sid, not the key.
-        # was: assert sc.cwd.endswith(str(code))
-        assert sc.cwd.endswith(db.session_sid(code))  # per-session working dir
-        assert sh.cwd.endswith(db.session_sid(chat))
+        # #181: nested layout — the cwd is <sid>/work (state is the sibling).
+        # was: assert sc.cwd.endswith(str(code))            # pre-#140
+        # was: assert sc.cwd.endswith(db.session_sid(code))  # pre-#181
+        assert sc.cwd.endswith(db.session_sid(code) + "/work")
+        assert sh.cwd.endswith(db.session_sid(chat) + "/work")
         await db.close_db()
 
     _run(_t)

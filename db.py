@@ -71,6 +71,10 @@ class ThreadState:
     # Per-session enabled tools (#129): None = the mode's full default universe
     # (chat → web tools, code → all); a list = exactly those (``[]`` = tool-free).
     tools_enabled: list[str] | None = None
+    # #164: post-reply 5-min warm-cache note (delegated; user-toggleable) and SDK
+    # auto-compaction (hidden/owner-only for now). See settings_schema + TODO #164.
+    hot_cache_timer: bool = False
+    auto_compact: bool = False
 
 
 def _require_conn() -> aiosqlite.Connection:
@@ -210,6 +214,15 @@ async def init_db(db_path: str) -> None:
         # (chat → web tools, code → all). Distinct from [] which means tool-free.
         if "tools_enabled" not in existing:
             await _conn.execute("ALTER TABLE threads ADD COLUMN tools_enabled TEXT")
+        # #164: warm-cache note toggle + SDK auto-compaction toggle (per session).
+        if "hot_cache_timer" not in existing:
+            await _conn.execute(
+                "ALTER TABLE threads ADD COLUMN hot_cache_timer INTEGER DEFAULT 0"
+            )
+        if "auto_compact" not in existing:
+            await _conn.execute(
+                "ALTER TABLE threads ADD COLUMN auto_compact INTEGER DEFAULT 0"
+            )
         await _conn.commit()
 
 
@@ -251,7 +264,9 @@ async def get_thread(thread_id: int) -> ThreadState | None:
             "effort, max_turns, add_dirs, COALESCE(fork_pending, 0) AS fork_pending, "
             "COALESCE(favorite, 0) AS favorite, "
             "COALESCE(no_sandbox, 0) AS no_sandbox, "
-            "tools_enabled "
+            "tools_enabled, "
+            "COALESCE(hot_cache_timer, 0) AS hot_cache_timer, "
+            "COALESCE(auto_compact, 0) AS auto_compact "
             "FROM threads WHERE thread_id = ?",
             (thread_id,),
         )
@@ -280,6 +295,8 @@ async def get_thread(thread_id: int) -> ThreadState | None:
         favorite=bool(row["favorite"]),
         no_sandbox=bool(row["no_sandbox"]),
         tools_enabled=_parse_tools_enabled(row["tools_enabled"]),
+        hot_cache_timer=bool(row["hot_cache_timer"]),
+        auto_compact=bool(row["auto_compact"]),
     )
 
 
@@ -377,6 +394,28 @@ async def set_stream_enabled(thread_id: int, on: bool) -> None:
     async with _lock:
         await conn.execute(
             "UPDATE threads SET stream_enabled = ? WHERE thread_id = ?",
+            (1 if on else 0, thread_id),
+        )
+        await conn.commit()
+
+
+async def set_hot_cache_timer(thread_id: int, on: bool) -> None:
+    """Persist the per-session warm-cache post-reply note toggle (#164)."""
+    conn = _require_conn()
+    async with _lock:
+        await conn.execute(
+            "UPDATE threads SET hot_cache_timer = ? WHERE thread_id = ?",
+            (1 if on else 0, thread_id),
+        )
+        await conn.commit()
+
+
+async def set_auto_compact(thread_id: int, on: bool) -> None:
+    """Persist the per-session SDK auto-compaction toggle (#164, hidden for now)."""
+    conn = _require_conn()
+    async with _lock:
+        await conn.execute(
+            "UPDATE threads SET auto_compact = ? WHERE thread_id = ?",
             (1 if on else 0, thread_id),
         )
         await conn.commit()
@@ -665,6 +704,46 @@ async def get_user_usage_breakdown(user_id: int) -> dict:
     }
 
 
+async def get_all_users_usage() -> list[dict]:
+    """Per-user token-usage aggregate for the owner stats dashboard (#164):
+    trailing-day / trailing-week / lifetime input+output tokens, request count and
+    last-activity ts — one row per DM user, busiest week first. The handler maps
+    chat_id → username via the allowlist.
+
+    Only DM users (``chat_id > 0`` == the user's Telegram id) count: a group /
+    supergroup chat has a negative ``-100…`` chat_id and is NOT a person, so it is
+    excluded (it would otherwise show up as a phantom 'user' — #164 follow-up)."""
+    now = time.time()
+    day_since = now - 86400
+    week_since = now - 7 * 86400
+    conn = _require_conn()
+    async with _lock:
+        cur = await conn.execute(
+            "SELECT th.chat_id AS uid, "
+            "COALESCE(SUM(CASE WHEN u.ts >= ? THEN u.input_tokens + u.output_tokens ELSE 0 END), 0) AS day, "
+            "COALESCE(SUM(CASE WHEN u.ts >= ? THEN u.input_tokens + u.output_tokens ELSE 0 END), 0) AS week, "
+            "COALESCE(SUM(u.input_tokens + u.output_tokens), 0) AS total, "
+            "COUNT(*) AS requests, COALESCE(MAX(u.ts), 0) AS last_ts "
+            "FROM usage u JOIN threads th ON u.thread_id = th.thread_id "
+            "WHERE th.chat_id > 0 "          # DM users only; groups (chat_id<0) are not people
+            "GROUP BY th.chat_id ORDER BY week DESC, total DESC",
+            (day_since, week_since),
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+    return [
+        {
+            "uid": int(r["uid"]),
+            "day": int(r["day"] or 0),
+            "week": int(r["week"] or 0),
+            "total": int(r["total"] or 0),
+            "requests": int(r["requests"] or 0),
+            "last_ts": float(r["last_ts"] or 0),
+        }
+        for r in rows
+    ]
+
+
 # --------------------------------------------------------------------------- #
 # Conversation log (feeds /recap + /history)
 # --------------------------------------------------------------------------- #
@@ -821,7 +900,8 @@ async def allocate_dm_session(
         # key, so the directory matches the id shown in /sessions and the export
         # filename and never leaks the internal numbering on disk.
         # was: cwd = str(Path(base_workdir) / str(key))  — replaced for #140
-        cwd = str(Path(base_workdir) / session_sid(key))
+        # #181: nested layout — the session cwd is <sid>/work (state is the sibling).
+        cwd = str(Path(base_workdir) / session_sid(key) / "work")
         session_mode = "code" if mode == "code" else "chat"
         await conn.execute(
             "INSERT INTO threads (thread_id, chat_id, mode, model, cwd, "
@@ -980,6 +1060,13 @@ async def migrate_workdirs_to_sid(base_workdir: str) -> int:
     raises for an individual row (logs and continues) so a single bad dir can't
     block the rest.
     """
+    # #181: RETIRED — return early so the legacy #140 rename can't CLOBBER the new
+    # nested layout (<sid>/work). Its skip-check keys on basename==sid, but the new
+    # cwd basename is "work", so re-running it would strip "/work" off every startup.
+    # This deployment is long-migrated and the nested move was done by hand (no new
+    # migration tooling, per the owner). Original body kept below (unreachable) for
+    # history per the audit convention.
+    return 0
     conn = _require_conn()
     base = Path(base_workdir)
     migrated = 0
