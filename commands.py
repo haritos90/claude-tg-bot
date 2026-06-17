@@ -95,6 +95,8 @@ COMMANDS: tuple[Cmd, ...] = (
     # — Tier C · occasional · run + session content —
     Cmd("context", {"en": "Context-window usage",
                     "ru": "Использование окна контекста"}, help_group="run"),
+    Cmd("limits", {"en": "📊 Your usage limits",
+                   "ru": "📊 Ваши лимиты использования"}, help_group="run"),
     Cmd("queue", {"en": "Show the pending-prompt queue",
                   "ru": "Показать очередь запросов"}, help_group="run"),
     Cmd("clearqueue", {"en": "Clear the pending queue",
@@ -153,6 +155,9 @@ COMMANDS: tuple[Cmd, ...] = (
     #   Order follows menu.md §2 Tier F (users first, sandbox last). —
     Cmd("users", {"en": "List allowed users (owner)", "ru": "Список пользователей (владелец)"},
         scope="owner", in_menu=False, help_group="owner"),
+    Cmd("userstats", {"en": "📊 User usage stats — table (owner)",
+                      "ru": "📊 Статистика пользователей — таблица (владелец)"},
+        scope="owner", in_menu=False, help_group="owner"),
     Cmd("allow", {"en": "Allow a user (owner)", "ru": "Разрешить пользователя (владелец)"},
         scope="owner", in_menu=False, help_group="owner"),
     Cmd("deny", {"en": "Remove a user (owner)", "ru": "Удалить пользователя (владелец)"},
@@ -169,9 +174,17 @@ COMMANDS: tuple[Cmd, ...] = (
     Cmd("codesplit", {"en": "Code blocks as separate messages: on | off (owner)",
                       "ru": "Блоки кода отдельными сообщениями: on | off (владелец)"},
         scope="owner", in_menu=False, help_group="settings"),
+    Cmd("workingplate", {"en": "⏳ Working/Stop plate: on | off (owner)",
+                         "ru": "⏳ Плашка Working/Stop: on | off (владелец)"},
+        scope="owner", in_menu=False, help_group="settings"),
     Cmd("sandbox", {"en": "Toggle this code session's sandbox (owner)",
                     "ru": "Песочница код-сессии вкл/выкл (владелец)"},
         scope="owner", in_menu=False, help_group="owner"),
+    # #172: owner-only streaming self-test. in_menu=False AND help_group="" → it is
+    # NOT advertised in the "/" menu or /help; it is typeable only. Kept LAST.
+    Cmd("test", {"en": "Simulate a streamed reply (owner self-test)",
+                 "ru": "Симуляция потоковой генерации (тест владельца)"},
+        scope="owner", in_menu=False, help_group=""),
 )
 
 # Locales every Cmd.label MUST cover (kept in sync with i18n.LANGUAGES via the

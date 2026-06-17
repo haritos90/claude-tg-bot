@@ -55,6 +55,36 @@ def _classify_stderr(text: str) -> str | None:
         return "rate_limit"
     return None
 
+
+# #134: request the 1M-token context window via the [1m] model-id SUFFIX, NOT the
+# `betas` param. Under the OAuth subscription `betas` are IGNORED ("Custom betas are
+# only available for API key users. Ignoring provided betas."), but the suffix works
+# and stays subscription-billed. Empirically (this subscription, 2026-06-16):
+#   • Opus   + [1m] → OK, auto-included, no usage credits, service_tier "standard".
+#   • Sonnet + [1m] → "API Error: Usage credits required for 1M context" (PAID; off here).
+#   • Haiku         → no 1M variant at all.
+# So [1m] is applied ONLY to models that get 1M WITHOUT paid credits — Opus by default.
+# A deployer who has enabled usage credits (claude.ai/settings/usage) can widen the set
+# via env BIG_MEMORY_1M_MODELS (comma-separated model-id substrings, e.g. "opus,sonnet").
+_ONE_M_SUFFIX = "[1m]"
+_ONE_M_MODELS = tuple(
+    s.strip().lower()
+    for s in os.environ.get("BIG_MEMORY_1M_MODELS", "opus").split(",")
+    if s.strip()
+)
+
+
+def _one_m_model(model: str) -> str:
+    """Append the [1m] 1M-context suffix to `model` when it is a 1M-capable model
+    (matches _ONE_M_MODELS and isn't already suffixed); otherwise return it unchanged.
+    Used for big_memory sessions so the 1M window is actually requested (#134)."""
+    m = model or ""
+    if not m or _ONE_M_SUFFIX in m:
+        return m
+    if any(tag in m.lower() for tag in _ONE_M_MODELS):
+        return m + _ONE_M_SUFFIX
+    return m
+
 # Short, friendly system prompt for chat mode. Chat now ships the read-only web
 # research tools (see _build_options), so the prompt tells the model it CAN browse
 # — otherwise it falls back to "I have no internet access" out of habit.
@@ -73,6 +103,24 @@ CHAT_SYSTEM_PROMPT = (
     "markup — never use $...$, $$...$$, \\(...\\), \\[...\\], or backslash commands "
     "like \\frac or \\text. Write math in plain Unicode instead "
     "(e.g. ×, ÷, ≈, ≤, ≥, ², ₂, √, π, ½, →, ∞)."
+)
+
+# #187: the host drains files the agent drops in <cwd>/outbox/ to the user's Telegram
+# chat after each turn (then removes them) — the agent's only channel to hand a SPECIFIC
+# file to the user (orthogonal to /export, which zips the whole workdir). Appended to the
+# code-mode system prompt so the agent knows the mechanism exists and how to use it.
+OUTBOX_INSTRUCTION = (
+    "\n\n## Sending a file to the user\n"
+    "You are running behind a Telegram bot. To deliver a specific file (an image, PDF, "
+    "chart, CSV, archive, …) to the user's chat, put a copy in the `outbox/` directory "
+    "inside your working directory — e.g. `cp report.pdf outbox/`, or save directly to "
+    "it like `outbox/chart.png`. Everything in `outbox/` is sent to the user "
+    "automatically when your turn ends, then removed. Only put files there that the user "
+    "should actually receive — do not dump build artefacts or large logs. Images up to "
+    "5 MB arrive as photos; other files up to ~49 MB as documents (larger ones are "
+    "skipped). To hand over the WHOLE workdir at once (an alternative to /export), "
+    "archive it into outbox/ — e.g. `tar czf outbox/project.tar.gz --exclude=./outbox .` "
+    "(the --exclude stops the archive from recursing into itself)."
 )
 
 # The full universe of tools the model may CALL in code mode (the `tools`
@@ -261,6 +309,7 @@ class ClaudeSession:
         sandbox: bool = False,
         sandbox_uid: int = 65534,
         sandbox_allow_exec: bool = True,
+        auto_compact: bool = True,
     ) -> None:
         self.mode = mode
         self.model = model
@@ -305,6 +354,9 @@ class ClaudeSession:
         self.sandbox = bool(sandbox)
         self.sandbox_uid = int(sandbox_uid)
         self.sandbox_allow_exec = bool(sandbox_allow_exec)
+        # #168: SDK auto-compaction (ON by default = the CLI default). When False,
+        # _build_env sets DISABLE_AUTO_COMPACT=1 (forwarded through the sandbox).
+        self.auto_compact = bool(auto_compact)
         # session_id is updated from each ResultMessage and passed back as
         # options.resume so a freshly-built client continues the prior session.
         self.session_id: str | None = resume_session_id
@@ -346,6 +398,10 @@ class ClaudeSession:
         env.pop("ANTHROPIC_API_KEY", None)
         env.pop("ANTHROPIC_AUTH_TOKEN", None)
         env["CLAUDE_CODE_DISABLE_WORKFLOWS"] = "1"
+        # #168: disable the CLI's auto-compaction when the (effective) toggle is off.
+        # Verified: this flips ContextUsageResponse.isAutoCompactEnabled to False.
+        if not self.auto_compact:
+            env["DISABLE_AUTO_COMPACT"] = "1"
         return env
 
     def _sandbox_launcher(self) -> str:
@@ -364,7 +420,7 @@ class ClaudeSession:
         env["SBX_EXEC"] = "1" if self.sandbox_allow_exec else "0"
         env["SBX_CLAUDE"] = shutil.which("claude") or os.path.expanduser("~/.local/bin/claude")
         env["SBX_CREDS"] = os.path.expanduser("~/.claude/.credentials.json")
-        env["SBX_STATE"] = f"{self.cwd}.sbxstate"  # persistent ~/.claude/projects (#115)
+        env["SBX_STATE"] = str(Path(self.cwd).parent / "state")  # #181: <sid>/state (was {cwd}.sbxstate)
         common["env"] = env
         common["cli_path"] = self._sandbox_launcher()
         # No workdir chown: bwrap's user namespace maps the jail's uid to the
@@ -440,7 +496,11 @@ class ClaudeSession:
         mem_block = self._global_memory_block()
 
         common: dict = {
-            "model": self.model,
+            # #134: a big_memory session requests the 1M context window via the [1m]
+            # model-id suffix (see _one_m_model) — for 1M-capable models only (Opus by
+            # default; the `betas` param below was ignored under the subscription).
+            # was: "model": self.model,
+            "model": _one_m_model(self.model) if self.big_memory else self.model,
             # Isolation: pass [] (NOT None) so the CLI loads NO user/project/local
             # settings and NO CLAUDE.md. In this SDK version None means "load all
             # filesystem sources" — the opposite of what we want.
@@ -480,19 +540,21 @@ class ClaudeSession:
                 self._enable_sandbox(common)
             code_tools = self._resolve_tools(CODE_TOOLS)
             code_extra: dict = {}
-            if mem_block:
-                # #130: inject the owner's CLAUDE.md/memory as an ADDITIVE append to
-                # the default Claude Code preset (keeps the full agent prompt intact),
-                # instead of loading it via setting_sources=["user"] (+ settings.json).
-                code_extra["system_prompt"] = {
-                    "type": "preset", "preset": "claude_code", "append": mem_block,
-                }
-            if self.big_memory:
-                # #133: big_memory is the unified 1M-context toggle for BOTH modes now
-                # (chat applies it below) — was unconditional for code. NOTE #134: the
-                # beta is IGNORED under the OAuth subscription, so this is currently a
-                # no-op; kept so it's correct if/when subscription betas are allowed.
-                code_extra["betas"] = ["context-1m-2025-08-07"]
+            # #187: ALWAYS append the outbox file-delivery instruction (+ the owner's
+            # CLAUDE.md/memory when present) as an ADDITIVE append to the default Claude
+            # Code preset — keeps the full agent prompt intact (the #130 mechanism),
+            # instead of loading via setting_sources=["user"] (+ settings.json). was:
+            # only set system_prompt when mem_block was non-empty (#130).
+            append = OUTBOX_INSTRUCTION + (("\n\n" + mem_block) if mem_block else "")
+            code_extra["system_prompt"] = {
+                "type": "preset", "preset": "claude_code", "append": append,
+            }
+            # #134: the 1M window is now requested via the [1m] model-id suffix in
+            # common["model"] (see _one_m_model). The `betas` param below was a NO-OP
+            # under the OAuth subscription ("Custom betas are only available for API
+            # key users"), so it's commented out — kept for revert/history. was (#133):
+            # if self.big_memory:
+            #     code_extra["betas"] = ["context-1m-2025-08-07"]
             return ClaudeAgentOptions(
                 cwd=self.cwd,
                 permission_mode=self.permission_mode,
@@ -517,10 +579,18 @@ class ClaudeSession:
         # chat has no can_use_tool gate, matching the app). A stored
         # tools_enabled=[] (via the Tools page) makes a truly tool-free chat.
         chat_tools = self._resolve_tools(CHAT_TOOLS)
+        # #180: jail chat too (was code-only). Chat is tool-free but still a
+        # subprocess — routing it through the bubblewrap launcher drops it to the
+        # unprivileged uid, confines it to the workdir, and keeps its transcript in
+        # the per-session <sid>/state dir instead of the host ~/.claude.
+        if self.sandbox:
+            self._enable_sandbox(common)
         chat_extra: dict = {}
-        if self.big_memory:
-            # Big-memory topics get the 1M context window in chat too.
-            chat_extra["betas"] = ["context-1m-2025-08-07"]
+        # #134: 1M is now requested via the [1m] model-id suffix (common["model"], see
+        # _one_m_model); the `betas` param was ignored under the subscription. Commented
+        # out — kept for revert/history. was:
+        # if self.big_memory:
+        #     chat_extra["betas"] = ["context-1m-2025-08-07"]
         return ClaudeAgentOptions(
             # #130: append the owner's CLAUDE.md/memory directly (mem_block is "" when
             # global memory is off or empty), instead of loading it via setting_sources.
@@ -545,17 +615,26 @@ class ClaudeSession:
             # CLI refuses to start if the directory does not exist, so create it up front.
             if self.cwd:
                 os.makedirs(self.cwd, exist_ok=True)
-                if self.mode == "code" and self.sandbox:
-                    # Persistent per-session claude state dir for the jail (#115).
-                    os.makedirs(f"{self.cwd}.sbxstate", exist_ok=True)
-                # #137: lock the workdir (+ its sbxstate) to the owner only. The
-                # sandboxed CLI writes as uid 65534 with the inherited 0022 umask, so
-                # outputs landed 0644 / dirs 0755 — world-readable on the host. 0700
-                # keeps a session's files off-limits to other local users.
+                # #187: pre-create the outbox drop-dir so the agent can always write
+                # into it (`cp file outbox/`). Code mode only — chat is tool-free, so it
+                # never creates files; the host drains + clears it after each turn.
+                if self.mode == "code":
+                    os.makedirs(str(Path(self.cwd) / "outbox"), exist_ok=True)
+                if self.sandbox:
+                    # #181: per-session jail state dir (HOME → ~/.claude/projects), a
+                    # SIBLING of the cwd under one <sid> parent: <sid>/work (cwd) +
+                    # <sid>/state. #180: created for ALL modes now — chat is jailed too.
+                    # was: code-only `{cwd}.sbxstate`.
+                    os.makedirs(str(Path(self.cwd).parent / "state"), exist_ok=True)
+                # #137: lock the workdir (+ state + the <sid> parent) to the owner only.
+                # The sandboxed CLI writes as the mapped uid with a 0022 umask, so
+                # outputs landed world-readable; 0700 keeps a session off-limits to
+                # other local users.
                 with contextlib.suppress(OSError):
                     os.chmod(self.cwd, 0o700)
-                    if self.mode == "code" and self.sandbox:
-                        os.chmod(f"{self.cwd}.sbxstate", 0o700)
+                    if self.sandbox:
+                        os.chmod(str(Path(self.cwd).parent / "state"), 0o700)
+                        os.chmod(str(Path(self.cwd).parent), 0o700)  # the <sid> parent
             # was: assign self.client THEN connect() — replaced for #137
             #   self.client = ClaudeSDKClient(self._build_options())
             #   await self.client.connect()

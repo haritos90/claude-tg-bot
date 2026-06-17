@@ -110,10 +110,13 @@ class Allowlist:
         self._entries: dict[int, dict] = {}
         # name -> same minus username (carried once the user is pinned to an id)
         self._pending: dict[str, dict] = {}
-        # Owner-only build-affecting preference (the owner is never an access
-        # entry). Only global_memory matters for the owner — they are always
-        # code / unexpiring / uncapped / max-effort-allowed.
-        self._owner_prefs: dict = {"global_memory": False}
+        # Owner self-prefs (the owner is never an access entry). global_memory is a
+        # build-affecting opt-out of isolation; rate / allow_max_effort / tool_cap are
+        # SELF-imposed limits the owner can set on itself to test the per-user caps
+        # (#185) — all default to uncapped/allowed so an owner who set nothing stays
+        # unlimited. The owner is always code / unexpiring regardless.
+        # was: {"global_memory": False} — extended for #185 (owner self-limit prefs)
+        self._owner_prefs: dict = self._norm_owner_prefs(None)
         self._mtime: Optional[float] = None
         self._load()
 
@@ -206,7 +209,17 @@ class Allowlist:
 
     def _norm_owner_prefs(self, rec: Optional[dict]) -> dict:
         rec = rec if isinstance(rec, dict) else {}
-        return {"global_memory": self._norm_bool(rec.get("global_memory"))}
+        # #185: rate / allow_max_effort / tool_cap are the owner's SELF-imposed limits
+        # (for testing the per-user caps). Defaults keep an owner who set nothing fully
+        # uncapped: no rate caps, max-effort allowed, no tool cap. A missing/legacy
+        # owner_prefs (only global_memory) upgrades transparently on load.
+        ame = rec.get("allow_max_effort")
+        return {
+            "global_memory": self._norm_bool(rec.get("global_memory")),
+            "rate": self._norm_rate(rec.get("rate")),
+            "allow_max_effort": True if ame is None else self._norm_bool(ame),
+            "tool_cap": self._norm_tool_cap(rec.get("tool_cap")),
+        }
 
     # -- loading / saving ---------------------------------------------------
 
@@ -345,10 +358,12 @@ class Allowlist:
 
     def rate_of(self, user_id: Optional[int], username: Optional[str]) -> dict:
         """The user's rolling-window token caps ``{"day": int|None, "week":
-        int|None}`` (None = no cap). Owner is always uncapped (#120)."""
+        int|None}`` (None = no cap). Owner reads its OWN self-caps (#185), default
+        uncapped (#120)."""
         self._reload_if_changed()
         if user_id is not None and user_id == self.owner_id:
-            return {"day": None, "week": None}
+            # #185: owner reads its self-imposed caps. was: return {"day": None, "week": None}
+            return self._norm_rate(self._owner_prefs.get("rate"))
         rec = self._find(user_id, username)
         return self._norm_rate(rec.get("rate")) if rec else {"day": None, "week": None}
 
@@ -364,19 +379,22 @@ class Allowlist:
 
     def allow_max_effort_of(self, user_id: Optional[int], username: Optional[str]) -> bool:
         """Whether this user may select the (expensive) ``max`` reasoning effort.
-        Owner is always allowed; everyone else defaults to False (#120/effort gate)."""
+        Owner reads its OWN self-pref (default True — #185); everyone else defaults to
+        False (#120/effort gate)."""
         self._reload_if_changed()
         if user_id is not None and user_id == self.owner_id:
-            return True
+            # #185: owner can self-revoke max-effort to test the gate. was: return True
+            return self._norm_bool(self._owner_prefs.get("allow_max_effort", True))
         rec = self._find(user_id, username)
         return self._norm_bool(rec.get("allow_max_effort")) if rec else False
 
     def tool_cap_of(self, user_id: Optional[int], username: Optional[str]):
         """The tools this user MAY use (a ``list[str]``), or ``None`` = uncapped (the
-        session's full default set). Owner is always uncapped (#131)."""
+        session's full default set). Owner reads its OWN self-cap (default None — #185)."""
         self._reload_if_changed()
         if user_id is not None and user_id == self.owner_id:
-            return None
+            # #185: owner can self-impose a tool cap to test it. was: return None
+            return self._norm_tool_cap(self._owner_prefs.get("tool_cap"))
         rec = self._find(user_id, username)
         return self._norm_tool_cap(rec.get("tool_cap")) if rec else None
 
@@ -497,6 +515,21 @@ class Allowlist:
         self._save()
         return True
 
+    def set_friendly_name(self, target: str, name: Optional[str]) -> bool:
+        """Set/clear an entry's owner-assigned friendly name (#171). A blank/`off`
+        name clears it. Returns True if the target exists."""
+        self._reload_if_changed()
+        rec = self._record_for_target(target)
+        if rec is None:
+            return False
+        n = (name or "").strip()
+        if n and n.lower() not in ("off", "none", "clear", "-"):
+            rec["friendly_name"] = n[:64]
+        else:
+            rec.pop("friendly_name", None)
+        self._save()
+        return True
+
     def grant_tokens(self, target: str, tokens: Optional[int]) -> bool:
         """Add ``tokens`` to the target's cumulative grant (``tokens=None`` →
         unlimited). Returns True if the target exists."""
@@ -534,11 +567,14 @@ class Allowlist:
         return True
 
     def set_allow_max_effort(self, target: str, on: bool) -> bool:
-        """Grant/revoke permission to select the ``max`` effort level. The owner is
-        always allowed (no-op success). Returns True if the target exists."""
+        """Grant/revoke permission to select the ``max`` effort level. The owner stores
+        its OWN self-pref (#185). Returns True if the target exists (or is the owner)."""
         self._reload_if_changed()
         if self._is_owner_target(target):
-            return True  # owner is always allowed; nothing to store
+            # #185: owner self-pref. was: return True  # owner is always allowed
+            self._owner_prefs["allow_max_effort"] = bool(on)
+            self._save()
+            return True
         rec = self._record_for_target(target)
         if rec is None:
             return False
@@ -548,10 +584,13 @@ class Allowlist:
 
     def set_tool_cap(self, target: str, tools) -> bool:
         """Set/clear a user's TOOL CAP (#131): ``tools`` is a list (the only tools
-        the user may use) or None (uncapped). Owner is always uncapped (no-op
-        success). Returns True if the target exists."""
+        the user may use) or None (uncapped). The owner stores its OWN self-cap
+        (#185). Returns True if the target exists (or is the owner)."""
         self._reload_if_changed()
         if self._is_owner_target(target):
+            # #185: owner self-cap. was: return True  # owner always uncapped
+            self._owner_prefs["tool_cap"] = self._norm_tool_cap(tools)
+            self._save()
             return True
         rec = self._record_for_target(target)
         if rec is None:
@@ -594,10 +633,19 @@ class Allowlist:
     def set_rate(self, target: str, day=_UNSET, week=_UNSET) -> bool:
         """Set/clear a user's rolling-window caps (#120). Pass ``day``/``week`` as an
         int (cap, in tokens), None (clear that window), or leave unset to keep it.
-        The owner is uncapped (no-op success). Returns True if the target exists."""
+        The owner stores its OWN self-caps (#185). Returns True if the target exists
+        (or is the owner)."""
         self._reload_if_changed()
         if self._is_owner_target(target):
-            return True  # owner is never rate-limited
+            # #185: owner self-cap (was a no-op: "owner is never rate-limited").
+            rate = self._norm_rate(self._owner_prefs.get("rate"))
+            if day is not _UNSET:
+                rate["day"] = None if day is None else self._norm_grant(day)
+            if week is not _UNSET:
+                rate["week"] = None if week is None else self._norm_grant(week)
+            self._owner_prefs["rate"] = rate
+            self._save()
+            return True
         rec = self._record_for_target(target)
         if rec is None:
             return False
@@ -648,11 +696,14 @@ class Allowlist:
             return {
                 "kind": "owner", "id": self.owner_id, "username": None,
                 "level": "code", "expires_at": None, "token_grant": None,
-                "rate": {"day": None, "week": None},
+                # #185: reflect the owner's self-imposed limits on the card (were
+                # hardcoded uncapped: rate {None,None} / allow_max_effort True / tool_cap None).
+                "rate": self._norm_rate(self._owner_prefs.get("rate")),
                 "global_memory": self._norm_bool(self._owner_prefs.get("global_memory")),
-                "allow_max_effort": True,
-                "tool_cap": None,
+                "allow_max_effort": self._norm_bool(self._owner_prefs.get("allow_max_effort", True)),
+                "tool_cap": self._norm_tool_cap(self._owner_prefs.get("tool_cap")),
                 "access": {},
+                "friendly_name": None,
             }
         rec = self._record_for_target(target)
         if rec is None:
@@ -672,6 +723,7 @@ class Allowlist:
             out["kind"] = "pending"
             out["id"] = None
             out["username"] = _norm_username(raw)
+        out["friendly_name"] = rec.get("friendly_name")  # owner-assigned alias (#171)
         return out
 
     def snapshot(self) -> dict:

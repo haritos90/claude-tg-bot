@@ -245,10 +245,39 @@ CATALOG: dict[str, dict[str, str]] = {
     "tool.scope_code": {"en": "code", "ru": "код"},
     "settings.row_users": {"en": "👥 Users ▸", "ru": "👥 Пользователи ▸"},
     "settings.row_admin": {"en": "👑 Admin ▸", "ru": "👑 Админ ▸"},
+    # #178 + owner Admin hub: the /settings → Admin sub-page (archive retention,
+    # global owner toggles, and user-management command launchers).
+    "admin.title": {"en": "👑 <b>Admin</b>\nOwner controls and archive retention.",
+                    "ru": "👑 <b>Администрирование</b>\nНастройки владельца и хранение архивов."},
+    "admin.retention": {"en": "🗄 Archive retention: {val} ▸",
+                        "ru": "🗄 Хранение архивов: {val} ▸"},
+    "admin.retention_title": {
+        "en": "🗄 <b>Archive retention</b>\nPurge deleted-session archives older than:",
+        "ru": "🗄 <b>Хранение архивов</b>\nУдалять архивы удалённых сессий старше:"},
+    "admin.ret_saved": {"en": "✓ Archive retention: {val}", "ru": "✓ Хранение архивов: {val}"},
+    "admin.ret_never": {"en": "♾ Never (keep forever)", "ru": "♾ Никогда (хранить всегда)"},
+    "admin.ret_1mo": {"en": "1 month", "ru": "1 месяц"},
+    "admin.ret_3mo": {"en": "3 months", "ru": "3 месяца"},
+    "admin.ret_6mo": {"en": "6 months", "ru": "6 месяцев"},
+    "admin.ret_12mo": {"en": "12 months", "ru": "12 месяцев"},
+    "admin.ret_days": {"en": "{n} days", "ru": "{n} дн."},
+    "admin.tog_codesplit": {"en": "🧩 Code split: {val}", "ru": "🧩 Разбивка кода: {val}"},
+    "admin.tog_workingplate": {"en": "⏳ Working plate: {val}", "ru": "⏳ Плашка работы: {val}"},
+    "admin.btn_allow": {"en": "➕ Allow", "ru": "➕ Разрешить"},
+    "admin.btn_deny": {"en": "➖ Deny", "ru": "➖ Удалить"},
+    "admin.btn_level": {"en": "🎚 Level", "ru": "🎚 Уровень"},
+    "admin.btn_expire": {"en": "⏳ Expiry", "ru": "⏳ Срок"},
+    "admin.btn_limit": {"en": "💳 Tokens", "ru": "💳 Токены"},
+    "admin.btn_userstats": {"en": "📊 Stats", "ru": "📊 Статистика"},
     "settings.back_to": {"en": "◂ Settings", "ru": "◂ Настройки"},
     "settings.saved": {"en": "✓ Saved", "ru": "✓ Сохранено"},
     "settings.row_perm": {"en": "🔐 Permissions: {val} ▸", "ru": "🔐 Права: {val} ▸"},
     "settings.row_usage": {"en": "📊 Usage: {val} ▸", "ru": "📊 Использование: {val} ▸"},
+    # #164: warm-cache post-reply note (delegated) + auto-compact (owner/hidden).
+    "settings.row_hot_cache_timer": {"en": "🔥 Warm-cache note: {val}", "ru": "🔥 Заметка о тёплом кэше: {val}"},
+    "settings.row_auto_compact": {"en": "📦 Auto-compact: {val}", "ru": "📦 Автокомпакт: {val}"},
+    "settings.row_ctx_status": {"en": "🧠 Live context size: {val}", "ru": "🧠 Размер контекста в плашке: {val}"},
+    "stream.context": {"en": "🧠 context {n}", "ru": "🧠 контекст {n}"},
     # #147: bare name for the usage-display picker title (sx: hub sub-page).
     "settings.usage_name": {"en": "📊 Usage display", "ru": "📊 Использование"},
     # #141: header for the per-session Tools grid ported onto the sx: hub.
@@ -600,13 +629,15 @@ CATALOG: dict[str, dict[str, str]] = {
     # -- /memory ------------------------------------------------------------ #
     "memory.show": {
         "en": "Big memory: <b>{current}</b>.\nWhen <b>on</b>, this session requests "
-              "the <b>1M-token</b> context window (chat or code). ⚠️ That beta is "
-              "currently ignored under the Pro/Max subscription, so it's a no-op for "
-              "now. Your conversation persists across restarts either way. Toggle with "
+              "the <b>1M-token</b> context window via the model's [1m] variant — active "
+              "on <b>Opus</b> (auto-included on Max). On Sonnet 1M needs paid "
+              "usage-credits and Haiku has no 1M, so it has no effect there. Your "
+              "conversation persists across restarts either way. Toggle with "
               "<code>/memory on</code> / <code>/memory off</code>.",
         "ru": "Большая память: <b>{current}</b>.\nКогда <b>вкл</b>, эта сессия "
-              "запрашивает окно контекста на <b>1M токенов</b> (чат или код). ⚠️ Эта "
-              "бета сейчас игнорируется на подписке Pro/Max, так что пока ни на что не "
+              "запрашивает окно контекста на <b>1M токенов</b> через [1m]-вариант "
+              "модели — работает на <b>Opus</b> (включено на Max). На Sonnet для 1M "
+              "нужны платные кредиты, а у Haiku 1M нет, так что там это ни на что не "
               "влияет. Разговор и так сохраняется между перезапусками. Переключение: "
               "<code>/memory on</code> / <code>/memory off</code>.",
     },
@@ -619,10 +650,12 @@ CATALOG: dict[str, dict[str, str]] = {
         "ru": "Большая память уже <b>{state}</b>.",
     },
     "memory.on": {
-        "en": "Big memory <b>on</b> — this chat session now uses the 1M-token "
-              "context window.{note}",
-        "ru": "Большая память <b>вкл</b> — эта чат-сессия теперь использует окно "
-              "контекста на 1M токенов.{note}",
+        "en": "Big memory <b>on</b> — on <b>Opus</b> this session now uses the 1M-token "
+              "context window (on Sonnet/Haiku 1M isn't available, so context stays "
+              "standard).{note}",
+        "ru": "Большая память <b>вкл</b> — на <b>Opus</b> эта сессия теперь использует "
+              "окно контекста на 1M токенов (на Sonnet/Haiku 1M недоступно, контекст "
+              "остаётся стандартным).{note}",
     },
     "memory.off": {
         "en": "Big memory <b>off</b> — back to the standard context window.{note}",
@@ -737,6 +770,41 @@ CATALOG: dict[str, dict[str, str]] = {
         "en": "Unknown usage mode. Use one of: {names}",
         "ru": "Неизвестный режим использования. Используйте один из: {names}",
     },
+    # --- #164: /limits (own / account), /userstats table, working-plate line,
+    #     warm-cache note. ---
+    "limits.header": {"en": "📊 <b>Your limits</b>", "ru": "📊 <b>Ваши лимиты</b>"},
+    "limits.today": {"en": "Today", "ru": "Сегодня"},
+    "limits.week": {"en": "This week", "ru": "За неделю"},
+    "limits.requests": {"en": "Requests", "ru": "Запросов"},
+    "limits.no_cap": {"en": "no cap", "ru": "без лимита"},
+    "limits.rolling_note": {
+        "en": "<i>Windows are rolling (trailing 24h / 7d).</i>",
+        "ru": "<i>Окна скользящие (последние 24ч / 7д).</i>",
+    },
+    "limits.account_header": {
+        "en": "📊 <b>Account usage</b> (subscription, owner)",
+        "ru": "📊 <b>Использование аккаунта</b> (подписка, владелец)",
+    },
+    "limits.account_empty": {"en": "No account usage data yet.", "ru": "Пока нет данных аккаунта."},
+    "userstats.title": {"en": "User statistics", "ru": "Статистика пользователей"},
+    "userstats.empty": {"en": "👥 No usage recorded yet.", "ru": "👥 Пока нет записанного использования."},
+    "userstats.col_user": {"en": "User", "ru": "Пользователь"},
+    "userstats.col_day": {"en": "Day", "ru": "День"},
+    "userstats.col_week": {"en": "Week", "ru": "Неделя"},
+    "userstats.col_total": {"en": "Total", "ru": "Всего"},
+    "userstats.col_req": {"en": "Req", "ru": "Запр"},
+    "userstats.col_last": {"en": "Last", "ru": "Актив."},
+    "stream.usage_line": {"en": "📊 {pct}% {kind}", "ru": "📊 {pct}% {kind}"},
+    "stream.kind_day": {"en": "of daily limit", "ru": "дневного лимита"},
+    "stream.kind_week": {"en": "of weekly limit", "ru": "недельного лимита"},
+    "hotcache.note": {
+        "en": "🔥 Warm cache ~{mins} min — reply soon to reuse it (cheaper).",
+        "ru": "🔥 Тёплый кэш ~{mins} мин — ответьте скоро, чтобы переиспользовать (дешевле).",
+    },
+    "hotcache.cold": {
+        "en": "❄️ Cache cooled — the next reply rebuilds context from scratch.",
+        "ru": "❄️ Кэш остыл — следующий ответ соберёт контекст заново.",
+    },
     "usage.set": {
         "en": "Usage display set to <b>{name}</b> — {help}.",
         "ru": "Показ использования: <b>{name}</b> — {help}.",
@@ -778,6 +846,22 @@ CATALOG: dict[str, dict[str, str]] = {
     "codesplit.set": {
         "en": "🧩 Each code block as its own message: <b>{state}</b>.",
         "ru": "🧩 Каждый блок кода — отдельным сообщением: <b>{state}</b>.",
+    },
+    # -- /workingplate (#175) ---------------------------------------------- #
+    "workingplate.show": {
+        "en": "⏳ \"Working…\" + ⏹ Stop plate: <b>{state}</b>.\n"
+              "<b>on</b> — show the plate (with the Stop button + your limits/context) "
+              "a few seconds into a turn. <b>off</b> — never show it (test whether it "
+              "makes generation visibly jump). Global; next turn.\nTap to change:",
+        "ru": "⏳ Плашка «Working…» + ⏹ Stop: <b>{state}</b>.\n"
+              "<b>вкл</b> — показывать плашку (с кнопкой Stop + лимитами/контекстом) "
+              "через пару секунд после старта. <b>выкл</b> — не показывать совсем "
+              "(проверить, не из-за неё ли прыгает генерация). Глобально; со следующего "
+              "хода.\nНажмите, чтобы изменить:",
+    },
+    "workingplate.set": {
+        "en": "⏳ \"Working…\" + ⏹ Stop plate: <b>{state}</b>.",
+        "ru": "⏳ Плашка «Working…» + ⏹ Stop: <b>{state}</b>.",
     },
 
     # -- /stop -------------------------------------------------------------- #
@@ -979,6 +1063,7 @@ CATALOG: dict[str, dict[str, str]] = {
     },
     "users.btn_owner": {"en": "👑 You (owner)", "ru": "👑 Вы (владелец)"},
     "users.btn_add": {"en": "➕ Add user", "ru": "➕ Добавить"},
+    "users.btn_stats": {"en": "📊 Statistics", "ru": "📊 Статистика"},
     "users.btn_entry": {"en": "{who} · {level}", "ru": "{who} · {level}"},
     "users.btn_pending": {"en": "@{name} · {level} (unpinned)", "ru": "@{name} · {level} (не привязан)"},
     "usercard.title": {
@@ -1006,8 +1091,8 @@ CATALOG: dict[str, dict[str, str]] = {
         "ru": "<i>⚠️ Глобальная память загружает ваш ~/.claude для этого пользователя — не только CLAUDE.md/память, но и <b>настройки</b> (правила авто-allow + env). Выдавайте только полностью доверенным и не держите секреты / allow-правила в ~/.claude/settings.json.</i>",
     },
     "usercard.owner_note": {
-        "en": "<i>The owner is always code, never expires, is uncapped, and may use max effort.</i>",
-        "ru": "<i>Владелец всегда code, не истекает, без лимитов и может использовать max effort.</i>",
+        "en": "<i>The owner is always code and never expires. The limits below are self-imposed for testing — clear them to go back to uncapped.</i>",
+        "ru": "<i>Владелец всегда code и не истекает. Лимиты ниже — самоограничения для теста; сбросьте их, чтобы снова стать без лимитов.</i>",
     },
     "usercard.not_found": {"en": "User not found.", "ru": "Пользователь не найден."},
     "usercard.btn_level": {"en": "Level: {level} → {next}", "ru": "Уровень: {level} → {next}"},
@@ -1029,9 +1114,12 @@ CATALOG: dict[str, dict[str, str]] = {
         "en": "🔑 <b>{name}</b>\nAccess for this user (Base = follow the global base).",
         "ru": "🔑 <b>{name}</b>\nДоступ для пользователя (База = по глобальной базе).",
     },
+    "usercard.btn_name": {"en": "✏️ Friendly name…", "ru": "✏️ Имя…"},
     "usercard.btn_expiry": {"en": "⏳ Set expiry…", "ru": "⏳ Срок доступа…"},
     "usercard.btn_day": {"en": "📊 Day limit…", "ru": "📊 Лимит/день…"},
     "usercard.btn_week": {"en": "📅 Week limit…", "ru": "📅 Лимит/неделя…"},
+    "usercard.btn_idle": {"en": "⏳ Idle: {val}", "ru": "⏳ Простой: {val}"},
+    "usercard.idle_default": {"en": "default", "ru": "по умолч."},
     "usercard.btn_clear_limits": {"en": "♾ Clear limits", "ru": "♾ Снять лимиты"},
     "usercard.btn_remove": {"en": "🗑 Remove access", "ru": "🗑 Убрать доступ"},
     "usercard.btn_back": {"en": "◂ Users", "ru": "◂ Пользователи"},
@@ -1044,6 +1132,10 @@ CATALOG: dict[str, dict[str, str]] = {
         "en": "Remove access for <code>{who}</code>?",
         "ru": "Убрать доступ для <code>{who}</code>?",
     },
+    "usercard.prompt_name": {
+        "en": "Send a friendly name for this user (or <code>-</code> to clear; /cancel).",
+        "ru": "Отправьте имя для этого пользователя (или <code>-</code> чтобы убрать; /cancel).",
+    },
     "usercard.prompt_expiry": {
         "en": "Send an expiry date <code>YYYY-MM-DD</code> (or <code>never</code>; /cancel).",
         "ru": "Отправьте дату окончания <code>ГГГГ-ММ-ДД</code> (или <code>never</code>; /cancel).",
@@ -1055,6 +1147,10 @@ CATALOG: dict[str, dict[str, str]] = {
     "usercard.prompt_week": {
         "en": "Send the WEEKLY token cap (e.g. <code>2m</code>, or <code>off</code>; /cancel).",
         "ru": "Отправьте НЕДЕЛЬНЫЙ лимит токенов (напр. <code>2m</code>, или <code>off</code>; /cancel).",
+    },
+    "usercard.prompt_idle": {
+        "en": "Send the idle-TTL in <b>minutes</b> (e.g. <code>6</code>), <code>off</code> for ∞ (never reap), or <code>default</code> for the server default. /cancel to abort.",
+        "ru": "Отправьте таймаут простоя в <b>минутах</b> (напр. <code>6</code>), <code>off</code> для ∞ (не выгружать), или <code>default</code> для значения по умолчанию. /cancel — отмена.",
     },
     "whoami.usage": {
         "en": "Usage — day <b>{day}</b> · week <b>{week}</b> · total <b>{total}</b>",
@@ -1083,6 +1179,9 @@ CATALOG: dict[str, dict[str, str]] = {
         "en": "Busy: {busy}; queued: {queued}",
         "ru": "Занят: {busy}; в очереди: {queued}",
     },
+    # #170: native-checklist labels (the checkbox itself shows on/off).
+    "status.chk_bigmem": {"en": "Big memory (1M context)", "ru": "Большая память (1M контекст)"},
+    "status.chk_busy": {"en": "Busy ({queued} queued)", "ru": "Занят (в очереди: {queued})"},
     "status.cache": {
         "en": "Cache window (5 min): ~{secs}s left",
         "ru": "Окно кэша (5 мин): осталось ~{secs}с",
@@ -1091,10 +1190,13 @@ CATALOG: dict[str, dict[str, str]] = {
         "en": "<b>Subscription limits</b>",
         "ru": "<b>Лимиты подписки</b>",
     },
-    "status.trend_header": {"en": "<b>Usage trend</b>", "ru": "<b>Тренд использования</b>"},
+    "status.trend_header": {
+        "en": "📈 Limit trend (recent utilization %, last ~hour)",
+        "ru": "📈 Тренд лимитов (недавняя загрузка %, ~час)",
+    },
     "status.totals_header": {
-        "en": "<b>Usage (session lifetime)</b>",
-        "ru": "<b>Использование (за всё время сессии)</b>",
+        "en": "Usage (session lifetime)",
+        "ru": "Использование (за всё время сессии)",
     },
     "status.requests": {"en": "Requests: {n}", "ru": "Запросов: {n}"},
     "status.tokens": {
@@ -1284,6 +1386,15 @@ CATALOG: dict[str, dict[str, str]] = {
         "en": "Could not download the file: {err}",
         "ru": "Не удалось скачать файл: {err}",
     },
+    # #187: outbox file send-back notices.
+    "outbox.too_big": {
+        "en": "📎 Too large to send to chat: {names}. Use /export to download the workdir.",
+        "ru": "📎 Слишком большие для отправки в чат: {names}. Используйте /export, чтобы скачать рабочую папку.",
+    },
+    "outbox.more": {
+        "en": "📎 {n} more file(s) staged in outbox/ — they'll be sent after the next turn.",
+        "ru": "📎 Ещё {n} файл(ов) в outbox/ — отправлю после следующего хода.",
+    },
     "attach.read_error": {
         "en": "Could not read the file.",
         "ru": "Не удалось прочитать файл.",
@@ -1350,6 +1461,10 @@ CATALOG: dict[str, dict[str, str]] = {
     "session.internal_error": {
         "en": "⚠️ Internal error: {exc}",
         "ru": "⚠️ Внутренняя ошибка: {exc}",
+    },
+    "busy.queued": {
+        "en": "⏳ Server busy — your turn is queued and will run as soon as a slot frees up.",
+        "ru": "⏳ Сервер занят — ваш ход в очереди и начнётся, как только освободится слот.",
     },
 
     # -- engine error events (engine.py emits a stable error_key) ------------ #

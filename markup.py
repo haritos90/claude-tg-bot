@@ -67,6 +67,13 @@ _FENCE_TILDE_RE = re.compile(
     re.DOTALL,
 )
 _FENCE_NOLANG_RE = re.compile(r"```(.*?)```", re.DOTALL)
+# #176: one FULL fenced code block (``` or ~~~, language optional). Requires a newline
+# after the opener, so an inline ``…`` span is NOT matched — only real multi-line blocks.
+_CODE_FENCE_BLOCK_RE = re.compile(
+    r"```[ \t]*[A-Za-z0-9_+\-.#]*[ \t]*\r?\n.*?```"
+    r"|~~~[ \t]*[A-Za-z0-9_+\-.#]*[ \t]*\r?\n.*?~~~",
+    re.DOTALL,
+)
 _INLINE_CODE_RE = re.compile(r"`([^`\n]+?)`")
 _BOLD_STAR_RE = re.compile(r"\*\*(.+?)\*\*", re.DOTALL)
 _BOLD_USCORE_RE = re.compile(r"__(.+?)__", re.DOTALL)
@@ -76,10 +83,23 @@ _ITALIC_USCORE_RE = re.compile(r"(?<![\w_])_(?!\s)(.+?)(?<!\s)_(?![\w_])", re.DO
 _LINK_RE = re.compile(r"\[([^\]\n]+)\]\(\s*([^)\s]+)\s*\)")
 _ATX_HEADER_RE = re.compile(r"(?m)^[ \t]{0,3}(#{1,6})[ \t]+(.+?)[ \t]*#*[ \t]*$")
 _PH_RE = re.compile(r"\x00PH(\d+)\x00")
-# A markdown table separator row: |---|:--:|---| (the line under the header).
+# A markdown table separator row (the line under the header). Accepts BOTH the GFM
+# pipe form |---|:--:|---| AND the grid/ASCII form ---+---+--- — some models emit `+`
+# at the column junctions and drop the outer pipes, which used to defeat detection so
+# the whole table rendered raw (#162). Junction char is `|` or `+`; data rows still use
+# `|` (split by _split_table_row), so only this separator line needed widening.
 _TABLE_SEP_RE = re.compile(
-    r"^[ \t]*\|?[ \t]*:?-{2,}:?[ \t]*(?:\|[ \t]*:?-{2,}:?[ \t]*)+\|?[ \t]*$"
+    r"^[ \t]*[|+]?[ \t]*:?-{2,}:?[ \t]*(?:[|+][ \t]*:?-{2,}:?[ \t]*)+[|+]?[ \t]*$"
 )
+
+# Auto grid/cards (#162): a rendered grid wider than this many monospace chars won't
+# fit a phone (a wide <pre> forces horizontal scroll / wraps and reads poorly), so
+# it is rendered as vertical per-row "cards" instead. Narrower tables stay a <pre> grid.
+_TABLE_GRID_MAX_WIDTH = 46
+# Markdown emphasis markers dropped from table cells: a <pre> grid is monospace and a
+# card bolds its title via tags, so raw **/__/~~/` would only show literally (the leaked
+# ** in **Rust**). Inner text is kept.
+_CELL_EMPH_RE = re.compile(r"\*\*(.+?)\*\*|__(.+?)__|~~(.+?)~~|`([^`]+)`")
 
 # --- modern rich formatting (Telegram "rich message formatting options") ------ #
 # ~~strikethrough~~ (GitHub). Guarded so the tildes of a ``~~~`` code fence (which
@@ -101,14 +121,26 @@ def _table_disp_len(s: str) -> int:
     return len(s.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">"))
 
 
+def _strip_cell_emphasis(s: str) -> str:
+    """Drop markdown emphasis markers (**b**/__b__/~~s~~/`c`) from a table cell, keeping
+    the inner text — a grid/card can't host them inline so the raw markers would leak."""
+    prev = None
+    out = s
+    while prev != out:
+        prev = out
+        out = _CELL_EMPH_RE.sub(lambda m: next(g for g in m.groups() if g is not None), out)
+    return out
+
+
 def _split_table_row(line: str) -> list[str]:
-    """Split a `| a | b |` row into trimmed cells (outer pipes optional)."""
+    """Split a `| a | b |` row into trimmed, emphasis-stripped cells (outer pipes
+    optional)."""
     s = line.strip()
     if s.startswith("|"):
         s = s[1:]
     if s.endswith("|"):
         s = s[:-1]
-    return [c.strip() for c in s.split("|")]
+    return [_strip_cell_emphasis(c.strip()) for c in s.split("|")]
 
 
 def _render_table_pre(rows: list[list[str]]) -> str:
@@ -131,8 +163,107 @@ def _render_table_pre(rows: list[list[str]]) -> str:
     return "<pre>" + "\n".join(body) + "</pre>"
 
 
+def _render_table_cards(rows: list[list[str]]) -> str:
+    """Render a wide table (won't fit a phone as a grid) as vertical per-row cards: the
+    first column is a bold title, the remaining columns become `label: value` lines under
+    it (the header row supplies the labels). No horizontal overflow — mobile-friendly.
+    Cells are already HTML-escaped + emphasis-stripped; the title is bolded via tags."""
+    ncol = max(len(r) for r in rows)
+    headers = rows[0] + [""] * (ncol - len(rows[0]))
+    blocks: list[str] = []
+    for r in rows[1:]:
+        r = r + [""] * (ncol - len(r))
+        title = r[0].strip() or "—"
+        lines = [f"▸ <b>{title}</b>"]
+        for c in range(1, ncol):
+            val = r[c].strip()
+            if not val:
+                continue
+            label = headers[c].strip()
+            lines.append(f"  <b>{label}:</b> {val}" if label else f"  {val}")
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks)
+
+
+def _render_table_auto(rows: list[list[str]]) -> str:
+    """Pick the table layout by width (#162): an aligned <pre> grid when it fits a phone,
+    else vertical cards. Both receive already-escaped, emphasis-stripped cells."""
+    ncol = max(len(r) for r in rows)
+    padded = [r + [""] * (ncol - len(r)) for r in rows]
+    widths = [max(_table_disp_len(r[c]) for r in padded) for c in range(ncol)]
+    grid_w = sum(widths) + 3 * (ncol - 1)  # " | " joins between columns
+    if grid_w <= _TABLE_GRID_MAX_WIDTH or len(rows) < 2:
+        return _render_table_pre(rows)
+    return _render_table_cards(rows)
+
+
+# #162: WIDE tables are now sent as IMAGES (table_image.render_table_png) rather than a
+# wrapping <pre> grid — Telegram has no native table and a wide grid runs off the bubble
+# (cramped). The split is decided by split_image_tables() below and the photo is sent
+# by the streamer (a photo can't live inside an HTML text message). _render_table_auto /
+# _render_table_cards above are the earlier text-only attempt (cards were rejected in
+# review); kept for reference / non-image fallback.
+
+class TableImage:
+    """A wide table to be sent as a PNG photo (#162) instead of a text grid. Holds the
+    parsed, emphasis-stripped (NOT HTML-escaped) rows for table_image.render_table_png."""
+
+    __slots__ = ("rows",)
+
+    def __init__(self, rows: list[list[str]]):
+        self.rows = rows
+
+
+def _table_is_wide(rows: list[list[str]]) -> bool:
+    """True when the rendered grid would be wider than a phone (> _TABLE_GRID_MAX_WIDTH)
+    — those tables are sent as an image rather than a wrapping <pre> grid (#162)."""
+    if len(rows) < 2:
+        return False
+    ncol = max(len(r) for r in rows)
+    padded = [r + [""] * (ncol - len(r)) for r in rows]
+    widths = [max(_table_disp_len(r[c]) for r in padded) for c in range(ncol)]
+    return sum(widths) + 3 * (ncol - 1) > _TABLE_GRID_MAX_WIDTH
+
+
+def split_image_tables(text: str):
+    """Split raw model text into ordered items: plain-text runs (str) and wide tables
+    (TableImage) to be sent as a photo (#162). Narrow tables stay inside the text runs
+    (md_to_html renders them as a <pre> grid). Returns [text] when there are no wide
+    tables, so table-free output is unchanged."""
+    if "|" not in text:
+        return [text]
+    lines = text.split("\n")
+    items: list = []
+    buf: list[str] = []
+    i, n = 0, len(lines)
+    while i < n:
+        nxt = lines[i + 1] if i + 1 < n else ""
+        if "|" in lines[i] and _TABLE_SEP_RE.match(nxt):
+            rows = [_split_table_row(lines[i])]
+            j = i + 2
+            while j < n and "|" in lines[j] and lines[j].strip():
+                rows.append(_split_table_row(lines[j]))
+                j += 1
+            if _table_is_wide(rows):
+                if buf:
+                    items.append("\n".join(buf))
+                    buf = []
+                items.append(TableImage(rows))
+            else:
+                buf.extend(lines[i:j])          # narrow → keep raw lines for the grid
+            i = j
+        else:
+            buf.append(lines[i])
+            i += 1
+    if buf:
+        items.append("\n".join(buf))
+    return items or [text]
+
+
 def _tables_to_pre(text: str, stash) -> str:
-    """Replace GitHub-style markdown tables with stashed, aligned <pre> grids."""
+    """Replace GitHub-style markdown tables with stashed, aligned <pre> grids (#162).
+    Wide tables meant to become images are extracted upstream (split_image_tables), so
+    here every detected table is narrow enough to render as a grid."""
     if "|" not in text:
         return text
     lines = text.split("\n")
@@ -152,6 +283,168 @@ def _tables_to_pre(text: str, stash) -> str:
             out.append(lines[i])
             i += 1
     return "\n".join(out)
+
+
+# --------------------------------------------------------------------------- #
+# NATIVE Telegram tables — Bot API 10.1 rich messages (#164)
+# --------------------------------------------------------------------------- #
+# Telegram Bot API 10.1 (2026-06-11) added sendRichMessage + an `html` field on
+# InputRichMessage that DOES render <table>/<tr>/<th>/<td> with bordered/striped,
+# colspan/rowspan, align/valign and <caption> (RichBlockTable). So a markdown
+# table no longer needs a PNG (table_image) or a monospace <pre> grid — we emit
+# real Telegram HTML and the client lays out (and side-scrolls) the columns.
+#
+# The PNG path (split_image_tables / TableImage / table_image.render_table_png)
+# and the <pre> grid (_render_table_pre via _tables_to_pre) are KEPT above as a
+# fallback / revert but are no longer on the live send path (the streamer routes
+# every table through split_rich_tables → RichTable → sendRichMessage; #164).
+
+# Inline cell emphasis we DO keep for native cells (a rich HTML cell can host
+# tags, unlike the monospace grid which had to strip them). Bold + inline code
+# are the common ones in model tables; kept conservative (paired markers only).
+_CELL_BOLD_RE = re.compile(r"\*\*(.+?)\*\*|__(.+?)__")
+_CELL_CODE_RE = re.compile(r"`([^`]+)`")
+
+
+class RichTable:
+    """A markdown table to be sent as a NATIVE Telegram table (#164) via
+    sendRichMessage. Holds the raw (NOT yet HTML-escaped) rows — first row is the
+    header — plus per-column alignments parsed from the ``:--:`` separator."""
+
+    __slots__ = ("rows", "aligns")
+
+    def __init__(self, rows: list[list[str]], aligns: list | None = None):
+        self.rows = rows
+        self.aligns = aligns or []
+
+
+def _split_table_row_raw(line: str) -> list[str]:
+    """Split a ``| a | b |`` row into trimmed cells, KEEPING markdown emphasis
+    (the native-table path converts **/`` `` to tags rather than stripping them)."""
+    s = line.strip()
+    if s.startswith("|"):
+        s = s[1:]
+    if s.endswith("|"):
+        s = s[:-1]
+    return [c.strip() for c in s.split("|")]
+
+
+def _parse_table_aligns(sep_line: str) -> list:
+    """Parse a markdown separator row (``|:--|:-:|--:|``) into per-column
+    alignments: ``"left"`` / ``"center"`` / ``"right"`` / None (default)."""
+    out: list = []
+    for c in _split_table_row_raw(sep_line):
+        c = c.strip()
+        left, right = c.startswith(":"), c.endswith(":")
+        out.append("center" if left and right else "right" if right else "left" if left else None)
+    return out
+
+
+def _cell_rich_html(cell: str) -> str:
+    """Escape a cell then re-introduce the common inline tags (bold, inline code)
+    a Telegram rich cell can render. Escaping runs first, so ``*``/`` ` `` markers
+    survive to be converted; everything else stays literal/escaped."""
+    s = escape_html(cell.strip())
+    s = _CELL_CODE_RE.sub(lambda m: f"<code>{m.group(1)}</code>", s)
+    s = _CELL_BOLD_RE.sub(lambda m: f"<b>{m.group(1) or m.group(2)}</b>", s)
+    return s
+
+
+def table_to_rich_html(
+    rows: list[list[str]],
+    aligns: list | None = None,
+    *,
+    bordered: bool = True,
+    striped: bool = True,
+    caption: str | None = None,
+) -> str:
+    """Render parsed rows as a NATIVE Telegram ``<table>`` (Bot API 10.1 rich HTML).
+    First row → ``<th>`` header cells; the rest → ``<td>``. Per-column ``align`` is
+    applied from ``aligns``; the table is bordered + zebra-striped by default."""
+    rows = [r for r in rows if r is not None]
+    if not rows:
+        return ""
+    ncol = max((len(r) for r in rows), default=0)
+    attrs = []
+    if bordered:
+        attrs.append("bordered")
+    if striped:
+        attrs.append("striped")
+    parts = ["<table" + ((" " + " ".join(attrs)) if attrs else "") + ">"]
+    if caption:
+        parts.append(f"<caption>{_cell_rich_html(caption)}</caption>")
+    for ri, r in enumerate(rows):
+        cells = list(r) + [""] * (ncol - len(r))
+        tag = "th" if ri == 0 else "td"
+        row = ["<tr>"]
+        for c in range(ncol):
+            a = aligns[c] if aligns and c < len(aligns) else None
+            align_attr = f' align="{a}"' if a else ""
+            row.append(f"<{tag}{align_attr}>{_cell_rich_html(cells[c])}</{tag}>")
+        row.append("</tr>")
+        parts.append("".join(row))
+    parts.append("</table>")
+    return "".join(parts)
+
+
+def split_rich_tables(text: str):
+    """Split raw model text into ordered items: plain-text runs (str) and tables
+    (:class:`RichTable`) to be sent as native Telegram tables (#164). EVERY markdown
+    table is extracted (narrow and wide alike) — unlike split_image_tables, which
+    only pulled wide ones for the PNG path. Returns ``[text]`` when there is no
+    table, so table-free output is unchanged."""
+    if "|" not in text:
+        return [text]
+    lines = text.split("\n")
+    items: list = []
+    buf: list[str] = []
+    i, n = 0, len(lines)
+    while i < n:
+        nxt = lines[i + 1] if i + 1 < n else ""
+        if "|" in lines[i] and _TABLE_SEP_RE.match(nxt):
+            rows = [_split_table_row_raw(lines[i])]
+            aligns = _parse_table_aligns(nxt)
+            j = i + 2
+            while j < n and "|" in lines[j] and lines[j].strip():
+                rows.append(_split_table_row_raw(lines[j]))
+                j += 1
+            if len(rows) >= 1:
+                if buf:
+                    items.append("\n".join(buf))
+                    buf = []
+                items.append(RichTable(rows, aligns))
+            i = j
+        else:
+            buf.append(lines[i])
+            i += 1
+    if buf:
+        items.append("\n".join(buf))
+    return items or [text]
+
+
+def has_code_block(text: str) -> bool:
+    """True if ``text`` contains a real (multi-line) fenced code block (#176)."""
+    return bool(_CODE_FENCE_BLOCK_RE.search(text or ""))
+
+
+def split_code_blocks(text: str):
+    """Split text into ordered ``("text", str)`` and ``("code", str)`` segments (#176):
+    a ``"code"`` segment is a full fenced block (``` or ~~~). Non-code runs (prose,
+    tables, lists, headings) are kept as-is. Lets the streamer send code as a CLASSIC
+    message (a REAL code block + copy) and everything else as RICH (consistent font +
+    native tables) — the only way to get both in one Telegram reply."""
+    if not has_code_block(text):
+        return [("text", text)]
+    out: list = []
+    pos = 0
+    for m in _CODE_FENCE_BLOCK_RE.finditer(text):
+        if m.start() > pos:
+            out.append(("text", text[pos:m.start()]))
+        out.append(("code", m.group(0)))
+        pos = m.end()
+    if pos < len(text):
+        out.append(("text", text[pos:]))
+    return out or [("text", text)]
 
 
 # --------------------------------------------------------------------------- #

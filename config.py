@@ -25,6 +25,18 @@ DEFAULT_DB_PATH = "./bot.db"
 DEFAULT_ALLOWLIST_PATH = "./allowlist.json"
 
 
+def _mem_total_mb() -> int:
+    """Total RAM in MiB from /proc/meminfo (best effort; 2048 if unknown)."""
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemTotal:"):
+                    return int(line.split()[1]) // 1024
+    except Exception:
+        pass
+    return 2048
+
+
 @dataclass
 class Settings:
     """Runtime configuration for the Telegram bot."""
@@ -44,12 +56,28 @@ class Settings:
     sandbox_code: bool = True
     sandbox_uid: int = 65534          # the unprivileged uid/gid the jail drops to
     sandbox_allow_exec: bool = True   # True = perm "7" (exec ok); False = "6" (noexec workdir)
+    # Concurrency / RAM management (#179). Defaults derived from the box's RAM + CPU
+    # at load (see load_settings) so a small VPS self-limits. Each LIVE `claude`
+    # client is a persistent subprocess (~400–600 MB RSS); without caps, N first-time
+    # users = N processes pinned until restart → OOM on a small box. The idle reaper
+    # frees them (history persists on disk; `resume` rebuilds on the next message).
+    max_live_clients: int = 4      # max simultaneously-LIVE claude clients (idle+busy)
+    idle_ttl_sec: int = 360        # reap a client idle longer than this — 6 min = the ~5-min warm
+                                   # prompt-cache window + ~1 min buffer (no caching gain past it)
+    max_concurrent_turns: int = 4  # cap on SIMULTANEOUS active turns (the generation spike)
+    min_free_mb: int = 400         # below this MemAvailable, evict idle clients before a turn
     # Extra prompt keyword triggers to neutralize, ON TOP of the built-in defaults
     # (engine.DEFAULT_KEYWORD_TRIGGERS = ultrathink, ultracode). Loaded from
     # BLOCKED_PROMPT_KEYWORDS (comma/space-separated). Each word is made inert in
     # user prompts so it can't trigger a hidden CLI behaviour — see the README and
     # engine.defuse_triggers. Empty by default (the defaults still apply).
     extra_blocked_keywords: list[str] = field(default_factory=list)
+    # #178: archive retention (days). Deleted-session bundles under
+    # BASE_WORKDIR/_archive are auto-purged when older than this; 0 = keep forever
+    # ("never"). Default 6 months. The owner can change it at runtime from
+    # /settings → Admin (persisted in kv `archive_retention_days`, which overrides
+    # this startup default).
+    archive_retention_days: int = 180
 
 
 def load_settings() -> Settings:
@@ -138,6 +166,30 @@ def load_settings() -> Settings:
         sandbox_uid = 65534
     sandbox_allow_exec = _flag("SANDBOX_EXEC", True)
 
+    # Concurrency / RAM caps (#179). Derive sane defaults from the box: reserve
+    # ~900 MB for the OS + bot + buffers, budget ~550 MB per live claude client.
+    def _int(name: str, default: int) -> int:
+        raw = os.environ.get(name)
+        if raw is None or not raw.strip():
+            return default
+        try:
+            return int(raw.strip())
+        except ValueError:
+            return default
+
+    _total_mb = _mem_total_mb()
+    _cpus = os.cpu_count() or 2
+    _default_live = max(2, (_total_mb - 900) // 550)
+    _default_turns = max(1, min(_default_live, _cpus * 2))
+    max_live_clients = max(1, _int("MAX_LIVE_CLIENTS", _default_live))
+    idle_ttl_sec = max(60, _int("IDLE_TTL_SEC", 360))  # #179: 6-min default = warm-cache (5m) + 1m
+                                                       # buffer (per-user override → #182)
+    max_concurrent_turns = max(1, _int("MAX_CONCURRENT_TURNS", _default_turns))
+    min_free_mb = max(0, _int("MIN_FREE_MB", 400))
+    # #178: archive retention in days (0 = keep forever). The startup default; the
+    # owner can override it at runtime via /settings → Admin (kv archive_retention_days).
+    archive_retention_days = max(0, _int("ARCHIVE_RETENTION_DAYS", 180))
+
     # Extra keyword triggers to neutralize in prompts (on top of the engine
     # defaults). Comma- or whitespace-separated; blanks dropped.
     raw_keywords = os.environ.get("BLOCKED_PROMPT_KEYWORDS", "") or ""
@@ -153,5 +205,10 @@ def load_settings() -> Settings:
         sandbox_code=sandbox_code,
         sandbox_uid=sandbox_uid,
         sandbox_allow_exec=sandbox_allow_exec,
+        max_live_clients=max_live_clients,
+        idle_ttl_sec=idle_ttl_sec,
+        max_concurrent_turns=max_concurrent_turns,
+        min_free_mb=min_free_mb,
+        archive_retention_days=archive_retention_days,
         extra_blocked_keywords=extra_blocked_keywords,
     )

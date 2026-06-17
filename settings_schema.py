@@ -93,6 +93,9 @@ BASE_ACCESS_DEFAULTS: dict[str, Access] = {
     "language": Access.DELEGATED,
     "usage_display": Access.READONLY,    # account-wide; owner delegates
     "tools": Access.DELEGATED,
+    "hot_cache_timer": Access.DELEGATED,  # #164: every user may toggle their note
+    "auto_compact": Access.HIDDEN,        # #168: forced-on; owner delegates to disable
+    "ctx_status": Access.HIDDEN,          # #167: forced-on; owner delegates to disable
 }
 
 
@@ -584,6 +587,60 @@ SETTINGS: dict[str, Setting] = {
             Scope.GLOBAL: _sandbox_global_setter(),
         },
     ),
+    # #164: post-reply warm-cache note. DELEGATED — every user may toggle it (own
+    # default + per session); the owner can still re-gate it via the access model.
+    "hot_cache_timer": Setting(
+        key="hot_cache_timer",
+        type=bool,
+        choices=(True, False),
+        default=False,
+        scopes=(Scope.SESSION, Scope.USER),
+        view_role=Role.CHAT,
+        edit_role=Role.CHAT,
+        name_key="settings.row_hot_cache_timer",
+        value_labels={},
+        get={
+            Scope.SESSION: _session_attr_get("hot_cache_timer"),
+            Scope.USER: _bool_user_get("hot_cache_timer"),
+        },
+        set={
+            Scope.SESSION: _session_attr_setter("set_hot_cache_timer"),
+            Scope.USER: _user_setter("hot_cache_timer"),
+        },
+    ),
+    # #168: SDK auto-compaction. Forced ON by default (the CLI default) but
+    # DISABLEABLE when the owner delegates it (Access). USER-scope ONLY: a per-session
+    # bool column defaults to off and would wrongly override the forced-on default,
+    # whereas the per-user kv is naturally "unset → default True". Wired in the engine
+    # via the DISABLE_AUTO_COMPACT env (verified to flip isAutoCompactEnabled).
+    "auto_compact": Setting(
+        key="auto_compact",
+        type=bool,
+        choices=(True, False),
+        default=True,
+        scopes=(Scope.USER,),
+        view_role=Role.CHAT,
+        edit_role=Role.CHAT,
+        name_key="settings.row_auto_compact",
+        value_labels={},
+        get={Scope.USER: _bool_user_get("auto_compact")},
+        set={Scope.USER: _user_setter("auto_compact")},
+    ),
+    # #167: live context size in the working plate. Same "forced ON, disableable if
+    # delegated" pattern (USER-scope, default True, HIDDEN access).
+    "ctx_status": Setting(
+        key="ctx_status",
+        type=bool,
+        choices=(True, False),
+        default=True,
+        scopes=(Scope.USER,),
+        view_role=Role.CHAT,
+        edit_role=Role.CHAT,
+        name_key="settings.row_ctx_status",
+        value_labels={},
+        get={Scope.USER: _bool_user_get("ctx_status")},
+        set={Scope.USER: _user_setter("ctx_status")},
+    ),
 }
 
 
@@ -623,6 +680,9 @@ def is_code_only(key: str) -> bool:
 PAGE_ORDER: tuple[str, ...] = (
     "model", "effort", "permission_mode", "max_turns",
     "memory", "sandbox", "language",
+    # #164: warm-cache note (delegated) + auto-compact + live context (forced-on,
+    # delegate-to-disable; #167/#168).
+    "hot_cache_timer", "auto_compact", "ctx_status",
 )
 
 

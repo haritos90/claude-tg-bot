@@ -258,7 +258,7 @@ Conventions legend).
 | `/limit` | Top up a user's token grant (owner) | Пополнить лимит токенов (владелец) | prompts (capture) | 👑 |
 | `/auto` | Run code tools without asking (owner) | Запускать инструменты кода без вопросов (владелец) | none → toggle | 👑 |
 | `/codesplit` | Code blocks as separate messages: on/off (owner) | Блоки кода отдельными сообщениями: on/off (владелец) | none → toggle | 👑 |
-| `/sandbox` | Toggle this code session's sandbox (owner) | Песочница код-сессии вкл/выкл (владелец) | none → toggle | 👑 |
+| `/sandbox` | Toggle this session's sandbox — all sessions, chat & code (owner) | Песочница сессии вкл/выкл — все сессии, чат и код (владелец) | none → toggle | 👑 |
 
 > **Not commands:** a plain message is a prompt to the current session; a photo,
 > PDF, or text/code file uses its caption as the prompt. Messages sent while a
@@ -309,6 +309,7 @@ rows appear only in a code session (§1.7).
 | 🧰 Tools ▸ *(code)* | ▮ full width |
 | 📊 Usage display ▸ *(owner)* | ▮ full width |
 | 👥 Users ▸ *(owner)* | ▮ full width |
+| 👑 Admin ▸ *(owner)* | ▮ full width |
 | ✖ Close | ▮ full width |
 
 **Table 11 — Settings hub rows.**
@@ -326,12 +327,21 @@ rows appear only in a code session (§1.7).
 | Tools | 🧰 Tools ▸ | 🧰 Инструменты ▸ | 🟦 |
 | Usage display | 📊 Usage display ▸ | 📊 Использование ▸ | 👑 |
 | Users | 👥 Users ▸ | 👥 Пользователи ▸ | 👑 |
+| Admin | 👑 Admin ▸ | 👑 Админ ▸ | 👑 |
 | Close | ✖ Close | ✖ Закрыть | 🟢 |
 
 A value row opens a **picker** (3 choices per row, §1.2) with a ✓ on the current
 value and a `◂ Back` that returns to this hub. A bool row toggles in place. The
 scope badge next to a value (`this session` / `my default` / `global default`)
 names where the effective value comes from (§4).
+
+The **👑 Admin** row (owner only) opens a sub-page that consolidates owner controls
+not surfaced as their own hub rows: the **🗄 Archive retention** picker (#178 —
+purge deleted-session bundles older than 1 / 3 / 6 / 12 months or Never; default
+6 months), the global owner toggles **🧩 Code split** and **⏳ Working plate**, and
+quick launchers for the user-management commands (**➕ Allow · ➖ Deny · 🎚 Level ·
+⏳ Expiry · 💳 Tokens · 📊 Stats**). Each launcher starts the matching command's
+arg-capture (§1.5) or opens its page.
 
 ### 3.3 The sessions browser (`/sessions`)
 
@@ -556,7 +566,7 @@ One row per option. *Applies to* marks code-only options (§1.7). *Base access* 
 | `max_turns` | int 1–1000, or unlimited | unlimited | code | Delegated | — |
 | `big_memory` | bool | off | all | Hidden | Delegated: granted users |
 | `streaming` | bool | on | all | Hidden | native streaming always-on (no user toggle) |
-| `sandbox` | bool | on | code | Hidden | owner: Delegated |
+| `sandbox` | bool | on | all | Hidden | owner: Delegated (#180: chat & code) |
 | `language` | enum: supported locales | en | all (UI) | Delegated | — |
 | `usage_display` | enum: off, footer, pinned, both | footer | account-wide | Read-only | owner: Delegated |
 | `code_split` | bool | on | all (rendering) | Read-only | owner: Delegated — toggle `/codesplit` (send each code block as its own message for easy mobile copy) |

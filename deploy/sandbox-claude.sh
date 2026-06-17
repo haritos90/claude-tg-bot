@@ -56,6 +56,11 @@ args=(
 [ -d /lib64 ] && args+=(--ro-bind /lib64 /lib64)
 [ -d /sbin ]  && args+=(--ro-bind /sbin /sbin)
 
+# #168: forward the auto-compaction kill-switch into the jail when the engine set it.
+# The bot's env reaches THIS launcher, but --clearenv wipes it for the inner CLI, so
+# it must be re-injected explicitly. Absent → autocompact stays ON (the CLI default).
+[ -n "${DISABLE_AUTO_COMPACT:-}" ] && args+=(--setenv DISABLE_AUTO_COMPACT "$DISABLE_AUTO_COMPACT")
+
 # DNS: when /etc/resolv.conf is a systemd-resolved symlink into /run, bind the
 # real target at its own path so the symlink resolves inside the jail (otherwise
 # claude can't reach the API — "FailedToOpenSocket").

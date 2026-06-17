@@ -18,11 +18,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import time
 from typing import Any
 
 from aiogram.exceptions import TelegramBadRequest, TelegramRetryAfter
 from aiogram.types import (
+    BufferedInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     LinkPreviewOptions,
@@ -30,6 +32,10 @@ from aiogram.types import (
 
 import i18n
 import markup
+import table_image  # noqa: F401  — kept for the commented-out #162 PNG-table revert path
+from rich_message import SendRichMessage, SendRichMessageDraft
+
+logger = logging.getLogger("streamer")
 
 # Links in model output should stay inline — never expand into a web-page preview
 # card (the owner asked for this; previews are noisy and can look like an
@@ -112,9 +118,18 @@ class Streamer:
         base_step: int | None = None,
         use_drafts: bool = False,
         split_code_messages: bool = True,
+        working_note: str = "",
+        controllable: bool = True,
     ) -> None:
         self.bot = bot
         self.chat_id = chat_id
+        # #172: whether to post the separate ⏹ Stop control message mid-stream. The
+        # /test demo turns this OFF — a new message arriving mid-draft makes some
+        # clients re-render the draft from the top (looks like it "regenerates").
+        self.controllable = bool(controllable)
+        # #164: an extra line shown under "Working…" in the Stop-control plate —
+        # the user's own limit (≥50%) or, for the owner, the account usage.
+        self.working_note = working_note or ""
         # Normalise the General topic (0) to None so _kwargs() omits the field.
         self.thread_id = thread_id if thread_id else None
         d_interval, d_step = CARET_SPEEDS[_DEFAULT_SPEED]
@@ -318,29 +333,38 @@ class Streamer:
         body = self._full[: self._shown].strip()
         if not body:
             return  # nothing yet — the empty "Thinking…" draft already shows
-        # Render the model text alone (no status block): split raw first so a fence
-        # cut at the tail stays balanced, then render the FRONTIER (tail) chunk so the
-        # live draft tracks the model's current frontier (best live progress).
-        # KNOWN ISSUE: for answers past Telegram's ~4096-char draft cap this tail
-        # "jumps", which Telegram DESKTOP FOR macOS re-renders as a visible "retype"
-        # (iOS animates it smoothly in one pass). That is a client-side draft-render
-        # limitation, documented in the README (Known issues) — NOT a bot bug; the
-        # final finish() message is always correct and complete on every client.
+        # #172: stream the RAW markdown via sendRichMessageDraft, so the draft is
+        # ALREADY FORMATTED as it generates (Durov's GIF) instead of plain text that
+        # snaps to rich at the end. Split raw first so a fence cut at the tail stays
+        # balanced; stream the FRONTIER (tail) chunk so a long stream tracks the
+        # frontier (Telegram animates same-draft_id updates). On any failure (e.g. a
+        # partial-markdown parse hiccup) we fall back to a plain HTML draft for that
+        # frame so streaming never goes dark; the final finish() message is always
+        # correct on every client.
         raw_chunks = markup.split_markdown(body, limit=markup.SAFE_LIMIT)
         frontier = raw_chunks[-1] if raw_chunks else body
-        chunk = markup.md_to_html(frontier) or "…"
-        display = f"{chunk}{_DRAFT_CURSOR}"
-        if display == self._rendered_text:
+        if frontier == self._rendered_text:
             return
-        await self._safe(
-            lambda: self.bot.send_message_draft(
-                chat_id=self.chat_id,
-                draft_id=_DRAFT_ID,
-                text=display,
-                parse_mode="HTML",
+        # #176→owner pref: stream the WHOLE reply as rich (code included → monospace
+        # in the draft, matching the final rich message). On any failure fall back to a
+        # plain HTML draft for that frame so streaming never goes dark.
+        try:
+            await self.bot(
+                SendRichMessageDraft(
+                    chat_id=self.chat_id,
+                    draft_id=_DRAFT_ID,
+                    rich_message={"markdown": frontier},
+                )
             )
-        )
-        self._rendered_text = display
+        except Exception:
+            chunk = markup.md_to_html(frontier) or "…"
+            await self._safe(
+                lambda: self.bot.send_message_draft(
+                    chat_id=self.chat_id, draft_id=_DRAFT_ID,
+                    text=f"{chunk}{_DRAFT_CURSOR}", parse_mode="HTML",
+                )
+            )
+        self._rendered_text = frontier
         self._last_edit = time.monotonic()
 
     async def _render_frame(self) -> None:
@@ -393,6 +417,8 @@ class Streamer:
                 return
         lang = i18n.cached_lang(self.chat_id)
         label = i18n.t("stream.working", lang)
+        if self.working_note:
+            label = f"{label}\n{self.working_note}"
         kb = InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text=i18n.t("btn.stop", lang), callback_data=f"stop:{self.thread_id or 0}")
         ]])
@@ -517,7 +543,9 @@ class Streamer:
 
             # DM: a draft can't carry a Stop button, so schedule a separate
             # control message (posted only if the turn outlasts _CONTROL_DELAY).
-            if self.use_drafts and self._control_task is None:
+            # #172: skipped for the /test demo (controllable=False) so a mid-draft
+            # message arrival can't make the client re-render the draft from the top.
+            if self.use_drafts and self.controllable and self._control_task is None:
                 self._control_task = asyncio.create_task(self._delayed_control())
 
     async def update(self, full_text: str) -> None:
@@ -611,19 +639,197 @@ class Streamer:
             if msg is not None:
                 self.message_id = getattr(msg, "message_id", None)
 
+    def _build_sendables(self, full_text: str, render_fn) -> list:
+        """Split the final answer into ordered sendables — ``('text', html)`` chunks and
+        ``('rich', RichTable)`` native tables (#164). EVERY markdown table is sent as a
+        NATIVE Telegram table (even in a code-containing reply, #172) — so a code reply
+        still gets a proper classic code block in its text chunks AND a native table;
+        _send_rich falls back to a <pre> grid only if that API call fails."""
+        out: list = []
+        # #164: route every table through the native rich-table path.
+        for item in markup.split_rich_tables(full_text):
+            if isinstance(item, markup.RichTable):
+                out.append(("rich", item))
+                continue
+            for chunk in render_fn(item):
+                if chunk and not markup.is_empty_render(chunk):
+                    out.append(("text", chunk))
+        return out
+
+        # # was (#162) — wide tables as PNG images / narrow as <pre> grids. Replaced
+        # # for #164 (native Telegram tables); kept commented for quick revert.
+        # out: list = []
+        # for item in markup.split_image_tables(full_text):
+        #     if isinstance(item, markup.TableImage):
+        #         try:
+        #             out.append(("photo", table_image.render_table_png(item.rows)))
+        #             continue
+        #         except Exception:
+        #             esc = [[markup.escape_html(c) for c in r] for r in item.rows]
+        #             out.append(("text", markup._render_table_pre(esc)))
+        #             continue
+        #     for chunk in render_fn(item):
+        #         if chunk and not markup.is_empty_render(chunk):
+        #             out.append(("text", chunk))
+        # return out
+
+    async def _send_rich(self, table, silent: bool) -> None:
+        """Send one markdown table as a NATIVE Telegram table via Bot API 10.1
+        sendRichMessage (#164). The method is new, so on ANY failure we fall back to
+        the old monospace <pre> grid — a table is never lost, just less pretty."""
+        html = markup.table_to_rich_html(table.rows, table.aligns)
+        try:
+            await self.bot(
+                SendRichMessage(
+                    chat_id=self.chat_id,
+                    rich_message={"html": html},
+                    disable_notification=silent,
+                    **self._kwargs(),
+                )
+            )
+            return
+        except Exception:
+            logger.warning("sendRichMessage failed; falling back to <pre> grid", exc_info=True)
+        # Fallback: the legacy monospace grid (cells emphasis-stripped + escaped).
+        esc = [[markup.escape_html(markup._strip_cell_emphasis(c)) for c in r] for r in table.rows]
+        await self._safe(
+            lambda: self.bot.send_message(
+                chat_id=self.chat_id,
+                text=markup._render_table_pre(esc),
+                parse_mode="HTML",
+                disable_notification=silent,
+                link_preview_options=_NO_PREVIEW,
+                **self._kwargs(),
+            )
+        )
+
+    async def _commit_rich_markdown(self, full_text: str, footer: str, silent: bool) -> bool:
+        """#169/#172: post the ENTIRE reply as ONE native rich message (the markdown
+        field): Telegram renders headings / lists / tables / quotes natively, with NO
+        splitting. Returns True on success; False (→ classic fallback) on any error.
+
+        ⚠ #172/#174: in a rich message a ```fence``` shows only as plain MONOSPACE (no
+        language label, no copy) — the "correct" RichBlockPreformatted is accepted by the
+        API but not styled by the client yet (verified 2026-06-17). Per the owner we send
+        code through here ANYWAY (one consistent rich message > splitting), accepting the
+        monospace look until Telegram styles it — at which point code renders properly
+        with NO change. (The split-by-segment alternative lives in _commit_mixed.)"""
+        md = full_text.strip() or "…"
+        if footer:
+            # Italicize each footer line separately — markdown italic can't span a
+            # newline, and the owner's usage footer is now 2 lines (5h / 7d) (#169).
+            foot = "\n".join(f"_{ln}_" for ln in footer.splitlines() if ln.strip())
+            md = f"{md}\n\n{foot}"
+        try:
+            await self.bot(
+                SendRichMessage(
+                    chat_id=self.chat_id,
+                    rich_message={"markdown": md},
+                    disable_notification=silent,
+                    **self._kwargs(),
+                )
+            )
+        except Exception:
+            logger.warning("#169 sendRichMessage(markdown) failed; legacy fallback", exc_info=True)
+            return False
+        # The rich message is a fresh bubble, so clear the streaming write-head
+        # placeholder if there was one (DM drafts have none — they self-expire).
+        if self.message_id is not None:
+            with contextlib.suppress(Exception):
+                await self.bot.delete_message(self.chat_id, self.message_id)
+            self.message_id = None
+        self._rendered_text = md
+        return True
+
+    async def _commit_mixed(self, full_text: str, footer: str, silent_first: bool) -> None:
+        """#176: a reply that contains code → split by code block. Non-code segments
+        (prose, tables, lists, headings) go as RICH messages (consistent font + native
+        tables); each code block goes CLASSIC (a real code block with language + copy).
+        The footer rides the last segment (or its own message if that segment is code).
+        Each rich piece falls back to classic HTML if its send fails."""
+        segs = [(k, s) for (k, s) in markup.split_code_blocks(full_text) if s.strip()]
+        if not segs:
+            segs = [("text", "…")]
+        # Segments are fresh messages → drop the streaming write-head placeholder
+        # (DM drafts have none; they self-expire).
+        if self.message_id is not None:
+            with contextlib.suppress(Exception):
+                await self.bot.delete_message(self.chat_id, self.message_id)
+            self.message_id = None
+        last = len(segs) - 1
+        for idx, (kind, seg) in enumerate(segs):
+            silent = silent_first if idx == 0 else True
+            want_footer = bool(footer) and idx == last
+            if kind == "code":
+                code_html = markup.md_to_html(seg)
+                await self._safe(
+                    lambda h=code_html, s=silent: self.bot.send_message(
+                        chat_id=self.chat_id, text=h, parse_mode="HTML",
+                        disable_notification=s, link_preview_options=_NO_PREVIEW,
+                        **self._kwargs(),
+                    )
+                )
+            else:
+                md = seg.strip()
+                if want_footer:
+                    foot = "\n".join(f"_{ln}_" for ln in footer.splitlines() if ln.strip())
+                    md = f"{md}\n\n{foot}"
+                    want_footer = False
+                try:
+                    await self.bot(
+                        SendRichMessage(
+                            chat_id=self.chat_id, rich_message={"markdown": md},
+                            disable_notification=silent, **self._kwargs(),
+                        )
+                    )
+                except Exception:
+                    seg_html = markup.md_to_html(seg)
+                    await self._safe(
+                        lambda h=seg_html, s=silent: self.bot.send_message(
+                            chat_id=self.chat_id, text=h, parse_mode="HTML",
+                            disable_notification=s, link_preview_options=_NO_PREVIEW,
+                            **self._kwargs(),
+                        )
+                    )
+            if want_footer:   # last segment was code → footer on its own line
+                await self._safe(
+                    lambda: self.bot.send_message(
+                        chat_id=self.chat_id,
+                        text=f"<i>{markup.escape_html(footer)}</i>",
+                        parse_mode="HTML", disable_notification=True,
+                        link_preview_options=_NO_PREVIEW, **self._kwargs(),
+                    )
+                )
+        self._rendered_text = full_text
+
     async def _commit(self, full_text: str, footer: str, notify: bool) -> None:
         """Render full_text and post it as permanent message(s). Caller holds the
         lock and owns the streaming flags. Links never preview; only the FIRST
         message may ping (notify), the rest are silent.
 
-        - Fits one chunk → edit the placeholder (write-head) or send fresh (draft).
-        - Multiple chunks → first as above, the rest as new messages.
-        - Very long → a .md document instead of many chunks.
+        #169: the whole reply now goes as ONE rich-markdown message (see
+        _commit_rich_markdown); the chunk/split/table-bubble logic below is the
+        FALLBACK only. Very long → a .md document instead.
         """
         silent_first = not notify
         footer_line = f"\n\n<i>{markup.escape_html(footer)}</i>" if footer else ""
 
-        # Very long output: deliver as a document so we do not spam chunks.
+        # #176 → owner preference 2026-06-17: send the WHOLE reply as ONE rich message,
+        # code included. In rich a ```fence``` renders as plain MONOSPACE (no language /
+        # copy — the "correct" RichBlockPreformatted is accepted but not styled by the
+        # client yet, #174), but the owner prefers a single, consistent rich message
+        # with monospace code over SPLITTING a code reply into rich+classic bubbles —
+        # and waiting for Telegram to fix code styling (then this needs no change). The
+        # split-by-segment path (_commit_mixed / markup.split_code_blocks) is kept,
+        # un-called, to flip back if that preference changes.
+        if await self._commit_rich_markdown(full_text, footer, silent_first):
+            return
+        # # was (#176): split a code reply → rich prose/tables + classic code block:
+        # if markup.has_code_block(full_text):
+        #     await self._commit_mixed(full_text, footer, silent_first)
+        #     return
+
+        # Very long output (fallback): deliver as a document so we do not spam chunks.
         if markup.should_send_as_file(full_text):
             note_chunk = self._render_chunks(
                 i18n.t("stream.too_long", i18n.cached_lang(self.chat_id))
@@ -661,64 +867,91 @@ class Streamer:
             self._rendered_text = note_chunk
             return
 
-        # Drop empty code boxes (a hard-cut over-long fence renders to a blank
-        # <pre></pre>); keep at least one chunk so an empty turn still shows "…".
-        # Per the global /codesplit toggle: isolate each fenced code block into its
-        # own message (default — easy mobile copy), or render inline as size-split
-        # chunks. Both drop empty code boxes; keep one chunk so an empty turn shows "…".
-        _render = self._render_message_chunks if self._split_code_messages else self._render_chunks
-        chunks = [c for c in _render(full_text) if not markup.is_empty_render(c)] or ["…"]
+        # ---- legacy fallback (pre-#169): md_to_html chunks + native-table bubbles +
+        #      char-limit splitting. Kept (not deleted) so a sendRichMessage failure
+        #      never loses a reply, and for a quick revert. ----
+        # #162: build ordered sendables — HTML text chunks + wide-table photos. A table
+        # too wide for a phone can't be a clean <pre> grid (it wraps / runs off the
+        # bubble) and Telegram has no native table, so it is drawn as a PNG and sent as
+        # its own photo; narrow tables stay <pre> grids inside the text chunks. Per the
+        # /codesplit toggle the text path isolates fenced code blocks (default — easy
+        # mobile copy) or size-splits inline; empty code boxes are dropped, and one "…"
+        # chunk is kept so an empty turn still shows something.
+        # Fallback only (a NO-code reply whose rich send failed): classic md_to_html
+        # chunks + native-table bubbles. Code-containing replies never reach here —
+        # they are handled by _commit_mixed (rich prose/tables + classic code).
+        render_fn = self._render_message_chunks if self._split_code_messages else self._render_chunks
+        sendables = self._build_sendables(full_text, render_fn) or [("text", "…")]
 
-        # Append the footer to the last chunk when it fits, else a trailing message.
-        footer_as_message = False
+        # Append the footer to the last TEXT sendable when it fits, else send it alone.
+        footer_as_message = bool(footer_line)
         if footer_line:
-            last = chunks[-1] or ""
-            if len(last) + len(footer_line) <= markup.HARD_LIMIT:
-                chunks[-1] = f"{last}{footer_line}"
-            else:
-                footer_as_message = True
+            for idx in range(len(sendables) - 1, -1, -1):
+                kind, payload = sendables[idx]
+                if kind == "text" and len(payload) + len(footer_line) <= markup.HARD_LIMIT:
+                    sendables[idx] = ("text", f"{payload}{footer_line}")
+                    footer_as_message = False
+                    break
 
-        # First chunk replaces the placeholder (write-head) or is sent fresh (draft).
-        first = chunks[0] or "…"
-        if self.message_id is not None:
+        # Send in order. The FIRST text sendable replaces the streaming placeholder
+        # (write-head/group); photos and the rest are sent fresh. Only the first send
+        # may ping the user; the rest are silent intermediates.
+        placeholder_used = False
+        first_send = True
+        for kind, payload in sendables:
+            silent = silent_first if first_send else True
+            if kind == "rich":
+                # #164: a native Telegram table — its own bubble (like the old photo),
+                # so it does not consume the streaming placeholder.
+                await self._send_rich(payload, silent)
+            elif kind == "photo":
+                await self._safe(
+                    lambda p=payload, s=silent: self.bot.send_photo(
+                        chat_id=self.chat_id,
+                        photo=BufferedInputFile(p, filename="table.png"),
+                        disable_notification=s,
+                        **self._kwargs(),
+                    )
+                )
+            elif self.message_id is not None and not placeholder_used:
+                await self._safe(
+                    lambda t=payload: self.bot.edit_message_text(
+                        text=t,
+                        chat_id=self.chat_id,
+                        message_id=self.message_id,
+                        parse_mode="HTML",
+                        link_preview_options=_NO_PREVIEW,
+                    )
+                )
+                self._rendered_text = payload
+                placeholder_used = True
+            else:
+                await self._safe(
+                    lambda t=payload, s=silent: self.bot.send_message(
+                        chat_id=self.chat_id,
+                        text=t,
+                        parse_mode="HTML",
+                        disable_notification=s,
+                        link_preview_options=_NO_PREVIEW,
+                        **self._kwargs(),
+                    )
+                )
+                self._rendered_text = payload
+            first_send = False
+
+        # A group placeholder left unconsumed (a photo-only answer) → don't orphan its
+        # "typing…" text; replace it with a thin marker.
+        if self.message_id is not None and not placeholder_used:
             await self._safe(
                 lambda: self.bot.edit_message_text(
-                    text=first,
+                    text="📊",
                     chat_id=self.chat_id,
                     message_id=self.message_id,
                     parse_mode="HTML",
                     link_preview_options=_NO_PREVIEW,
                 )
             )
-        else:
-            await self._safe(
-                lambda first=first: self.bot.send_message(
-                    chat_id=self.chat_id,
-                    text=first,
-                    parse_mode="HTML",
-                    disable_notification=silent_first,
-                    link_preview_options=_NO_PREVIEW,
-                    **self._kwargs(),
-                )
-            )
-        self._rendered_text = first
 
-        # Remaining chunks + standalone footer are always silent (intermediate).
-        for chunk in chunks[1:]:
-            # Skip empty strings AND empty code boxes (a hard-cut over-long fence
-            # renders to a blank <pre></pre>) so no stray empty message is sent.
-            if not chunk or markup.is_empty_render(chunk):
-                continue
-            await self._safe(
-                lambda chunk=chunk: self.bot.send_message(
-                    chat_id=self.chat_id,
-                    text=chunk,
-                    parse_mode="HTML",
-                    disable_notification=True,
-                    link_preview_options=_NO_PREVIEW,
-                    **self._kwargs(),
-                )
-            )
         if footer_as_message:
             await self._safe(
                 lambda: self.bot.send_message(

@@ -85,6 +85,22 @@ async def main() -> None:
     with contextlib.suppress(Exception):
         await sessions.load_persisted()
 
+    # #135: start polling the account usage endpoint so the footer / pinned / status
+    # show the REAL subscription % even when idle (the SDK rate-events only report it
+    # near a limit). Best-effort; the poller swallows its own errors.
+    with contextlib.suppress(Exception):
+        sessions.start_usage_poller()
+
+    # #179: start the idle-client reaper so idle sessions release their ~400 MB
+    # claude subprocess (history persists on disk; resume rebuilds on next message).
+    with contextlib.suppress(Exception):
+        sessions.start_reaper()
+
+    # #178: start the archive-retention purger (deletes deleted-session bundles older
+    # than the configured retention; runs at startup + daily). Best-effort.
+    with contextlib.suppress(Exception):
+        sessions.start_archive_purger()
+
     router = build_router(settings, sessions, gate, bot, allowlist)
     dp.include_router(router)
 

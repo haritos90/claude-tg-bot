@@ -23,7 +23,7 @@ import contextlib
 import inspect
 import io
 import re
-import shutil
+# import shutil  # unused after #177 — session-delete teardown moved to archive.py
 import time
 import zipfile
 from pathlib import Path
@@ -41,6 +41,7 @@ from aiogram.types import (
     Message,
 )
 
+import archive
 import commands
 import db
 import engine
@@ -49,6 +50,7 @@ import markup
 import settings_schema as ss
 import usage
 from allowlist import normalize_date
+from rich_message import SendRichMessage  # #164: native Telegram tables
 
 
 # Friendly aliases mapped to concrete model ids for the /model command.
@@ -232,6 +234,18 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         if message.chat.type != "private" and message.message_thread_id:
             send_kwargs["message_thread_id"] = message.message_thread_id
 
+        # #172: send command replies as NATIVE rich messages too, so their look/font
+        # matches /status, /userstats and the streamed answers (the owner flagged the
+        # inconsistency). `text` is already valid Telegram HTML → use the html field;
+        # rich messages also need no char-splitting. Fall back to the classic
+        # doc/chunked path below on any failure, so a reply is never lost.
+        try:
+            await bot(SendRichMessage(chat_id=message.chat.id,
+                                      rich_message={"html": text}, **send_kwargs))
+            return
+        except Exception:
+            pass
+
         # Very long: send as a document rather than spamming chunks.
         if markup.should_send_as_file(text):
             try:
@@ -273,6 +287,19 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                     pass
 
     # ------------------------------------------------------------------ helpers
+
+    async def reply_rich_html(message: Message, html: str) -> None:
+        """#170: send a READ-ONLY reply as a native rich message (sendRichMessage html)
+        so headings, lists and checklists render. Falls back to the classic HTML
+        reply() if the (new) API call fails — a reply is never lost."""
+        send_kwargs: dict = {}
+        if message.chat.type != "private" and message.message_thread_id:
+            send_kwargs["message_thread_id"] = message.message_thread_id
+        try:
+            await bot(SendRichMessage(chat_id=message.chat.id,
+                                      rich_message={"html": html}, **send_kwargs))
+        except Exception:
+            await reply(message, html)
 
     async def _session_key(message: Message) -> int:
         """Resolve the session key for an incoming message.
@@ -328,10 +355,13 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
 
     def _may_max_effort(uid: int | None, uname: str | None) -> bool:
         """Whether this user may select the (expensive) `max` reasoning effort — the
-        owner, or a user explicitly granted it. Guests are blocked so they can't burn
-        the owner's one shared subscription via max thinking (#120 / effort gate)."""
-        if uid is not None and uid == settings.owner_id:
-            return True
+        owner (unless self-revoked for testing, #185), or a user explicitly granted it.
+        Guests are blocked so they can't burn the owner's one shared subscription via
+        max thinking (#120 / effort gate)."""
+        # #185: route the owner through allow_max_effort_of too — it defaults the owner
+        # to True, so default behaviour is unchanged, but an owner self-revoke now gates
+        # the owner. was an unconditional owner pass:
+        #   if uid is not None and uid == settings.owner_id: return True
         return bool(allowlist.allow_max_effort_of(uid, uname))
 
     def _lang(obj) -> str:
@@ -355,7 +385,8 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         key = await _session_key(message)
         # #140: name the per-session workdir by the stable public sid, not the raw
         # key. was: default_cwd = str(settings.base_workdir / str(key))
-        default_cwd = str(settings.base_workdir / db.session_sid(key))
+        # #181: nested layout — the session cwd is <sid>/work.
+        default_cwd = str(settings.base_workdir / db.session_sid(key) / "work")
         return await db.ensure_thread(
             key, message.chat.id, settings.default_model, default_cwd
         )
@@ -450,8 +481,9 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 await db.set_model(key, MODEL_ALIASES.get(val, val))
                 await _rebuild_session(key)
             elif cat == "effort":
-                if val == "max" and not (uid == settings.owner_id
-                                         or allowlist.allow_max_effort_of(uid, None)):
+                # #185: via _may_max_effort so an owner self-revoke gates the owner too.
+                # was: not (uid == settings.owner_id or allowlist.allow_max_effort_of(uid, None))
+                if val == "max" and not _may_max_effort(uid, None):
                     return "effort"  # max effort is gated (#123) — ignore the tap
                 await db.set_effort(key, None if val in ("default", "none") else val)
                 await _rebuild_session(key)
@@ -691,8 +723,76 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                                            val=getattr(sessions, "usage_mode", "footer")),
                                callback_data="sx:usage")])
                 rows.append([B(text=i18n.t("settings.row_users", lang), callback_data="sx:users")])
+                # #178 + owner Admin hub: the Admin sub-page (archive retention,
+                # global toggles, user-management launchers) sits LAST (menu.md §1.8).
+                rows.append([B(text=i18n.t("settings.row_admin", lang), callback_data="sx:admin")])
         rows.append([B(text=i18n.t("btn.close", lang), callback_data="sx:close")])
         return InlineKeyboardMarkup(inline_keyboard=rows)
+
+    # ----------------------------------------------- owner Admin sub-page (#178)
+    # Retention picker choices: (days, i18n_key). 0 = keep forever ("never").
+    _RETENTION_CHOICES = (
+        (30, "admin.ret_1mo"), (90, "admin.ret_3mo"), (180, "admin.ret_6mo"),
+        (365, "admin.ret_12mo"), (0, "admin.ret_never"),
+    )
+
+    async def _archive_retention_days() -> int:
+        """Effective archive retention in days: the owner's runtime value (kv
+        ``archive_retention_days``, set here) if present, else the startup default
+        (``settings.archive_retention_days``). 0 = keep forever."""
+        raw = await db.get_kv("archive_retention_days")
+        if raw is not None:
+            try:
+                return max(0, int(raw))
+            except (TypeError, ValueError):
+                pass
+        return max(0, int(getattr(settings, "archive_retention_days", 180) or 0))
+
+    def _retention_label(days: int, lang: str) -> str:
+        for d, k in _RETENTION_CHOICES:
+            if d == days:
+                return i18n.t(k, lang)
+        return i18n.t("admin.ret_days", lang, n=days)
+
+    def _ss_retention_keyboard(cur: int, lang: str) -> InlineKeyboardMarkup:
+        B = InlineKeyboardButton
+        rows = [
+            [B(text=("✓ " if d == cur else "") + i18n.t(k, lang),
+               callback_data=f"sx:admin:rset:{d}")]
+            for d, k in _RETENTION_CHOICES
+        ]
+        rows.append([B(text=i18n.t("settings.back_to", lang), callback_data="sx:admin"),
+                     B(text=i18n.t("btn.close", lang), callback_data="sx:close")])
+        return InlineKeyboardMarkup(inline_keyboard=rows)
+
+    def _ss_admin_keyboard(lang: str, ret_days: int, cs_on: bool, wp_on: bool) -> InlineKeyboardMarkup:
+        B = InlineKeyboardButton
+        rows = [
+            [B(text=i18n.t("admin.retention", lang, val=_retention_label(ret_days, lang)),
+               callback_data="sx:admin:ret")],
+            [B(text=i18n.t("admin.tog_codesplit", lang, val=i18n.onoff(cs_on, lang)),
+               callback_data="sx:admin:tog:cs"),
+             B(text=i18n.t("admin.tog_workingplate", lang, val=i18n.onoff(wp_on, lang)),
+               callback_data="sx:admin:tog:wp")],
+            [B(text=i18n.t("admin.btn_allow", lang), callback_data="sx:admin:cmd:allow"),
+             B(text=i18n.t("admin.btn_deny", lang), callback_data="sx:admin:cmd:deny")],
+            [B(text=i18n.t("admin.btn_level", lang), callback_data="sx:admin:cmd:level"),
+             B(text=i18n.t("admin.btn_expire", lang), callback_data="sx:admin:cmd:expire"),
+             B(text=i18n.t("admin.btn_limit", lang), callback_data="sx:admin:cmd:limit")],
+            [B(text=i18n.t("admin.btn_userstats", lang), callback_data="usr:stats")],
+            [B(text=i18n.t("settings.back_to", lang), callback_data="sx:tab:s"),
+             B(text=i18n.t("btn.close", lang), callback_data="sx:close")],
+        ]
+        return InlineKeyboardMarkup(inline_keyboard=rows)
+
+    async def _send_ss_admin(msg, lang: str) -> None:
+        """Render (edit in place) the owner Admin sub-page."""
+        days = await _archive_retention_days()
+        cs = bool(getattr(sessions, "split_code_messages", True))
+        wp = bool(getattr(sessions, "working_plate", True))
+        with contextlib.suppress(Exception):
+            await msg.edit_text(i18n.t("admin.title", lang), parse_mode="HTML",
+                                reply_markup=_ss_admin_keyboard(lang, days, cs, wp))
 
     def _ss_picker_keyboard(setting, scope, ctx: ss.Ctx, lang: str,
                             may_max: bool = True) -> InlineKeyboardMarkup:
@@ -972,6 +1072,57 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                         await sessions.set_usage_mode(mode_val)
                 await _send_ss_hub(msg.chat.id, key, uid, uname, lang, ss.Scope.SESSION, edit_msg=msg)
                 await cb.answer(i18n.t("settings.saved", lang))
+                return
+
+            # ---- owner Admin sub-page (#178): retention + global toggles + launchers ----
+            if verb == "admin":
+                if role < ss.Role.OWNER:
+                    await cb.answer(i18n.t("settings.denied", lang), show_alert=True)
+                    return
+                sub = parts[2] if len(parts) > 2 else ""
+                arg = parts[3] if len(parts) > 3 else ""
+                if sub == "ret":
+                    # Open the archive-retention picker.
+                    cur = await _archive_retention_days()
+                    with contextlib.suppress(Exception):
+                        await msg.edit_text(i18n.t("admin.retention_title", lang),
+                                            parse_mode="HTML",
+                                            reply_markup=_ss_retention_keyboard(cur, lang))
+                    await cb.answer()
+                    return
+                if sub == "rset":
+                    try:
+                        days = max(0, int(arg))
+                    except (TypeError, ValueError):
+                        days = 180
+                    await db.set_kv("archive_retention_days", str(days))
+                    await _send_ss_admin(msg, lang)
+                    await cb.answer(i18n.t("admin.ret_saved", lang, val=_retention_label(days, lang)))
+                    return
+                if sub == "cmd" and arg in ("allow", "deny", "level", "expire", "limit"):
+                    # Launch an owner arg-capture command from the Admin page (#101):
+                    # set up the pending capture + send the command's own prompt. The
+                    # owner's next message is consumed by on_text → _run_pending → _do_*.
+                    pending[(msg.chat.id, thread_key(msg), uid or 0)] = arg
+                    with contextlib.suppress(Exception):
+                        await bot.send_message(msg.chat.id, i18n.t(f"{arg}.prompt", lang),
+                                               parse_mode="HTML")
+                    await cb.answer()
+                    return
+                if sub == "tog" and arg in ("cs", "wp"):
+                    # Global owner toggles (code-block split / working plate).
+                    if arg == "cs":
+                        await sessions.set_split_code_messages(
+                            not bool(getattr(sessions, "split_code_messages", True)))
+                    else:
+                        await sessions.set_working_plate(
+                            not bool(getattr(sessions, "working_plate", True)))
+                    await _send_ss_admin(msg, lang)
+                    await cb.answer(i18n.t("settings.saved", lang))
+                    return
+                # Default (sx:admin): render the Admin page.
+                await _send_ss_admin(msg, lang)
+                await cb.answer()
                 return
 
             # ---- #151 access model: read-only toast + owner option-admin pages ----
@@ -1267,7 +1418,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             await _do_expire(message, text)
         elif action == "limit":
             await _do_limit(message, text)
-        elif action.startswith(("usrexp:", "usrrday:", "usrrweek:")):
+        elif action.startswith(("usrexp:", "usrrday:", "usrrweek:", "usrname:", "usridle:")):
             await _apply_user_value(message, action, text)
         elif action == "sessearch":
             await _open_sessions(message, keyword=text)
@@ -1492,7 +1643,8 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         # #140: the workdir is named by the public sid, not the raw key — match it
         # (the zip FILENAME already uses the sid from #136).
         # was: root = settings.base_workdir / str(key)  — replaced for #140
-        root = settings.base_workdir / db.session_sid(key)
+        # #181: zip only the user's WORK files (state/transcript live in <sid>/state).
+        root = settings.base_workdir / db.session_sid(key) / "work"
         files = [p for p in root.rglob("*") if p.is_file()] if root.exists() else []
         if not files:
             return None, "export.empty"
@@ -1731,6 +1883,9 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             if verb == "delok" and len(parts) > 2 and is_dm:
                 key = int(parts[2])
                 uid = cb.from_user.id
+                # Capture the name BEFORE the row is dropped (for the archive meta).
+                st = await db.get_thread(key)
+                sname = (st.name if st else None)
                 # Tear down any live subprocess/worker, then drop the row + workdir.
                 with contextlib.suppress(Exception):
                     await sessions.reset(key)
@@ -1739,17 +1894,24 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                     deleted = await db.delete_dm_session(uid, key)
                 if deleted:
                     with contextlib.suppress(Exception):
-                        # #140: workdirs are named by the public sid, not the raw
-                        # key. was: wd = settings.base_workdir / str(key)
-                        #          sbx = settings.base_workdir / f"{key}.sbxstate"
+                        # #140: workdirs are named by the public sid, not the raw key.
                         sid = db.session_sid(key)
-                        wd = settings.base_workdir / sid
-                        if wd.exists():
-                            shutil.rmtree(wd, ignore_errors=True)
-                        # Sandbox persistent state dir (#115), if any.
-                        sbx = settings.base_workdir / f"{sid}.sbxstate"
-                        if sbx.exists():
-                            shutil.rmtree(sbx, ignore_errors=True)
+                        # was: destroy the workdir + sbxstate outright (rmtree) —
+                        #      replaced for #177. We now ARCHIVE to cold storage
+                        #      instead of deleting, so nothing is lost (the transcript
+                        #      lives OUTSIDE the workdir, in ~/.claude/projects/, and
+                        #      was being orphaned by the old path). Retention/auto-
+                        #      purge of the archives is deferred — #178.
+                        # wd = settings.base_workdir / sid
+                        # if wd.exists():
+                        #     shutil.rmtree(wd, ignore_errors=True)
+                        # sbx = settings.base_workdir / f"{sid}.sbxstate"
+                        # if sbx.exists():
+                        #     shutil.rmtree(sbx, ignore_errors=True)
+                        archive.archive_session(
+                            settings.base_workdir, sid,
+                            owner_id=uid, key=key, name=sname,
+                        )
                     # If the deleted session was current, switch to the most recent
                     # remaining one (or create a fresh default so there's always one).
                     if await db.get_dm_current(uid) == key:
@@ -2274,18 +2436,20 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
 
     @router.message(Command("sandbox"))
     async def cmd_sandbox(message: Message) -> None:
-        """Owner-only: toggle the per-session bubblewrap sandbox for a CODE session.
-        `/sandbox off` runs THIS session's claude WITHOUT isolation (so the owner can
-        tell a sandbox issue apart from a bot bug); `/sandbox on` re-isolates. Only
-        has effect when SANDBOX_CODE is enabled globally."""
-        state = await _ensure_state(message)
+        """Owner-only: toggle the per-session bubblewrap sandbox. #180: the jail now
+        covers ALL sessions (chat AND code), so there is NO mode gate — `/sandbox off`
+        runs THIS session's claude WITHOUT isolation (to tell a sandbox issue apart
+        from a bot bug); `/sandbox on` re-isolates. Only has effect when SANDBOX_CODE
+        is enabled globally."""
+        await _ensure_state(message)  # ensure the thread row exists
         lang = _lang(message)
         if not _is_owner(message):
             await reply(message, i18n.t("common.owner_only_access", lang))
             return
-        if state.mode != "code":
-            await reply(message, i18n.t("common.code_only", lang))
-            return
+        # #180: removed the code-only gate (the sandbox now applies to chat too). was:
+        # if state.mode != "code":
+        #     await reply(message, i18n.t("common.code_only", lang))
+        #     return
         key = await _session_key(message)
         arg = _command_arg(message).lower().strip()
         if arg in ("on", "off"):
@@ -2508,6 +2672,56 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                     i18n.t("codesplit.show", lang, state=i18n.onoff(val, lang)),
                     parse_mode="HTML",
                     reply_markup=_codesplit_kb(val, lang),
+                )
+        with contextlib.suppress(Exception):
+            await cb.answer(i18n.t("settings.saved", lang))
+
+    def _workingplate_kb(cur: bool, lang: str) -> InlineKeyboardMarkup:
+        B = InlineKeyboardButton
+        return InlineKeyboardMarkup(inline_keyboard=[[
+            B(text=("✓ " if cur else "") + i18n.onoff(True, lang), callback_data="wpl:on"),
+            B(text=("✓ " if not cur else "") + i18n.onoff(False, lang), callback_data="wpl:off"),
+        ]])
+
+    @router.message(Command("workingplate"))
+    async def cmd_workingplate(message: Message) -> None:
+        """Owner: globally toggle the "Working…" + ⏹ Stop control plate (#175). OFF =
+        no plate at all (A/B test whether it makes generation visibly jump). Global;
+        persisted; takes effect on the next turn."""
+        lang = _lang(message)
+        if not _is_owner(message):
+            await reply(message, i18n.t("codesplit.owner_only", lang))
+            return
+        cur = bool(getattr(sessions, "working_plate", True))
+        arg = _command_arg(message).strip().lower()
+        if arg in ("on", "off"):
+            await sessions.set_working_plate(arg == "on")
+            await reply(message, i18n.t("workingplate.set", lang, state=i18n.onoff(arg == "on", lang)))
+            return
+        with contextlib.suppress(Exception):
+            await bot.send_message(
+                message.chat.id,
+                i18n.t("workingplate.show", lang, state=i18n.onoff(cur, lang)),
+                parse_mode="HTML",
+                reply_markup=_workingplate_kb(cur, lang),
+            )
+
+    @router.callback_query(F.data.startswith("wpl:"))
+    async def on_workplate_cb(cb: CallbackQuery) -> None:
+        """Apply a /workingplate toggle tap (owner-only — it is a global setting)."""
+        lang = _lang(cb)
+        if not (cb.from_user and cb.from_user.id == settings.owner_id):
+            with contextlib.suppress(Exception):
+                await cb.answer(i18n.t("codesplit.owner_only", lang))
+            return
+        val = (cb.data or "wpl:on").split(":", 1)[1] == "on"
+        await sessions.set_working_plate(val)
+        if cb.message is not None:
+            with contextlib.suppress(Exception):
+                await cb.message.edit_text(
+                    i18n.t("workingplate.show", lang, state=i18n.onoff(val, lang)),
+                    parse_mode="HTML",
+                    reply_markup=_workingplate_kb(val, lang),
                 )
         with contextlib.suppress(Exception):
             await cb.answer(i18n.t("settings.saved", lang))
@@ -2783,7 +2997,13 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             lines.append(i18n.t("users.none_entries", lang))
         for uid, rec in entries.items():
             uname = rec.get("username")
-            uname_s = f" @{markup.escape_html(uname)}" if uname else ""
+            fname = rec.get("friendly_name")  # #171: friendly name BEFORE the @username
+            _bits = []
+            if fname:
+                _bits.append(f"<b>{markup.escape_html(fname)}</b>")
+            if uname:
+                _bits.append(f"@{markup.escape_html(uname)}")
+            uname_s = (" " + " ".join(_bits)) if _bits else ""
             exp = rec.get("expires_at") or i18n.t("users.never", lang)
             # was (#105 lifetime grant — replaced by #120 rolling caps):
             #   grant = rec.get("token_grant")
@@ -2826,7 +3046,8 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             rows.append([B(
                 text=i18n.t("users.btn_pending", lang, name=name, level=rec.get("level", "chat")),
                 callback_data=f"usr:card:{name}")])
-        rows.append([B(text=i18n.t("users.btn_add", lang), callback_data="usr:add")])
+        rows.append([B(text=i18n.t("users.btn_add", lang), callback_data="usr:add"),
+                     B(text=i18n.t("users.btn_stats", lang), callback_data="usr:stats")])
         rows.append([
             # #142: Back returns to the unified sx: hub (was st:nav:admin — the
             # deprecated flat hub; that was the "another menu pops up" bug).
@@ -2837,7 +3058,8 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
 
     async def _render_user_card(target: str, lang: str):
         """Build the (text, keyboard) for one user's settings card. Owner-aware: the
-        owner only exposes the GLOBAL MEMORY toggle (always code/uncapped/etc.)."""
+        owner card exposes the SELF-LIMIT toggles (memory, idle-TTL, max-effort, tool
+        cap, day/week token caps — #185) but not level/expiry/access/name/remove."""
         B = InlineKeyboardButton
         d = allowlist.describe(target)
         if d is None:
@@ -2845,7 +3067,9 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 B(text=i18n.t("usercard.btn_back", lang), callback_data="usr:list")]])
             return i18n.t("usercard.not_found", lang), kb
         is_owner = d["kind"] == "owner"
-        who = f"@{d['username']}" if d.get("username") else str(d.get("id") or target)
+        base_who = f"@{d['username']}" if d.get("username") else str(d.get("id") or target)
+        fname = d.get("friendly_name")  # #171: owner-assigned alias
+        who = f"{fname} ({base_who})" if fname else base_who
         tid = d.get("id")
         bd = await db.get_user_usage_breakdown(tid) if tid is not None else \
             {"day": 0, "week": 0, "total": 0, "requests": 0}
@@ -2853,6 +3077,13 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
 
         def cap(v):
             return i18n.t("users.unlimited", lang) if v is None else _fmt_tokens(v)
+
+        idle_raw = await db.get_user_default(tid, "idle_ttl_min") if tid is not None else None
+
+        def _idle_lbl(v):  # #182: None → default, ≤0 → ∞, N → "{N}m"
+            if v is None:
+                return i18n.t("usercard.idle_default", lang)
+            return "∞" if int(v) <= 0 else f"{int(v)}m"
 
         kind_label = (i18n.t("usercard.kind_owner", lang) if is_owner else
                       i18n.t("usercard.kind_pending", lang) if d["kind"] == "pending" else "")
@@ -2876,8 +3107,25 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         rows: list[list[InlineKeyboardButton]] = []
         mem_btn = B(text=i18n.t("usercard.btn_memory", lang, state=i18n.onoff(d.get("global_memory"), lang)),
                     callback_data=f"usr:mem:{target}")
+        # #182: per-user idle-TTL — shown on EVERY card, including the owner's own
+        # (the owner can set it on themselves to tune/test reaper behaviour).
+        idle_btn = B(text=i18n.t("usercard.btn_idle", lang, val=_idle_lbl(idle_raw)),
+                     callback_data=f"usr:idle:{target}")
         if is_owner:
-            rows.append([mem_btn])
+            # #185: the owner can self-impose the per-user limits (to TEST them). Show
+            # the same toggles as a guest EXCEPT level/expiry/access/name/remove (the
+            # owner is always code, never expires, always full access, can't self-remove).
+            # was: rows.append([mem_btn, idle_btn])
+            rows.append([mem_btn,
+                         B(text=i18n.t("usercard.btn_maxeffort", lang, state=i18n.onoff(d.get("allow_max_effort"), lang)),
+                           callback_data=f"usr:eff:{target}")])
+            rows.append([B(text=i18n.t("usercard.btn_tools", lang, val=_fmt_cap(d.get("tool_cap"), lang)),
+                           callback_data=f"usr:tools:{target}"),
+                         idle_btn])
+            rows.append([B(text=i18n.t("usercard.btn_day", lang), callback_data=f"usr:rday:{target}"),
+                         B(text=i18n.t("usercard.btn_week", lang), callback_data=f"usr:rweek:{target}")])
+            if rate.get("day") is not None or rate.get("week") is not None:
+                rows.append([B(text=i18n.t("usercard.btn_clear_limits", lang), callback_data=f"usr:rclr:{target}")])
         else:
             nxt = "code" if d.get("level") == "chat" else "chat"
             rows.append([B(text=i18n.t("usercard.btn_level", lang, level=d.get("level", "chat"), next=nxt),
@@ -2888,9 +3136,11 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             rows.append([B(text=i18n.t("usercard.btn_tools", lang, val=_fmt_cap(d.get("tool_cap"), lang)),
                            callback_data=f"usr:tools:{target}"),
                          B(text=i18n.t("usercard.btn_access", lang), callback_data=f"usr:acc:{target}")])
-            rows.append([B(text=i18n.t("usercard.btn_expiry", lang), callback_data=f"usr:exp:{target}")])
+            rows.append([B(text=i18n.t("usercard.btn_name", lang), callback_data=f"usr:name:{target}"),
+                         B(text=i18n.t("usercard.btn_expiry", lang), callback_data=f"usr:exp:{target}")])
             rows.append([B(text=i18n.t("usercard.btn_day", lang), callback_data=f"usr:rday:{target}"),
-                         B(text=i18n.t("usercard.btn_week", lang), callback_data=f"usr:rweek:{target}")])
+                         B(text=i18n.t("usercard.btn_week", lang), callback_data=f"usr:rweek:{target}"),
+                         idle_btn])
             if rate.get("day") is not None or rate.get("week") is not None:
                 rows.append([B(text=i18n.t("usercard.btn_clear_limits", lang), callback_data=f"usr:rclr:{target}")])
             rows.append([B(text=i18n.t("usercard.btn_remove", lang), callback_data=f"usr:del:{target}")])
@@ -2902,8 +3152,10 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         tools this user may use at all. cap=None = every tool allowed."""
         B = InlineKeyboardButton
         d = allowlist.describe(target)
-        if d is None or d["kind"] == "owner":
-            return await _render_user_card(target, lang)  # owner is always uncapped
+        # #185: the owner CAN open its own tool-cap sub-page now (self-impose for testing).
+        # was: if d is None or d["kind"] == "owner": return await _render_user_card(...)
+        if d is None:
+            return await _render_user_card(target, lang)
         cap = d.get("tool_cap")
         allowed = set(cap) if cap is not None else set(ALL_TOOLS)
         who = f"@{d['username']}" if d.get("username") else str(d.get("id") or target)
@@ -3007,12 +3259,23 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                                         reply_markup=_users_keyboard(snap, lang))
                 await cb.answer()
                 return
-            if verb in ("exp", "rday", "rweek"):
+            if verb == "stats":
+                # #172: the 📊 button on the /users page → the per-user stats table,
+                # so /userstats is reachable from the menu (not just by typing it).
+                send_kwargs: dict = {}
+                if msg.chat.type != "private" and msg.message_thread_id:
+                    send_kwargs["message_thread_id"] = msg.message_thread_id
+                await _send_userstats(msg.chat.id, send_kwargs, lang)
+                await cb.answer()
+                return
+            if verb in ("exp", "rday", "rweek", "name", "idle"):
                 # Free-text value → arg-capture the owner's next message.
-                action = {"exp": "usrexp", "rday": "usrrday", "rweek": "usrrweek"}[verb]
+                action = {"exp": "usrexp", "rday": "usrrday", "rweek": "usrrweek",
+                          "name": "usrname", "idle": "usridle"}[verb]
                 pending[(msg.chat.id, thread_key(msg), cb.from_user.id)] = f"{action}:{target}"
                 prompt = {"exp": "usercard.prompt_expiry", "rday": "usercard.prompt_day",
-                          "rweek": "usercard.prompt_week"}[verb]
+                          "rweek": "usercard.prompt_week", "name": "usercard.prompt_name",
+                          "idle": "usercard.prompt_idle"}[verb]
                 with contextlib.suppress(Exception):
                     await bot.send_message(msg.chat.id, i18n.t(prompt, lang), parse_mode="HTML")
                 await cb.answer()
@@ -3027,7 +3290,8 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 # target carries "<target>:<toolname>" (split(":",2) kept it whole).
                 tgt, _, tool = target.partition(":")
                 d = allowlist.describe(tgt)
-                if d and d["kind"] != "owner" and tool in ALL_TOOLS:
+                # #185: allow the owner to toggle its OWN tool cap (was `d["kind"] != "owner"`).
+                if d and tool in ALL_TOOLS:
                     cap = d.get("tool_cap")
                     allowed = set(cap) if cap is not None else set(ALL_TOOLS)
                     allowed.discard(tool) if tool in allowed else allowed.add(tool)
@@ -3119,14 +3383,18 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 await cb.answer(i18n.t("common.error", lang))
 
     async def _apply_user_value(message: Message, action: str, text: str) -> None:
-        """Apply an arg-captured user-card value (expiry / day cap / week cap), then
-        re-post the card. action is 'usrexp:<t>' / 'usrrday:<t>' / 'usrrweek:<t>'."""
+        """Apply an arg-captured user-card value (expiry / day cap / week cap /
+        friendly name), then re-post the card. action is 'usrexp:<t>' / 'usrrday:<t>'
+        / 'usrrweek:<t>' / 'usrname:<t>' (#171)."""
         lang = _lang(message)
         if not _is_owner(message):
             return
         kind, _, target = action.partition(":")
         raw = text.strip()
-        if kind == "usrexp":
+        if kind == "usrname":
+            # '-' / off / none / clear wipes the alias; otherwise set it.
+            allowlist.set_friendly_name(target, raw)
+        elif kind == "usrexp":
             if raw.lower() in ("never", "none", "off"):
                 allowlist.set_expiry(target, None)
             else:
@@ -3147,6 +3415,31 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                     await reply(message, i18n.t("limit.bad", lang))
                     return
                 allowlist.set_rate(target, **{window: n})
+        elif kind == "usridle":
+            # #182: per-user idle-TTL (minutes). off/none/inf/∞/never/0 → 0 (never
+            # reap); default/clear → unset (fall back to the server default); else a
+            # positive integer of minutes. Stored in the per-uid KV keyed by uid, so
+            # it works for ANY target including the owner (no allowlist entry needed).
+            d = allowlist.describe(target)
+            tid = d.get("id") if d else None
+            if tid is None:
+                await reply(message, i18n.t("usercard.not_found", lang))
+                return
+            low = raw.lower()
+            if low in ("default", "clear", "reset", "-"):
+                await db.set_user_default(tid, "idle_ttl_min", None)
+            elif low in ("off", "none", "inf", "infinite", "∞", "never", "unlimited", "0"):
+                await db.set_user_default(tid, "idle_ttl_min", 0)
+            else:
+                try:
+                    minutes = int(raw)
+                except ValueError:
+                    await reply(message, i18n.t("limit.bad", lang))
+                    return
+                if minutes < 1:
+                    await reply(message, i18n.t("limit.bad", lang))
+                    return
+                await db.set_user_default(tid, "idle_ttl_min", minutes)
         card_text, kb = await _render_user_card(target, lang)
         await bot.send_message(message.chat.id, card_text, parse_mode="HTML", reply_markup=kb)
 
@@ -3154,6 +3447,11 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
     async def cmd_status(message: Message) -> None:
         state = await _ensure_state(message)
         key = await _session_key(message)
+
+        # #135: refresh the account usage so /status shows the LIVE per-window % (not
+        # a stale snapshot from the last turn / poll). Best-effort.
+        with contextlib.suppress(Exception):
+            await sessions.refresh_account_usage()
 
         try:
             st = sessions.status(key) or {}
@@ -3176,10 +3474,10 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         lang = _lang(message)
         sess_name = state.name or ("General" if key == 0 else f"#{abs(key)}")
         lines: list[str] = [
-            i18n.t("status.header", lang, glyph=mode_glyph(str(mode)),
-                   name=markup.escape_html(sess_name),
-                   mode=i18n.mode_word(str(mode), lang),
-                   sid=db.session_sid(key)),
+            "<h3>" + i18n.t("status.header", lang, glyph=mode_glyph(str(mode)),
+                            name=markup.escape_html(sess_name),
+                            mode=i18n.mode_word(str(mode), lang),
+                            sid=db.session_sid(key)) + "</h3>",
         ]
         lines.append(i18n.t("status.model", lang, model=markup.escape_html(str(model))))
         if mode == "code":
@@ -3188,20 +3486,34 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         lines.append(i18n.t("status.usage_display", lang, usage=markup.escape_html(str(usage_mode))))
         # Streaming row RETIRED (native streaming always on); restore with /stream.
         # lines.append(i18n.t("status.streaming", lang, state=i18n.onoff(stream_on, lang)))
-        lines.append(i18n.t("status.big_memory", lang, state=i18n.onoff(bool(state.big_memory), lang)))
-        lines.append(i18n.t("status.busy", lang, busy=i18n.yesno(busy, lang), queued=queued))
+        # #170: session flags as a NATIVE checklist (the checkbox is the on/off).
+        _chk = lambda on: " checked" if on else ""  # noqa: E731
+        lines.append(
+            "<ul>"
+            f'<li><input type="checkbox"{_chk(bool(state.big_memory))}> '
+            f'{markup.escape_html(i18n.t("status.chk_bigmem", lang))}</li>'
+            f'<li><input type="checkbox"{_chk(busy)}> '
+            f'{markup.escape_html(i18n.t("status.chk_busy", lang, queued=queued))}</li>'
+            "</ul>"
+        )
         lines.append(i18n.t("status.cache", lang, secs=int(cache_left)))
 
-        # Subscription limits: prefer the account-wide multi-window block, fall
-        # back to the latest per-thread snapshot.
-        rate_block = ""
-        try:
-            rate_block = usage.pinned_text(getattr(sessions, "rate_by_type", {}) or {}, lang)
-        except Exception:
-            rate_block = ""
-        if rate_block:
+        # #172: subscription usage windows as a native LIST — a bold header then one
+        # <li> per window (5h, 7d, 7d Opus, 7d Sonnet, …) so it reads cleanly instead
+        # of a run-on line. Falls back to the latest per-thread snapshot.
+        rbt = getattr(sessions, "rate_by_type", {}) or {}
+        win_items = []
+        with contextlib.suppress(Exception):
+            for _wk in usage.WINDOW_ORDER:
+                _info = rbt.get(_wk)
+                if _info is not None:
+                    _s = usage.window_str(_info, lang)
+                    if _s:
+                        win_items.append(_s)
+        if win_items:
             lines.append("")
-            lines.append(rate_block)
+            lines.append("<b>" + i18n.t("usage.pinned_header", lang) + "</b>")
+            lines.append("<ul>" + "".join(f"<li>{s}</li>" for s in win_items) + "</ul>")
         elif rate is not None:
             rate_str = _format_rate(rate, lang)
             if rate_str:
@@ -3227,10 +3539,10 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 trend_lines.append(f"{label}: <code>{spark}</code>{tail}")
         if trend_lines:
             lines.append("")
-            lines.append(i18n.t("status.trend_header", lang))
-            lines.extend(trend_lines)
+            lines.append("<b>" + i18n.t("status.trend_header", lang) + "</b>")
+            lines.append("<ul>" + "".join(f"<li>{t}</li>" for t in trend_lines) + "</ul>")
 
-        # Usage totals from the database.
+        # #172: per-session usage TOTALS as a native list.
         try:
             totals = await db.get_usage_totals(key)
         except Exception:
@@ -3238,21 +3550,18 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         if totals:
             cost = totals.get("cost", 0.0) or 0.0
             lines.append("")
-            lines.append(i18n.t("status.totals_header", lang))
-            lines.append(i18n.t("status.requests", lang, n=totals.get("requests", 0)))
-            lines.append(i18n.t(
-                "status.tokens", lang,
-                inp=_fmt_tokens(totals.get("input", 0)),
-                out=_fmt_tokens(totals.get("output", 0)),
-            ))
-            lines.append(i18n.t(
-                "status.cache_tokens", lang,
-                read=_fmt_tokens(totals.get("cache_read", 0)),
-                created=_fmt_tokens(totals.get("cache_creation", 0)),
-            ))
-            lines.append(i18n.t("status.cost", lang, cost=f"{cost:.4f}"))
+            lines.append("<b>" + i18n.t("status.totals_header", lang) + "</b>")
+            lines.append(
+                "<ul>"
+                f'<li>{i18n.t("status.requests", lang, n=totals.get("requests", 0))}</li>'
+                f'<li>{i18n.t("status.tokens", lang, inp=_fmt_tokens(totals.get("input", 0)), out=_fmt_tokens(totals.get("output", 0)))}</li>'
+                f'<li>{i18n.t("status.cache_tokens", lang, read=_fmt_tokens(totals.get("cache_read", 0)), created=_fmt_tokens(totals.get("cache_creation", 0)))}</li>'
+                f'<li>{i18n.t("status.cost", lang, cost=f"{cost:.4f}")}</li>'
+                "</ul>"
+            )
 
-        await reply(message, "\n".join(lines))
+        # #170: render /status as a native rich message (heading + checklist).
+        await reply_rich_html(message, "\n".join(lines))
 
     @router.message(Command("context"))
     async def cmd_context(message: Message) -> None:
@@ -3306,6 +3615,131 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             lines.append(f"<code>{markup.escape_html(str(info))}</code>")
 
         await reply(message, "\n".join(lines))
+
+    @router.message(Command("limits"))
+    async def cmd_limits(message: Message) -> None:
+        """Show the caller's OWN rolling usage limits (#164). For the owner this
+        instead shows the REAL account/subscription usage (the global windows) —
+        a delegated user never sees the owner's account-wide numbers."""
+        await _ensure_state(message)
+        lang = _lang(message)
+        uid = message.from_user.id if message.from_user else 0
+        uname = message.from_user.username if message.from_user else None
+
+        if _is_owner(message):
+            # Owner → the real account (subscription) usage, refreshed live.
+            with contextlib.suppress(Exception):
+                await sessions.refresh_account_usage()
+            body = usage.pinned_text(getattr(sessions, "rate_by_type", {}) or {}, lang)
+            if body:
+                await reply(message, i18n.t("limits.account_header", lang) + "\n" + body)
+            else:
+                await reply(message, i18n.t("limits.account_empty", lang))
+            return
+
+        # Delegated user → their own trailing-24h / trailing-7d token use vs cap.
+        bd = await db.get_user_usage_breakdown(uid)
+        caps = allowlist.rate_of(uid, uname)
+
+        def _row(label: str, used: int, cap) -> str:
+            if cap:
+                pct = min(100, int(used * 100 / cap)) if cap else 0
+                bar = usage._bar(used / cap if cap else 0.0)
+                return (f"{label}: <b>{_fmt_tokens(used)}</b> / "
+                        f"{_fmt_tokens(cap)} ({pct}%) {bar}")
+            return (f"{label}: <b>{_fmt_tokens(used)}</b> "
+                    f"({i18n.t('limits.no_cap', lang)})")
+
+        lines = [
+            i18n.t("limits.header", lang),
+            _row(i18n.t("limits.today", lang), bd["day"], caps.get("day")),
+            _row(i18n.t("limits.week", lang), bd["week"], caps.get("week")),
+            f"{i18n.t('limits.requests', lang)}: <b>{bd['requests']}</b>",
+            i18n.t("limits.rolling_note", lang),
+        ]
+        await reply(message, "\n".join(lines))
+
+    async def _send_userstats(chat_id: int, send_kwargs: dict, lang: str) -> None:
+        """#164: build + send the per-user usage dashboard as a NATIVE table (one row
+        per user: trailing-day / week / lifetime tokens, requests, last-seen). Falls
+        back to a monospace grid if sendRichMessage fails. Shared by /userstats and the
+        📊 button on the /users page (#172)."""
+        rows = await db.get_all_users_usage()
+        if not rows:
+            with contextlib.suppress(Exception):
+                await bot.send_message(chat_id, i18n.t("userstats.empty", lang),
+                                       parse_mode="HTML", **send_kwargs)
+            return
+        # uid → friendly-name / @username label from the allowlist snapshot.
+        labels: dict[int, str] = {}
+        with contextlib.suppress(Exception):
+            for sid, rec in (allowlist.snapshot().get("entries") or {}).items():
+                try:
+                    luid = int(sid)
+                except (TypeError, ValueError):
+                    continue
+                uname = rec.get("username")
+                fname = rec.get("friendly_name")  # #171: prefer the owner's alias
+                labels[luid] = fname or (f"@{uname}" if uname else str(luid))
+        now = time.time()
+
+        def _ago(ts: float) -> str:
+            if not ts:
+                return "—"
+            d = max(0, now - ts)
+            if d < 3600:
+                return f"{int(d // 60)}m"
+            if d < 86400:
+                return f"{int(d // 3600)}h"
+            return f"{int(d // 86400)}d"
+
+        header = [
+            i18n.t("userstats.col_user", lang), i18n.t("userstats.col_day", lang),
+            i18n.t("userstats.col_week", lang), i18n.t("userstats.col_total", lang),
+            i18n.t("userstats.col_req", lang), i18n.t("userstats.col_last", lang),
+        ]
+        trows = [header]
+        for r in rows:
+            uid = r["uid"]
+            label = labels.get(uid, str(uid))
+            if uid == settings.owner_id:
+                label = f"👑 {label}"
+            trows.append([
+                label, _fmt_tokens(r["day"]), _fmt_tokens(r["week"]),
+                _fmt_tokens(r["total"]), str(r["requests"]), _ago(r["last_ts"]),
+            ])
+        aligns = ["left", "right", "right", "right", "right", "right"]
+        title = f"<b>👥 {markup.escape_html(i18n.t('userstats.title', lang))}</b>"
+        html = title + markup.table_to_rich_html(trows, aligns)
+        try:
+            await bot(SendRichMessage(
+                chat_id=chat_id, rich_message={"html": html}, **send_kwargs))
+        except Exception:
+            esc = [[markup.escape_html(c) for c in row] for row in trows]
+            with contextlib.suppress(Exception):
+                await bot.send_message(chat_id, markup._render_table_pre(esc),
+                                       parse_mode="HTML", **send_kwargs)
+
+    @router.message(Command("userstats"))
+    async def cmd_userstats(message: Message) -> None:
+        """Owner-only per-user usage dashboard (native table, #164)."""
+        lang = _lang(message)
+        if not _is_owner(message):
+            await reply(message, i18n.t("common.owner_only_access", lang))
+            return
+        send_kwargs: dict = {}
+        if message.chat.type != "private" and message.message_thread_id:
+            send_kwargs["message_thread_id"] = message.message_thread_id
+        await _send_userstats(message.chat.id, send_kwargs, lang)
+
+    @router.message(Command("test"))
+    async def cmd_test(message: Message) -> None:
+        """#172: owner-only self-test — SIMULATE a streamed generation (3 paragraphs +
+        a 5×5 table + an asm snippet) so the live rich-draft formatting can be eyeballed
+        (it should format as it streams, not snap to rich at the end)."""
+        if not _is_owner(message):
+            return
+        await sessions.stream_demo(message.chat.id)
 
     async def _recap_messages(key: int, lang: str) -> list[str]:
         """Build a session's last exchange as ready-to-send HTML message(s).
