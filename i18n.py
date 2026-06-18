@@ -550,6 +550,11 @@ CATALOG: dict[str, dict[str, str]] = {
               "<code>/sandbox on|off</code> — запускать эту код-сессию с изоляцией "
               "или без (тест владельца).",
     },
+    # #231: the sandbox is mandatory now; the toggle is retired.
+    "sandbox.mandatory": {
+        "en": "🔒 The sandbox is <b>always on</b> for every session (chat and code) — it can't be turned off. Each session runs in its own isolated jail.",
+        "ru": "🔒 Песочница <b>всегда включена</b> для каждой сессии (chat и code) — отключить нельзя. Каждая сессия работает в собственном изолированном джейле.",
+    },
     "sandbox.set_on": {
         "en": "🧪 Sandbox <b>on</b> for this session — code runs isolated.{note}",
         "ru": "🧪 Песочница <b>вкл</b> для этой сессии — код выполняется в изоляции.{note}",
@@ -683,10 +688,10 @@ CATALOG: dict[str, dict[str, str]] = {
     },
     # #221: startup owner alert when the uid doctor finds an on-disk collision.
     "admin.uid_collision_alert": {
-        "en": "⚠️ <b>Sandbox uid check (#221)</b>\n{count} host uid(s) own more than one "
+        "en": "⚠️ <b>Sandbox uid check (#221)</b> · <i>{ts}</i>\n{count} host uid(s) own more than one "
               "session's files on disk — a per-session isolation gap. Usually transient: "
               "the affected sessions re-chown to a unique uid on their next turn.\n{detail}",
-        "ru": "⚠️ <b>Проверка uid песочниц (#221)</b>\n{count} host-uid владеют файлами более "
+        "ru": "⚠️ <b>Проверка uid песочниц (#221)</b> · <i>{ts}</i>\n{count} host-uid владеют файлами более "
               "чем одной сессии на диске — брешь в изоляции сессий. Обычно временно: "
               "затронутые сессии перечоунятся на уникальный uid на следующем ходу.\n{detail}",
     },
@@ -1130,16 +1135,17 @@ CATALOG: dict[str, dict[str, str]] = {
         "ru": "Нет записи в списке доступа для <code>{val}</code>.",
     },
     "limit.prompt": {
-        "en": "Send: <code>&lt;id|@user&gt; &lt;tokens&gt; [day|week]</code> (or <code>off</code>; /cancel).",
-        "ru": "Отправьте: <code>&lt;id|@user&gt; &lt;токены&gt; [day|week]</code> (или <code>off</code>; /cancel).",
+        "en": "Send: <code>&lt;id|@user&gt; &lt;units&gt; [day|week]</code> (or <code>off</code>; /cancel).",
+        "ru": "Отправьте: <code>&lt;id|@user&gt; &lt;единицы&gt; [day|week]</code> (или <code>off</code>; /cancel).",
     },
     "limit.usage": {
-        "en": "Usage: <code>/limit &lt;id|@user&gt; &lt;tokens&gt; [day|week] | off</code> (default: day).",
-        "ru": "Использование: <code>/limit &lt;id|@user&gt; &lt;токены&gt; [day|week] | off</code> (по умолчанию: day).",
+        "en": "Usage: <code>/limit &lt;id|@user&gt; &lt;units&gt; [day|week] | off</code> (default: day).",
+        "ru": "Использование: <code>/limit &lt;id|@user&gt; &lt;единицы&gt; [day|week] | off</code> (по умолчанию: day).",
     },
+    # #192: the cap is enforced in weighted usage units (#165), not raw tokens.
     "limit.set": {
-        "en": "✅ <code>{val}</code> — <b>{window}</b> cap set to <b>{n}</b> tokens.",
-        "ru": "✅ <code>{val}</code> — лимит на <b>{window}</b>: <b>{n}</b> токенов.",
+        "en": "✅ <code>{val}</code> — <b>{window}</b> cap set to <b>{n}</b> units.",
+        "ru": "✅ <code>{val}</code> — лимит на <b>{window}</b>: <b>{n}</b> единиц.",
     },
     "limit.cleared": {
         "en": "✅ Rate limits cleared for <code>{val}</code>.",
@@ -1297,13 +1303,17 @@ CATALOG: dict[str, dict[str, str]] = {
         "en": "Send an expiry date <code>YYYY-MM-DD</code> (or <code>never</code>; /cancel).",
         "ru": "Отправьте дату окончания <code>ГГГГ-ММ-ДД</code> (или <code>never</code>; /cancel).",
     },
+    # #192: caps are compared against WEIGHTED USAGE UNITS (#165), not raw tokens, so the
+    # entry prompt must say "units" (a unit ≈ a Sonnet-input-token-equivalent; Opus + cache
+    # run ~5–25× raw tokens). was (#120): "Send the DAILY token cap (e.g. 500k, …)".
     "usercard.prompt_day": {
-        "en": "Send the DAILY token cap (e.g. <code>500k</code>, or <code>off</code>; /cancel).",
-        "ru": "Отправьте ДНЕВНОЙ лимит токенов (напр. <code>500k</code>, или <code>off</code>; /cancel).",
+        "en": "Send the DAILY usage cap in <b>units</b> (e.g. <code>500k</code>, or <code>off</code>; /cancel). Caps and usage are weighted units, not raw tokens.",
+        "ru": "Отправьте ДНЕВНОЙ лимит в <b>единицах</b> (напр. <code>500k</code>, или <code>off</code>; /cancel). Лимиты и расход — во взвешенных единицах, не в сырых токенах.",
     },
+    # was (#120): "Send the WEEKLY token cap (e.g. 2m, …)". Relabelled to units for #192.
     "usercard.prompt_week": {
-        "en": "Send the WEEKLY token cap (e.g. <code>2m</code>, or <code>off</code>; /cancel).",
-        "ru": "Отправьте НЕДЕЛЬНЫЙ лимит токенов (напр. <code>2m</code>, или <code>off</code>; /cancel).",
+        "en": "Send the WEEKLY usage cap in <b>units</b> (e.g. <code>2m</code>, or <code>off</code>; /cancel). Caps and usage are weighted units, not raw tokens.",
+        "ru": "Отправьте НЕДЕЛЬНЫЙ лимит в <b>единицах</b> (напр. <code>2m</code>, или <code>off</code>; /cancel). Лимиты и расход — во взвешенных единицах, не в сырых токенах.",
     },
     "usercard.prompt_idle": {
         "en": "Send the idle-TTL in <b>minutes</b> (e.g. <code>6</code>), <code>off</code> for ∞ (never reap), or <code>default</code> for the server default. /cancel to abort.",

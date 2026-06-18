@@ -44,6 +44,28 @@ _HOP = {"connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
 _DROP_REQ = _HOP | {"host", "authorization", "content-length", "x-api-key"}
 _DROP_RESP = _HOP | {"content-length"}
 
+# #194: inbound method+path allowlist. The broker attaches the REAL OAuth bearer to
+# whatever it relays, so anything that can reach 127.0.0.1:<port> could otherwise drive
+# arbitrary authenticated calls to api.anthropic.com. The CLI only ever POSTs to
+# /v1/messages (incl. /v1/messages/count_tokens, optionally with a ?beta=true query), so
+# restrict to exactly that and 403 the rest — matching the #119 no-bypass intent.
+_ALLOW: tuple[tuple[str, str], ...] = (("POST", "/v1/messages"),)
+
+
+# #196: per-socket (idle-read) timeout on the upstream connection. http.client applies this
+# to EVERY socket op, so it caps how long a single read may BLOCK with no bytes — not a total
+# deadline. A live SSE stream from Anthropic emits tokens/`ping` events continuously (idle
+# gaps are seconds), so 180 s is generous for normal turns while bounding a WEDGED upstream to
+# 3 min instead of the old fixed 600 s (which tied up a broker thread for 10 min).
+_UPSTREAM_IDLE_TIMEOUT = 180
+
+
+def _path_allowed(method: str, path: str) -> bool:
+    """True iff (method, path) matches the inbound allowlist (path matched by prefix,
+    query string ignored). Pure + testable."""
+    base = path.split("?", 1)[0]
+    return any(method == m and base.startswith(p) for m, p in _ALLOW)
+
 
 class _Creds:
     """Reads the real OAuth access token from the host creds file, re-reading when the
@@ -78,22 +100,53 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *a):  # quiet; we log our own one-liners (no token)
         pass
 
+    def _read_request_body(self) -> bytes:
+        """#193: read the inbound body whether it is Content-Length-framed OR
+        Transfer-Encoding: chunked. The old code only honoured Content-Length, and
+        `_DROP_REQ` strips `transfer-encoding`, so a chunked request body would be
+        relayed EMPTY (and the turn fail silently). The CLI sends Content-Length today,
+        but never depend on that. Returns the fully-buffered body; http.client then
+        re-frames it with a Content-Length upstream."""
+        te = (self.headers.get("transfer-encoding") or "").lower()
+        if "chunked" in te:
+            body = bytearray()
+            while True:
+                size_line = self.rfile.readline(65536).split(b";", 1)[0].strip()
+                if not size_line:
+                    continue
+                try:
+                    size = int(size_line, 16)
+                except ValueError:
+                    break                          # malformed framing → stop, send what we have
+                if size == 0:
+                    while self.rfile.readline(65536) not in (b"\r\n", b"\n", b""):
+                        pass                       # consume trailers up to the blank line
+                    break
+                body += self.rfile.read(size)
+                self.rfile.read(2)                 # the CRLF after each chunk
+            return bytes(body)
+        n = int(self.headers.get("content-length") or 0)
+        return self.rfile.read(n) if n else b""
+
     def _proxy(self):
+        # #194: reject anything outside the inbound allowlist BEFORE touching the token
+        # or upstream — a disallowed caller never gets the bearer attached.
+        if not _path_allowed(self.command, self.path):
+            self.send_error(403, "broker: method/path not allowed")
+            sys.stderr.write(f"[broker] BLOCKED {self.command} {self.path.split('?')[0]} -> 403\n")
+            return
         token = self.creds.token()
         if not token:
             self.send_error(503, "broker: no subscription credential")
             return
-        body = b""
-        n = int(self.headers.get("content-length") or 0)
-        if n:
-            body = self.rfile.read(n)
+        body = self._read_request_body()
 
         out_headers = {k: v for k, v in self.headers.items()
                        if k.lower() not in _DROP_REQ}
         out_headers["Host"] = self.upstream_host
         out_headers["Authorization"] = f"Bearer {token}"   # the REAL token, injected here
 
-        conn = http.client.HTTPSConnection(self.upstream_host, timeout=600)
+        conn = http.client.HTTPSConnection(self.upstream_host, timeout=_UPSTREAM_IDLE_TIMEOUT)
         try:
             conn.request(self.command, self.path, body=body or None, headers=out_headers)
             resp = conn.getresponse()
@@ -104,7 +157,13 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             self.send_header("Transfer-Encoding", "chunked")
             self.end_headers()
             while True:
-                chunk = resp.read(65536)              # streams SSE as it arrives
+                # #228: read1() returns as soon as ANY bytes arrive (≤1 underlying socket
+                # read). resp.read(65536) instead BLOCKS until 64 KB accumulate or the
+                # upstream closes — so a short SSE reply (< 64 KB) was buffered whole and
+                # only flushed at end-of-stream, killing token-by-token streaming through
+                # the broker (the live draft only appeared as one finished message).
+                # was (#119b): chunk = resp.read(65536)  # claimed "streams as it arrives" — it does NOT
+                chunk = resp.read1(65536)            # stream SSE frames as they arrive
                 if not chunk:
                     break
                 self.wfile.write(b"%x\r\n%s\r\n" % (len(chunk), chunk))

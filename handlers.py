@@ -2524,46 +2524,34 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
 
     @router.message(Command("sandbox"))
     async def cmd_sandbox(message: Message) -> None:
-        """Owner-only: toggle the per-session bubblewrap sandbox. #180: the jail now
-        covers ALL sessions (chat AND code), so there is NO mode gate — `/sandbox off`
-        runs THIS session's claude WITHOUT isolation (to tell a sandbox issue apart
-        from a bot bug); `/sandbox on` re-isolates. Only has effect when SANDBOX_CODE
-        is enabled globally."""
-        await _ensure_state(message)  # ensure the thread row exists
+        """#231: the sandbox is now MANDATORY for every session (chat AND code) — always
+        on, no per-session opt-out. The toggle is retired (it existed to debug isolation
+        vs bot bugs, #138/#180; the jail is stable now). This handler is kept only so a
+        typed /sandbox gives a clear answer; it no longer changes anything."""
+        await _ensure_state(message)
         lang = _lang(message)
         if not _is_owner(message):
             await reply(message, i18n.t("common.owner_only_access", lang))
             return
-        # #180: removed the code-only gate (the sandbox now applies to chat too). was:
-        # if state.mode != "code":
-        #     await reply(message, i18n.t("common.code_only", lang))
+        await reply(message, i18n.t("sandbox.mandatory", lang))
+        # was (#138/#145/#180): per-session toggle — set/clear no_sandbox and rebuild.
+        # Removed for #231 (sandbox is mandatory; no_sandbox is never set anymore).
+        # key = await _session_key(message)
+        # arg = _command_arg(message).lower().strip()
+        # if arg in ("on", "off"):
+        #     await db.set_no_sandbox(key, arg == "off")
+        #     deferred = await _rebuild_session(key)
+        #     note = i18n.t("common.defer_note", lang) if deferred else ""
+        #     await reply(message, i18n.t("sandbox.set_on" if arg == "on" else "sandbox.set_off", lang, note=note))
         #     return
-        key = await _session_key(message)
-        arg = _command_arg(message).lower().strip()
-        if arg in ("on", "off"):
-            # /sandbox on → isolate (no_sandbox=False); off → raw (no_sandbox=True).
-            await db.set_no_sandbox(key, arg == "off")
-            deferred = await _rebuild_session(key)
-            note = i18n.t("common.defer_note", lang) if deferred else ""
-            await reply(
-                message,
-                i18n.t("sandbox.set_on" if arg == "on" else "sandbox.set_off", lang, note=note),
-            )
-            return
-        # No arg → TOGGLE the effective sandbox in place (menu.md §2: "none → toggle";
-        # #145). Resolve the current value via the registry (so it matches the
-        # /settings hub) and flip it; no_sandbox is the inverse of "isolate".
-        uid = message.from_user.id if message.from_user else None
-        sctx = await _build_ss_ctx(key, uid, _role_of(uid, None))
-        value, _src = ss.resolve(ss.SETTINGS["sandbox"], sctx)
-        new_on = not bool(value)
-        await db.set_no_sandbox(key, not new_on)
-        deferred = await _rebuild_session(key)
-        note = i18n.t("common.defer_note", lang) if deferred else ""
-        await reply(
-            message,
-            i18n.t("sandbox.set_on" if new_on else "sandbox.set_off", lang, note=note),
-        )
+        # uid = message.from_user.id if message.from_user else None
+        # sctx = await _build_ss_ctx(key, uid, _role_of(uid, None))
+        # value, _src = ss.resolve(ss.SETTINGS["sandbox"], sctx)
+        # new_on = not bool(value)
+        # await db.set_no_sandbox(key, not new_on)
+        # deferred = await _rebuild_session(key)
+        # note = i18n.t("common.defer_note", lang) if deferred else ""
+        # await reply(message, i18n.t("sandbox.set_on" if new_on else "sandbox.set_off", lang, note=note))
 
     @router.message(Command("permissions"))
     async def cmd_permissions(message: Message) -> None:
@@ -3118,7 +3106,9 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
 
     @router.message(Command("limit"))
     async def cmd_limit(message: Message) -> None:
-        """Owner: set a user's rolling token cap — /limit @user <tokens> [day|week]|off (#120)."""
+        """Owner: set a user's rolling usage cap — /limit @user <units> [day|week]|off (#120).
+
+        #192: the cap is enforced against WEIGHTED USAGE UNITS (#165), not raw tokens."""
         lang = _lang(message)
         if not _is_owner(message):
             await reply(message, i18n.t("common.owner_only_access", lang))

@@ -185,9 +185,11 @@ COMMANDS: tuple[Cmd, ...] = (
     Cmd("workingplate", {"en": "⏳ Working/Stop plate: on | off (owner)",
                          "ru": "⏳ Плашка Working/Stop: on | off (владелец)"},
         scope="owner", in_menu=False, help_group="settings"),
-    Cmd("sandbox", {"en": "Toggle this session's sandbox (owner)",
-                    "ru": "Песочница сессии вкл/выкл (владелец)"},
-        scope="owner", in_menu=False, help_group="owner"),
+    # #231: /sandbox retired — the sandbox is now MANDATORY for all sessions, no opt-out.
+    # was:
+    # Cmd("sandbox", {"en": "Toggle this session's sandbox (owner)",
+    #                 "ru": "Песочница сессии вкл/выкл (владелец)"},
+    #     scope="owner", in_menu=False, help_group="owner"),
     # #172: owner-only streaming self-test. in_menu=False AND help_group="" → it is
     # NOT advertised in the "/" menu or /help; it is typeable only. Kept LAST.
     Cmd("test", {"en": "Simulate a streamed reply (owner self-test)",

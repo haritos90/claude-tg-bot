@@ -17,6 +17,8 @@ arch whose syscall numbers differ.
 Usage: make-seccomp.py <out-path>   (writes the blob; prints a one-line summary)
 """
 
+import contextlib
+import os
 import platform
 import struct
 import sys
@@ -87,11 +89,25 @@ def main() -> int:
     out = sys.argv[1]
     mach = platform.machine()
     if mach not in ("x86_64", "amd64"):
-        sys.stderr.write(f"[seccomp] arch {mach!r} unsupported — skipping (no filter)\n")
+        # #195: the DENY table holds x86_64 syscall numbers only, so on another arch we
+        # emit nothing — but a STALE blob from a previous x86 run would still be on disk,
+        # and bot.py forwards any pre-existing file (os.path.exists), applying an
+        # arch-mismatched filter. Remove it so a stale blob can never be applied.
+        with contextlib.suppress(OSError):
+            os.remove(out)
+        sys.stderr.write(f"[seccomp] arch {mach!r} unsupported — skipping (no filter; "
+                         f"removed any stale blob at {out})\n")
         return 0
     blob = build(DENY_X86_64)
-    with open(out, "wb") as fh:
+    # #195: write atomically (temp in the same dir + os.replace) so a crash mid-write can
+    # never leave a TRUNCATED program that bwrap would load as malformed. os.replace is
+    # atomic within a filesystem.
+    tmp = f"{out}.tmp.{os.getpid()}"
+    with open(tmp, "wb") as fh:
         fh.write(blob)
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, out)
     sys.stderr.write(f"[seccomp] wrote {out} ({len(blob)//8} insns, "
                      f"{len(DENY_X86_64)} syscalls denied)\n")
     return 0
