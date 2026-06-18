@@ -1,14 +1,22 @@
 # Sandbox & isolation architecture (#104 + #119)
 
-How a code session is contained: what an untrusted `code`-level user (driving the
+How a session is contained: what an untrusted `code`-level user (driving the
 agent) **cannot** do, and the mechanism behind each guarantee. This is the deep
 reference; [`AGENTS.md`](AGENTS.md) §5 *Sandbox* is the summary and
 [`TODO.md`](TODO.md) #119 holds the threat model + design rationale.
 
-The layers are **independent and individually opt-in**. The bare bubblewrap jail
-(#104/#180) is **on by default** and confines the filesystem; the four #119 layers
-(broker, egress, secrets, DoS/seccomp) are **off by default** and turn the jail into
-real containment for a semi-trusted user.
+**The jail is MANDATORY for every session — chat AND code, no exceptions (#231).** There
+is no per-session opt-out and no toggle (the `/sandbox` command and the `/settings` Sandbox
+row were retired in #231; `no_sandbox` is never set). `claude` is jailed identically in both
+modes; the only mode difference is that the egress allowlist + cgroup DoS limits (§5–§6)
+apply to **code** sessions only — a `chat` session has no Bash/file surface to leak and needs
+open egress for `WebFetch`. The jail, per-session uid, broker (§3) and seccomp (§6) apply to
+**all** modes regardless.
+
+The layers are **independent**. The bare bubblewrap jail (#104/#180) is **always on** and
+confines the filesystem; the four #119 layers (broker, egress, secrets, DoS/seccomp) are
+deployer-gated in `.env` (all **enabled on this deployment**) and turn the jail into real
+containment for a semi-trusted user.
 
 ---
 

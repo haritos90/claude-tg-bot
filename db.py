@@ -1229,10 +1229,24 @@ async def release_session_uid(sid: str) -> None:
 
 
 def _uid_collisions(uid_by_sid: dict[str, int]) -> dict[int, list[str]]:
-    """Group sids by their host uid; return only the uids shared by MORE THAN ONE sid
-    (a per-session isolation break). Pure + testable; the disk scan below feeds it."""
+    """Group sids by their host uid; return only the NON-ROOT uids shared by MORE THAN
+    ONE sid (a genuine per-session isolation break). Pure + testable; the disk scan
+    below feeds it.
+
+    #231: uid 0 (root) is EXCLUDED — root ownership is the ROUTINE pre-launch / no-jail
+    default, not a runtime collision, so it must not raise an owner alert. A workdir stays
+    root-owned until a CODE session first runs and the launcher chowns it to its claimed
+    per-session uid; chat sessions (no jail) and sandbox-off sessions stay root-owned for
+    good. None of those is the birthday-collision this doctor exists to catch — two
+    sessions whose uid hash maps to the SAME ASSIGNED non-root uid. A jailed session runs
+    as a distinct non-root uid and cannot read another's root-owned 0700 dir anyway, so
+    shared root ownership is not an isolation break. (Counting it fired a benign warning on
+    every restart for chat sessions that can never self-heal.)
+    # was: every shared uid (incl. uid 0) was reported — replaced for #231."""
     by_uid: dict[int, list[str]] = {}
     for sid, uid in uid_by_sid.items():
+        if uid == 0:
+            continue                      # root = unassigned / no-jail default, not a collision
         by_uid.setdefault(uid, []).append(sid)
     return {uid: sorted(sids) for uid, sids in by_uid.items() if len(sids) > 1}
 

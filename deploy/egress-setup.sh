@@ -27,6 +27,11 @@ PROXY_PORT="${2:-8790}"
 
 # The cgroup match lives in xt_cgroup; load it (iptables won't always auto-load it).
 modprobe xt_cgroup 2>/dev/null || true
+# #196: the ESTABLISHED,RELATED rule below uses `-m conntrack`, whose kernel module is not
+# always autoloaded — without it that `iptables -A` fails and (under set -e) aborts setup
+# mid-chain, leaving egress UNENFORCED. Load it explicitly (best-effort; the post-setup
+# verification at the end is the real backstop).
+modprobe nf_conntrack 2>/dev/null || true
 
 # 1) The cgroup the launcher joins: membership = both the firewall match (this file)
 #    and the per-jail resource container (#119e). Enable the memory/pids/cpu controllers
@@ -67,4 +72,13 @@ add_v6() {
 add_v4
 add_v6 2>/dev/null || true   # a box without ip6tables still gets the v4 confinement
 
-echo "[egress-setup] cgroup=$CG_ROOT chain=$CHAIN allow=lo:{$BROKER_PORT,$PROXY_PORT}"
+# #196: VERIFY the v4 cgroup→chain jump actually landed (the rule that does the enforcing).
+# Under set -e an earlier failure already aborts, but a partial/missing jump must NEVER pass
+# silently — bot.main reads our exit code and logs LOUDLY if egress is not enforced. (v6 is
+# best-effort: a box without ip6tables legitimately has no v6 rule, so it isn't gated here.)
+if ! iptables -C OUTPUT -m cgroup --path "$CG_NAME" -j "$CHAIN" 2>/dev/null; then
+  echo "[egress-setup] ERROR: cgroup egress jump did NOT apply (chain=$CHAIN, cgroup=$CG_NAME)" >&2
+  exit 1
+fi
+
+echo "[egress-setup] cgroup=$CG_ROOT chain=$CHAIN allow=lo:{$BROKER_PORT,$PROXY_PORT} (verified)"

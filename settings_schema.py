@@ -687,7 +687,12 @@ def is_code_only(key: str) -> bool:
 # menu.md §3.2 Table 10 row order. (#144: "stream_enabled" removed — retired.)
 PAGE_ORDER: tuple[str, ...] = (
     "model", "effort", "permission_mode", "max_turns",
-    "memory", "sandbox", "language",
+    # #231: "sandbox" row removed from the menu — the sandbox is now MANDATORY for ALL
+    # sessions (chat AND code), always on, no per-session opt-out. The toggle existed to
+    # debug isolation vs bot bugs (#138); now that the jail is stable it's just a footgun.
+    # The `sandbox` Setting still exists (drives resolution) but is no longer surfaced.
+    # was: "memory", "sandbox", "language",
+    "memory", "language",
     # #164: warm-cache note (delegated) + auto-compact + live context (forced-on,
     # delegate-to-disable; #167/#168).
     "hot_cache_timer", "auto_compact", "ctx_status",

@@ -9,6 +9,7 @@ Run with:  python bot.py   (from the project directory, with a .env present)
 
 import asyncio
 import contextlib
+import datetime
 import logging
 import os
 import shutil
@@ -130,6 +131,17 @@ async def main() -> None:
     with contextlib.suppress(Exception):
         sessions.start_token_refresher()
 
+    # #196: Mark the service "up" to systemd IMMEDIATELY (sd_notify READY=1) and start the
+    # watchdog BEFORE any network I/O AND before the (local-only) sandbox setup below —
+    # so a slow box's seccomp-compile / egress-firewall steps can't delay READY and trip a
+    # Type=notify start-timeout (#158). Everything before this point is local + non-blocking
+    # (the pollers are background tasks). The watchdog still pings WATCHDOG=1 only after a
+    # successful get_me, well within WatchdogSec. No-op when not under systemd.
+    # (#158 invariant preserved: still NO synchronous network I/O before this line.)
+    wd_task: asyncio.Task | None = None
+    watchdog.ready()
+    wd_task = asyncio.create_task(watchdog.run(bot))
+
     # #119b: when the credential broker is enabled, run it as a host sidecar so the
     # subscription token can stay OUT of every session jail (the jail gets a dummy token
     # + ANTHROPIC_BASE_URL pointing here; the broker injects the real bearer). Off by
@@ -154,8 +166,12 @@ async def main() -> None:
     # no-ops on other arches). The engine points bwrap's --seccomp fd at this file per jail.
     if getattr(settings, "sandbox_seccomp", False) and settings.sandbox_seccomp_path:
         with contextlib.suppress(Exception):
-            subprocess.run([sys.executable, str(_deploy / "make-seccomp.py"),
-                            settings.sandbox_seccomp_path], check=False, timeout=30)
+            # #196: off the event loop so a slow compile can't block the loop (and so the
+            # already-running watchdog task stays responsive). Runs post-READY now.
+            await asyncio.to_thread(
+                subprocess.run,
+                [sys.executable, str(_deploy / "make-seccomp.py"),
+                 settings.sandbox_seccomp_path], check=False, timeout=30)
             if os.path.exists(settings.sandbox_seccomp_path):
                 logger.info("Seccomp filter (#119e) compiled at %s",
                             settings.sandbox_seccomp_path)
@@ -188,10 +204,21 @@ async def main() -> None:
     egress_proc: subprocess.Popen | None = None
     if getattr(settings, "sandbox_egress", False):
         with contextlib.suppress(Exception):
-            subprocess.run(["bash", str(_deploy / "egress-setup.sh"),
-                            str(settings.cred_broker_port), str(settings.egress_proxy_port)],
-                           check=False, timeout=30)
-            logger.info("Egress allowlist (#119c) firewall set up (cgroup-scoped)")
+            # #196: off the event loop (post-READY); capture the result so a FAILED setup
+            # (e.g. nf_conntrack not loaded → rule insert fails) is logged loudly instead of
+            # silently leaving egress unenforced. The script self-verifies with `iptables -C`
+            # and exits non-zero if the rule did not land.
+            _eg = await asyncio.to_thread(
+                subprocess.run,
+                ["bash", str(_deploy / "egress-setup.sh"),
+                 str(settings.cred_broker_port), str(settings.egress_proxy_port)],
+                check=False, timeout=30, capture_output=True, text=True)
+            if _eg.returncode == 0:
+                logger.info("Egress allowlist (#119c) firewall set up (cgroup-scoped)")
+            else:
+                logger.error("Egress allowlist (#119c) setup FAILED (rc=%s) — egress is NOT "
+                             "enforced; sessions fail closed at the jail cgroup-join guard. %s",
+                             _eg.returncode, (_eg.stderr or "").strip()[-300:])
         with contextlib.suppress(Exception):
             proxy_env = {k: v for k, v in os.environ.items()
                          if k not in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")}
@@ -221,16 +248,11 @@ async def main() -> None:
     dp.message.outer_middleware(language_mw)
     dp.callback_query.outer_middleware(language_mw)
 
-    wd_task: asyncio.Task | None = None
     try:
-        # Mark the service "up" to systemd IMMEDIATELY (sd_notify READY=1) and start
-        # the watchdog BEFORE any network I/O — so a slow/flaky Telegram link at
-        # startup can't stall readiness and trip a Type=notify start-timeout restart
-        # loop (seen 2026-06-16). The watchdog then governs ongoing reachability and
-        # force-restarts only after a PROLONGED outage, never a startup blip. No-op
-        # when not under systemd.
-        watchdog.ready()
-        wd_task = asyncio.create_task(watchdog.run(bot))
+        # #196: watchdog.ready() + the watchdog task are started ABOVE, before the local
+        # sandbox setup, so that setup can't delay READY. The watchdog governs ongoing
+        # reachability and force-restarts only after a PROLONGED outage, never a startup
+        # blip; it pings WATCHDOG=1 only after the get_me below succeeds.
 
         # Identify the bot (nice log + early bad-token detection). A network blip
         # here is NOT fatal — polling retries on its own — but a real auth error
@@ -258,11 +280,15 @@ async def main() -> None:
             detail = "; ".join(
                 f"uid {u}: {', '.join(s)}" for u, s in uid_collisions.items()
             )
+            # #221: stamp the check with a UTC time so a recurring alert can be told
+            # apart from an earlier one (e.g. a restart re-runs the doctor on the same
+            # not-yet-self-healed workdirs vs a genuinely new collision).
+            ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
             with contextlib.suppress(Exception):
                 await bot.send_message(
                     settings.owner_id,
                     i18n.t("admin.uid_collision_alert", i18n.DEFAULT_LANG,
-                           count=len(uid_collisions), detail=detail),
+                           count=len(uid_collisions), detail=detail, ts=ts),
                 )
 
         # Only the update types we actually handle are requested from Telegram.
