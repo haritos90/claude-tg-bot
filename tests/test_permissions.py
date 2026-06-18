@@ -41,6 +41,7 @@ _SAFE = [
     "make build", "git status", "git diff HEAD~1", "git log --oneline -20",
     "git add -A", 'git commit -m "wip"',
     "git checkout -b feature",            # new branch — not a discard
+    "git checkout main",                  # branch switch — not a discard (#219)
     "git clean -n",                       # dry run only
     "rm -f scratch.txt",                  # single-file force-remove, no recursion
     "mkdir -p build && cd build",
@@ -56,10 +57,14 @@ _DANGEROUS = [
     "pnpm publish --access public", "twine upload dist/x", "docker push reg/img:tag",
     "ssh user@host 'echo hi'", "scp ./secret user@host:/tmp/",
     "rsync -a ./ user@host:/backup",      # remote target
+    "rsync -a ./ myhost:/backup",         # remote via ssh Host alias, no @ (#219)
     # destructive: irreversible loss of in-workdir work
     "rm -rf build", "rm -fr node_modules", "sudo rm -r /var/lib/x",
-    "git reset --hard origin/main", "git clean -fd", "git restore .",
+    "rm -R build", "rm -Rf node_modules", "rm --recursive build",   # capital/long recursive (#219)
+    "git reset --hard origin/main", "git clean -fd", "git clean --force",  # --force long form (#219)
+    "git restore .",
     "git checkout -- src/app.py", "git checkout .",
+    "git checkout HEAD~1 -- f.py",        # discard a path at a ref (#219)
     "dd if=/dev/zero of=disk.img", "mkfs.ext4 /dev/sdb", "truncate -s 0 important.log",
 ]
 

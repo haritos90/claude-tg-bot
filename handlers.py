@@ -2914,6 +2914,14 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         # not the level.usage error (repo convention: fixed-choice → picker). The user
         # part stays free-text (open input); only the level becomes a tap.
         # was: if len(toks) < 2 or toks[1].lower() not in VALID_MODES: reply(level.usage)
+        # #220: the picker round-trips `target` through callback_data ("setlvl:<target>:<level>"),
+        # which Telegram caps at 64 bytes and on_level_pick parses by ":". A ":" inside the
+        # target corrupts that split and an over-long handle overflows the cap — no real
+        # @username or numeric id hits either, so treat it as not-found rather than building a
+        # broken button (the full-form "<user> chat|code" path above is unaffected).
+        if ":" in target or len(f"setlvl:{target}:code".encode()) > 64:
+            await reply(message, i18n.t("level.not_found", lang, val=markup.escape_html(target)))
+            return
         kb = InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text=i18n.t("level.pick_chat", lang),
                                  callback_data=f"setlvl:{target}:chat"),
