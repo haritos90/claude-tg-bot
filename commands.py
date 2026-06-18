@@ -124,6 +124,9 @@ COMMANDS: tuple[Cmd, ...] = (
     Cmd("tools", {"en": "Configure this session's tools",
                   "ru": "Настроить инструменты сессии"},
         scope="code", in_menu=False, help_group="code"),
+    Cmd("secret", {"en": "🔐 Set a per-session service credential (code)",
+                   "ru": "🔐 Учётные данные сервиса для сессии (код)"},
+        scope="code", in_menu=False, help_group="code"),
     # — Tier E · meta —
     Cmd("help", {"en": "Show help", "ru": "Показать справку"}, help_group="meta"),
     Cmd("whoami", {"en": "Show your id and username",

@@ -192,3 +192,34 @@ def test_favorite_flag_persists_and_sorts_first():
         await db.close_db()
 
     _run(_t)
+
+
+def test_usage_units_weighting_and_breakdown():
+    """#165: weighted usage units bill model weight + output + cache, not just raw
+    input+output, and the breakdown rolls up by the user's DM chat_id."""
+    async def _t():
+        await db.init_db(tempfile.mktemp(suffix=".db"))
+        uid = 5
+        key = await db.allocate_dm_session(uid, "s", "claude-opus-4-8", "/tmp", mode="code")
+        # One Opus turn: input 1000, output 100, cache_creation 200, cache_read 10000.
+        await db.add_usage(
+            key,
+            {"input_tokens": 1000, "output_tokens": 100,
+             "cache_creation_input_tokens": 200, "cache_read_input_tokens": 10000},
+            0.0, model="claude-opus-4-8", context_tokens=42000,
+        )
+        # Raw metric ignores cache + model weight: 1000 + 100 = 1100.
+        assert await db.get_user_usage_tokens(uid) == 1100
+        # Units = 5.0 * (1000 + 5*100 + 1.25*200 + 0.1*10000)
+        #       = 5.0 * (1000 + 500 + 250 + 1000) = 13750.
+        assert await db.get_user_usage_units(uid) == 13750
+        # A NULL-model row weights at the default (Sonnet) baseline 1.0.
+        await db.add_usage(key, {"input_tokens": 10, "output_tokens": 0}, 0.0)
+        assert await db.get_user_usage_units(uid) == 13750 + 10
+        bd = await db.get_user_units_breakdown(uid)
+        assert bd["day"] == 13760 and bd["week"] == 13760 and bd["total"] == 13760
+        # A different user sees none of it.
+        assert await db.get_user_usage_units(999) == 0
+        await db.close_db()
+
+    _run(_t)

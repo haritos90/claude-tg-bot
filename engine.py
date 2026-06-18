@@ -309,6 +309,16 @@ class ClaudeSession:
         sandbox: bool = False,
         sandbox_uid: int = 65534,
         sandbox_allow_exec: bool = True,
+        cred_broker_url: str | None = None,
+        egress: bool = False,
+        egress_proxy_url: str | None = None,
+        sbx_mem_max: str | None = None,
+        sbx_cpu_max: str | None = None,
+        sbx_pids_max: int = 0,
+        seccomp_path: str | None = None,
+        per_session_uid: bool = False,
+        uid_base: int = 700000,
+        uid_range: int = 60000,
         auto_compact: bool = True,
     ) -> None:
         self.mode = mode
@@ -354,6 +364,25 @@ class ClaudeSession:
         self.sandbox = bool(sandbox)
         self.sandbox_uid = int(sandbox_uid)
         self.sandbox_allow_exec = bool(sandbox_allow_exec)
+        # #119b: when set, the jail gets a DUMMY token + ANTHROPIC_BASE_URL=this, so the
+        # real OAuth token never enters the jail (the host broker injects it). None = off.
+        self.cred_broker_url = cred_broker_url
+        # #119c/#119e: egress allowlist + per-jail DoS limits. egress → the launcher joins
+        # the firewalled cgroup + routes tools via the CONNECT proxy; the limit strings
+        # (already formatted for memory.max / cpu.max / pids.max) populate the cgroup leaf;
+        # seccomp_path is the compiled denylist BPF bound via bwrap --seccomp. All optional.
+        self.egress = bool(egress)
+        self.egress_proxy_url = egress_proxy_url
+        self.sbx_mem_max = sbx_mem_max
+        self.sbx_cpu_max = sbx_cpu_max
+        self.sbx_pids_max = int(sbx_pids_max or 0)
+        self.seccomp_path = seccomp_path
+        # Per-session unprivileged HOST uid: each jail runs (via setpriv) as a distinct
+        # non-root uid derived from the session id, so an escape is unprivileged AND can't
+        # read other sessions' (differently-owned) files. Applies to ALL modes.
+        self.per_session_uid = bool(per_session_uid)
+        self.uid_base = int(uid_base)
+        self.uid_range = max(1, int(uid_range))
         # #168: SDK auto-compaction (ON by default = the CLI default). When False,
         # _build_env sets DISABLE_AUTO_COMPACT=1 (forwarded through the sandbox).
         self.auto_compact = bool(auto_compact)
@@ -418,9 +447,60 @@ class ClaudeSession:
         env["SBX_UID"] = str(self.sandbox_uid)
         env["SBX_GID"] = str(self.sandbox_uid)
         env["SBX_EXEC"] = "1" if self.sandbox_allow_exec else "0"
-        env["SBX_CLAUDE"] = shutil.which("claude") or os.path.expanduser("~/.local/bin/claude")
+        # The exec target. Under a per-session unprivileged uid the jail can't reach the
+        # default ~/.local/bin/claude (/root is 0700), so use the world-readable staged
+        # copy under /usr that bot.main maintains (see _stage_sandbox_claude).
+        if self.per_session_uid:
+            env["SBX_CLAUDE"] = "/usr/local/bin/claude"
+        else:
+            env["SBX_CLAUDE"] = shutil.which("claude") or os.path.expanduser("~/.local/bin/claude")
         env["SBX_CREDS"] = os.path.expanduser("~/.claude/.credentials.json")
         env["SBX_STATE"] = str(Path(self.cwd).parent / "state")  # #181: <sid>/state (was {cwd}.sbxstate)
+        # #119b: broker mode — the launcher binds a DUMMY credential and points the
+        # inner CLI at the host broker (ANTHROPIC_BASE_URL), so the real token is never
+        # in the jail. When unset, the launcher binds the real SBX_CREDS as before.
+        if self.cred_broker_url:
+            env["SBX_BROKER_URL"] = self.cred_broker_url
+        # #119d: per-session user-supplied service creds — the launcher injects each
+        # KEY=VALUE from this file as --setenv into THIS jail only (file is per-session,
+        # root-owned 0600). Always pointed at <sid>/secrets.env; the launcher no-ops if
+        # absent. The owner's own credentials never enter any jail.
+        env["SBX_SECRETS_ENV"] = str(Path(self.cwd).parent / "secrets.env")
+        # #119c egress allowlist + #119e cgroup DoS limits apply to CODE sessions ONLY —
+        # that's the Bash/file-capable exfil surface the #119 threat model targets. Chat
+        # carries only the read-only web tools (no Bash, no host-data to leak), so egress
+        # there adds ~no security but WOULD break WebFetch (it fetches arbitrary URLs
+        # client-side) by blocking everything off the allowlist; leave chat egress open.
+        # SBX_USE_CGROUP gates the cgroup placement (needed for the firewall match AND the
+        # limits). The broker, seccomp and per-session secrets below apply to ALL modes.
+        if self.mode == "code":
+            if self.egress and self.egress_proxy_url:
+                env["SBX_EGRESS"] = "1"
+                env["SBX_PROXY_URL"] = self.egress_proxy_url
+            if self.sbx_mem_max:
+                env["SBX_MEM_MAX"] = self.sbx_mem_max
+            if self.sbx_cpu_max:
+                env["SBX_CPU_MAX"] = self.sbx_cpu_max
+            if self.sbx_pids_max:
+                env["SBX_PIDS_MAX"] = str(self.sbx_pids_max)
+            if self.egress or self.sbx_mem_max or self.sbx_cpu_max or self.sbx_pids_max:
+                env["SBX_USE_CGROUP"] = "1"
+        if self.seccomp_path and os.path.exists(self.seccomp_path):
+            env["SBX_SECCOMP"] = self.seccomp_path
+        # Per-session unprivileged HOST uid (ALL modes): a distinct non-root uid derived
+        # from the session id. The launcher chowns the workdir to it and runs bwrap via
+        # setpriv as that uid, so a jail escape is unprivileged and can't reach another
+        # session's (differently-owned) files. Deterministic so the uid is stable across
+        # rebuilds (the on-disk chown stays valid).
+        if self.per_session_uid:
+            sid = Path(self.cwd).parent.name
+            try:
+                n = int(sid, 16)            # the sid is a 6-hex-char digest (db.session_sid)
+            except ValueError:
+                n = sum(sid.encode()) or 1  # fallback for non-sid cwds (e.g. tests)
+            host_uid = self.uid_base + (n % self.uid_range)
+            env["SBX_HOST_UID"] = str(host_uid)
+            env["SBX_HOST_GID"] = str(host_uid)
         common["env"] = env
         common["cli_path"] = self._sandbox_launcher()
         # No workdir chown: bwrap's user namespace maps the jail's uid to the

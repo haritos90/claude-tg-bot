@@ -14,7 +14,7 @@ contain ``<table bordered striped>…</table>`` with ``<th>``/``<td>``, ``align`
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Union
 
 from aiogram.methods.base import TelegramMethod
 from aiogram.types import Message
@@ -37,6 +37,27 @@ class SendRichMessage(TelegramMethod[Message]):
     message_thread_id: int | None = None
     disable_notification: bool | None = None
     protect_content: bool | None = None
+    reply_markup: Any | None = None
+
+
+class EditRichMessage(TelegramMethod[Union[Message, bool]]):
+    """Edit an existing message's content to a rich message in place (Bot API 10.1
+    added the ``rich_message`` parameter to ``editMessageText``). This lets inline-
+    keyboard menus (settings hub, user cards, session menus) render with the SAME
+    native rich font as command replies and streamed answers (#173), instead of the
+    classic ``parse_mode="HTML"`` path used by ``Message.edit_text``.
+
+    ``rich_message`` is an InputRichMessage dict (``{"html": …}`` here, since menu
+    text is authored as Telegram HTML). ``reply_markup`` re-attaches the inline
+    keyboard. Returns the edited Message, or ``True`` for an inline message."""
+
+    __returning__ = Union[Message, bool]
+    __api_method__ = "editMessageText"
+
+    chat_id: int | str | None = None
+    message_id: int | None = None
+    inline_message_id: str | None = None
+    rich_message: dict[str, Any]
     reply_markup: Any | None = None
 
 

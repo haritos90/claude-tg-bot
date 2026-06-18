@@ -10,7 +10,11 @@ Run with:  python bot.py   (from the project directory, with a .env present)
 import asyncio
 import contextlib
 import logging
+import os
+import shutil
+import subprocess
 import sys
+from pathlib import Path
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
@@ -101,6 +105,89 @@ async def main() -> None:
     with contextlib.suppress(Exception):
         sessions.start_archive_purger()
 
+    # #191: start the proactive OAuth token refresher so the on-disk subscription token
+    # is renewed before its ~8h expiry — a turn after a long idle gap never 401s on a
+    # stale token (the reaper kills the subprocess but never rotates the credential).
+    # Best-effort + fail-soft; disable with OAUTH_REFRESH=0.
+    with contextlib.suppress(Exception):
+        sessions.start_token_refresher()
+
+    # #119b: when the credential broker is enabled, run it as a host sidecar so the
+    # subscription token can stay OUT of every session jail (the jail gets a dummy token
+    # + ANTHROPIC_BASE_URL pointing here; the broker injects the real bearer). Off by
+    # default; the broker self-refuses to start if an API key is in the env (P0).
+    broker_proc: subprocess.Popen | None = None
+    if getattr(settings, "cred_broker", False):
+        with contextlib.suppress(Exception):
+            broker_env = {k: v for k, v in os.environ.items()
+                          if k not in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")}
+            broker_proc = subprocess.Popen(
+                [sys.executable,
+                 str(Path(__file__).resolve().parent / "deploy" / "cred-broker.py"),
+                 "--port", str(settings.cred_broker_port)],
+                env=broker_env,
+            )
+            logger.info("Credential broker (#119b) started on 127.0.0.1:%s",
+                        settings.cred_broker_port)
+
+    _deploy = Path(__file__).resolve().parent / "deploy"
+
+    # #119e: compile the seccomp denylist BPF once at startup (x86_64 only — make-seccomp.py
+    # no-ops on other arches). The engine points bwrap's --seccomp fd at this file per jail.
+    if getattr(settings, "sandbox_seccomp", False) and settings.sandbox_seccomp_path:
+        with contextlib.suppress(Exception):
+            subprocess.run([sys.executable, str(_deploy / "make-seccomp.py"),
+                            settings.sandbox_seccomp_path], check=False, timeout=30)
+            if os.path.exists(settings.sandbox_seccomp_path):
+                logger.info("Seccomp filter (#119e) compiled at %s",
+                            settings.sandbox_seccomp_path)
+
+    # #119: when per-session uid is on, the jail runs as a non-root uid that can't reach
+    # ~/.local/bin/claude (/root is 0700). Stage the (self-contained) binary world-readably
+    # at /usr/local/bin/claude so the jail (which binds /usr) can exec it. Refresh only on
+    # a version change (a marker records the resolved source path).
+    if getattr(settings, "sandbox_per_session_uid", False):
+        with contextlib.suppress(Exception):
+            src = os.path.realpath(shutil.which("claude")
+                                   or os.path.expanduser("~/.local/bin/claude"))
+            dst, marker = "/usr/local/bin/claude", "/usr/local/bin/claude.src"
+            cur = ""
+            if os.path.exists(marker):
+                with open(marker, encoding="utf-8") as fh:
+                    cur = fh.read().strip()
+            if src and os.path.exists(src) and (cur != src or not os.path.exists(dst)):
+                tmp = dst + ".tmp"
+                shutil.copy2(src, tmp)
+                os.chmod(tmp, 0o755)
+                os.replace(tmp, dst)
+                with open(marker, "w", encoding="utf-8") as fh:
+                    fh.write(src)
+                logger.info("Staged sandbox claude binary at %s (from %s)", dst, src)
+
+    # #119c: when egress filtering is on, set up the cgroup-scoped firewall once (fully
+    # reverted on shutdown) and run the CONNECT allowlist proxy as a host sidecar. The
+    # firewall match is scoped to the sandbox cgroup, so it can never affect SSH / the bot.
+    egress_proc: subprocess.Popen | None = None
+    if getattr(settings, "sandbox_egress", False):
+        with contextlib.suppress(Exception):
+            subprocess.run(["bash", str(_deploy / "egress-setup.sh"),
+                            str(settings.cred_broker_port), str(settings.egress_proxy_port)],
+                           check=False, timeout=30)
+            logger.info("Egress allowlist (#119c) firewall set up (cgroup-scoped)")
+        with contextlib.suppress(Exception):
+            proxy_env = {k: v for k, v in os.environ.items()
+                         if k not in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")}
+            proxy_env["EGRESS_PROXY_PORT"] = str(settings.egress_proxy_port)
+            if getattr(settings, "egress_allow_hosts", ""):
+                proxy_env["EGRESS_ALLOW_HOSTS"] = settings.egress_allow_hosts
+            egress_proc = subprocess.Popen(
+                [sys.executable, str(_deploy / "egress-proxy.py"),
+                 "--port", str(settings.egress_proxy_port)],
+                env=proxy_env,
+            )
+            logger.info("Egress proxy (#119c) started on 127.0.0.1:%s",
+                        settings.egress_proxy_port)
+
     router = build_router(settings, sessions, gate, bot, allowlist)
     dp.include_router(router)
 
@@ -165,6 +252,21 @@ async def main() -> None:
         # error must not mask the original shutdown reason.
         with contextlib.suppress(Exception):
             await sessions.aclose()
+        # #119b: stop the credential broker sidecar (if running).
+        if broker_proc is not None and broker_proc.poll() is None:
+            with contextlib.suppress(Exception):
+                broker_proc.terminate()
+                broker_proc.wait(timeout=5)
+        # #119c: stop the egress proxy sidecar + REVERT the firewall (remove the cgroup
+        # jump + the SBX_EGRESS chain) so a stopped bot never leaves a dangling rule.
+        if egress_proc is not None and egress_proc.poll() is None:
+            with contextlib.suppress(Exception):
+                egress_proc.terminate()
+                egress_proc.wait(timeout=5)
+        if getattr(settings, "sandbox_egress", False):
+            with contextlib.suppress(Exception):
+                subprocess.run(["bash", str(_deploy / "egress-teardown.sh")],
+                               check=False, timeout=15)
         await close_db()
         await bot.session.close()
         logger.info("Shutdown complete.")

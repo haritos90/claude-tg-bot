@@ -255,6 +255,15 @@ CATALOG: dict[str, dict[str, str]] = {
         "en": "🗄 <b>Archive retention</b>\nPurge deleted-session archives older than:",
         "ru": "🗄 <b>Хранение архивов</b>\nУдалять архивы удалённых сессий старше:"},
     "admin.ret_saved": {"en": "✓ Archive retention: {val}", "ru": "✓ Хранение архивов: {val}"},
+    "admin.gsl_btn": {"en": "🔢 Sessions/user: {val} ▸", "ru": "🔢 Сессий/польз.: {val} ▸"},
+    "admin.gsl_prompt": {
+        "en": "Send the GLOBAL default session limit per user (a number, e.g. <code>10</code>, "
+              "or <code>off</code> for unlimited). /cancel to abort.",
+        "ru": "Отправьте ГЛОБАЛЬНЫЙ лимит сессий на пользователя (число, напр. <code>10</code>, "
+              "или <code>off</code> для безлимита). /cancel — отмена.",
+    },
+    "admin.gsl_saved": {"en": "✓ Global session limit: {val} per user.",
+                        "ru": "✓ Глобальный лимит сессий: {val} на пользователя."},
     "admin.ret_never": {"en": "♾ Never (keep forever)", "ru": "♾ Никогда (хранить всегда)"},
     "admin.ret_1mo": {"en": "1 month", "ru": "1 месяц"},
     "admin.ret_3mo": {"en": "3 months", "ru": "3 месяца"},
@@ -368,6 +377,16 @@ CATALOG: dict[str, dict[str, str]] = {
     "session.default_name_code": {"en": "Code session", "ru": "Код-сессия"},
     "session.first_default": {"en": "Session 1", "ru": "Сессия 1"},
     "session.fork_name": {"en": "{base} (fork)", "ru": "{base} (форк)"},
+    "session.limit_reached": {
+        "en": "🔢 You've reached your session limit (<b>{total}/{cap}</b>). Delete a session "
+              "or <code>/clear</code> one to reuse it (see <code>/sessions</code>), then try again.",
+        "ru": "🔢 Достигнут лимит сессий (<b>{total}/{cap}</b>). Удалите сессию или очистите её "
+              "через <code>/clear</code>, чтобы переиспользовать (см. <code>/sessions</code>), затем повторите.",
+    },
+    "session.limit_reached_short": {
+        "en": "Session limit reached — delete or /clear one first.",
+        "ru": "Достигнут лимит сессий — удалите или очистите одну.",
+    },
     "session.cleared": {"en": "Session cleared.", "ru": "Сессия очищена."},
     "session.clear_error": {
         "en": "Could not fully clear the session: {err}",
@@ -547,6 +566,40 @@ CATALOG: dict[str, dict[str, str]] = {
               "(owner test).{note}",
         "ru": "🧪 Песочница <b>выкл</b> для этой сессии — код выполняется БЕЗ изоляции "
               "(тест владельца).{note}",
+    },
+
+    # -- /secret (per-session user-supplied service credentials; #119d) ----- #
+    "secret.help": {
+        "en": "🔐 <b>Session secrets</b>\nStored: {names}\n\nSend <code>NAME=VALUE</code> "
+              "to add one (e.g. <code>GH_TOKEN=ghp_xxx</code>), or <code>/cancel</code>.\n"
+              "Clear with <code>/secret clear</code> (all) or <code>/secret clear NAME</code> "
+              "(one).\nSecrets are injected as environment variables into <b>this session's "
+              "jail only</b> — not other sessions, and the owner's own credentials are never "
+              "shared. Values are never shown again.",
+        "ru": "🔐 <b>Секреты сессии</b>\nСохранено: {names}\n\nОтправьте <code>NAME=VALUE</code>, "
+              "чтобы добавить (напр. <code>GH_TOKEN=ghp_xxx</code>), или <code>/cancel</code>.\n"
+              "Очистить: <code>/secret clear</code> (все) или <code>/secret clear NAME</code> "
+              "(один).\nСекреты внедряются как переменные окружения <b>только в jail этой "
+              "сессии</b> — не в другие сессии, и учётные данные владельца никогда не "
+              "передаются. Значения больше не показываются.",
+    },
+    "secret.stored": {
+        "en": "🔐 Stored <code>{name}</code> for this session — injected into the jail on "
+              "the next turn. The value is never shown again.",
+        "ru": "🔐 Сохранено <code>{name}</code> для этой сессии — внедряется в jail на "
+              "следующем ходе. Значение больше не показывается.",
+    },
+    "secret.cleared": {
+        "en": "🔐 Removed {what} for this session.",
+        "ru": "🔐 Удалено {what} для этой сессии.",
+    },
+    "secret.all": {"en": "all secrets", "ru": "все секреты"},
+    "secret.none": {"en": "(none)", "ru": "(нет)"},
+    "secret.bad_name": {
+        "en": "🔐 Couldn't parse that. Send <code>NAME=VALUE</code> — NAME is letters, "
+              "digits and underscores (e.g. <code>GH_TOKEN</code>) — or <code>/secret clear</code>.",
+        "ru": "🔐 Не удалось разобрать. Отправьте <code>NAME=VALUE</code> — NAME из букв, "
+              "цифр и подчёркиваний (напр. <code>GH_TOKEN</code>) — или <code>/secret clear</code>.",
     },
 
     # -- /maxturns ---------------------------------------------------------- #
@@ -777,9 +830,15 @@ CATALOG: dict[str, dict[str, str]] = {
     "limits.week": {"en": "This week", "ru": "За неделю"},
     "limits.requests": {"en": "Requests", "ru": "Запросов"},
     "limits.no_cap": {"en": "no cap", "ru": "без лимита"},
+    "limits.sessions": {"en": "Sessions: <b>{used}</b> / {cap}", "ru": "Сессии: <b>{used}</b> / {cap}"},
+    "limits.unlimited_word": {"en": "∞", "ru": "∞"},
     "limits.rolling_note": {
         "en": "<i>Windows are rolling (trailing 24h / 7d).</i>",
         "ru": "<i>Окна скользящие (последние 24ч / 7д).</i>",
+    },
+    "limits.units_note": {
+        "en": "<i>Usage is in weighted units (cost-aware: model, output and cache); caps are in units too.</i>",
+        "ru": "<i>Расход во взвешенных единицах (с учётом модели, вывода и кэша); лимиты тоже в единицах.</i>",
     },
     "limits.account_header": {
         "en": "📊 <b>Account usage</b> (subscription, owner)",
@@ -1036,12 +1095,12 @@ CATALOG: dict[str, dict[str, str]] = {
 
     # -- #120 rolling rate limits + per-user effort/permissions gates ------- #
     "access.rate_day_exceeded": {
-        "en": "🔒 Daily token limit reached (<b>{used}/{cap}</b>). It frees up as your last 24h of usage ages out.",
-        "ru": "🔒 Дневной лимит токенов исчерпан (<b>{used}/{cap}</b>). Освободится по мере устаревания последних 24 часов.",
+        "en": "🔒 Daily usage limit reached (<b>{used}/{cap}</b> units). It frees up as your last 24h of usage ages out.",
+        "ru": "🔒 Дневной лимит исчерпан (<b>{used}/{cap}</b> ед.). Освободится по мере устаревания последних 24 часов.",
     },
     "access.rate_week_exceeded": {
-        "en": "🔒 Weekly token limit reached (<b>{used}/{cap}</b>). It frees up as your last 7 days age out.",
-        "ru": "🔒 Недельный лимит токенов исчерпан (<b>{used}/{cap}</b>). Освободится по мере устаревания последних 7 дней.",
+        "en": "🔒 Weekly usage limit reached (<b>{used}/{cap}</b> units). It frees up as your last 7 days age out.",
+        "ru": "🔒 Недельный лимит исчерпан (<b>{used}/{cap}</b> ед.). Освободится по мере устаревания последних 7 дней.",
     },
     "effort.max_denied": {
         "en": "🔒 The <b>max</b> effort level is restricted (it's costly on the shared subscription). Ask the owner to grant it.",
@@ -1151,6 +1210,15 @@ CATALOG: dict[str, dict[str, str]] = {
     "usercard.prompt_idle": {
         "en": "Send the idle-TTL in <b>minutes</b> (e.g. <code>6</code>), <code>off</code> for ∞ (never reap), or <code>default</code> for the server default. /cancel to abort.",
         "ru": "Отправьте таймаут простоя в <b>минутах</b> (напр. <code>6</code>), <code>off</code> для ∞ (не выгружать), или <code>default</code> для значения по умолчанию. /cancel — отмена.",
+    },
+    "usercard.sessions": {"en": "🔢 Session limit: <b>{val}</b>", "ru": "🔢 Лимит сессий: <b>{val}</b>"},
+    "usercard.sessions_default": {"en": "default", "ru": "по умолч."},
+    "usercard.btn_sessions": {"en": "🔢 Sessions: {val}", "ru": "🔢 Сессии: {val}"},
+    "usercard.prompt_sessions": {
+        "en": "Send the session limit — a number (e.g. <code>10</code>), <code>off</code> for "
+              "unlimited, or <code>default</code> to inherit the global. /cancel to abort.",
+        "ru": "Отправьте лимит сессий — число (напр. <code>10</code>), <code>off</code> для "
+              "безлимита, или <code>default</code> чтобы наследовать глобальный. /cancel — отмена.",
     },
     "whoami.usage": {
         "en": "Usage — day <b>{day}</b> · week <b>{week}</b> · total <b>{total}</b>",

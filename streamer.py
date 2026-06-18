@@ -708,16 +708,16 @@ class Streamer:
         field): Telegram renders headings / lists / tables / quotes natively, with NO
         splitting. Returns True on success; False (→ classic fallback) on any error.
 
-        ⚠ #172/#174: in a rich message a ```fence``` shows only as plain MONOSPACE (no
-        language label, no copy) — the "correct" RichBlockPreformatted is accepted by the
-        API but not styled by the client yet (verified 2026-06-17). Per the owner we send
-        code through here ANYWAY (one consistent rich message > splitting), accepting the
-        monospace look until Telegram styles it — at which point code renders properly
-        with NO change. (The split-by-segment alternative lives in _commit_mixed.)"""
+        #172/#174: in a rich message a ```fence``` renders as plain MONOSPACE (no
+        language label, no copy) — RichBlockPreformatted is accepted by the API but not
+        styled by the current client. Code is sent through this path anyway, keeping one
+        consistent rich message instead of splitting; when the client styles
+        RichBlockPreformatted, code renders as a full code block with NO change here.
+        (The split-by-segment alternative lives in _commit_mixed.)"""
         md = full_text.strip() or "…"
         if footer:
             # Italicize each footer line separately — markdown italic can't span a
-            # newline, and the owner's usage footer is now 2 lines (5h / 7d) (#169).
+            # newline, and the usage footer is 2 lines (5h / 7d) (#169).
             foot = "\n".join(f"_{ln}_" for ln in footer.splitlines() if ln.strip())
             md = f"{md}\n\n{foot}"
         try:
@@ -814,14 +814,13 @@ class Streamer:
         silent_first = not notify
         footer_line = f"\n\n<i>{markup.escape_html(footer)}</i>" if footer else ""
 
-        # #176 → owner preference 2026-06-17: send the WHOLE reply as ONE rich message,
-        # code included. In rich a ```fence``` renders as plain MONOSPACE (no language /
-        # copy — the "correct" RichBlockPreformatted is accepted but not styled by the
-        # client yet, #174), but the owner prefers a single, consistent rich message
-        # with monospace code over SPLITTING a code reply into rich+classic bubbles —
-        # and waiting for Telegram to fix code styling (then this needs no change). The
-        # split-by-segment path (_commit_mixed / markup.split_code_blocks) is kept,
-        # un-called, to flip back if that preference changes.
+        # #176: send the WHOLE reply as ONE rich message, code included. In rich a
+        # ```fence``` renders as plain MONOSPACE (no language / copy — RichBlockPreformatted
+        # is accepted but not styled by the current client, #174); a single consistent
+        # rich message is used rather than SPLITTING a code reply into rich+classic
+        # bubbles, and when Telegram styles code this needs no change. The split-by-
+        # segment path (_commit_mixed / markup.split_code_blocks) is kept, un-called, to
+        # flip back if the trade-off is revisited.
         if await self._commit_rich_markdown(full_text, footer, silent_first):
             return
         # # was (#176): split a code reply → rich prose/tables + classic code block:
