@@ -769,12 +769,12 @@ CATALOG: dict[str, dict[str, str]] = {
         "ru": "Права установлены в <b>{name}</b> — {help}.{note}",
     },
     "perm.help.ask": {
-        "en": "ask for approval before dangerous tools (Bash/Write/Edit)",
-        "ru": "спрашивать подтверждение перед опасными инструментами (Bash/Write/Edit)",
+        "en": "ask before every tool — Bash, Write, Edit, web (maximum oversight)",
+        "ru": "спрашивать перед каждым инструментом — Bash, Write, Edit, web (максимальный контроль)",
     },
     "perm.help.auto-edits": {
-        "en": "auto-approve file edits, still ask for the rest",
-        "ru": "автоматически одобрять правки файлов, остальное спрашивать",
+        "en": "default — auto-run edits & safe commands; ask only for push, destructive or web/outbound actions",
+        "ru": "по умолчанию — авто-запуск правок и безопасных команд; спрашивать только push, разрушительные и сетевые действия",
     },
     "perm.help.plan": {
         "en": "plan only, do not run tools",
@@ -994,8 +994,10 @@ CATALOG: dict[str, dict[str, str]] = {
     },
     # -- /level /expire /limit (owner access management; #102/#103/#105) ----- #
     "level.prompt": {
-        "en": "Send: <code>&lt;id|@user&gt; chat|code</code> (or /cancel).",
-        "ru": "Отправьте: <code>&lt;id|@user&gt; chat|code</code> (или /cancel).",
+        "en": "Send <code>&lt;id|@user&gt;</code> — I'll then offer chat/code — or "
+              "<code>&lt;id|@user&gt; chat|code</code> directly. /cancel to stop.",
+        "ru": "Отправьте <code>&lt;id|@user&gt;</code> — затем выберете chat/code — или "
+              "сразу <code>&lt;id|@user&gt; chat|code</code>. /cancel — отмена.",
     },
     "level.usage": {
         "en": "Usage: <code>/level &lt;id|@user&gt; chat|code</code>.",
@@ -1009,6 +1011,12 @@ CATALOG: dict[str, dict[str, str]] = {
         "en": "No allowlist entry for <code>{val}</code>.",
         "ru": "Нет записи в списке доступа для <code>{val}</code>.",
     },
+    "level.pick": {
+        "en": "Set the access level for <code>{val}</code>:",
+        "ru": "Выберите уровень доступа для <code>{val}</code>:",
+    },
+    "level.pick_chat": {"en": "💬 chat", "ru": "💬 chat"},
+    "level.pick_code": {"en": "🟩 code", "ru": "🟩 code"},
     "expire.prompt": {
         "en": "Send: <code>&lt;id|@user&gt; YYYY-MM-DD</code> (or <code>never</code>; /cancel).",
         "ru": "Отправьте: <code>&lt;id|@user&gt; ГГГГ-ММ-ДД</code> (или <code>never</code>; /cancel).",

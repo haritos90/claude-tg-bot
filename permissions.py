@@ -11,6 +11,7 @@ is resolved by handle_decision() when the owner taps a button.
 import asyncio
 import contextlib
 import os
+import re
 
 from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -28,9 +29,56 @@ SAFE_TOOLS: set[str] = {
     "TodoWrite",
 }
 
-# File-editing tools, auto-allowed under the "acceptEdits" policy (but not Bash,
-# WebFetch, etc., which still prompt). "bypassPermissions" allows EVERYTHING.
+# File-editing tools, auto-allowed under the "acceptEdits" policy. Plain Bash is
+# also auto-allowed under acceptEdits UNLESS _bash_needs_approval flags it (below);
+# WebFetch/WebSearch/Task still prompt. "bypassPermissions" allows EVERYTHING.
 EDIT_TOOLS: set[str] = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
+
+# --- #212: Bash risk classifier for the relaxed "acceptEdits" default ----------
+# Under acceptEdits the #119 jail (per-uid FS confinement, egress allowlist,
+# brokered token, seccomp, resource caps) is the HARD containment layer: an
+# escaped/compromised agent still cannot touch the host or other sessions. So the
+# gate no longer asks about ordinary in-jail work (ls/grep/build/test/git status) —
+# it only stops the actions the jail PERMITS but the owner may not intend:
+#   * OUTBOUND-WITH-CREDS / push-class — reach the user's OWN repos/services with
+#     their identity (egress lets allowlisted hosts through by design), and
+#   * DESTRUCTIVE workdir ops — irreversibly trash the user's in-jail work.
+# This is the confused-deputy / prompt-injection catch, NOT host protection.
+#
+# Threat model: each pattern matches a known-bad command appearing ANYWHERE in the
+# line (so `cd x && git push` is caught), which reliably gates an HONEST agent.
+# Deliberate obfuscation (`g=push; git $g`) can slip past — that adversarial case
+# is exactly what the sandbox backstops. Fail-safe: matching errs toward PROMPT.
+# NOTE: secret-using commands are deliberately NOT gated here — secrets are env
+# vars (any command can read them, so a regex gate is bypassable + false comfort)
+# and a secret only does harm by LEAVING the jail, which egress already gates.
+_BASH_APPROVAL_PATTERNS: tuple[re.Pattern, ...] = (
+    # push-class / outbound carrying the user's credentials
+    re.compile(r"\bgit\s+push\b"),
+    re.compile(r"\bgh\b"),                        # GitHub CLI (PRs/releases/api) — uses the PAT
+    re.compile(r"\b(?:npm|yarn|pnpm)\s+publish\b"),
+    re.compile(r"\btwine\s+upload\b"),
+    re.compile(r"\bdocker\s+push\b"),
+    re.compile(r"\b(?:ssh|scp|sftp)\b"),          # remote shell / copy
+    re.compile(r"\brsync\b.*(?:::|\S+@)"),         # rsync to a REMOTE target (local rsync is fine)
+    # destructive: irreversible loss of in-workdir work
+    re.compile(r"\brm\s+-\w*r"),                   # recursive remove (rm -r / -rf / -fr)
+    re.compile(r"\bgit\s+reset\s+--hard\b"),
+    re.compile(r"\bgit\s+clean\s+-\w*[fd]"),
+    re.compile(r"\bgit\s+restore\b"),
+    re.compile(r"\bgit\s+checkout\s+(?:--|\.)"),   # discard tracked changes
+    re.compile(r"\b(?:dd|mkfs\w*|shred|truncate)\b"),
+)
+
+
+def _bash_needs_approval(command: str | None) -> bool:
+    """True if a Bash command should STILL prompt under the relaxed acceptEdits
+    policy (push-class / outbound-with-creds or destructive). Empty/None → False
+    (nothing to run). See _BASH_APPROVAL_PATTERNS for the threat model."""
+    if not command or not command.strip():
+        return False
+    return any(p.search(command) for p in _BASH_APPROVAL_PATTERNS)
+
 
 # How long we wait for the owner to decide before auto-denying.
 DEFAULT_TIMEOUT = 300.0
@@ -156,8 +204,10 @@ class PermissionGate:
         WITHOUT a tap (the SDK invokes this callback for every non-auto-allowed
         tool, so the policy must be enforced HERE, not only in the SDK options):
           - "bypassPermissions" (full-access / auto mode) → allow everything, no prompts;
-          - "acceptEdits"                          → also auto-allow file edits;
-          - anything else                          → prompt for non-safe tools.
+          - "acceptEdits" (the default since #212)  → auto-allow file edits AND
+              ordinary in-jail Bash; only outbound/destructive Bash (and
+              WebFetch/WebSearch/Task) prompt (see _bash_needs_approval);
+          - anything else ("default"/"plan")        → prompt for every non-safe tool.
 
         Signature matches the SDK: (tool_name, tool_input, ctx) ->
         PermissionResultAllow | PermissionResultDeny.
@@ -170,9 +220,22 @@ class PermissionGate:
             # Auto mode (full-access): run everything without asking.
             if permission_mode == "bypassPermissions":
                 return PermissionResultAllow()
-            # acceptEdits: file edits run without asking; the rest still prompt.
-            if permission_mode == "acceptEdits" and tool_name in EDIT_TOOLS:
-                return PermissionResultAllow()
+            # acceptEdits (the default since #212): file edits + ordinary in-jail
+            # Bash run without asking; only outbound/destructive Bash and the rest
+            # (WebFetch/WebSearch/Task) still prompt. The #119 jail is the hard
+            # containment layer — the gate now catches just the confused-deputy /
+            # prompt-injection actions the jail PERMITS (push to the user's repo,
+            # workdir destruction), not host compromise. See _bash_needs_approval.
+            # was (prompted for ALL Bash under acceptEdits) — replaced for #212:
+            #   if permission_mode == "acceptEdits" and tool_name in EDIT_TOOLS:
+            #       return PermissionResultAllow()
+            if permission_mode == "acceptEdits":
+                if tool_name in EDIT_TOOLS:
+                    return PermissionResultAllow()
+                if tool_name == "Bash" and not _bash_needs_approval(
+                    (tool_input or {}).get("command")
+                ):
+                    return PermissionResultAllow()
 
             # Localize to the owner's interface language (DM chat_id == user id;
             # the prompt is always answered by the owner).

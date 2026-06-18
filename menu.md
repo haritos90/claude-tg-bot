@@ -150,8 +150,10 @@ Consequences for menus and settings:
 - **Every chat setting is also relevant to code.** Settings are presented
   uniformly for both.
 - **Some settings are code-only** and are explicitly flagged as such (they need a
-  working directory or the agent toolset): permissions, max turns, tools,
-  sandbox, the file commands. These rows simply do not appear in a chat session.
+  working directory or the agent toolset): permissions, max turns, tools, the file
+  commands. These rows simply do not appear in a chat session. (Sandbox is **not**
+  code-only — the jail now covers chat sessions too, so its owner-only row shows in
+  both chat and code.)
 - The settings hub and pickers look identical in both; code merely shows
   additional, clearly-marked rows.
 
@@ -210,6 +212,7 @@ Conventions legend).
 | `/memory` | 1M context window (chat): on \| off | Окно контекста 1M (чат): on \| off | none → toggle | 🟢 |
 | `/language` | Choose the interface language | Выбрать язык интерфейса | none → picker | 🟢 |
 | `/context` | Context-window usage | Использование окна контекста | none | 🟢 |
+| `/limits` | 📊 Your usage limits | 📊 Ваши лимиты использования | none | 🟢 |
 | `/queue` | Show the pending-prompt queue | Показать очередь запросов | none | 🟢 |
 | `/clearqueue` | Clear the pending queue | Очистить очередь | none | 🟢 |
 | `/rename` | Rename the current session | Переименовать текущую сессию | prompts for a name (capture) | 🟢 |
@@ -229,6 +232,7 @@ Conventions legend).
 | `/maxturns` | Cap agentic turns (code) | Лимит агентных ходов (код) | none → picker | 🟦 |
 | `/permissions` | Code tool policy: ask \| auto-edits \| plan | Политика инструментов кода: ask \| auto-edits \| plan | none → picker | 🟦 (`full-access` 👑) |
 | `/tools` | Configure this session's tools | Настроить инструменты сессии | none → grid | 🟦 |
+| `/secret` | 🔐 Set a per-session service credential (code) | 🔐 Учётные данные сервиса для сессии (код) | prompts (capture) | 🟦 |
 
 ### Tier E — Meta & secondary
 
@@ -243,6 +247,7 @@ Conventions legend).
 | `/newchat` | 💬 New chat session | 💬 Новая чат-сессия | prompts for a name | 🟢 |
 | `/newcode` | 🟩 New code session | 🟩 Новая код-сессия | prompts for a name | 🟦 |
 | `/mode` | Switch session type (alias of /code, /chat) | Сменить тип сессии (синоним /code, /chat) | none | 🟢 |
+| `/close` | Close (delete) the current session | Закрыть (удалить) текущую сессию | none | 🟢 |
 
 ### Tier F — Owner (👑, appended to the owner's menu only)
 
@@ -251,6 +256,7 @@ Conventions legend).
 | Command | EN label | RU label | Args | Access |
 |---|---|---|---|---|
 | `/users` | List allowed users (owner) | Список пользователей (владелец) | none → cards | 👑 |
+| `/userstats` | 📊 User usage stats — table (owner) | 📊 Статистика пользователей — таблица (владелец) | none → table | 👑 |
 | `/allow` | Allow a user (owner) | Разрешить пользователя (владелец) | prompts (capture) | 👑 |
 | `/deny` | Remove a user (owner) | Удалить пользователя (владелец) | prompts (capture) | 👑 |
 | `/level` | Set a user's access level (owner) | Уровень доступа (владелец) | prompts (capture) | 👑 |
@@ -258,7 +264,8 @@ Conventions legend).
 | `/limit` | Top up a user's token grant (owner) | Пополнить лимит токенов (владелец) | prompts (capture) | 👑 |
 | `/auto` | Run code tools without asking (owner) | Запускать инструменты кода без вопросов (владелец) | none → toggle | 👑 |
 | `/codesplit` | Code blocks as separate messages: on/off (owner) | Блоки кода отдельными сообщениями: on/off (владелец) | none → toggle | 👑 |
-| `/sandbox` | Toggle this session's sandbox — all sessions, chat & code (owner) | Песочница сессии вкл/выкл — все сессии, чат и код (владелец) | none → toggle | 👑 |
+| `/workingplate` | ⏳ Working/Stop plate: on \| off (owner) | ⏳ Плашка Working/Stop: on \| off (владелец) | none → toggle | 👑 |
+| `/sandbox` | Toggle this session's sandbox — applies to all sessions, chat & code (owner) | Песочница сессии вкл/выкл — для всех сессий, чат и код (владелец) | none → toggle | 👑 |
 
 > **Not commands:** a plain message is a prompt to the current session; a photo,
 > PDF, or text/code file uses its caption as the prompt. Messages sent while a
@@ -301,11 +308,14 @@ rows appear only in a code session (§1.7).
 | 📍 This session | 👤 My defaults · 🌍 Global (👑) |
 | 🧠 Model: opus · this session ▸ | ▮ full width |
 | ⚡ Effort: high ▸ | ▮ full width |
-| 🔐 Permissions: ask ▸ *(code)* | ▮ full width |
+| 🔐 Permissions: auto-edits ▸ *(code)* | ▮ full width |
 | 🔁 Max turns: unlimited ▸ *(code)* | ▮ full width |
 | 🗄 Big memory: off *(granted)* | ▮ full width |
 | 🧪 Sandbox: on ▸ *(owner)* | ▮ full width |
 | 🌐 Language: English ▸ | ▮ full width |
+| 🔥 Warm-cache note: off | ▮ full width |
+| 📦 Auto-compact: on | ▮ full width |
+| 🧠 Live context size: on | ▮ full width |
 | 🧰 Tools ▸ *(code)* | ▮ full width |
 | 📊 Usage display ▸ *(owner)* | ▮ full width |
 | 👥 Users ▸ *(owner)* | ▮ full width |
@@ -324,6 +334,9 @@ rows appear only in a code session (§1.7).
 | Big memory | 🗄 Big memory: {on/off} | 🗄 Большая память: {вкл/выкл} | 🟢 (granted) |
 | Sandbox | 🧪 Sandbox: {value} ▸ | 🧪 Песочница: {value} ▸ | 👑 |
 | Language | 🌐 Language: {name} ▸ | 🌐 Язык: {name} ▸ | 🟢 |
+| Warm-cache note | 🔥 Warm-cache note: {on/off} | 🔥 Заметка о тёплом кэше: {вкл/выкл} | 🟢 (delegated) |
+| Auto-compact | 📦 Auto-compact: {on/off} | 📦 Автокомпакт: {вкл/выкл} | 🟢 (forced-on; owner delegates to disable) |
+| Live context size | 🧠 Live context size: {on/off} | 🧠 Размер контекста в плашке: {вкл/выкл} | 🟢 (forced-on; owner delegates to disable) |
 | Tools | 🧰 Tools ▸ | 🧰 Инструменты ▸ | 🟦 |
 | Usage display | 📊 Usage display ▸ | 📊 Использование ▸ | 👑 |
 | Users | 👥 Users ▸ | 👥 Пользователи ▸ | 👑 |
@@ -405,26 +418,37 @@ owner-only surface. They are where the owner sets each user's **access exception
 
 **Table 15 — User card keyboard.**
 
-| User card — keyboard | (col 2) |
-|---|---|
-| Level: chat → code | ▮ full width |
-| 🗄 Memory: on | ⚡ Max effort: off |
-| 🧰 Tools: all | 🔑 Access |
-| ⏳ Set expiry… | ▮ full width |
-| 📊 Day limit… | 📅 Week limit… |
-| ♾ Clear limits | 🗑 Remove access |
-| ◂ Users | ✖ Close |
+| User card — keyboard | (col 2) | (col 3) |
+|---|---|---|
+| Level: chat → code | 🔢 Sessions: default | |
+| 🗄 Memory: on | ⚡ Max effort: off | |
+| 🧰 Tools: all | 🔑 Access | |
+| ✏️ Friendly name… | ⏳ Set expiry… | |
+| 📊 Day limit… | 📅 Week limit… | ⏳ Idle: default |
+| ♾ Clear limits | ▮ full width | |
+| 🗑 Remove access | ▮ full width | |
+| ◂ Users | | |
+
+> **Owner self-limit card.** The owner has their own card too. It omits
+> level / expiry / access / friendly-name / remove (the owner is always code,
+> never expires, always full access, and can't self-remove) but exposes the same
+> self-imposable limits for testing: **🗄 Memory · ⚡ Max effort · 🧰 Tools · ⏳ Idle ·
+> 📊 Day limit · 📅 Week limit · 🔢 Sessions** (clear the limits to go back to
+> uncapped).
 
 **Table 16 — User card buttons.**
 
 | Button | EN | RU |
 |---|---|---|
 | Level | Level: {level} → {next} | Уровень: {level} → {next} |
+| Sessions | 🔢 Sessions: {value} | 🔢 Сессии: {value} |
 | Memory | 🗄 Memory: {state} | 🗄 Память: {state} |
 | Max effort | ⚡ Max effort: {state} | ⚡ Max effort: {state} |
 | Tools | 🧰 Tools: {value} | 🧰 Инструменты: {value} |
 | Access | 🔑 Access | 🔑 Доступ |
+| Name | ✏️ Friendly name… | ✏️ Имя… |
 | Expiry | ⏳ Set expiry… | ⏳ Срок доступа… |
+| Idle | ⏳ Idle: {value} | ⏳ Простой: {value} |
 | Day / Week limit | 📊 Day limit… · 📅 Week limit… | 📊 Лимит/день… · 📅 Лимит/неделя… |
 | Clear limits | ♾ Clear limits | ♾ Снять лимиты |
 | Remove | 🗑 Remove access → 🗑 Yes, remove | 🗑 Убрать доступ → 🗑 Да, убрать |
@@ -562,14 +586,15 @@ One row per option. *Applies to* marks code-only options (§1.7). *Base access* 
 |---|---|---|---|---|---|
 | `model` | enum: opus, sonnet, haiku | opus | all | Delegated | — |
 | `effort` | enum: low, medium, high, xhigh, max, default | high | all | Delegated | `max`: delegated only to granted users |
-| `permission_mode` | enum: ask, auto-edits, plan, full-access | ask | code | Delegated | `full-access`: owner only |
+| `permission_mode` | enum: ask, auto-edits, plan, full-access | auto-edits | code | Delegated | `full-access`: owner only; default `auto-edits` auto-runs in-jail edits + ordinary shell, prompts only for push/destructive/web |
 | `max_turns` | int 1–1000, or unlimited | unlimited | code | Delegated | — |
-| `big_memory` | bool | off | all | Hidden | Delegated: granted users |
-| `streaming` | bool | on | all | Hidden | native streaming always-on (no user toggle) |
-| `sandbox` | bool | on | all | Hidden | owner: Delegated (#180: chat & code) |
+| `memory` | bool | off | all | Hidden | Delegated: granted users (the per-session 1M big-memory toggle) |
+| `sandbox` | bool | on | all (chat & code) | Hidden | owner: Delegated (#180: jail covers chat sessions too) |
 | `language` | enum: supported locales | en | all (UI) | Delegated | — |
 | `usage_display` | enum: off, footer, pinned, both | footer | account-wide | Read-only | owner: Delegated |
-| `code_split` | bool | on | all (rendering) | Read-only | owner: Delegated — toggle `/codesplit` (send each code block as its own message for easy mobile copy) |
+| `hot_cache_timer` | bool | off | all | Delegated | every user may toggle their warm-cache note |
+| `auto_compact` | bool | on | all | Hidden | forced-on (CLI default); owner: Delegated to disable |
+| `ctx_status` | bool | on | all | Hidden | forced-on; owner: Delegated to disable (live context size in the working plate) |
 | `tools` | multi-select (chat: web tools; code: full toolset) | all on | all (universe varies by type) | Delegated | per-user tool allow-list |
 
 Reading the columns:
@@ -581,9 +606,10 @@ Reading the columns:
   *given to all* → base *Delegated*, no exceptions; *given to some* → base *Hidden*
   (or *Read-only*) with an exception `Delegated: …`.
 
-**Resource quotas are a separate axis.** Per-user token caps (day/week) and access
-expiry are *limits*, not option values; they live on the user-admin card (§3.4)
-and are not part of this matrix.
+**Resource quotas are a separate axis.** Per-user token caps (day/week), access
+expiry, the per-user session limit (max-sessions), and the idle-TTL are *limits*,
+not option values; they live on the user-admin card (§3.4) and are not part of this
+matrix.
 
 ### 4.6 Standing rules
 
