@@ -86,7 +86,7 @@ class Access(enum.Enum):
 BASE_ACCESS_DEFAULTS: dict[str, Access] = {
     "model": Access.DELEGATED,
     "effort": Access.DELEGATED,           # `max` further gated (allow_max_effort)
-    "permission_mode": Access.DELEGATED,  # `full-access` is owner-only
+    "permission_mode": Access.DELEGATED,  # #223: full-access now delegated to code users too
     "max_turns": Access.DELEGATED,
     "memory": Access.HIDDEN,              # big_memory: owner delegates to granted users
     "sandbox": Access.HIDDEN,            # owner delegates
@@ -422,7 +422,9 @@ def _language_user_setter() -> Setter:
 # SDK literals. Kept as literals here to avoid importing the handler layer (which
 # imports this module would risk a cycle) — PART 2 maps friendly labels via i18n.
 _EFFORT_CHOICES = ("low", "medium", "high", "xhigh", "max")
-_PERM_CHOICES = ("default", "acceptEdits", "plan", "bypassPermissions")
+# #223: dropped "default"/ask — auto-edits is the floor; full-access is un-gated for
+# code users (sandbox contains it). was: ("default", "acceptEdits", "plan", "bypassPermissions")
+_PERM_CHOICES = ("acceptEdits", "plan", "bypassPermissions")
 
 
 SETTINGS: dict[str, Setting] = {

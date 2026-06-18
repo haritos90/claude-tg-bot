@@ -567,14 +567,12 @@ CATALOG: dict[str, dict[str, str]] = {
               "to add one (e.g. <code>GH_TOKEN=ghp_xxx</code>), or <code>/cancel</code>.\n"
               "Clear with <code>/secret clear</code> (all) or <code>/secret clear NAME</code> "
               "(one).\nSecrets are injected as environment variables into <b>this session's "
-              "jail only</b> — not other sessions, and the owner's own credentials are never "
-              "shared. Values are never shown again.",
+              "jail only</b> — not other sessions. Values are never shown again.",
         "ru": "🔐 <b>Секреты сессии</b>\nСохранено: {names}\n\nОтправьте <code>NAME=VALUE</code>, "
               "чтобы добавить (напр. <code>GH_TOKEN=ghp_xxx</code>), или <code>/cancel</code>.\n"
               "Очистить: <code>/secret clear</code> (все) или <code>/secret clear NAME</code> "
               "(один).\nСекреты внедряются как переменные окружения <b>только в jail этой "
-              "сессии</b> — не в другие сессии, и учётные данные владельца никогда не "
-              "передаются. Значения больше не показываются.",
+              "сессии</b> — не в другие сессии. Значения больше не показываются.",
     },
     "secret.stored": {
         "en": "🔐 Stored <code>{name}</code> for this session — injected into the jail on "
@@ -593,6 +591,104 @@ CATALOG: dict[str, dict[str, str]] = {
               "digits and underscores (e.g. <code>GH_TOKEN</code>) — or <code>/secret clear</code>.",
         "ru": "🔐 Не удалось разобрать. Отправьте <code>NAME=VALUE</code> — NAME из букв, "
               "цифр и подчёркиваний (напр. <code>GH_TOKEN</code>) — или <code>/secret clear</code>.",
+    },
+    # #222: the detailed how-to behind the "How to use" button on the /secret prompt.
+    "secret.guide": {
+        "en": (
+            "🔐 <b>Session secrets — how to use</b>\n\n"
+            "A secret is any <code>NAME=VALUE</code> pair. It is stored for THIS session "
+            "only and injected as an environment variable into this session's sandbox on "
+            "the next turn, so tools like <code>gh</code>, <code>git</code>, "
+            "<code>npm</code> or <code>aws</code> can authenticate. The value is "
+            "write-only — it is never shown again, and the agent can't read the secrets "
+            "file itself.\n\n"
+            "<b>Example — connect GitHub over HTTPS</b>\n"
+            "1. Create a token at <code>github.com/settings/tokens</code> → "
+            "<i>Fine-grained token</i>, scoped to just the repo you need "
+            "(Contents: Read and write). Copy it (starts with <code>github_pat_</code> "
+            "or <code>ghp_</code>).\n"
+            "2. Send it here: <code>GH_TOKEN=github_pat_xxx</code>\n"
+            "3. Next turn, ask the agent to use it — e.g. <i>clone github.com/me/repo and "
+            "push a branch</i>. <code>gh</code> reads <code>GH_TOKEN</code> "
+            "automatically; for plain git use <code>gh auth setup-git</code> or an "
+            "<code>https://x-access-token:$GH_TOKEN@github.com/...</code> URL.\n\n"
+            "⚠️ <b>HTTPS only — SSH is not supported in the bot.</b> There is no way to "
+            "install an SSH key in the sandbox (its home is wiped each turn), so always "
+            "use an HTTPS token.\n\n"
+            "Other uses: <code>NPM_TOKEN</code>, <code>AWS_ACCESS_KEY_ID</code> / "
+            "<code>AWS_SECRET_ACCESS_KEY</code>, <code>OPENAI_API_KEY</code>, "
+            "<code>DATABASE_URL</code>, ... (the remote host must be on the sandbox's "
+            "egress allowlist).\n\n"
+            "🔒 <b>Trust:</b> secrets are stored on the machine that runs this bot, so "
+            "its operator can technically read them. Use narrowly-scoped, revocable "
+            "tokens — never a master password.\n\n"
+            "Manage: <code>/secret</code> (list names) · "
+            "<code>/secret clear NAME</code> · <code>/secret clear</code> (all)."
+        ),
+        "ru": (
+            "🔐 <b>Секреты сессии — как пользоваться</b>\n\n"
+            "Секрет — это пара <code>NAME=VALUE</code>. Хранится только для ЭТОЙ сессии и "
+            "на следующем ходу внедряется как переменная окружения в песочницу сессии, "
+            "чтобы инструменты вроде <code>gh</code>, <code>git</code>, <code>npm</code> "
+            "или <code>aws</code> могли авторизоваться. Значение write-only — больше не "
+            "показывается, и сам агент файл секретов не читает.\n\n"
+            "<b>Пример — подключить GitHub по HTTPS</b>\n"
+            "1. Создайте токен на <code>github.com/settings/tokens</code> → "
+            "<i>Fine-grained token</i>, с доступом только к нужному репозиторию "
+            "(Contents: Read and write). Скопируйте (начинается с "
+            "<code>github_pat_</code> или <code>ghp_</code>).\n"
+            "2. Пришлите сюда: <code>GH_TOKEN=github_pat_xxx</code>\n"
+            "3. На следующем ходу попросите агента это использовать — напр. "
+            "<i>склонируй github.com/me/repo и запушь ветку</i>. <code>gh</code> читает "
+            "<code>GH_TOKEN</code> сам; для чистого git — <code>gh auth setup-git</code> "
+            "или URL <code>https://x-access-token:$GH_TOKEN@github.com/...</code>.\n\n"
+            "⚠️ <b>Только HTTPS — SSH в боте не поддерживается.</b> Положить SSH-ключ в "
+            "песочницу нельзя (её домашняя папка стирается каждый ход), поэтому всегда "
+            "используйте HTTPS-токен.\n\n"
+            "Другое применение: <code>NPM_TOKEN</code>, <code>AWS_ACCESS_KEY_ID</code> / "
+            "<code>AWS_SECRET_ACCESS_KEY</code>, <code>OPENAI_API_KEY</code>, "
+            "<code>DATABASE_URL</code>, ... (удалённый хост должен быть в egress-allowlist "
+            "песочницы).\n\n"
+            "🔒 <b>Доверие:</b> секреты хранятся на машине, где запущен бот, поэтому её "
+            "оператор технически может их прочитать. Берите узкие отзываемые токены — "
+            "никогда не мастер-пароль.\n\n"
+            "Управление: <code>/secret</code> (список имён) · "
+            "<code>/secret clear NAME</code> · <code>/secret clear</code> (всё)."
+        ),
+    },
+    "secret.btn_guide": {"en": "📖 How to use", "ru": "📖 Как использовать"},
+    "settings.row_secret": {"en": "🔐 Session secrets ▸", "ru": "🔐 Секреты сессии ▸"},
+    # -- /shell (shell-mode overlay; #224) ---------------------------------- #
+    "shell.code_only": {
+        "en": "⌨️ Shell mode is available in <b>code</b> sessions only.",
+        "ru": "⌨️ Режим shell доступен только в <b>code</b>-сессиях.",
+    },
+    "shell.on": {
+        "en": "⌨️ <b>Shell mode ON.</b> Every message now runs as a command in this "
+              "session's sandbox — no AI, no tokens. Send <code>/shell</code> again to "
+              "exit. Non-interactive commands only; <code>cd</code>/env don't persist "
+              "between commands yet.",
+        "ru": "⌨️ <b>Режим shell ВКЛ.</b> Каждое сообщение теперь выполняется как команда "
+              "в песочнице сессии — без ИИ и без токенов. Отправьте <code>/shell</code> "
+              "ещё раз, чтобы выйти. Только неинтерактивные команды; <code>cd</code>/env "
+              "пока не сохраняются между командами.",
+    },
+    "shell.off": {
+        "en": "⌨️ <b>Shell mode OFF.</b> Back to talking with the agent.",
+        "ru": "⌨️ <b>Режим shell ВЫКЛ.</b> Снова общаемся с агентом.",
+    },
+    "shell.accidental": {
+        "en": "<i>(command not found — you're in shell mode; send /shell to exit)</i>",
+        "ru": "<i>(команда не найдена — вы в режиме shell; отправьте /shell для выхода)</i>",
+    },
+    # #221: startup owner alert when the uid doctor finds an on-disk collision.
+    "admin.uid_collision_alert": {
+        "en": "⚠️ <b>Sandbox uid check (#221)</b>\n{count} host uid(s) own more than one "
+              "session's files on disk — a per-session isolation gap. Usually transient: "
+              "the affected sessions re-chown to a unique uid on their next turn.\n{detail}",
+        "ru": "⚠️ <b>Проверка uid песочниц (#221)</b>\n{count} host-uid владеют файлами более "
+              "чем одной сессии на диске — брешь в изоляции сессий. Обычно временно: "
+              "затронутые сессии перечоунятся на уникальный uid на следующем ходу.\n{detail}",
     },
 
     # -- /maxturns ---------------------------------------------------------- #
@@ -759,10 +855,9 @@ CATALOG: dict[str, dict[str, str]] = {
         "en": "Permissions set to <b>{name}</b> — {help}.{note}",
         "ru": "Права установлены в <b>{name}</b> — {help}.{note}",
     },
-    "perm.help.ask": {
-        "en": "ask before every tool — Bash, Write, Edit, web (maximum oversight)",
-        "ru": "спрашивать перед каждым инструментом — Bash, Write, Edit, web (максимальный контроль)",
-    },
+    # #223: "perm.help.ask" removed — "ask" is dropped; auto-edits is the floor now (the
+    # #119 sandbox makes per-tool prompting unnecessary). en was: "ask before every tool
+    # — Bash, Write, Edit, web (maximum oversight)".
     "perm.help.auto-edits": {
         "en": "default — auto-run edits & safe commands; ask only for push, destructive or web/outbound actions",
         "ru": "по умолчанию — авто-запуск правок и безопасных команд; спрашивать только push, разрушительные и сетевые действия",
@@ -772,8 +867,10 @@ CATALOG: dict[str, dict[str, str]] = {
         "ru": "только планирование, без запуска инструментов",
     },
     "perm.help.full-access": {
-        "en": "bypass all approval — can run anything",
-        "ru": "без подтверждений — может выполнить что угодно",
+        "en": "run everything unattended, no approvals — fast, but uses more of your "
+              "usage limit; the sandbox still confines it to this session",
+        "ru": "выполнять всё без подтверждений и присмотра — быстро, но расходует больше "
+              "лимита; песочница всё равно ограничивает этим сеансом",
     },
 
     # -- /auto -------------------------------------------------------------- #

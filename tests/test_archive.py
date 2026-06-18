@@ -31,8 +31,8 @@ def _seed(base: Path, sid: str, home: Path):
 def test_transcript_dir_encoding(tmp_path):
     """The project dir is the cwd with every non-alphanumeric char → '-'."""
     home = tmp_path / ".claude"
-    got = archive.transcript_dir("/root/claude/claude-tg-bot/workdirs/cf8c89", home)
-    assert got == home / "projects" / "-root-claude-claude-tg-bot-workdirs-cf8c89"
+    got = archive.transcript_dir("/var/lib/claude-tg-bot/workdirs/cf8c89/work", home)
+    assert got == home / "projects" / "-var-lib-claude-tg-bot-workdirs-cf8c89-work"
 
 
 def test_archive_bundles_session_and_transcript_and_removes_live(tmp_path):

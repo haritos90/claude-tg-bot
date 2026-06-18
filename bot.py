@@ -21,13 +21,14 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.exceptions import TelegramNetworkError
 
 from config import load_settings
-from db import init_db, close_db, migrate_workdirs_to_sid
+from db import init_db, close_db, migrate_workdirs_to_sid, sandbox_uid_collisions
 from allowlist import Allowlist
 from access import AllowlistMiddleware, LanguageMiddleware
 from permissions import PermissionGate
 from sessions import SessionManager
 from handlers import build_router, setup_commands
 import watchdog
+import i18n
 
 logger = logging.getLogger("bot")
 
@@ -68,6 +69,23 @@ async def main() -> None:
         n = await migrate_workdirs_to_sid(str(settings.base_workdir))
         if n:
             logger.info("Migrated %d session workdir(s) to sid-based names (#140)", n)
+
+    # #221 doctor: scan on-disk session workdirs for any host uid shared by >1 session
+    # (a per-session isolation break). With the uid registry this is always empty; it
+    # surfaces a PRE-#221 collision not yet healed (heals on the sessions' next turn).
+    # Filesystem-only → safe here; the owner is alerted after the bot connects (below).
+    uid_collisions: dict[int, list[str]] = {}
+    with contextlib.suppress(Exception):
+        uid_collisions = sandbox_uid_collisions(str(settings.base_workdir))
+        if uid_collisions:
+            logger.warning(
+                "#221: %d sandbox uid collision(s) on disk: %s — affected sessions "
+                "self-heal (re-chown to a registry uid) on their next turn.",
+                len(uid_collisions),
+                "; ".join(f"uid {u}: {','.join(s)}" for u, s in uid_collisions.items()),
+            )
+        else:
+            logger.info("#221: sandbox uid check clean (no host uid shared across sessions)")
 
     # The bot uses HTML parse mode by default; the markup helpers emit HTML.
     bot = Bot(
@@ -233,6 +251,19 @@ async def main() -> None:
             await asyncio.wait_for(
                 setup_commands(bot, owner_id=settings.owner_id), timeout=30
             )
+
+        # #221: if the doctor found on-disk uid collisions, alert the owner now that the
+        # bot is connected (best-effort, post-READY — off the startup-critical path).
+        if uid_collisions and settings.owner_id:
+            detail = "; ".join(
+                f"uid {u}: {', '.join(s)}" for u, s in uid_collisions.items()
+            )
+            with contextlib.suppress(Exception):
+                await bot.send_message(
+                    settings.owner_id,
+                    i18n.t("admin.uid_collision_alert", i18n.DEFAULT_LANG,
+                           count=len(uid_collisions), detail=detail),
+                )
 
         # Only the update types we actually handle are requested from Telegram.
         await dp.start_polling(

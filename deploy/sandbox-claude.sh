@@ -181,6 +181,15 @@ fi
 # (skipped when already correct), then we drop with `setpriv`, which EXECs (no fork — the
 # process tree + the cgroup membership set above stay intact, so the reaper still works).
 # The credential fd 9 and seccomp fd were opened as root above and survive the drop.
+
+# #224: shell mode — swap the exec target to a ONE-SHOT bash command in the jail. All the
+# SBX_* isolation above (uid, egress allowlist, secrets, cgroup, seccomp) is target-agnostic
+# and already applied; only the final exec target changes. SBX_SHELL_CMD is the command line.
+if [ "${SBX_MODE:-}" = "shell" ]; then
+  CLAUDE="/bin/bash"
+  set -- -lc "${SBX_SHELL_CMD:-true}"
+fi
+
 if [ -n "${SBX_HOST_UID:-}" ]; then
   _huid="$SBX_HOST_UID"; _hgid="${SBX_HOST_GID:-$SBX_HOST_UID}"
   # The per-session parent (<sid>/) stays root-owned but must be TRAVERSABLE by the

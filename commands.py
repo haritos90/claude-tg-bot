@@ -120,14 +120,17 @@ COMMANDS: tuple[Cmd, ...] = (
                      "ru": "Лимит агентных ходов (код)"}, scope="code", help_group="code"),
     # #217: surfaced into the "/" menu (code users) — these are routine code-session
     # config that was previously only typeable / buried in the hub.
-    Cmd("permissions", {"en": "Code tool policy: ask | auto-edits | plan",
-                        "ru": "Политика инструментов кода: ask | auto-edits | plan"},
+    Cmd("permissions", {"en": "Code tool policy: auto-edits · plan · full-access",
+                        "ru": "Политика инструментов кода: auto-edits · plan · full-access"},
         scope="code", help_group="code"),
     Cmd("tools", {"en": "Configure this session's tools",
                   "ru": "Настроить инструменты сессии"},
         scope="code", help_group="code"),
     Cmd("secret", {"en": "🔐 Set a per-session service credential (code)",
                    "ru": "🔐 Учётные данные сервиса для сессии (код)"},
+        scope="code", help_group="code"),
+    Cmd("shell", {"en": "⌨️ Toggle shell mode — run commands in the jail (code)",
+                  "ru": "⌨️ Режим shell — команды в песочнице (код)"},
         scope="code", help_group="code"),
     # — Tier E · meta —
     Cmd("help", {"en": "Show help", "ru": "Показать справку"}, help_group="meta"),

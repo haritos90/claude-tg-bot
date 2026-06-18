@@ -13,6 +13,7 @@ import hashlib
 import json
 import logging
 import os
+import sqlite3
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -68,6 +69,9 @@ class ThreadState:
     # claude runs WITHOUT the bubblewrap jail even if SANDBOX_CODE is on, so the
     # owner can compare sandboxed vs raw behaviour. Guests can never set it.
     no_sandbox: bool = False
+    # #224: shell-mode overlay — a code session whose text messages route to a one-shot
+    # command in its jail instead of the model. NOT a mode change (stays "code").
+    shell_mode: bool = False
     # Per-session enabled tools (#129): None = the mode's full default universe
     # (chat → web tools, code → all); a list = exactly those (``[]`` = tool-free).
     tools_enabled: list[str] | None = None
@@ -169,6 +173,18 @@ async def init_db(db_path: str) -> None:
             )
             """
         )
+        # #221: per-session host-uid registry — maps each session's sid to a UNIQUE
+        # unprivileged host uid for its sandbox. The engine prefers the deterministic
+        # hash uid but probes to a free one on collision and records it here, so two
+        # sessions never share a uid (which would break per-session FS isolation).
+        await _conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS session_uid (
+                sid TEXT PRIMARY KEY,
+                uid INTEGER NOT NULL UNIQUE
+            )
+            """
+        )
         # Migrate threads: add any columns introduced after the first release.
         cur = await _conn.execute("PRAGMA table_info(threads)")
         columns = await cur.fetchall()
@@ -209,6 +225,11 @@ async def init_db(db_path: str) -> None:
         if "no_sandbox" not in existing:
             await _conn.execute(
                 "ALTER TABLE threads ADD COLUMN no_sandbox INTEGER DEFAULT 0"
+            )
+        # #224: shell-mode overlay for code sessions (routes text → jailed command).
+        if "shell_mode" not in existing:
+            await _conn.execute(
+                "ALTER TABLE threads ADD COLUMN shell_mode INTEGER DEFAULT 0"
             )
         # Per-session enabled-tools list (#129): JSON array, or NULL = mode default
         # (chat → web tools, code → all). Distinct from [] which means tool-free.
@@ -277,6 +298,7 @@ async def get_thread(thread_id: int) -> ThreadState | None:
             "effort, max_turns, add_dirs, COALESCE(fork_pending, 0) AS fork_pending, "
             "COALESCE(favorite, 0) AS favorite, "
             "COALESCE(no_sandbox, 0) AS no_sandbox, "
+            "COALESCE(shell_mode, 0) AS shell_mode, "
             "tools_enabled, "
             "COALESCE(hot_cache_timer, 0) AS hot_cache_timer, "
             "COALESCE(auto_compact, 0) AS auto_compact "
@@ -307,6 +329,7 @@ async def get_thread(thread_id: int) -> ThreadState | None:
         fork_pending=bool(row["fork_pending"]),
         favorite=bool(row["favorite"]),
         no_sandbox=bool(row["no_sandbox"]),
+        shell_mode=bool(row["shell_mode"]),
         tools_enabled=_parse_tools_enabled(row["tools_enabled"]),
         hot_cache_timer=bool(row["hot_cache_timer"]),
         auto_compact=bool(row["auto_compact"]),
@@ -440,6 +463,17 @@ async def set_no_sandbox(thread_id: int, on: bool) -> None:
     async with _lock:
         await conn.execute(
             "UPDATE threads SET no_sandbox = ? WHERE thread_id = ?",
+            (1 if on else 0, thread_id),
+        )
+        await conn.commit()
+
+
+async def set_shell_mode(thread_id: int, on: bool) -> None:
+    """Persist the per-session shell-mode overlay toggle (#224)."""
+    conn = _require_conn()
+    async with _lock:
+        await conn.execute(
+            "UPDATE threads SET shell_mode = ? WHERE thread_id = ?",
             (1 if on else 0, thread_id),
         )
         await conn.commit()
@@ -1147,8 +1181,80 @@ async def delete_dm_session(user_id: int, key: int) -> bool:
         await cur.close()
         await conn.execute("DELETE FROM usage WHERE thread_id = ?", (key,))
         await conn.execute("DELETE FROM messages WHERE thread_id = ?", (key,))
+        await conn.execute("DELETE FROM session_uid WHERE sid = ?", (session_sid(key),))  # #221
         await conn.commit()
     return removed > 0
+
+
+async def claim_session_uid(sid: str, preferred: int, lo: int, hi: int) -> int:
+    """Return a STABLE, collision-free host uid for ``sid`` (#221). ``hi`` is exclusive.
+
+    First call: record ``preferred`` (the deterministic hash uid) if free, else
+    linear-probe ``[lo, hi)`` for the next unused uid and record THAT — so two sessions
+    whose hashes collide get DISTINCT uids. Later calls return the recorded uid, so the
+    on-disk chown stays valid across rebuilds. ``_lock`` serialises the probe and the
+    UNIQUE(uid) constraint is the backstop that makes an already-taken slot fail.
+    """
+    conn = _require_conn()
+    span = max(1, hi - lo)
+    start = lo + ((preferred - lo) % span)            # clamp preferred into [lo, hi)
+    async with _lock:
+        cur = await conn.execute("SELECT uid FROM session_uid WHERE sid = ?", (sid,))
+        row = await cur.fetchone()
+        await cur.close()
+        if row is not None:
+            return int(row["uid"])
+        for i in range(span):
+            cand = lo + ((start - lo + i) % span)
+            try:
+                await conn.execute(
+                    "INSERT INTO session_uid (sid, uid) VALUES (?, ?)", (sid, cand)
+                )
+                await conn.commit()
+                return cand
+            except sqlite3.IntegrityError:
+                continue                              # uid taken by another sid → next slot
+        # Space exhausted (>> any realistic session count): fall back to the bare hash
+        # rather than fail the session. Collisions are possible again only in this case.
+        return start
+
+
+async def release_session_uid(sid: str) -> None:
+    """Free a session's reserved uid (#221) so the uid space can be reused. No-op if
+    absent. Called when a session is permanently deleted."""
+    conn = _require_conn()
+    async with _lock:
+        await conn.execute("DELETE FROM session_uid WHERE sid = ?", (sid,))
+        await conn.commit()
+
+
+def _uid_collisions(uid_by_sid: dict[str, int]) -> dict[int, list[str]]:
+    """Group sids by their host uid; return only the uids shared by MORE THAN ONE sid
+    (a per-session isolation break). Pure + testable; the disk scan below feeds it."""
+    by_uid: dict[int, list[str]] = {}
+    for sid, uid in uid_by_sid.items():
+        by_uid.setdefault(uid, []).append(sid)
+    return {uid: sorted(sids) for uid, sids in by_uid.items() if len(sids) > 1}
+
+
+def sandbox_uid_collisions(base_workdir: str) -> dict[int, list[str]]:
+    """#221 doctor: scan on-disk session workdirs and return ``{uid: [sids]}`` for any
+    host uid that owns more than one session's ``<sid>/work`` — the real isolation break.
+    Empty dict = clean. With the uid registry this should always be empty; it surfaces a
+    PRE-#221 collision not yet healed (it heals when the affected sessions next run and
+    get re-chowned to their registry uid). Sync (filesystem stat); never raises."""
+    uid_by_sid: dict[str, int] = {}
+    try:
+        for child in Path(base_workdir).iterdir():
+            if not child.is_dir():
+                continue
+            try:
+                uid_by_sid[child.name] = os.stat(child / "work").st_uid
+            except OSError:
+                continue                      # no work dir yet / unreadable → skip
+    except OSError:
+        return {}
+    return _uid_collisions(uid_by_sid)
 
 
 async def migrate_workdirs_to_sid(base_workdir: str) -> int:

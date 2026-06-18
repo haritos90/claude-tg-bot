@@ -41,7 +41,7 @@ header rows. Columns:
 - **Closed** — `| ID | Theme | Title | Resolution | Release notes |`
 - **Deferred** — `| ID | Pri | Eff | Theme | Title | Reason |`
 
-**Next free ID:** 221
+**Next free ID:** 228
 
 ---
 
@@ -68,6 +68,8 @@ Not started; promote to Open when picked up.
 | 198 | P2 | S | docs | isolation.md cross-references a threat model deleted from TODO #119 |
 | 199 | P2 | XS | docs | data-model.md threads schema omits the live stream_enabled column |
 | 201 | P3 | XS | docs | Spec-voice cleanup: first-person narration in isolation.md and TODO #189 |
+| 227 | P2 | L | features | Shell mode phase 2: persistent tmux/PTY shell + lifecycle |
+| 226 | P2 | M | ux | Rich-draft tables: only the first row streams; full table snaps in at finish |
 
 ### Details
 
@@ -150,6 +152,72 @@ added…" and "…the egress rule uses `iptables -m cgroup --path`". TODO.md #18
 "Our reaper… continuous context — our default… Marginal for us… we deliberately favour…" →
 restate without "our / us / we".
 
+**#227 — Shell mode phase 2: persistent tmux/PTY shell + lifecycle** (P2 · L · features)
+
+Phase 1 (#224, shipped) gave the frame + a ONE-SHOT jailed runner (each message runs in a fresh
+`bash -lc` in the session's #119 jail). Phase 2 makes the shell PERSISTENT and interactive
+(`cd`/env survive between commands; line-interactive flows like password prompts / `gh auth
+login` work) and adds the lifecycle controls a long-lived shell needs.
+
+Design nuance (found in phase 1): a persistent tmux SERVER can't be reached across separate
+`bwrap` invocations — each is a fresh user/PID namespace + tmpfs, so a second `tmux send-keys`
+call can't see the first jail's server. Persistence therefore needs ONE long-lived jailed
+process the runner HOLDS — i.e. a held PTY subprocess (bash, or tmux on that pty), driven by
+writing the command to the pty and reading until a quiescence/sentinel. Reuse the
+`SBX_MODE=shell` launcher branch + `engine.run_shell`'s env, but keep the process alive instead
+of one-shot, store its handle on the `_ThreadRecord`, and add the items below.
+
+Execution (tmux-backed persistent shell):
+- Each toggled-on session gets a PERSISTENT shell hosted in `tmux` INSIDE its #119 jail, so
+  `cd`/env persist between messages and input can be sent to a RUNNING process (the interactive
+  path a one-shot `bash -lc` can't do). Reuse `deploy/sandbox-claude.sh`: add an exec branch that
+  launches `tmux` (new-session + a login shell) under the same SBX_* setup
+  (uid/egress/secrets/cgroup/seccomp) instead of `$CLAUDE`. A thin runner (no `ClaudeSDKClient`)
+  drives it: `tmux send-keys` feeds the user's line as keystrokes, and output is read by polling
+  `tmux capture-pane`; a prompt/quiescence heuristic decides when the command has settled before
+  replying. Output as a monospace block; long output truncated + attached as `.txt` (reuse
+  `markup.as_document` / outbox).
+- Catch-all text, when a code session has shell_mode on, routes to the runner instead of
+  `session.run`. A ⏹ Stop control sends Ctrl-C (`send-keys C-c`) to interrupt a foreground
+  command (mirror the existing turn-stop control).
+- No approval gate: the user is the principal (no confused-deputy) and the jail is the hard
+  boundary — they run only in their own session. Gate the toggle to code-level users.
+- Limits: fundamental — a smooth live full-screen TUI (`vim`/`top`) can't render in a chat bubble
+  (capture-pane is snapshot-and-send, laggy for fast refreshers). But LINE-interactive flows
+  (password prompts, `gh auth login` device step, `read`) DO work via send-keys. Document the
+  boundary. A degenerate one-shot mode (`bash -lc`, no persistence) is the trivial fallback if
+  tmux proves too heavy.
+
+Lifecycle & resources (MUST resolve before build):
+- **RAM:** an idle tmux server + login shell is light (order of a few MB RSS each) but NOT free
+  and CANNOT be held forever per session — many concurrent [shell] sessions add up, and whatever
+  the user leaves running (a dev server, `tail -f`) keeps consuming. Account/cap a persistent
+  shell like the claude subprocess.
+- **No direct close (the toggle gap):** a single `/shell` toggle gives the user no obvious way to
+  KILL a shell that hangs in PARALLEL to their session (a stuck/long command, an orphaned server).
+  Resolve with: (a) an IDLE REAPER that kills the tmux session after N min of no activity — reuse
+  the #179 reaper machinery so an abandoned shell can't linger; (b) tie the tmux session lifetime
+  to the bot session — killed on session delete and on bot restart; (c) the ⏹ Stop / Ctrl-C control
+  for a hanging foreground command; (d) toggle-OFF semantics — keep the tmux session alive for
+  re-toggle persistence (cd/env survive) and rely on the idle reaper, OR kill on OFF (simpler, no
+  orphans, loses persistence). Recommend (a)+(b)+(c) with toggle-OFF keeping the session until the
+  idle reaper collects it; revisit if RAM pressure shows up.
+- **Caps:** count a live shell against the per-session #119e cgroup mem/pids caps, and add a
+  max-concurrent-[shell] ceiling so a fleet of idle shells can't exhaust host RAM.
+
+**#226 — Rich-draft tables: only the first row streams; full table snaps in at finish** (P2 · M · ux)
+
+While a reply streams, a markdown table shows only its first row; the whole RENDERED table appears
+only when the message finishes. During draft streaming the streamer pushes RAW markdown (#172,
+`streamer.py`), and a markdown table is atomic — not a valid/renderable table until the header +
+separator + all rows exist, so mid-stream the user sees a partial/raw table and `finish()` snaps to
+the rendered one. Hypothesis: the table content may be emitted in an order that delays a
+renderable state; consider revealing it row-by-row (emit each row as it completes) or streaming the
+table as plain pre-formatted text until complete, then snapping to the rich table. Look at how
+tables render (`markup.py` / `rich_message` / the #162 `table_image` path) and whether a partial
+table can be shown incrementally. Likely shares the draft/streamer path with #225 — root-cause #225
+first.
+
 ---
 
 ## Closed
@@ -158,6 +226,11 @@ Title-only history.
 
 | ID | Theme | Title | Resolution | Release notes |
 |---|---|---|---|---|
+| 225 | ux | Streaming: replies arrive whole — Telegram stopped rendering bot draft previews (external) | DM streaming used Telegram message DRAFTS (`sendMessageDraft`/`sendRichMessageDraft`, Bot API 10.1), but Telegram STOPPED rendering bot draft previews client-side. Confirmed live: an animated self-test draft sent directly to the owner chat had every frame accepted by the API (returned `True`) while the client showed NOTHING; `stream_enabled=1` on all sessions ruled out a disabled stream; `streamer.py`/`rich_message.py` were unchanged across all recent commits (not a code regression). Draft rendering is client-side and undetectable server-side (API 200s regardless), and unfixable from our side. By DESIGN the bot streams via drafts (the smooth native typewriter) and NEVER the ~1/sec `editMessageText` write-head — 1 edit/sec is jarring and rejected as a design violation (see memory `streaming-drafts-never-writehead`). So replies show whole until Telegram restores draft rendering, then stream smoothly again with zero changes. Menus stay on rich messages (`SendRichMessage`), unaffected. (A brief write-head workaround was added then FULLY reverted per owner — `use_drafts = thread_id < 0` always; no flag.) pytest (155) + ruff; live, polling. | No code change — streaming stays on Telegram rich-message drafts by design. Telegram is temporarily not rendering bot draft previews, so replies currently show whole; they stream smoothly again automatically once Telegram restores it. |
+| 224 | features | Shell mode for code sessions (phase 1): `/shell` toggle + one-shot jailed runner | A `/shell` single-toggle overlay on code sessions (`threads.shell_mode`, mirrored on the live `_ThreadRecord`; does NOT change the session type — stays `code`). When on, the catch-all routes each message to `engine.ClaudeSession.run_shell` — a ONE-SHOT `bash -lc` in the session's #119 jail (per-session uid + egress + seccomp + injected `/secret` env, no LLM, no tokens) via a new `SBX_MODE=shell` branch in `deploy/sandbox-claude.sh`; output posts as a code block (60k cap + truncate). A `[shell]` marker shows in the status / session-card / options headers; a not-found command (exit 127) appends a one-line "you're in shell mode — /shell to exit" hint. Code-only gated; routing-only flag (no session rebuild). Verified: jailed exec runs as the per-session host uid with the workdir chowned correctly (direct launcher test, both uid paths), shell_mode db roundtrip, pytest (155), ruff, `bash -n`; live on the bot. Persistent `cd`/env + interactivity + Ctrl-C + idle-reaper/RAM caps deferred to #227. | Code sessions can toggle `/shell` to run shell commands straight in their sandbox — no AI, no tokens (e.g. git/gh with a `/secret` token). Each command runs one-shot (no `cd`/env persistence yet); a `[shell]` tag marks the session. |
+| 221 | isolation | Per-session uid collision: hash mapped two sessions to one host uid | `engine.py` derived each jail's host uid as `uid_base + (int(sid,16) % uid_range)` (60000 buckets) — deterministic but birthday-colliding: two sessions (even different users, since `thread_id` is global) could map to one uid, making their `0700` workdirs mutually readable/writable. Added a `session_uid(sid PK, uid UNIQUE)` registry + `db.claim_session_uid(sid, preferred, lo, hi)`: returns the recorded uid (stable across rebuilds), else the preferred hash uid if free, else linear-probes `[lo,hi)` for a free slot and records it (serialised by `_lock`; `UNIQUE(uid)` is the backstop). `ClaudeSession._ensure_client` claims the uid async — before the sync `_build_options`/`_enable_sandbox` — and caches it on `self.host_uid`; `_enable_sandbox` reads it, falling back to the bare hash if unclaimed (tests) or the registry is down. `delete_dm_session` frees the slot (`release_session_uid`). Migration is near-free: preferred == the existing hash uid, so live sessions keep their uid (no re-chown) and only a pre-existing collision self-heals on the bumped session's next turn via the launcher's stat-guarded `chown -R`. A startup "doctor" (`db.sandbox_uid_collisions`, run in `bot.main` off the pre-READY path) scans on-disk workdirs for any host uid shared by >1 session and logs + DMs the owner if found (self-heals on the affected sessions' next turn). +4 db tests. py_compile + pytest (155) + ruff; registry table + clean doctor verified on the live db, bot re-polling. | Two sessions can no longer be assigned the same sandbox uid — each session's host uid is reserved in a registry that probes past collisions, so per-session file isolation holds even when the uid hash collides. |
+| 222 | ux | `/secret` was hard to discover and under-explained | `/secret` was registered and in the "/" command menu (code scope) but absent from the in-app `/settings` hub, and its prompt gave only a terse blurb. Added a "🔐 Session secrets" row to the hub Session tab (code only, `sx:secret`) that opens the arg-capture prompt; the prompt now carries a "📖 How to use" button → a detailed bilingual guide (`secret.guide`) with a GitHub-over-HTTPS walkthrough (fine-grained PAT → `GH_TOKEN=` → `gh`/git over HTTPS), an explicit "SSH is not supported" note, other-service examples, and a host-operator trust note. Dropped the "owner's credentials are never shared" clause from `secret.help` (a user need not know an owner exists). py_compile + i18n + commands-consistency + pytest (151) + ruff. | `/secret` is reachable from the settings menu and has a built-in "How to use" guide (with a GitHub HTTPS setup walkthrough) in both languages. |
+| 223 | ux | `/permissions` offered the defunct `ask` floor and gated `full-access` to the owner | The code permission picker still offered `ask` (per-tool prompting) and hid `full-access` (`bypassPermissions`) from non-owners. With #119/#212 making the jail the hard boundary, `ask`/`default` was removed from the choices (`_PERM_CHOICES` + `PERM_NAME_TO_MODE`, old kept commented) so `auto-edits` is the floor, and `full-access` was un-gated for all code users (picker hide, apply-gate, and `/permissions` command gate all commented out) — the sandbox confines it to the user's own session and the user opts into the risk. `/auto off` now lands on `acceptEdits` (was `default`). Help/label copy (`perm.help.full-access`, commands.py, menu.md) updated; no jargon ("full-access", not "yolo"). py_compile + pytest (151) + ruff. | Code sessions default to auto-edits with no "ask" option; any code user can switch to plan or full-access (run everything unattended) — the sandbox is the safety boundary. |
 | 207 | docs | Cyrillic sample literal in tests/test_markup.py broke the English-only rule | The `ensure_text_bom` test used a Cyrillic string literal as its non-ASCII sample, violating golden rule 1 (English-only outside the i18n/commands/menu translation surfaces). Replaced with `"café"`; the helper keys off the filename, not the content, so the BOM assertions are unaffected. py_compile + pytest + ruff. | — |
 | 208 | isolation | ISOLATION_NOTE asserted cross-session privacy unconditionally | `engine.ISOLATION_NOTE` (#205), appended to every code session's system prompt, opened with an unconditional "an isolated, per-session sandbox … you cannot see or reach another session's files" — but that enforcement only holds when the sandbox layers (#104/#119/#180) are on. Reworded so only the always-true per-session SEPARATE directory (#181) is stated outright; filesystem confinement is now hedged ("may be") like the network clause. Old string kept commented. | The code agent no longer overstates isolation: it describes filesystem/network confinement as conditional and asserts only the always-true private per-session directory. |
 | 209 | core | Output-formatting helper nits (BOM case-match + menu newline note) | `markup.as_document` now matches the `.md`/`.txt` extension case-insensitively, mirroring `ensure_text_bom` (#206), so a `.MD`/`.TXT` is BOM'd identically by the long-reply and outbox paths. Added a note on `handlers._send_menu` that the `\n`→`<br>` rich-HTML conversion (#202) assumes menus carry no `<pre>`/preformatted content. py_compile + pytest + ruff. | — |
