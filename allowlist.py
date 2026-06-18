@@ -187,6 +187,7 @@ class Allowlist:
             "level": self._norm_level(rec.get("level")),
             "expires_at": self._norm_expiry(rec.get("expires_at")),
             "token_grant": self._norm_grant(rec.get("token_grant")),
+            "max_sessions": self._norm_grant(rec.get("max_sessions")),
             "rate": self._norm_rate(rec.get("rate")),
             "global_memory": self._norm_bool(rec.get("global_memory")),
             "allow_max_effort": self._norm_bool(rec.get("allow_max_effort")),
@@ -200,6 +201,7 @@ class Allowlist:
             "level": self._norm_level(rec.get("level")),
             "expires_at": self._norm_expiry(rec.get("expires_at")),
             "token_grant": self._norm_grant(rec.get("token_grant")),
+            "max_sessions": self._norm_grant(rec.get("max_sessions")),
             "rate": self._norm_rate(rec.get("rate")),
             "global_memory": self._norm_bool(rec.get("global_memory")),
             "allow_max_effort": self._norm_bool(rec.get("allow_max_effort")),
@@ -219,6 +221,7 @@ class Allowlist:
             "rate": self._norm_rate(rec.get("rate")),
             "allow_max_effort": True if ame is None else self._norm_bool(ame),
             "tool_cap": self._norm_tool_cap(rec.get("tool_cap")),
+            "max_sessions": self._norm_grant(rec.get("max_sessions")),
         }
 
     # -- loading / saving ---------------------------------------------------
@@ -355,6 +358,17 @@ class Allowlist:
         if rec is None:
             return None
         return self._norm_grant(rec.get("token_grant"))
+
+    def max_sessions_of(self, user_id: Optional[int], username: Optional[str]) -> Optional[int]:
+        """The user's per-user session-count override (int; 0 = unlimited), or ``None``
+        = inherit the global default. The owner reads its OWN self-override (#185),
+        also ``None`` by default (so the owner inherits the global / is uncapped per the
+        caller's resolution)."""
+        self._reload_if_changed()
+        if user_id is not None and user_id == self.owner_id:
+            return self._norm_grant(self._owner_prefs.get("max_sessions"))
+        rec = self._find(user_id, username)
+        return self._norm_grant(rec.get("max_sessions")) if rec else None
 
     def rate_of(self, user_id: Optional[int], username: Optional[str]) -> dict:
         """The user's rolling-window token caps ``{"day": int|None, "week":
@@ -658,6 +672,23 @@ class Allowlist:
         self._save()
         return True
 
+    def set_max_sessions(self, target: str, n) -> bool:
+        """Set/clear a user's session-count cap. ``n`` = int (0 = unlimited) or ``None``
+        to clear (inherit the global default). The owner stores its OWN override (#185).
+        Returns True if the target exists (or is the owner)."""
+        self._reload_if_changed()
+        val = None if n is None else self._norm_grant(n)
+        if self._is_owner_target(target):
+            self._owner_prefs["max_sessions"] = val
+            self._save()
+            return True
+        rec = self._record_for_target(target)
+        if rec is None:
+            return False
+        rec["max_sessions"] = val
+        self._save()
+        return True
+
     def remove(self, target: str) -> bool:
         """Remove a matching id or username (also drops an id-entry whose stored
         username matches, so ``/deny @name`` works after the user was pinned).
@@ -702,6 +733,7 @@ class Allowlist:
                 "global_memory": self._norm_bool(self._owner_prefs.get("global_memory")),
                 "allow_max_effort": self._norm_bool(self._owner_prefs.get("allow_max_effort", True)),
                 "tool_cap": self._norm_tool_cap(self._owner_prefs.get("tool_cap")),
+                "max_sessions": self._norm_grant(self._owner_prefs.get("max_sessions")),
                 "access": {},
                 "friendly_name": None,
             }

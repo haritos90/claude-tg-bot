@@ -242,3 +242,24 @@ def test_owner_prefs_legacy_upgrade(tmp_path):
     assert a.allow_max_effort_of(OWNER, None) is True
     assert a.tool_cap_of(OWNER, None) is None
     assert a.describe(str(OWNER))["access"] == {}
+
+
+def test_max_sessions_per_user_and_owner(tmp_path):
+    """Per-user session cap (#session-limit): unset → inherit (None); a positive int =
+    cap; 0 = explicit unlimited; None clears. Owner stores its OWN override (#185).
+    Persists across reload."""
+    p = tmp_path / "a.json"
+    a = al.Allowlist(p, OWNER)
+    a.add("111", level="code")
+    assert a.max_sessions_of(111, None) is None        # unset → inherit the global default
+    assert a.max_sessions_of(OWNER, None) is None
+    assert a.set_max_sessions("111", 3) is True
+    assert a.max_sessions_of(111, None) == 3
+    a.set_max_sessions("111", 0)                        # explicit unlimited
+    assert a.max_sessions_of(111, None) == 0
+    a.set_max_sessions("111", None)                     # clear → inherit
+    assert a.max_sessions_of(111, None) is None
+    assert a.set_max_sessions(str(OWNER), 5) is True    # owner self-override (#185)
+    assert a.max_sessions_of(OWNER, None) == 5
+    b = al.Allowlist(p, OWNER)                           # persists across reload
+    assert b.max_sessions_of(OWNER, None) == 5

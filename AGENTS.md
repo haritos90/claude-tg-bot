@@ -148,27 +148,19 @@ Out-of-process helpers live in `deploy/`: `tg-bot.service` (systemd unit) and
 
 ### Data model
 
-All durable state lives in one SQLite DB (`DB_PATH`, default `bot.db`, WAL mode),
-created on `db.init` and migrated **forward in place** — only additive, guarded
-`ALTER TABLE … ADD COLUMN` (never a destructive rewrite/drop):
-
-| Table | Key | Holds |
-|---|---|---|
-| `threads` | `thread_id` (PK) | One row per session: `chat_id`, `mode`, `model`, `cwd`, the resumable `code_session_id` / `chat_session_id`, `name`, `created_by`, `created_at`, plus per-session toggles added by migration — `permission_mode`, `effort`, `max_turns`, `big_memory`, `favorite`, `no_sandbox`, `tools_enabled`, `stream_enabled`, `add_dirs`, `fork_pending`, `auto_compact`, `hot_cache_timer`. |
-| `usage` | `id` (PK) | One row per turn: `thread_id`, `ts`, `input_tokens`, `output_tokens`, `cache_read`, `cache_creation`, `cost_usd`. Per-USER totals roll up via `JOIN threads ON chat_id` (the table has no user column — #105). |
-| `messages` | `id` (PK) | Conversation log (`thread_id`, `ts`, `role`, `text`) feeding `/last` / `/recap` / `/history`; indexed `(thread_id, id)`. |
-| `kv` | `key` (PK) | Small key-value state: per-user current session (`dm_current:<uid>`), `dm_seq`, usage display mode, pinned-message id, per-user `lang:<uid>`, access overrides + user defaults (settings hub). |
-| `rate_history` | `id` (PK) | Append-only subscription rate-limit snapshots (`ts`, `rate_type`, `utilization`, `status`) feeding the `/status` trend. |
-
-A DM session's `thread_id` is a synthetic **negative** id (see "Sessions, identity
-& access" in §5); supergroup topics are `>= 0` (0 = General). To add session state,
-append a guarded `ADD COLUMN` in `db.init` — don't rewrite or drop a column.
+The full storage layout (the `/var/lib/claude-tg-bot/workdirs` tree, the per-session
+`work/` `state/` `secrets.env`, where the OAuth token lives) and the SQLite schema are
+specified in **[`data-model.md`](data-model.md)**. Two invariants to keep in mind when
+editing `db.py`: durable state is one SQLite DB migrated **forward in place** (only
+additive, guarded `ALTER TABLE … ADD COLUMN`), and a DM session's `thread_id` is a
+synthetic **negative** id (supergroup topics are `>= 0`, 0 = General). The subscription
+token is never in the DB — see `data-model.md` and [`isolation.md`](isolation.md).
 
 ---
 
 ## 5. Gotchas & hard-won invariants
 
-These are SDK/Telegram traps that already bit us. Re-check them before editing
+These are SDK/Telegram traps that have caused real bugs. Re-check them before editing
 `engine.py`, `handlers.py`, or `streamer.py`.
 
 ### Agent SDK (claude-agent-sdk 0.2.101) — all SDK code is in `engine.py`
@@ -202,8 +194,8 @@ These are SDK/Telegram traps that already bit us. Re-check them before editing
   an explicit list — `["WebSearch","WebFetch"]` for chat (web-capable like the
   Claude apps), or `[]` for a truly tool-free chat. The same tools go in
   `allowed_tools` so they AUTO-run (chat has no `can_use_tool` gate). **This
-  REVERSES the old "chat is tool-free" rule (#24):** chat is now web-capable by
-  default (owner request 2026-06-15); code mode is unchanged (full toolset,
+  REVERSES the old "chat is tool-free" rule (#24):** chat is web-capable by
+  default; code mode is unchanged (full toolset,
   dangerous tools gated). `allowed_tools=[]` alone never limits the universe — it
   only controls auto-approval.
 - **The CLI honours prompt KEYWORD triggers, even on the SDK path — neutralize
@@ -438,7 +430,7 @@ These are SDK/Telegram traps that already bit us. Re-check them before editing
   `ss.CODE_ONLY` (permission_mode / max_turns / sandbox) + `_ss_code_blocked` hide
   those rows on the session tab of a *chat* session even for a code-level user.
 
-### Sandbox (#104 — optional, OFF by default, STILL IN PROGRESS)
+### Sandbox (#104/#180 jail ON by default; #119 hardening OPT-IN)
 
 Code sessions can run `claude` inside a **bubblewrap** jail when `SANDBOX_CODE=1`
 (`config.sandbox_code`). `engine._enable_sandbox` points
@@ -454,14 +446,46 @@ owner-only) to separate a sandbox issue from a bot bug. bwrap's userns maps the 
 uid to outer-root for host writes, so the workdir is writable **without** a chown —
 don't add one.
 
-**Not a hard jail yet — don't treat it as one.** The subscription token is
-currently injected *into* the jail and the network is open, so a code-level user's
-Bash can read and exfiltrate it (also via the bot's own reply stream — a firewall
-alone can't stop that). It limits **filesystem** blast radius for semi-trusted
-users, not a malicious one. The full design — a credential **broker** (token never
-enters the jail) + network **egress allowlist** + per-session secrets + DoS limits
-— is the umbrella ticket **#119**; until it lands, `code` level = trusted users
-only.
+**Isolation hardening (#119 — OPT-IN, OFF by default).** The bwrap jail above limits
+**filesystem** blast radius; #119 closes the rest, each behind its own flag so a botched
+rule only affects opted-in turns:
+
+- **Credential broker (`CRED_BROKER=1`, #119b).** The subscription OAuth token stays
+  OUTSIDE the jail in a host sidecar (`deploy/cred-broker.py`); the jail gets only a
+  far-future DUMMY token + `ANTHROPIC_BASE_URL` at the broker, which injects the REAL
+  bearer (read fresh from `~/.claude/.credentials.json`, kept current by #191) and
+  forwards to `api.anthropic.com`. Token USABLE but UN-extractable — closes the
+  chat-output + allowed-destination exfil channels a firewall alone can't.
+- **Egress allowlist (`SANDBOX_EGRESS=1`, #119c — CODE sessions only).** A code jail's
+  egress is hard-blocked to LOOPBACK ONLY by a **cgroup-scoped** iptables rule
+  (`deploy/egress-setup.sh`: a dedicated `SBX_EGRESS` chain + one `OUTPUT` jump matched by
+  `-m cgroup --path sbx` — NEVER a global rule / the policy; the live-VPS lockout trap).
+  `claude` reaches Anthropic via the broker; the agent's tools reach allowlisted dev
+  hosts (Anthropic + GitHub/PyPI/npm by default; extend via `EGRESS_ALLOW_HOSTS`) via a
+  CONNECT proxy (`deploy/egress-proxy.py`); all else dropped, so the proxy is the only
+  exit and there's no bypass (design option E). **Chat sessions keep open egress** — no
+  Bash/files to exfil, and `WebFetch` needs arbitrary URLs (gated in `engine._enable_sandbox`).
+- **Per-session secrets (`/secret`, #119d).** A code user stores their OWN service creds
+  in `<sid>/secrets.env` (0600), injected as env vars into THAT jail only; the owner's
+  creds never enter any jail.
+- **DoS limits + seccomp (#119e).** A per-jail cgroup leaf carries
+  `memory.max`/`cpu.max`/`pids.max` (`SANDBOX_MEM_MB`/`SANDBOX_CPU_PERCENT`/`SANDBOX_PIDS_MAX`);
+  `SANDBOX_SECCOMP=1` loads an x86_64 denylist BPF (`deploy/make-seccomp.py`) refusing
+  ~29 exotic syscalls (ptrace/bpf/kexec/keyctl/module-load/…) via `bwrap --seccomp`.
+
+All mechanism is in `deploy/` shell+standalone (Component 5); Python only sets `SBX_*`
+env + runs the sidecars (`bot.main` starts the broker/proxy, sets up + reverts the
+firewall, compiles the seccomp blob). **Two hard-won gotchas:** (1) the jail joins the
+cgroup via a MANUAL `/sys/fs/cgroup/sbx/<pid>` leaf in `deploy/sandbox-claude.sh`, NOT
+`systemd-run --scope` — that forks the target under PID 1, so a SIGKILL on the SDK's
+child orphans the ~500 MB `claude` (defeating the #179 reaper); the manual leaf keeps
+the tree `SDK→launcher/bwrap→claude` intact. (2) the seccomp BPF must be a DENYLIST
+whose **fall-through is ALLOW** and DENY is jumped-to only — invert it and every
+non-denied syscall returns EPERM and the process SIGSEGVs; bwrap applies the filter
+AFTER its own mounts, so denying `mount`/`pivot_root` is safe. With broker + egress on, a
+semi-trusted `code` user is contained (token un-extractable, egress allowlisted, FS
+confined); without them, `code` level = trusted users only. **Full architecture +
+data-flow diagram: [`isolation.md`](isolation.md).**
 
 ### Operating the bot
 
@@ -480,3 +504,8 @@ only.
   deployment-operation notes. Not shared, must not be committed; this file
   (`AGENTS.md`) is the shared doc every contributor follows.
 - **Setup & Telegram walkthrough:** [`README.md`](README.md).
+- **Data model:** [`data-model.md`](data-model.md) — storage layout (the
+  `/var/lib/claude-tg-bot/workdirs` tree), the SQLite schema, and where credentials live.
+- **Sandbox & isolation architecture:** [`isolation.md`](isolation.md) — the bwrap jail
+  plus the #119 credential broker / egress allowlist / per-session uid / per-session
+  secrets / DoS+seccomp scheme, with a data-flow diagram.

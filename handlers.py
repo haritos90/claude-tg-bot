@@ -30,6 +30,7 @@ from pathlib import Path
 from datetime import datetime
 
 from aiogram import Router, F
+from aiogram.exceptions import TelegramBadRequest  # #173: detect "not modified" on rich edits
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     BotCommand,
@@ -50,7 +51,7 @@ import markup
 import settings_schema as ss
 import usage
 from allowlist import normalize_date
-from rich_message import SendRichMessage  # #164: native Telegram tables
+from rich_message import EditRichMessage, SendRichMessage  # #164/#173: native rich
 
 
 # Friendly aliases mapped to concrete model ids for the /model command.
@@ -301,6 +302,44 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         except Exception:
             await reply(message, html)
 
+    async def _send_menu(chat_id: int, text: str, kb=None, **send_kwargs):
+        """#173: OPEN an inline-keyboard menu as a NATIVE rich message (sendRichMessage
+        + reply_markup), so menu screens (settings hub, user cards, session menus)
+        carry the same rich font as command replies and streamed answers — not the
+        classic ``parse_mode="HTML"`` look. ``text`` is already valid Telegram HTML →
+        the ``html`` rich field. Returns the sent Message (callers may need its id), or
+        None if both the rich and the classic fallback send fail — so a menu is never
+        lost even when the rich API rejects the payload."""
+        try:
+            return await bot(SendRichMessage(chat_id=chat_id, rich_message={"html": text},
+                                             reply_markup=kb, **send_kwargs))
+        except Exception:
+            pass
+        try:
+            return await bot.send_message(chat_id, text, parse_mode="HTML",
+                                          reply_markup=kb, **send_kwargs)
+        except Exception:
+            return None
+
+    async def _edit_menu(msg, text: str, kb=None) -> None:
+        """#173: EDIT a menu in place as a NATIVE rich message (editMessageText +
+        rich_message, Bot API 10.1) so the nav-edits keep the rich font instead of
+        downgrading to classic HTML on every tap. An unchanged body ("message is not
+        modified") is a no-op. Any other failure (e.g. the message was opened classic
+        before this shipped, or the rich edit is rejected) falls back to the classic
+        ``edit_text`` — preserving exactly the prior behaviour."""
+        try:
+            await bot(EditRichMessage(chat_id=msg.chat.id, message_id=msg.message_id,
+                                      rich_message={"html": text}, reply_markup=kb))
+            return
+        except TelegramBadRequest as exc:
+            if "not modified" in str(exc).lower():
+                return  # identical content already on screen — nothing to do
+        except Exception:
+            pass
+        with contextlib.suppress(Exception):
+            await msg.edit_text(text, parse_mode="HTML", reply_markup=kb)
+
     async def _session_key(message: Message) -> int:
         """Resolve the session key for an incoming message.
 
@@ -524,9 +563,9 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         except Exception:
             state = None
         try:
-            await bot.send_message(
-                message.chat.id, i18n.t("settings.tools_title", lang), parse_mode="HTML",
-                reply_markup=_ss_tools_keyboard(state, lang),
+            await _send_menu(  # #173: native rich menu open
+                message.chat.id, i18n.t("settings.tools_title", lang),
+                _ss_tools_keyboard(state, lang),
             )
         except Exception as exc:
             await reply(message, i18n.t("settings.open_error", lang, err=markup.escape_html(str(exc))))
@@ -765,11 +804,14 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                      B(text=i18n.t("btn.close", lang), callback_data="sx:close")])
         return InlineKeyboardMarkup(inline_keyboard=rows)
 
-    def _ss_admin_keyboard(lang: str, ret_days: int, cs_on: bool, wp_on: bool) -> InlineKeyboardMarkup:
+    def _ss_admin_keyboard(lang: str, ret_days: int, cs_on: bool, wp_on: bool,
+                           gsl: int = 10) -> InlineKeyboardMarkup:
         B = InlineKeyboardButton
+        gsl_lbl = "∞" if gsl <= 0 else str(gsl)
         rows = [
             [B(text=i18n.t("admin.retention", lang, val=_retention_label(ret_days, lang)),
-               callback_data="sx:admin:ret")],
+               callback_data="sx:admin:ret"),
+             B(text=i18n.t("admin.gsl_btn", lang, val=gsl_lbl), callback_data="sx:admin:gsl")],
             [B(text=i18n.t("admin.tog_codesplit", lang, val=i18n.onoff(cs_on, lang)),
                callback_data="sx:admin:tog:cs"),
              B(text=i18n.t("admin.tog_workingplate", lang, val=i18n.onoff(wp_on, lang)),
@@ -790,9 +832,10 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         days = await _archive_retention_days()
         cs = bool(getattr(sessions, "split_code_messages", True))
         wp = bool(getattr(sessions, "working_plate", True))
+        gsl = await _global_session_limit()
         with contextlib.suppress(Exception):
-            await msg.edit_text(i18n.t("admin.title", lang), parse_mode="HTML",
-                                reply_markup=_ss_admin_keyboard(lang, days, cs, wp))
+            await _edit_menu(msg, i18n.t("admin.title", lang),  # #173: native rich nav-edit
+                             _ss_admin_keyboard(lang, days, cs, wp, gsl))
 
     def _ss_picker_keyboard(setting, scope, ctx: ss.Ctx, lang: str,
                             may_max: bool = True) -> InlineKeyboardMarkup:
@@ -894,9 +937,9 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         kb = _ss_hub_keyboard(scope, ctx, role, lang)
         if edit_msg is not None:
             with contextlib.suppress(Exception):
-                await edit_msg.edit_text(text, parse_mode="HTML", reply_markup=kb)
+                await _edit_menu(edit_msg, text, kb)  # #173: native rich nav-edit
             return
-        await bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=kb)
+        await _send_menu(chat_id, text, kb)  # #173: native rich menu open
 
     async def _send_setting_picker(chat_id: int, key: int, uid: int | None,
                                    uname: str | None, lang: str, setting_key: str,
@@ -920,10 +963,10 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         kb = _ss_picker_keyboard(setting, scope, ctx, lang,
                                  may_max=_may_max_effort(uid, uname))
         with contextlib.suppress(Exception):
-            await bot.send_message(
+            await _send_menu(  # #173: native rich menu open
                 chat_id,
                 i18n.t("settings.v2_pick", lang, name=_setting_name(setting, lang)),
-                parse_mode="HTML", reply_markup=kb)
+                kb)
         return True
 
     @router.callback_query(F.data.startswith("sx:"))
@@ -967,10 +1010,10 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                     return
                 ctx = await _build_ss_ctx(key, uid, role)
                 with contextlib.suppress(Exception):
-                    await msg.edit_text(
+                    await _edit_menu(  # #173: native rich nav-edit
+                        msg,
                         i18n.t("settings.v2_pick", lang, name=_setting_name(setting, lang)),
-                        parse_mode="HTML",
-                        reply_markup=_ss_picker_keyboard(
+                        _ss_picker_keyboard(
                             setting, scope, ctx, lang, may_max=_may_max_effort(uid, uname)))
                 await cb.answer()
                 return
@@ -1010,8 +1053,8 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                     await cb.answer(i18n.t("settings.denied", lang), show_alert=True)
                     return
                 with contextlib.suppress(Exception):
-                    await msg.edit_text(i18n.t("settings.tools_title", lang), parse_mode="HTML",
-                                        reply_markup=_ss_tools_keyboard(state, lang))
+                    await _edit_menu(msg, i18n.t("settings.tools_title", lang),  # #173: rich nav-edit
+                                     _ss_tools_keyboard(state, lang))
                 await cb.answer()
                 return
 
@@ -1034,8 +1077,8 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                     await _rebuild_session(key)
                     state = await db.get_thread(key)
                     with contextlib.suppress(Exception):
-                        await msg.edit_text(i18n.t("settings.tools_title", lang), parse_mode="HTML",
-                                            reply_markup=_ss_tools_keyboard(state, lang))
+                        await _edit_menu(msg, i18n.t("settings.tools_title", lang),  # #173: rich nav-edit
+                                         _ss_tools_keyboard(state, lang))
                 await cb.answer()
                 return
 
@@ -1045,8 +1088,9 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                     return
                 snap = allowlist.snapshot()
                 with contextlib.suppress(Exception):
-                    await msg.edit_text("\n".join(await _users_text(snap, lang)), parse_mode="HTML",
-                                        reply_markup=_users_keyboard(snap, lang))
+                    await _edit_menu(  # #173: native rich nav-edit
+                        msg, "\n".join(await _users_text(snap, lang)),
+                        _users_keyboard(snap, lang))
                 await cb.answer()
                 return
 
@@ -1055,10 +1099,10 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                     await cb.answer(i18n.t("settings.denied", lang), show_alert=True)
                     return
                 with contextlib.suppress(Exception):
-                    await msg.edit_text(
+                    await _edit_menu(  # #173: native rich nav-edit
+                        msg,
                         i18n.t("settings.v2_pick", lang, name=i18n.t("settings.usage_name", lang)),
-                        parse_mode="HTML",
-                        reply_markup=_ss_usage_keyboard(getattr(sessions, "usage_mode", "footer"), lang))
+                        _ss_usage_keyboard(getattr(sessions, "usage_mode", "footer"), lang))
                 await cb.answer()
                 return
 
@@ -1085,9 +1129,9 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                     # Open the archive-retention picker.
                     cur = await _archive_retention_days()
                     with contextlib.suppress(Exception):
-                        await msg.edit_text(i18n.t("admin.retention_title", lang),
-                                            parse_mode="HTML",
-                                            reply_markup=_ss_retention_keyboard(cur, lang))
+                        await _edit_menu(  # #173: native rich nav-edit
+                            msg, i18n.t("admin.retention_title", lang),
+                            _ss_retention_keyboard(cur, lang))
                     await cb.answer()
                     return
                 if sub == "rset":
@@ -1098,6 +1142,15 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                     await db.set_kv("archive_retention_days", str(days))
                     await _send_ss_admin(msg, lang)
                     await cb.answer(i18n.t("admin.ret_saved", lang, val=_retention_label(days, lang)))
+                    return
+                if sub == "gsl":
+                    # Global default per-user session limit → arg-capture the owner's
+                    # next message (a number, or off/unlimited). Handled by _run_pending.
+                    pending[(msg.chat.id, thread_key(msg), uid or 0)] = "gsessionlimit"
+                    with contextlib.suppress(Exception):
+                        await bot.send_message(msg.chat.id, i18n.t("admin.gsl_prompt", lang),
+                                               parse_mode="HTML")
+                    await cb.answer()
                     return
                 if sub == "cmd" and arg in ("allow", "deny", "level", "expire", "limit"):
                     # Launch an owner arg-capture command from the Admin page (#101):
@@ -1142,9 +1195,10 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                     return
                 octx = await _build_ss_ctx(key, uid, role)
                 with contextlib.suppress(Exception):
-                    await msg.edit_text(
+                    await _edit_menu(  # #173: native rich nav-edit
+                        msg,
                         i18n.t("settings.opt_title", lang, name=_setting_name(setting, lang)),
-                        parse_mode="HTML", reply_markup=_ss_option_admin_kb(setting, octx, lang))
+                        _ss_option_admin_kb(setting, octx, lang))
                 await cb.answer()
                 return
 
@@ -1159,9 +1213,10 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                     return
                 octx = await _build_ss_ctx(key, uid, role)
                 with contextlib.suppress(Exception):
-                    await msg.edit_text(
+                    await _edit_menu(  # #173: native rich nav-edit
+                        msg,
                         i18n.t("settings.acc_title", lang, name=_setting_name(setting, lang)),
-                        parse_mode="HTML", reply_markup=_ss_access_kb(setting, octx, lang))
+                        _ss_access_kb(setting, octx, lang))
                 await cb.answer()
                 return
 
@@ -1178,9 +1233,10 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 octx = await _build_ss_ctx(key, uid, role)
                 if setting is not None:
                     with contextlib.suppress(Exception):
-                        await msg.edit_text(
+                        await _edit_menu(  # #173: native rich nav-edit
+                            msg,
                             i18n.t("settings.opt_title", lang, name=_setting_name(setting, lang)),
-                            parse_mode="HTML", reply_markup=_ss_option_admin_kb(setting, octx, lang))
+                            _ss_option_admin_kb(setting, octx, lang))
                 await cb.answer(i18n.t("settings.saved", lang))
                 return
 
@@ -1244,11 +1300,10 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                                       "language", ss.Scope.USER):
             return
         with contextlib.suppress(Exception):
-            await bot.send_message(
+            await _send_menu(  # #173: native rich menu open
                 message.chat.id,
                 i18n.t("lang.title", lang, name=i18n.lang_name(lang)),
-                parse_mode="HTML",
-                reply_markup=_language_keyboard(lang),
+                _language_keyboard(lang),
             )
 
     @router.callback_query(F.data.startswith("lang:"))
@@ -1266,9 +1321,9 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             lang = _lang(cb)
             if cb.message is not None:
                 with contextlib.suppress(Exception):
-                    await cb.message.edit_text(
+                    await _edit_menu(  # #173: native rich (was classic edit_text)
+                        cb.message,
                         i18n.t("lang.set", lang, name=i18n.lang_name(lang)),
-                        parse_mode="HTML",
                     )
             await cb.answer(i18n.t("common.switched", lang))
         except Exception:
@@ -1300,6 +1355,39 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         )
         await db.set_dm_current(uid, key)
         return key
+
+    async def _global_session_limit() -> int:
+        """The global default per-user session limit: kv `max_sessions_default` (owner-set
+        in Admin) else `settings.max_sessions_default`. 0 = unlimited."""
+        raw = await db.get_kv("max_sessions_default")
+        default = getattr(settings, "max_sessions_default", 10)
+        try:
+            return max(0, int(raw)) if raw is not None else default
+        except (TypeError, ValueError):
+            return default
+
+    async def _effective_max_sessions(uid: int, uname: str | None) -> int:
+        """Resolve a user's session-count cap (read-only to the user): the per-user
+        override (allowlist) → the owner is uncapped by default → the GLOBAL default.
+        0 = unlimited."""
+        override = allowlist.max_sessions_of(uid, uname)
+        if override is not None:
+            return override
+        if uid == settings.owner_id:
+            return 0  # owner uncapped by default (#185-style; settable per-user)
+        return await _global_session_limit()
+
+    async def _session_limit_block(uid: int, uname: str | None, lang: str) -> str | None:
+        """If the user is at/over their session cap, return the block message (which
+        offers to delete or /clear an existing session); else None. The cap counts ALL
+        of the user's sessions (chat + code)."""
+        cap = await _effective_max_sessions(uid, uname)
+        if cap <= 0:
+            return None
+        _, total = await db.browse_threads(uid, limit=1)
+        if total < cap:
+            return None
+        return i18n.t("session.limit_reached", lang, cap=cap, total=total)
 
     def _default_session_name(mode: str, lang: str) -> str:
         """Localized default name for a session created without one."""
@@ -1336,6 +1424,10 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         if not name:
             name = _default_session_name("code" if want_code else "chat", lang)
         if message.chat.type == "private":
+            block = await _session_limit_block(uid, uname, lang)
+            if block:
+                await reply(message, block)
+                return
             key = await _new_dm_session(message.chat.id, "chat", name)
             if want_code:
                 await db.switch_mode(key, "code")
@@ -1418,10 +1510,14 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             await _do_expire(message, text)
         elif action == "limit":
             await _do_limit(message, text)
-        elif action.startswith(("usrexp:", "usrrday:", "usrrweek:", "usrname:", "usridle:")):
+        elif action.startswith(("usrexp:", "usrrday:", "usrrweek:", "usrname:", "usridle:", "usrmax:")):
             await _apply_user_value(message, action, text)
+        elif action == "gsessionlimit":
+            await _set_global_session_limit(message, text)
         elif action == "sessearch":
             await _open_sessions(message, keyword=text)
+        elif action == "secret":
+            await _do_secret(message, text)
 
     @router.message(Command("cancel"))
     async def cmd_cancel(message: Message) -> None:
@@ -1533,10 +1629,9 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         send_kwargs: dict = {}
         if message.message_thread_id:
             send_kwargs["message_thread_id"] = message.message_thread_id
-        with contextlib.suppress(Exception):
-            sent = await bot.send_message(
-                chat_id, text, parse_mode="HTML", reply_markup=kb, **send_kwargs
-            )
+        # #173: native rich menu open; _send_menu returns the sent Message (or None).
+        sent = await _send_menu(chat_id, text, kb, **send_kwargs)
+        if sent is not None:
             browsers[(chat_id, sent.message_id)] = keyword
 
     async def _session_card(key: int, lang: str = "en") -> str:
@@ -1632,7 +1727,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             return
         text, kb = opts
         with contextlib.suppress(Exception):
-            await bot.send_message(cb.message.chat.id, text, parse_mode="HTML", reply_markup=kb)
+            await _send_menu(cb.message.chat.id, text, kb)  # #173: native rich menu open
         with contextlib.suppress(Exception):
             await cb.message.delete()
 
@@ -1710,8 +1805,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 opts = await _session_options(key, lang)
                 if opts is not None:
                     text, kb = opts
-                    with contextlib.suppress(Exception):
-                        await msg.edit_text(text, parse_mode="HTML", reply_markup=kb)
+                    await _edit_menu(msg, text, kb)  # #173: native rich nav-edit
                 await cb.answer()
                 return
             if verb in ("up", "down") and len(parts) > 2 and is_dm:
@@ -1729,8 +1823,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 opts = await _session_options(key, lang)
                 if opts is not None:
                     text, kb = opts
-                    with contextlib.suppress(Exception):
-                        await msg.edit_text(text, parse_mode="HTML", reply_markup=kb)
+                    await _edit_menu(msg, text, kb)  # #173: native rich nav-edit
                 await cb.answer(i18n.t("mode.switched_toast", lang, mode=i18n.mode_word(new_mode, lang)))
                 return
             if verb == "recap" and len(parts) > 2 and is_dm:
@@ -1806,11 +1899,14 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 if mode == "code" and allowlist.level_of(uid, cb.from_user.username) != "code":
                     await cb.answer(i18n.t("access.code_denied", lang), show_alert=True)
                     return
+                if await _session_limit_block(uid, cb.from_user.username, lang):
+                    await cb.answer(i18n.t("session.limit_reached_short", lang), show_alert=True)
+                    return
                 await _new_dm_session(uid, mode, _default_session_name(mode, lang))
                 current = await db.get_dm_current(uid)
                 text, kb = await _render_sessions(chat_id, is_dm, current or 0, keyword, 0, lang)
                 with contextlib.suppress(Exception):
-                    await msg.edit_text(text, parse_mode="HTML", reply_markup=kb)
+                    await _edit_menu(msg, text, kb)  # #173: native rich nav-edit
                 await cb.answer(i18n.t("common.created", lang))
                 return
             if verb == "sw" and len(parts) > 2:
@@ -1837,8 +1933,8 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                         InlineKeyboardButton(text=i18n.t("btn.transcript", lang), callback_data=f"ses:hist:{key}"),
                     ]])
                     with contextlib.suppress(Exception):
-                        await bot.send_message(chat_id, await _session_card(key, lang),
-                                               parse_mode="HTML", reply_markup=quick)
+                        await _send_menu(chat_id, await _session_card(key, lang),  # #173: rich menu open
+                                         quick)
                     # #136: close the now-stale options menu the Switch button came
                     # from so it doesn't linger above the switch card.
                     with contextlib.suppress(Exception):
@@ -1858,8 +1954,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 opts = await _session_options(key, lang)
                 if opts is not None:
                     text, kb = opts
-                    with contextlib.suppress(Exception):
-                        await msg.edit_text(text, parse_mode="HTML", reply_markup=kb)
+                    await _edit_menu(msg, text, kb)  # #173: native rich nav-edit
                 await cb.answer(
                     i18n.t("common.favorited" if new_fav else "common.unfavorited", lang)
                 )
@@ -1873,10 +1968,10 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                     InlineKeyboardButton(text=i18n.t("btn.cancel", lang), callback_data="ses:pg:0"),
                 ]])
                 with contextlib.suppress(Exception):
-                    await msg.edit_text(
+                    await _edit_menu(  # #173: native rich nav-edit
+                        msg,
                         i18n.t("session.delete_confirm", lang, name=markup.escape_html(name)),
-                        parse_mode="HTML",
-                        reply_markup=kb,
+                        kb,
                     )
                 await cb.answer()
                 return
@@ -1927,7 +2022,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 current = await db.get_dm_current(uid)
                 text, kb = await _render_sessions(chat_id, is_dm, current or 0, keyword, 0, lang)
                 with contextlib.suppress(Exception):
-                    await msg.edit_text(text, parse_mode="HTML", reply_markup=kb)
+                    await _edit_menu(msg, text, kb)  # #173: native rich nav-edit
                 await cb.answer(
                     i18n.t("common.deleted" if deleted else "session.delete_failed", lang)
                 )
@@ -1939,7 +2034,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 )
                 text, kb = await _render_sessions(chat_id, is_dm, current or 0, keyword, offset, lang)
                 with contextlib.suppress(Exception):
-                    await msg.edit_text(text, parse_mode="HTML", reply_markup=kb)
+                    await _edit_menu(msg, text, kb)  # #173: native rich nav-edit
                 await cb.answer()
                 return
             await cb.answer()
@@ -2062,10 +2157,10 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             deferred = await _rebuild_session(key)
             defer = i18n.t("common.defer_note", lang) if deferred else ""
             with contextlib.suppress(Exception):
-                await msg.edit_text(
+                await _edit_menu(  # #173: native rich (was classic edit_text)
+                    msg,
                     i18n.t("model.set", lang,
                            model=markup.escape_html(MODEL_ALIASES[alias]), defer=defer),
-                    parse_mode="HTML",
                 )
             await cb.answer()
         except Exception:
@@ -2288,6 +2383,11 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         uid = message.chat.id
         base_name = state.name or _default_session_name(state.mode, lang)
         name = i18n.t("session.fork_name", lang, base=base_name)
+        block = await _session_limit_block(
+            uid, message.from_user.username if message.from_user else None, lang)
+        if block:
+            await reply(message, block)
+            return
         new_key = await _new_dm_session(uid, state.mode, name)
         # Seed the branch: resume the current underlying session id, and fork on the
         # first turn so the original session is not mutated (#23).
@@ -2433,6 +2533,81 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             await bot.send_document(
                 chat_id=message.chat.id, document=doc, caption=i18n.t("export.caption", lang)
             )
+
+    # ----------------------------------------------------- /secret (#119d)
+    # Per-session user-supplied service credentials (e.g. a GitHub token). Stored in
+    # <sid>/secrets.env (root-owned 0600, a sibling of the agent's workdir — NOT inside
+    # it) and injected by deploy/sandbox-claude.sh as env vars into THIS session's jail
+    # ONLY: never into other sessions, and the OWNER's own credentials never enter any
+    # jail. A user leaking their own credential is their problem, not the owner's — the
+    # #119 threat model. Values are never echoed back.
+    _SECRET_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+    def _secrets_path(key: int) -> Path:
+        return settings.base_workdir / db.session_sid(key) / "secrets.env"
+
+    def _read_secrets(key: int) -> dict[str, str]:
+        out: dict[str, str] = {}
+        path = _secrets_path(key)
+        if path.exists():
+            for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    if _SECRET_KEY_RE.match(k):
+                        out[k] = v
+        return out
+
+    def _write_secrets(key: int, secrets: dict[str, str]) -> None:
+        path = _secrets_path(key)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.parent / (path.name + ".tmp")
+        tmp.write_text("".join(f"{k}={v}\n" for k, v in secrets.items()), encoding="utf-8")
+        tmp.chmod(0o600)
+        tmp.replace(path)   # atomic swap; mode 0600 so only root (the bot) reads it
+
+    async def _do_secret(message: Message, text: str) -> None:
+        lang = _lang(message)
+        key = await _session_key(message)
+        text = (text or "").strip()
+        secrets = _read_secrets(key)
+        low = text.lower()
+        if low == "clear" or low.startswith("clear "):
+            target = text[6:].strip() if low.startswith("clear ") else ""
+            if target:
+                secrets.pop(target, None)
+                _write_secrets(key, secrets)
+                await reply(message, i18n.t("secret.cleared", lang, what=markup.escape_html(target)))
+            else:
+                _write_secrets(key, {})
+                await reply(message, i18n.t("secret.cleared", lang, what=i18n.t("secret.all", lang)))
+            return
+        if "=" in text:
+            k, v = text.split("=", 1)
+            k = k.strip()
+            if not _SECRET_KEY_RE.match(k):
+                await reply(message, i18n.t("secret.bad_name", lang))
+                return
+            secrets[k] = v.strip()
+            _write_secrets(key, secrets)
+            await reply(message, i18n.t("secret.stored", lang, name=markup.escape_html(k)))
+            return
+        # No parseable arg → list current NAMES (never values) + prompt, capturing the
+        # next message as the KEY=VALUE to add (the #101 arg-capture convention).
+        names = (", ".join(f"<code>{markup.escape_html(n)}</code>" for n in secrets)
+                 or i18n.t("secret.none", lang))
+        pending[_pkey(message)] = "secret"
+        await reply(message, i18n.t("secret.help", lang, names=names))
+
+    @router.message(Command("secret"))
+    async def cmd_secret(message: Message) -> None:
+        """Store a per-session service credential (e.g. a GitHub token), injected as an
+        env var into THIS session's jail only (#119d). Code sessions only."""
+        state = await _ensure_state(message)
+        lang = _lang(message)
+        if state.mode != "code":
+            await reply(message, i18n.t("common.code_only", lang))
+            return
+        await _do_secret(message, _command_arg(message))
 
     @router.message(Command("sandbox"))
     async def cmd_sandbox(message: Message) -> None:
@@ -2582,10 +2757,10 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             # (the display is account-wide; menu.md Table 7: 🟢 view · 👑 change).
             if _is_owner(message):
                 with contextlib.suppress(Exception):
-                    await bot.send_message(
+                    await _send_menu(  # #173: native rich menu open
                         message.chat.id,
                         i18n.t("settings.v2_pick", lang, name=i18n.t("settings.usage_name", lang)),
-                        parse_mode="HTML", reply_markup=_ss_usage_keyboard(cur, lang))
+                        _ss_usage_keyboard(cur, lang))
                 return
             lines = [
                 i18n.t("usage.current", lang, current=markup.escape_html(str(cur))),
@@ -2649,11 +2824,10 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             await reply(message, i18n.t("codesplit.set", lang, state=i18n.onoff(arg == "on", lang)))
             return
         with contextlib.suppress(Exception):
-            await bot.send_message(
+            await _send_menu(  # #173: native rich menu open
                 message.chat.id,
                 i18n.t("codesplit.show", lang, state=i18n.onoff(cur, lang)),
-                parse_mode="HTML",
-                reply_markup=_codesplit_kb(cur, lang),
+                _codesplit_kb(cur, lang),
             )
 
     @router.callback_query(F.data.startswith("csm:"))
@@ -2668,10 +2842,10 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         await sessions.set_split_code_messages(val)
         if cb.message is not None:
             with contextlib.suppress(Exception):
-                await cb.message.edit_text(
+                await _edit_menu(  # #173: native rich nav-edit
+                    cb.message,
                     i18n.t("codesplit.show", lang, state=i18n.onoff(val, lang)),
-                    parse_mode="HTML",
-                    reply_markup=_codesplit_kb(val, lang),
+                    _codesplit_kb(val, lang),
                 )
         with contextlib.suppress(Exception):
             await cb.answer(i18n.t("settings.saved", lang))
@@ -2699,11 +2873,10 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             await reply(message, i18n.t("workingplate.set", lang, state=i18n.onoff(arg == "on", lang)))
             return
         with contextlib.suppress(Exception):
-            await bot.send_message(
+            await _send_menu(  # #173: native rich menu open
                 message.chat.id,
                 i18n.t("workingplate.show", lang, state=i18n.onoff(cur, lang)),
-                parse_mode="HTML",
-                reply_markup=_workingplate_kb(cur, lang),
+                _workingplate_kb(cur, lang),
             )
 
     @router.callback_query(F.data.startswith("wpl:"))
@@ -2718,10 +2891,10 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         await sessions.set_working_plate(val)
         if cb.message is not None:
             with contextlib.suppress(Exception):
-                await cb.message.edit_text(
+                await _edit_menu(  # #173: native rich nav-edit
+                    cb.message,
                     i18n.t("workingplate.show", lang, state=i18n.onoff(val, lang)),
-                    parse_mode="HTML",
-                    reply_markup=_workingplate_kb(val, lang),
+                    _workingplate_kb(val, lang),
                 )
         with contextlib.suppress(Exception):
             await cb.answer(i18n.t("settings.saved", lang))
@@ -2977,9 +3150,9 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         set (owner request). The token column shows the #120 ROLLING caps (day/week)."""
         async def _usage_line(uid):
             try:
-                bd = await db.get_user_usage_breakdown(uid)
-                return i18n.t("users.entry_usage", lang, day=_fmt_tokens(bd["day"]),
-                              week=_fmt_tokens(bd["week"]), total=_fmt_tokens(bd["total"]))
+                ub = await db.get_user_units_breakdown(uid)  # #165: weighted units
+                return i18n.t("users.entry_usage", lang, day=_fmt_tokens(ub["day"]),
+                              week=_fmt_tokens(ub["week"]), total=_fmt_tokens(ub["total"]))
             except Exception:
                 return None
 
@@ -3073,6 +3246,10 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         tid = d.get("id")
         bd = await db.get_user_usage_breakdown(tid) if tid is not None else \
             {"day": 0, "week": 0, "total": 0, "requests": 0}
+        # #165: the day/week/total figures on the card are WEIGHTED USAGE UNITS (the
+        # same metric the caps enforce); the request count stays from the raw breakdown.
+        ub = await db.get_user_units_breakdown(tid) if tid is not None else \
+            {"day": 0, "week": 0, "total": 0}
         rate = d.get("rate") or {"day": None, "week": None}
 
         def cap(v):
@@ -3085,6 +3262,11 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 return i18n.t("usercard.idle_default", lang)
             return "∞" if int(v) <= 0 else f"{int(v)}m"
 
+        def _ms_lbl(v):  # session limit: None → "default", 0 → ∞, N → "{N}"
+            if v is None:
+                return i18n.t("usercard.sessions_default", lang)
+            return "∞" if int(v) <= 0 else str(int(v))
+
         kind_label = (i18n.t("usercard.kind_owner", lang) if is_owner else
                       i18n.t("usercard.kind_pending", lang) if d["kind"] == "pending" else "")
         lines = [
@@ -3096,8 +3278,9 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             i18n.t("usercard.memory", lang, state=i18n.onoff(d.get("global_memory"), lang)),
             i18n.t("usercard.maxeffort", lang, state=i18n.onoff(d.get("allow_max_effort"), lang)),
             i18n.t("usercard.tools", lang, tools=_fmt_cap(d.get("tool_cap"), lang)),
-            i18n.t("usercard.usage", lang, day=_fmt_tokens(bd["day"]), week=_fmt_tokens(bd["week"]),
-                   total=_fmt_tokens(bd["total"]), reqs=bd["requests"]),
+            i18n.t("usercard.sessions", lang, val=_ms_lbl(d.get("max_sessions"))),
+            i18n.t("usercard.usage", lang, day=_fmt_tokens(ub["day"]), week=_fmt_tokens(ub["week"]),
+                   total=_fmt_tokens(ub["total"]), reqs=bd["requests"]),
         ]
         if d.get("global_memory") and not is_owner:
             lines.append(i18n.t("usercard.memory_warn", lang))
@@ -3111,6 +3294,8 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         # (the owner can set it on themselves to tune/test reaper behaviour).
         idle_btn = B(text=i18n.t("usercard.btn_idle", lang, val=_idle_lbl(idle_raw)),
                      callback_data=f"usr:idle:{target}")
+        ses_btn = B(text=i18n.t("usercard.btn_sessions", lang, val=_ms_lbl(d.get("max_sessions"))),
+                    callback_data=f"usr:max:{target}")
         if is_owner:
             # #185: the owner can self-impose the per-user limits (to TEST them). Show
             # the same toggles as a guest EXCEPT level/expiry/access/name/remove (the
@@ -3123,13 +3308,15 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                            callback_data=f"usr:tools:{target}"),
                          idle_btn])
             rows.append([B(text=i18n.t("usercard.btn_day", lang), callback_data=f"usr:rday:{target}"),
-                         B(text=i18n.t("usercard.btn_week", lang), callback_data=f"usr:rweek:{target}")])
+                         B(text=i18n.t("usercard.btn_week", lang), callback_data=f"usr:rweek:{target}"),
+                         ses_btn])
             if rate.get("day") is not None or rate.get("week") is not None:
                 rows.append([B(text=i18n.t("usercard.btn_clear_limits", lang), callback_data=f"usr:rclr:{target}")])
         else:
             nxt = "code" if d.get("level") == "chat" else "chat"
             rows.append([B(text=i18n.t("usercard.btn_level", lang, level=d.get("level", "chat"), next=nxt),
-                           callback_data=f"usr:lvl:{target}")])
+                           callback_data=f"usr:lvl:{target}"),
+                         ses_btn])
             rows.append([mem_btn,
                          B(text=i18n.t("usercard.btn_maxeffort", lang, state=i18n.onoff(d.get("allow_max_effort"), lang)),
                            callback_data=f"usr:eff:{target}")])
@@ -3218,9 +3405,9 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             await reply(message, i18n.t("common.owner_only_access", lang))
             return
         snap = allowlist.snapshot()
-        await bot.send_message(
+        await _send_menu(  # #173: native rich menu open
             message.chat.id, "\n".join(await _users_text(snap, lang)),
-            parse_mode="HTML", reply_markup=_users_keyboard(snap, lang),
+            _users_keyboard(snap, lang),
         )
 
     @router.callback_query(F.data.startswith("usr:"))
@@ -3255,8 +3442,9 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             if verb == "list":
                 snap = allowlist.snapshot()
                 with contextlib.suppress(Exception):
-                    await msg.edit_text("\n".join(await _users_text(snap, lang)), parse_mode="HTML",
-                                        reply_markup=_users_keyboard(snap, lang))
+                    await _edit_menu(  # #173: native rich nav-edit
+                        msg, "\n".join(await _users_text(snap, lang)),
+                        _users_keyboard(snap, lang))
                 await cb.answer()
                 return
             if verb == "stats":
@@ -3268,14 +3456,14 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 await _send_userstats(msg.chat.id, send_kwargs, lang)
                 await cb.answer()
                 return
-            if verb in ("exp", "rday", "rweek", "name", "idle"):
+            if verb in ("exp", "rday", "rweek", "name", "idle", "max"):
                 # Free-text value → arg-capture the owner's next message.
                 action = {"exp": "usrexp", "rday": "usrrday", "rweek": "usrrweek",
-                          "name": "usrname", "idle": "usridle"}[verb]
+                          "name": "usrname", "idle": "usridle", "max": "usrmax"}[verb]
                 pending[(msg.chat.id, thread_key(msg), cb.from_user.id)] = f"{action}:{target}"
                 prompt = {"exp": "usercard.prompt_expiry", "rday": "usercard.prompt_day",
                           "rweek": "usercard.prompt_week", "name": "usercard.prompt_name",
-                          "idle": "usercard.prompt_idle"}[verb]
+                          "idle": "usercard.prompt_idle", "max": "usercard.prompt_sessions"}[verb]
                 with contextlib.suppress(Exception):
                     await bot.send_message(msg.chat.id, i18n.t(prompt, lang), parse_mode="HTML")
                 await cb.answer()
@@ -3283,7 +3471,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             if verb == "tools":
                 text, kb = await _render_user_tools(target, lang)
                 with contextlib.suppress(Exception):
-                    await msg.edit_text(text, parse_mode="HTML", reply_markup=kb)
+                    await _edit_menu(msg, text, kb)  # #173: native rich nav-edit
                 await cb.answer()
                 return
             if verb == "tcap":
@@ -3301,14 +3489,14 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                     allowlist.set_tool_cap(tgt, None if set(ordered) == set(ALL_TOOLS) else ordered)
                 text, kb = await _render_user_tools(tgt, lang)
                 with contextlib.suppress(Exception):
-                    await msg.edit_text(text, parse_mode="HTML", reply_markup=kb)
+                    await _edit_menu(msg, text, kb)  # #173: native rich nav-edit
                 await cb.answer()
                 return
             if verb == "acc":
                 # Per-user ACCESS-exceptions sub-page (#151, menu.md §3.4).
                 text, kb = await _render_user_access(target, lang)
                 with contextlib.suppress(Exception):
-                    await msg.edit_text(text, parse_mode="HTML", reply_markup=kb)
+                    await _edit_menu(msg, text, kb)  # #173: native rich nav-edit
                 await cb.answer()
                 return
             if verb == "accopt":
@@ -3319,10 +3507,11 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                     return
                 setting = ss.SETTINGS[skey]
                 with contextlib.suppress(Exception):
-                    await msg.edit_text(
+                    await _edit_menu(  # #173: native rich nav-edit
+                        msg,
                         i18n.t("usercard.access_opt_title", lang,
                                name=_setting_name(setting, lang)),
-                        parse_mode="HTML", reply_markup=_user_access_picker_kb(tgt, skey, lang))
+                        _user_access_picker_kb(tgt, skey, lang))
                 await cb.answer()
                 return
             if verb == "accset":
@@ -3334,8 +3523,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                         allowlist.set_access_exception(
                             tgt, skey, None if level == "base" else level)
                     text, kb = await _render_user_access(tgt, lang)
-                    with contextlib.suppress(Exception):
-                        await msg.edit_text(text, parse_mode="HTML", reply_markup=kb)
+                    await _edit_menu(msg, text, kb)  # #173: native rich nav-edit
                 await cb.answer(i18n.t("settings.saved", lang))
                 return
             if verb == "del":
@@ -3346,17 +3534,19 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                                           callback_data=f"usr:card:{target}")],
                 ])
                 with contextlib.suppress(Exception):
-                    await msg.edit_text(i18n.t("usercard.confirm_remove", lang,
-                                               who=markup.escape_html(target)),
-                                        parse_mode="HTML", reply_markup=kb)
+                    await _edit_menu(  # #173: native rich nav-edit
+                        msg, i18n.t("usercard.confirm_remove", lang,
+                                    who=markup.escape_html(target)),
+                        kb)
                 await cb.answer()
                 return
             if verb == "delok":
                 allowlist.remove(target)
                 snap = allowlist.snapshot()
                 with contextlib.suppress(Exception):
-                    await msg.edit_text("\n".join(await _users_text(snap, lang)), parse_mode="HTML",
-                                        reply_markup=_users_keyboard(snap, lang))
+                    await _edit_menu(  # #173: native rich nav-edit
+                        msg, "\n".join(await _users_text(snap, lang)),
+                        _users_keyboard(snap, lang))
                 await cb.answer(i18n.t("common.deleted", lang))
                 return
             # In-place toggles (re-render the card afterwards).
@@ -3376,7 +3566,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 allowlist.set_rate(target, day=None, week=None)
             text, kb = await _render_user_card(target, lang)
             with contextlib.suppress(Exception):
-                await msg.edit_text(text, parse_mode="HTML", reply_markup=kb)
+                await _edit_menu(msg, text, kb)  # #173: native rich nav-edit
             await cb.answer()
         except Exception:
             with contextlib.suppress(Exception):
@@ -3440,8 +3630,48 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                     await reply(message, i18n.t("limit.bad", lang))
                     return
                 await db.set_user_default(tid, "idle_ttl_min", minutes)
+        elif kind == "usrmax":
+            # Per-user session-count cap. default/clear/- → inherit the global default;
+            # off/none/unlimited/0 → 0 (unlimited); else a positive integer.
+            low = raw.lower()
+            if low in ("default", "clear", "reset", "-"):
+                allowlist.set_max_sessions(target, None)
+            elif low in ("off", "none", "unlimited", "0"):
+                allowlist.set_max_sessions(target, 0)
+            else:
+                try:
+                    n = int(raw)
+                except ValueError:
+                    await reply(message, i18n.t("limit.bad", lang))
+                    return
+                if n < 1:
+                    await reply(message, i18n.t("limit.bad", lang))
+                    return
+                allowlist.set_max_sessions(target, n)
         card_text, kb = await _render_user_card(target, lang)
-        await bot.send_message(message.chat.id, card_text, parse_mode="HTML", reply_markup=kb)
+        await _send_menu(message.chat.id, card_text, kb)  # #173: native rich user card
+
+    async def _set_global_session_limit(message: Message, text: str) -> None:
+        """Owner sets the GLOBAL default per-user session limit (kv `max_sessions_default`;
+        applies to users without a per-user override). off/none/unlimited/0 → unlimited."""
+        lang = _lang(message)
+        if not _is_owner(message):
+            return
+        low = text.strip().lower()
+        if low in ("off", "none", "unlimited", "0"):
+            await db.set_kv("max_sessions_default", "0")
+            await reply(message, i18n.t("admin.gsl_saved", lang, val="∞"))
+            return
+        try:
+            n = int(text.strip())
+        except ValueError:
+            await reply(message, i18n.t("limit.bad", lang))
+            return
+        if n < 1:
+            await reply(message, i18n.t("limit.bad", lang))
+            return
+        await db.set_kv("max_sessions_default", str(n))
+        await reply(message, i18n.t("admin.gsl_saved", lang, val=str(n)))
 
     @router.message(Command("status"))
     async def cmd_status(message: Message) -> None:
@@ -3637,8 +3867,11 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 await reply(message, i18n.t("limits.account_empty", lang))
             return
 
-        # Delegated user → their own trailing-24h / trailing-7d token use vs cap.
-        bd = await db.get_user_usage_breakdown(uid)
+        # Delegated user → their own trailing-24h / trailing-7d use vs cap. #165: the
+        # day/week figures and the caps are WEIGHTED USAGE UNITS (cost-aware), while the
+        # request count still comes from the raw breakdown.
+        bd = await db.get_user_usage_breakdown(uid)      # for the request count
+        ub = await db.get_user_units_breakdown(uid)      # weighted units (#165)
         caps = allowlist.rate_of(uid, uname)
 
         def _row(label: str, used: int, cap) -> str:
@@ -3650,12 +3883,17 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             return (f"{label}: <b>{_fmt_tokens(used)}</b> "
                     f"({i18n.t('limits.no_cap', lang)})")
 
+        scap = await _effective_max_sessions(uid, uname)
+        _, scount = await db.browse_threads(uid, limit=1)
+        scap_lbl = i18n.t("limits.unlimited_word", lang) if scap <= 0 else str(scap)
         lines = [
             i18n.t("limits.header", lang),
-            _row(i18n.t("limits.today", lang), bd["day"], caps.get("day")),
-            _row(i18n.t("limits.week", lang), bd["week"], caps.get("week")),
+            _row(i18n.t("limits.today", lang), ub["day"], caps.get("day")),
+            _row(i18n.t("limits.week", lang), ub["week"], caps.get("week")),
             f"{i18n.t('limits.requests', lang)}: <b>{bd['requests']}</b>",
+            i18n.t("limits.sessions", lang, used=scount, cap=scap_lbl),
             i18n.t("limits.rolling_note", lang),
+            i18n.t("limits.units_note", lang),
         ]
         await reply(message, "\n".join(lines))
 
@@ -3959,10 +4197,8 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         send_kwargs: dict = {}
         if message.message_thread_id:
             send_kwargs["message_thread_id"] = message.message_thread_id
-        with contextlib.suppress(Exception):
-            await bot.send_message(
-                message.chat.id, text, parse_mode="HTML", reply_markup=kb, **send_kwargs
-            )
+        # #173: native rich menu open
+        await _send_menu(message.chat.id, text, kb, **send_kwargs)
 
     @router.callback_query(F.data.startswith("qx:"))
     async def on_queue_cb(cb: CallbackQuery) -> None:
@@ -3995,7 +4231,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 await cb.answer(i18n.t("queue.cancelled_toast" if removed else "queue.already_running", lang))
             text, kb = await _render_queue(key, lang)
             with contextlib.suppress(Exception):
-                await msg.edit_text(text, parse_mode="HTML", reply_markup=kb)
+                await _edit_menu(msg, text, kb)  # #173: native rich nav-edit
         except Exception:
             with contextlib.suppress(Exception):
                 await cb.answer(i18n.t("common.error", _lang(cb)))
@@ -4086,21 +4322,24 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         # session) — mirrors the run-time code-level gate above. Owner is exempt.
         if st is not None and st.effort == "max" and not _may_max_effort(uid, uname):
             await db.set_effort(key, "xhigh")
-        # Rolling-window rate limits (#120): deny when the user's trailing-24h or
-        # trailing-7d input+output tokens reach their cap. Windows are computed from
-        # usage timestamps, so they free up on their own (no reset job). The legacy
-        # lifetime token_grant (#105) is no longer enforced — superseded by these.
+        # Rolling-window rate limits (#120 → #165): deny when the user's trailing-24h or
+        # trailing-7d WEIGHTED USAGE UNITS reach their cap. Windows are computed from
+        # usage timestamps, so they free up on their own (no reset job). #165: the cap
+        # now counts cost-weighted units (model weight + cache + output) instead of raw
+        # input+output, so a big warm context no longer reads as near-zero spend; caps
+        # are therefore interpreted in units (≈ Sonnet-input-token-equivalents). The
+        # legacy lifetime token_grant (#105) is not enforced — superseded by these.
         rate = allowlist.rate_of(uid, uname)
         now = time.time()
         day_cap = rate.get("day")
         if day_cap is not None:
-            used = await db.get_user_usage_tokens(uid, since=now - 86400)
+            used = await db.get_user_usage_units(uid, since=now - 86400)
             if used >= day_cap:
                 return i18n.t("access.rate_day_exceeded", lang,
                               used=_fmt_tokens(used), cap=_fmt_tokens(day_cap))
         week_cap = rate.get("week")
         if week_cap is not None:
-            used = await db.get_user_usage_tokens(uid, since=now - 7 * 86400)
+            used = await db.get_user_usage_units(uid, since=now - 7 * 86400)
             if used >= week_cap:
                 return i18n.t("access.rate_week_exceeded", lang,
                               used=_fmt_tokens(used), cap=_fmt_tokens(week_cap))

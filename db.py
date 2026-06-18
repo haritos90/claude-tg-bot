@@ -223,6 +223,19 @@ async def init_db(db_path: str) -> None:
             await _conn.execute(
                 "ALTER TABLE threads ADD COLUMN auto_compact INTEGER DEFAULT 0"
             )
+        # #165: the per-turn MODEL and the live CONTEXT size are needed to compute the
+        # weighted "usage units" metric (a cost-aware proxy for the official windows;
+        # see get_user_usage_units). Older rows have NULL model / 0 context — they
+        # simply weight as the default-model baseline with no context term.
+        cur = await _conn.execute("PRAGMA table_info(usage)")
+        ucols = {col["name"] for col in await cur.fetchall()}
+        await cur.close()
+        if "model" not in ucols:
+            await _conn.execute("ALTER TABLE usage ADD COLUMN model TEXT")
+        if "context_tokens" not in ucols:
+            await _conn.execute(
+                "ALTER TABLE usage ADD COLUMN context_tokens INTEGER DEFAULT 0"
+            )
         await _conn.commit()
 
 
@@ -579,9 +592,13 @@ async def reset_thread(thread_id: int) -> None:
 
 
 async def add_usage(
-    thread_id: int, usage: dict | None, cost_usd: float | None
+    thread_id: int, usage: dict | None, cost_usd: float | None,
+    model: str | None = None, context_tokens: int = 0,
 ) -> None:
-    """Append one usage record. Missing keys default to 0."""
+    """Append one usage record. Missing keys default to 0. ``model`` and
+    ``context_tokens`` (#165) are stored alongside the raw token counts so the
+    weighted ``usage_units`` metric can be computed at query time from each turn's
+    own data (concurrency-safe — no shared global gauge)."""
     usage = usage or {}
 
     def _int(key: str) -> int:
@@ -601,13 +618,19 @@ async def add_usage(
     cache_creation = _int("cache_creation_input_tokens")
     cost = float(cost_usd) if cost_usd is not None else 0.0
 
+    try:
+        ctx_tokens = int(context_tokens or 0)
+    except (TypeError, ValueError):
+        ctx_tokens = 0
+
     conn = _require_conn()
     async with _lock:
         await conn.execute(
             """
             INSERT INTO usage
-                (thread_id, ts, input_tokens, output_tokens, cache_read, cache_creation, cost_usd)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                (thread_id, ts, input_tokens, output_tokens, cache_read, cache_creation,
+                 cost_usd, model, context_tokens)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 thread_id,
@@ -617,6 +640,8 @@ async def add_usage(
                 cache_read,
                 cache_creation,
                 cost,
+                model,
+                ctx_tokens,
             ),
         )
         await conn.commit()
@@ -701,6 +726,91 @@ async def get_user_usage_breakdown(user_id: int) -> dict:
         "week": int(row["week"] or 0),
         "total": int(row["total"] or 0),
         "requests": int(row["requests"] or 0),
+    }
+
+
+# #165: weighted "usage units" — a cost-aware per-turn metric that mirrors how the
+# shared subscription windows actually fill, so a user with a big WARM context (cheap
+# input but a huge cache_read re-read every turn) is no longer under-counted by the
+# raw input+output total. A unit is a cost-weighted token-equivalent, baselined on a
+# Sonnet INPUT token; the coefficients track Anthropic list-price ratios:
+#   unit = MODEL_WEIGHT * (input + OUT*output + CC*cache_creation + CR*cache_read)
+# Computed at QUERY time from each row's stored raw columns + model, so the weights are
+# tunable here with NO migration, and every turn's cost is derived only from its own
+# numbers (concurrency-safe — not a before/after delta on a shared global gauge). The
+# model is matched by substring, so a "[1m]" / dated suffix still resolves.
+USAGE_OUTPUT_MULT = 5.0          # output tokens ≈ 5× input price
+USAGE_CACHE_CREATE_MULT = 1.25   # cache write ≈ 1.25× input price
+USAGE_CACHE_READ_MULT = 0.10     # cache read ≈ 0.1× input price
+USAGE_MODEL_WEIGHT_OPUS = 5.0    # Opus ≈ 5× Sonnet input price
+USAGE_MODEL_WEIGHT_SONNET = 1.0  # baseline
+USAGE_MODEL_WEIGHT_HAIKU = 0.27  # Haiku ≈ 0.27× Sonnet input price
+USAGE_MODEL_WEIGHT_DEFAULT = 1.0  # unknown / NULL model → Sonnet-equivalent baseline
+
+
+def _units_sql_expr() -> str:
+    """SQL sub-expression turning one ``usage u`` row into weighted units (#165). The
+    numeric weights are trusted module constants formatted inline (never user input)."""
+    return (
+        "((CASE "
+        f"WHEN u.model LIKE '%opus%'   THEN {USAGE_MODEL_WEIGHT_OPUS} "
+        f"WHEN u.model LIKE '%sonnet%' THEN {USAGE_MODEL_WEIGHT_SONNET} "
+        f"WHEN u.model LIKE '%haiku%'  THEN {USAGE_MODEL_WEIGHT_HAIKU} "
+        f"ELSE {USAGE_MODEL_WEIGHT_DEFAULT} END) "
+        f"* (COALESCE(u.input_tokens,0) + {USAGE_OUTPUT_MULT}*COALESCE(u.output_tokens,0) "
+        f"+ {USAGE_CACHE_CREATE_MULT}*COALESCE(u.cache_creation,0) "
+        f"+ {USAGE_CACHE_READ_MULT}*COALESCE(u.cache_read,0)))"
+    )
+
+
+async def get_user_usage_units(user_id: int, since: float | None = None) -> int:
+    """Total weighted usage UNITS a user has spent across all their sessions (#165) —
+    the cost-aware basis for the rolling-window caps, replacing the raw input+output
+    sum (which ignored cache tokens and model weight, so a user looked cheap while the
+    owner's window drained). With ``since`` (epoch seconds), counts only at-or-after
+    that time."""
+    conn = _require_conn()
+    query = (
+        f"SELECT COALESCE(SUM({_units_sql_expr()}), 0) AS u "
+        "FROM usage u JOIN threads th ON u.thread_id = th.thread_id "
+        "WHERE th.chat_id = ?"
+    )
+    params: list = [user_id]
+    if since is not None:
+        query += " AND u.ts >= ?"
+        params.append(since)
+    async with _lock:
+        cur = await conn.execute(query, params)
+        row = await cur.fetchone()
+        await cur.close()
+    return int(row["u"] or 0)
+
+
+async def get_user_units_breakdown(user_id: int) -> dict:
+    """Weighted usage UNITS over the trailing day / week plus the lifetime total (#165),
+    mirroring get_user_usage_breakdown but in cost-weighted units (feeds the per-user
+    card + /limits)."""
+    now = time.time()
+    day_since = now - 86400
+    week_since = now - 7 * 86400
+    expr = _units_sql_expr()
+    conn = _require_conn()
+    async with _lock:
+        cur = await conn.execute(
+            f"SELECT "
+            f"COALESCE(SUM(CASE WHEN u.ts >= ? THEN {expr} ELSE 0 END), 0) AS day, "
+            f"COALESCE(SUM(CASE WHEN u.ts >= ? THEN {expr} ELSE 0 END), 0) AS week, "
+            f"COALESCE(SUM({expr}), 0) AS total "
+            "FROM usage u JOIN threads th ON u.thread_id = th.thread_id "
+            "WHERE th.chat_id = ?",
+            (day_since, week_since, user_id),
+        )
+        row = await cur.fetchone()
+        await cur.close()
+    return {
+        "day": int(row["day"] or 0),
+        "week": int(row["week"] or 0),
+        "total": int(row["total"] or 0),
     }
 
 

@@ -587,8 +587,8 @@ and are not part of this matrix.
 
 ### 4.6 Standing rules
 
-These are baked into the standard (and could be flipped if ever decided
-otherwise):
+These are baked into the standard (and could be flipped if the model is ever
+revised):
 
 - **Soft revoke.** Lowering an option's access keeps the user's stored values but
   stops counting them — the effective value falls back to global. Restoring access

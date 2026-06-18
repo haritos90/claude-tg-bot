@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -28,6 +29,7 @@ import archive
 import db
 import i18n
 import markup  # noqa: F401  (kept for symmetry / future formatting helpers)
+import token_refresh
 import usage
 import settings_schema
 from engine import ClaudeSession
@@ -244,6 +246,9 @@ class SessionManager:
         self._reaper_task: asyncio.Task | None = None
         # #178: background task purging expired archive bundles (retention).
         self._archive_purge_task: asyncio.Task | None = None
+        # #191: background task refreshing the subscription OAuth token before it
+        # expires (the on-disk token has a hard ~8h life; nothing else rotates it).
+        self._token_refresh_task: asyncio.Task | None = None
 
     # ------------------------------------------------------------------ records
 
@@ -446,6 +451,26 @@ class SessionManager:
             sandbox=self._resolve_sandbox(state),
             sandbox_uid=self.settings.sandbox_uid,
             sandbox_allow_exec=self.settings.sandbox_allow_exec,
+            # #119b: when the credential broker is on, the jail gets a dummy token +
+            # ANTHROPIC_BASE_URL pointing at the host broker (the real token stays out).
+            cred_broker_url=(f"http://127.0.0.1:{self.settings.cred_broker_port}"
+                             if getattr(self.settings, "cred_broker", False) else None),
+            # #119c/#119e: egress allowlist + per-jail DoS limits + seccomp. getattr-guarded
+            # so a minimal test Settings stub still constructs. cpu% → cpu.max "quota period"
+            # (100% = one core); mem MB → memory.max bytes.
+            egress=getattr(self.settings, "sandbox_egress", False),
+            egress_proxy_url=(f"http://127.0.0.1:{self.settings.egress_proxy_port}"
+                              if getattr(self.settings, "sandbox_egress", False) else None),
+            sbx_mem_max=(str(self.settings.sandbox_mem_mb * 1024 * 1024)
+                         if getattr(self.settings, "sandbox_mem_mb", 0) else None),
+            sbx_cpu_max=(f"{self.settings.sandbox_cpu_percent * 1000} 100000"
+                         if getattr(self.settings, "sandbox_cpu_percent", 0) else None),
+            sbx_pids_max=getattr(self.settings, "sandbox_pids_max", 0),
+            seccomp_path=((getattr(self.settings, "sandbox_seccomp_path", "") or None)
+                          if getattr(self.settings, "sandbox_seccomp", False) else None),
+            per_session_uid=getattr(self.settings, "sandbox_per_session_uid", False),
+            uid_base=getattr(self.settings, "sandbox_uid_base", 700000),
+            uid_range=getattr(self.settings, "sandbox_uid_range", 60000),
             extra_blocked_keywords=getattr(self.settings, "extra_blocked_keywords", None),
             auto_compact=eff.get("auto_compact", True),  # #168
         )
@@ -825,9 +850,18 @@ class SessionManager:
                     # current (last) burst in running_text — do NOT reuse ev.text,
                     # which for a multi-tool turn can repeat earlier segments.
                     final_text = running_text if segmented else (ev.text or running_text)
-                    # Persist usage + the resumable session id for this mode.
+                    # Persist usage + the resumable session id for this mode. #165:
+                    # also store the turn's model + last-known context size so the
+                    # weighted usage-units metric can be computed from each row's own
+                    # data (context_tokens is the most recent measured value — captured
+                    # at the end of the prior turn — and is informational; the units
+                    # formula itself bills cache_read, which already reflects context).
                     with contextlib.suppress(Exception):
-                        await db.add_usage(thread_id, ev.usage, ev.cost)
+                        await db.add_usage(
+                            thread_id, ev.usage, ev.cost,
+                            model=getattr(rec, "model", None),
+                            context_tokens=int(getattr(rec, "last_context_tokens", 0) or 0),
+                        )
                     if ev.session_id:
                         if rec.mode == "code":
                             with contextlib.suppress(Exception):
@@ -1655,6 +1689,18 @@ class SessionManager:
         if self._archive_purge_task is None or self._archive_purge_task.done():
             self._archive_purge_task = asyncio.create_task(self._archive_purge_loop())
 
+    # ------------------------------------------------- OAuth token refresh (#191)
+
+    def start_token_refresher(self) -> None:
+        """Start the proactive OAuth token refresher (idempotent). Keeps the on-disk
+        subscription token fresh so a turn after a long idle gap never 401s on an
+        expired token (see token_refresh). Best-effort + fail-soft — disable with
+        ``OAUTH_REFRESH=0`` in .env if ever needed."""
+        if os.environ.get("OAUTH_REFRESH", "1").strip() in ("0", "false", "off", "no"):
+            return
+        if self._token_refresh_task is None or self._token_refresh_task.done():
+            self._token_refresh_task = asyncio.create_task(token_refresh.refresh_loop())
+
     # ------------------------------------------------------------------ status
 
     def status(self, thread_id: int) -> dict:
@@ -1796,6 +1842,11 @@ class SessionManager:
             self._archive_purge_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._archive_purge_task
+        # #191: stop the OAuth token refresher too.
+        if self._token_refresh_task is not None and not self._token_refresh_task.done():
+            self._token_refresh_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._token_refresh_task
         for thread_id in list(self._records.keys()):
             rec = self._records.get(thread_id)
             if rec is None:
