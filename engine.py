@@ -123,6 +123,30 @@ OUTBOX_INSTRUCTION = (
     "(the --exclude stops the archive from recursing into itself)."
 )
 
+# #205: appended to the code-mode system prompt so the agent can answer the user
+# accurately about isolation (privacy / where files live / whether others can see them)
+# instead of guessing. The per-session-private workdir is ALWAYS true (#181 layout);
+# the FS-confinement / network-allowlist parts are hedged ("may be") since they depend
+# on whether the sandbox layers (#119/#180) are enabled.
+# #208: the opening previously asserted isolation unconditionally ("inside an isolated,
+# per-session sandbox … you cannot see or reach another session's files"), but that
+# enforcement only holds when the sandbox layers are on, so it is hedged too now. Only
+# the per-session SEPARATE directory (#181 layout) is stated as always-true. was:
+#   "You run inside an isolated, per-session sandbox. Your working directory is "
+#   "PRIVATE to this session — it is not shared with any other user or session, and "
+#   "you cannot see or reach another session's files (each session gets its own "
+#   "separate directory). Your filesystem access is confined to this working directory "
+ISOLATION_NOTE = (
+    "\n\n## Your environment\n"
+    "You run in a per-session sandbox. Your working directory is PRIVATE to this "
+    "session — each session is given its own separate directory, not shared with any "
+    "other user or session. Filesystem access may be confined to this working directory "
+    "(paths outside it may be read-only or unavailable), and network access may be "
+    "restricted to an allowlist of hosts. If the user asks whether their files are "
+    "private, whether other people can see them, or where their work lives, explain "
+    "this per-session isolation accurately rather than guessing."
+)
+
 # The full universe of tools the model may CALL in code mode (the `tools`
 # option). Availability != auto-permission: dangerous tools here are NOT in
 # allowed_tools, so the CLI's permission rules evaluate to "ask" and our
@@ -625,7 +649,9 @@ class ClaudeSession:
             # Code preset — keeps the full agent prompt intact (the #130 mechanism),
             # instead of loading via setting_sources=["user"] (+ settings.json). was:
             # only set system_prompt when mem_block was non-empty (#130).
-            append = OUTBOX_INSTRUCTION + (("\n\n" + mem_block) if mem_block else "")
+            # #205: also state the per-session isolation so the agent can answer the
+            # user accurately if asked about privacy / where their files live.
+            append = OUTBOX_INSTRUCTION + ISOLATION_NOTE + (("\n\n" + mem_block) if mem_block else "")
             code_extra["system_prompt"] = {
                 "type": "preset", "preset": "claude_code", "append": append,
             }

@@ -10,6 +10,7 @@ is resolved by handle_decision() when the owner taps a button.
 
 import asyncio
 import contextlib
+import os
 
 from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -46,7 +47,24 @@ def _truncate(value: str, limit: int = _PREVIEW_LIMIT) -> str:
     return value[: limit - 1] + "…"
 
 
-def _preview_input(tool_name: str, tool_input: dict | None) -> str:
+def _rel_to_cwd(path: str, cwd: str | None) -> str:
+    """#204: render an in-workdir absolute path relative to the session's working
+    directory, so an approval prompt shows ``readme.md`` instead of the full
+    ``/var/lib/.../<sid>/work/readme.md``. A path OUTSIDE the workdir keeps its
+    absolute form on purpose — a tool reaching out of the sandbox should stand out."""
+    if not cwd or not os.path.isabs(path):
+        return path
+    try:
+        acwd = os.path.abspath(cwd)
+        ap = os.path.abspath(path)
+        if ap == acwd or ap.startswith(acwd + os.sep):
+            return os.path.relpath(ap, acwd)
+    except Exception:
+        pass
+    return path
+
+
+def _preview_input(tool_name: str, tool_input: dict | None, cwd: str | None = None) -> str:
     """Build a compact, human-readable preview of the tool input."""
     if not tool_input:
         return ""
@@ -68,6 +86,8 @@ def _preview_input(tool_name: str, tool_input: dict | None) -> str:
     for key in candidate_keys:
         val = tool_input.get(key)
         if isinstance(val, str) and val.strip():
+            if key in ("file_path", "notebook_path", "path"):
+                val = _rel_to_cwd(val, cwd)  # #204: show paths relative to the workdir
             return _truncate(val)
 
     # Fallback: a short rendering of the whole dict.
@@ -122,6 +142,7 @@ class PermissionGate:
         send_thread_id: int | None,
         key: int,
         permission_mode: str = "default",
+        cwd: str | None = None,
     ):
         """Return a can_use_tool coroutine bound to a chat/session.
 
@@ -178,7 +199,7 @@ class PermissionGate:
                 ]
             )
 
-            preview = _preview_input(tool_name, tool_input)
+            preview = _preview_input(tool_name, tool_input, cwd)
             lines = [
                 i18n.t("permgate.request", lang, tool=_escape(tool_name)),
             ]

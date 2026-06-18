@@ -419,8 +419,10 @@ CATALOG: dict[str, dict[str, str]] = {
     "sessions.row": {
         # #136: dropped the leading <code>{sid}</code> — the public id is noise to
         # the user; the list now leads with the icon + name.
-        "en": "{icon} <b>{name}</b> — {mode} · {date}{mark}",
-        "ru": "{icon} <b>{name}</b> — {mode} · {date}{mark}",
+        # #211: dropped {mode}/{date} too — the icon already conveys the mode and the
+        # date is list noise. was: "{icon} <b>{name}</b> — {mode} · {date}{mark}"
+        "en": "{icon} <b>{name}</b>{mark}",
+        "ru": "{icon} <b>{name}</b>{mark}",
     },
     "sessions.row_stats": {
         "en": "    {reqs} msgs · {toks} tok",

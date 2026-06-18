@@ -947,6 +947,23 @@ def as_document(text: str, filename: str) -> BufferedInputFile:
     """
     bom = chr(0xFEFF)  # UTF-8 BOM, written explicitly (it is invisible in source)
     data = text or ""
-    if filename.endswith((".md", ".txt")) and not data.startswith(bom):
+    # #209: case-insensitive match, mirroring ensure_text_bom (the bytes-level twin),
+    # so a `.MD`/`.TXT` is BOM'd by both paths. was: filename.endswith((".md", ".txt"))
+    if filename.lower().endswith((".md", ".txt")) and not data.startswith(bom):
         data = bom + data
     return BufferedInputFile(data.encode("utf-8"), filename=filename)
+
+
+_UTF8_BOM = b"\xef\xbb\xbf"
+
+
+def ensure_text_bom(data: bytes, filename: str) -> bytes:
+    """#206: prepend a UTF-8 BOM to a user-facing ``.md``/``.txt`` file's bytes when
+    absent, so mobile/legacy viewers detect UTF-8 instead of guessing a charset and
+    rendering non-ASCII (Cyrillic, accents, CJK, …) as mojibake. Language-agnostic; a
+    no-op for other file types and for content that already carries a BOM. The
+    bytes-level twin of :func:`as_document` (which BOMs ``str`` content), used when the
+    bot ships an agent-created file verbatim (the outbox channel)."""
+    if filename.lower().endswith((".md", ".txt")) and not data.startswith(_UTF8_BOM):
+        return _UTF8_BOM + data
+    return data

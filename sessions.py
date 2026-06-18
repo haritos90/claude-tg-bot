@@ -28,7 +28,7 @@ from aiogram.types import BufferedInputFile
 import archive
 import db
 import i18n
-import markup  # noqa: F401  (kept for symmetry / future formatting helpers)
+import markup
 import token_refresh
 import usage
 import settings_schema
@@ -418,7 +418,8 @@ class SessionManager:
             # The gate uses the EFFECTIVE permission_mode (a soft-revoked full-access
             # reverts to asking).
             can_use_tool = self.gate.make_callback(
-                state.chat_id, send_tid, state.thread_id, eff["permission_mode"]
+                state.chat_id, send_tid, state.thread_id, eff["permission_mode"],
+                cwd=state.cwd,  # #204: relativize tool-path previews to the workdir
             )
             resume_id = state.code_session_id
         else:
@@ -1786,6 +1787,10 @@ class SessionManager:
                 data = path.read_bytes()
             except OSError:
                 continue
+            if not is_img:
+                # #206: a .md/.txt the agent dropped in outbox/ is shipped verbatim;
+                # add a UTF-8 BOM (if absent) so mobile viewers don't mojibake non-ASCII.
+                data = markup.ensure_text_bom(data, path.name)
             upload = BufferedInputFile(data, filename=path.name)
             try:
                 if is_img:

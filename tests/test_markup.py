@@ -350,3 +350,17 @@ def test_split_code_blocks_no_code_is_single_text():
     assert markup.split_code_blocks("just prose, no fence") == [("text", "just prose, no fence")]
     assert markup.has_code_block("inline `code` only") is False
     assert markup.has_code_block("```\nblock\n```") is True
+
+
+def test_ensure_text_bom():  # #206
+    bom = b"\xef\xbb\xbf"
+    # .md / .txt with non-ASCII gain a BOM so mobile viewers detect UTF-8.
+    body = "café".encode("utf-8")
+    assert markup.ensure_text_bom(body, "report.md") == bom + body
+    assert markup.ensure_text_bom(body, "notes.TXT") == bom + body  # case-insensitive
+    # Idempotent — never double-BOMs.
+    assert markup.ensure_text_bom(bom + body, "report.md") == bom + body
+    # Other file types are shipped verbatim (a BOM would corrupt them).
+    png = b"\x89PNG\r\n"
+    assert markup.ensure_text_bom(png, "chart.png") == png
+    assert markup.ensure_text_bom(b"#!/bin/sh\n", "run.sh") == b"#!/bin/sh\n"
