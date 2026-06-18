@@ -47,8 +47,8 @@ def transcript_dir(workdir: str | Path, claude_home: Path | None = None) -> Path
     transcript ``*.jsonl`` for the given working directory.
 
     Claude Code names the project dir after the cwd, replacing every
-    non-alphanumeric character with ``-`` (so ``/root/claude/claude-tg-bot/
-    workdirs/cf8c89`` → ``-root-claude-claude-tg-bot-workdirs-cf8c89``). Verified
+    non-alphanumeric character with ``-`` (so ``/var/lib/claude-tg-bot/workdirs/
+    cf8c89/work`` → ``-var-lib-claude-tg-bot-workdirs-cf8c89-work``). Verified
     against the live deployment's project dirs.
     """
     home = claude_home or (Path.home() / ".claude")

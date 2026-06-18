@@ -163,6 +163,9 @@ class _ThreadRecord:
     # behavior (live streaming). last_prompt holds the most recent submitted
     # prompt for this thread (used by /retry).
     stream_enabled: bool = True
+    # #224: shell-mode overlay (route text → one-shot jailed command). Mirrors the
+    # persisted ThreadState.shell_mode; re-synced on rebuild like stream_enabled.
+    shell_mode: bool = False
     # Most recent (text, attachments) submitted for this thread (used by /retry).
     last_prompt: tuple | None = None
     # #167/#168: effective forced-on toggles the live session was built for, plus the
@@ -546,6 +549,7 @@ class SessionManager:
             rec.ctx_status = eff.get("ctx_status", True)       # #167
             # Restore the persisted /stream preference (survives restart).
             rec.stream_enabled = state.stream_enabled
+            rec.shell_mode = state.shell_mode  # #224: re-sync the shell overlay flag
         return rec.session
 
     # ------------------------------------------------------------------ entry
@@ -626,6 +630,10 @@ class SessionManager:
                 # ~1/sec, so the write-head path below is DORMANT (kept only for the
                 # frozen supergroup mode). There is no separate "drafts" toggle:
                 # whether to stream at all is the per-session stream_enabled flag.
+                # Stream DM replies via rich message DRAFTS (the smooth native typewriter),
+                # by design — this is the streaming standard. (Telegram may currently render
+                # them as whole messages client-side until it restores bot draft previews;
+                # we keep drafts regardless — write-head is a worse fallback we don't use.)
                 use_drafts = thread_id < 0
                 # #166: a new turn resets the warm-cache window → drop the previous
                 # turn's ticking countdown and its message.
@@ -710,6 +718,34 @@ class SessionManager:
         await streamer.update(remainder)
         return remainder, True
 
+    async def _run_shell_command(
+        self, rec: "_ThreadRecord", thread_id: int, prompt: str, streamer: Streamer
+    ) -> None:
+        """#224: execute `prompt` as a one-shot shell command in the session's jail and
+        post the output. No model, no tokens. A not-found command (exit 127) appends a
+        one-line hint — the user most likely toggled /shell on by accident."""
+        session = rec.session
+        lang = i18n.cached_lang(streamer.chat_id)
+        cmd = (prompt or "").strip()
+        if session is None or not cmd:
+            return
+        with contextlib.suppress(Exception):
+            await db.log_message(thread_id, "user", cmd)
+        rec.last_activity = time.monotonic()
+        try:
+            rc, out = await session.run_shell(cmd)
+        except Exception as exc:  # never let a shell failure kill the worker
+            rc, out = (-1, f"shell error: {exc}")
+        body = out.replace("\r\n", "\n").rstrip("\n")
+        cap = 60_000  # output cap (chars) — a runaway command can't flood the chat
+        if len(body) > cap:
+            body = body[:cap] + "\n... (truncated)"
+        rendered = "```\n" + (body or "(no output)") + "\n```"
+        if rc == 127:  # command not found → likely an accidental /shell
+            rendered += "\n" + i18n.t("shell.accidental", lang)
+        with contextlib.suppress(Exception):
+            await streamer.finish(rendered, notify=True)
+
     async def _run_one(
         self,
         rec: _ThreadRecord,
@@ -727,6 +763,12 @@ class SessionManager:
                 streamer.thread_id,
                 i18n.t("session.not_initialized", i18n.cached_lang(streamer.chat_id)),
             )
+            return
+
+        # #224: shell-mode overlay — route the message to a one-shot jailed command
+        # instead of the model (code sessions only; no tokens).
+        if rec.shell_mode and rec.mode == "code":
+            await self._run_shell_command(rec, thread_id, prompt, streamer)
             return
 
         # When streaming is off we never call streamer.start()/update(): no live
@@ -1188,6 +1230,14 @@ class SessionManager:
         # Persist so the preference survives a restart (#28).
         with contextlib.suppress(Exception):
             await db.set_stream_enabled(thread_id, on)
+
+    async def set_shell_mode(self, thread_id: int, on: bool) -> None:
+        """#224: toggle the shell-mode overlay for a code session (text → jailed
+        command). Mirrors set_stream: update the live record + persist."""
+        rec = self._record(thread_id)
+        rec.shell_mode = bool(on)
+        with contextlib.suppress(Exception):
+            await db.set_shell_mode(thread_id, on)
 
     # ------------------------------------------------------------------ usage
 

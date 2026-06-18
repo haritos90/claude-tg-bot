@@ -108,7 +108,7 @@ MAX_TEXT_INLINE_CHARS = 200_000
 # Friendly /permissions names <-> SDK permission_mode values (code mode only).
 # Per-name help text lives in the l10n table under "perm.help.<name>".
 PERM_NAME_TO_MODE: dict[str, str] = {
-    "ask": "default",
+    # "ask": "default",  # #223: "ask" dropped — auto-edits is the minimum floor now
     "auto-edits": "acceptEdits",
     "plan": "plan",
     "full-access": "bypassPermissions",
@@ -676,6 +676,8 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         if scope == ss.Scope.SESSION:
             if getattr(ctx.state, "mode", None) == "code":
                 rows.append([B(text=i18n.t("settings.row_tools", lang), callback_data="sx:tools")])
+                rows.append([B(text=i18n.t("settings.row_secret", lang),  # #222: discoverable
+                               callback_data="sx:secret")])
             if role >= ss.Role.OWNER:
                 rows.append([B(text=i18n.t("settings.row_usage", lang,
                                            val=getattr(sessions, "usage_mode", "footer")),
@@ -776,10 +778,11 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         choices = _setting_choice_labels(setting, lang)
         if setting.key == "effort" and not may_max:
             choices = [(v, lbl) for v, lbl in choices if v != "max"]
-        # full-access (bypassPermissions) disarms the approval gate → OWNER-ONLY
-        # (#150); hide it from non-owners (the apply path also rejects a forged tap).
-        if setting.key == "permission_mode" and ctx.role < ss.Role.OWNER:
-            choices = [(v, lbl) for v, lbl in choices if v not in ("full-access", "bypassPermissions")]
+        # #223: full-access (bypassPermissions) is now offered to all code users — the
+        # #119 sandbox (per-session uid + egress + jail) confines the blast radius to the
+        # user's own session and they opt into the risk. was OWNER-ONLY (#150):
+        # if setting.key == "permission_mode" and ctx.role < ss.Role.OWNER:
+        #     choices = [(v, lbl) for v, lbl in choices if v not in ("full-access", "bypassPermissions")]
         btns = [B(text=_mark(label, cur_label),
                   callback_data=f"sx:set:{sc_code}:{setting.key}:{cbval}")
                 for cbval, label in choices]
@@ -809,12 +812,13 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         # 4. Per-setting extra gates that the role matrix alone doesn't cover.
         if setting.key == "effort" and raw_val == "max" and not _may_max_effort(uid, uname):
             return False
-        # full-access (bypassPermissions) disarms the code-mode approval gate, so it
-        # is OWNER-ONLY (AGENTS §2 / #150) — reject a forged tap from a code user.
-        if (setting.key == "permission_mode"
-                and raw_val in ("full-access", "bypassPermissions")
-                and role < ss.Role.OWNER):
-            return False
+        # #223: full-access (bypassPermissions) un-gated for code users (the #119 sandbox
+        # confines it to their own session; the user opts into the risk). was OWNER-ONLY
+        # (AGENTS §2 / #150):
+        # if (setting.key == "permission_mode"
+        #         and raw_val in ("full-access", "bypassPermissions")
+        #         and role < ss.Role.OWNER):
+        #     return False
         # 5. Coerce the callback string into the stored value.
         value = _coerce_ss_value(setting, raw_val)
         # Setters may be sync (GLOBAL model/sandbox mutate config in-process) or
@@ -922,6 +926,23 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             if verb == "tab":
                 scope = _CODE_SCOPE.get(parts[2] if len(parts) > 2 else "s", ss.Scope.SESSION)
                 await _send_ss_hub(msg.chat.id, key, uid, uname, lang, scope, edit_msg=msg)
+                await cb.answer()
+                return
+
+            if verb == "secret":
+                # #222: open the /secret arg-capture prompt from the hub (Session tab,
+                # code only) so the feature is discoverable without the "/" command menu.
+                ctx = await _build_ss_ctx(key, uid, role)
+                if getattr(ctx.state, "mode", None) != "code":
+                    await cb.answer(i18n.t("common.error", lang))
+                    return
+                secrets = _read_secrets(key)
+                names = (", ".join(f"<code>{markup.escape_html(n)}</code>" for n in secrets)
+                         or i18n.t("secret.none", lang))
+                pending[(msg.chat.id, thread_key(msg), uid or 0)] = "secret"
+                kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+                    text=i18n.t("secret.btn_guide", lang), callback_data="secret:guide")]])
+                await _send_menu(msg.chat.id, i18n.t("secret.help", lang, names=names), kb)
                 await cb.answer()
                 return
 
@@ -1569,7 +1590,8 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         reqs, toks = await _session_stats(key)
         lines = [
             i18n.t("session.switched_to", lang, glyph=mode_glyph(st.mode),
-                   name=markup.escape_html(name)),
+                   name=markup.escape_html(name)
+                   + (" [shell]" if getattr(st, "shell_mode", False) else "")),
             mode_tagline(st.mode, cwd=st.cwd, lang=lang),
             i18n.t("session.card_meta", lang,
                    sid=db.session_sid(key),
@@ -1597,7 +1619,8 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         reqs, toks = await _session_stats(key)
         text = "\n".join([
             i18n.t("sessions.options_header", lang, glyph=mode_glyph(st.mode),
-                   name=markup.escape_html(name)),
+                   name=markup.escape_html(name)
+                   + (" [shell]" if getattr(st, "shell_mode", False) else "")),
             mode_tagline(st.mode, cwd=st.cwd, lang=lang),
             i18n.t("session.card_meta", lang, sid=db.session_sid(key),
                    model=MODEL_ID_TO_ALIAS.get(st.model, st.model),
@@ -2469,7 +2492,13 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         names = (", ".join(f"<code>{markup.escape_html(n)}</code>" for n in secrets)
                  or i18n.t("secret.none", lang))
         pending[_pkey(message)] = "secret"
-        await reply(message, i18n.t("secret.help", lang, names=names))
+        # #222: attach a "How to use" button → the detailed guide (secret.guide).
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+            text=i18n.t("secret.btn_guide", lang), callback_data="secret:guide")]])
+        skw: dict = {}
+        if getattr(message, "message_thread_id", None) is not None:
+            skw["message_thread_id"] = message.message_thread_id
+        await _send_menu(message.chat.id, i18n.t("secret.help", lang, names=names), kb, **skw)
 
     @router.message(Command("secret"))
     async def cmd_secret(message: Message) -> None:
@@ -2481,6 +2510,17 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             await reply(message, i18n.t("common.code_only", lang))
             return
         await _do_secret(message, _command_arg(message))
+
+    @router.callback_query(F.data == "secret:guide")
+    async def on_secret_guide_cb(cb: CallbackQuery) -> None:
+        """#222: show the detailed how-to (incl. the GitHub-over-HTTPS walkthrough)
+        behind the "How to use" button on the /secret prompt."""
+        lang = _lang(cb)
+        if cb.message is not None:
+            with contextlib.suppress(Exception):
+                await _send_menu(cb.message.chat.id, i18n.t("secret.guide", lang))
+        with contextlib.suppress(Exception):
+            await cb.answer()
 
     @router.message(Command("sandbox"))
     async def cmd_sandbox(message: Message) -> None:
@@ -2564,11 +2604,12 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             await reply(message, i18n.t("perm.unknown", lang, names=names))
             return
 
-        # full-access (bypassPermissions) removes every approval gate, so it is
-        # owner-only — a guest must not be able to disarm the code-mode gate.
-        if arg == "full-access" and not _is_owner(message):
-            await reply(message, i18n.t("perm.full_access_owner_only", lang))
-            return
+        # #223: full-access (bypassPermissions) is now available to all code users — the
+        # #119 sandbox confines it to their own session and they opt into the risk. was
+        # owner-only:
+        # if arg == "full-access" and not _is_owner(message):
+        #     await reply(message, i18n.t("perm.full_access_owner_only", lang))
+        #     return
 
         sdk_mode = PERM_NAME_TO_MODE[arg]
         await db.set_permission_mode(key, sdk_mode)
@@ -2604,7 +2645,8 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             # No arg → toggle in place (menu.md §2: "none → toggle"; #145). Was a
             # show-only reply that forced typing /auto on|off.
             new_on = not is_on
-            await db.set_permission_mode(key, "bypassPermissions" if new_on else "default")
+            # #223: off → the auto-edits floor (was "default"/ask, now removed).
+            await db.set_permission_mode(key, "bypassPermissions" if new_on else "acceptEdits")
             deferred = await _rebuild_session(key)
             note = i18n.t("common.defer_note", lang) if deferred else ""
             await reply(message, i18n.t("auto.on" if new_on else "auto.off", lang, note=note))
@@ -2613,11 +2655,26 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             await reply(message, i18n.t("auto.usage", lang))
             return
 
-        new_mode = "bypassPermissions" if arg == "on" else "default"
+        new_mode = "bypassPermissions" if arg == "on" else "acceptEdits"  # #223: was "default"/ask
         await db.set_permission_mode(key, new_mode)
         deferred = await _rebuild_session(key)
         note = i18n.t("common.defer_note", lang) if deferred else ""
         await reply(message, i18n.t("auto.on" if arg == "on" else "auto.off", lang, note=note))
+
+    @router.message(Command("shell"))
+    async def cmd_shell(message: Message) -> None:
+        """#224: toggle shell mode for THIS code session — one command flips it on/off.
+        In shell mode every message runs as a command in the session's jail (no model);
+        does NOT change the session type. Code sessions only."""
+        state = await _ensure_state(message)
+        lang = _lang(message)
+        if state.mode != "code":
+            await reply(message, i18n.t("shell.code_only", lang))
+            return
+        key = await _session_key(message)
+        new_on = not bool(state.shell_mode)
+        await sessions.set_shell_mode(key, new_on)
+        await reply(message, i18n.t("shell.on" if new_on else "shell.off", lang))
 
     @router.message(Command("usage"))
     async def cmd_usage(message: Message) -> None:
@@ -3635,7 +3692,8 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         sess_name = state.name or ("General" if key == 0 else f"#{abs(key)}")
         lines: list[str] = [
             "<h3>" + i18n.t("status.header", lang, glyph=mode_glyph(str(mode)),
-                            name=markup.escape_html(sess_name),
+                            name=markup.escape_html(sess_name)
+                            + (" [shell]" if getattr(state, "shell_mode", False) else ""),
                             mode=i18n.mode_word(str(mode), lang),
                             sid=db.session_sid(key)) + "</h3>",
         ]

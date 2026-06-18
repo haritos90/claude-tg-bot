@@ -230,9 +230,10 @@ Conventions legend).
 | `/files` | Browse the working-dir tree (code) | Дерево рабочей папки (код) | none | 🟦 |
 | `/export` | Export working-dir files as .zip (code) | Экспорт файлов рабочей папки (.zip, код) | none | 🟦 |
 | `/maxturns` | Cap agentic turns (code) | Лимит агентных ходов (код) | none → picker | 🟦 |
-| `/permissions` | Code tool policy: ask \| auto-edits \| plan | Политика инструментов кода: ask \| auto-edits \| plan | none → picker | 🟦 (`full-access` 👑) |
+| `/permissions` | Code tool policy: auto-edits · plan · full-access | Политика инструментов кода: auto-edits · plan · full-access | none → picker | 🟦 |
 | `/tools` | Configure this session's tools | Настроить инструменты сессии | none → grid | 🟦 |
 | `/secret` | 🔐 Set a per-session service credential (code) | 🔐 Учётные данные сервиса для сессии (код) | prompts (capture) | 🟦 |
+| `/shell` | ⌨️ Toggle shell mode — run commands in the jail (code) | ⌨️ Режим shell — команды в песочнице (код) | none → toggle | 🟦 |
 
 ### Tier E — Meta & secondary
 

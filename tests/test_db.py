@@ -223,3 +223,67 @@ def test_usage_units_weighting_and_breakdown():
         await db.close_db()
 
     _run(_t)
+
+
+def test_claim_session_uid_stable_and_collision_free():
+    """#221: the host-uid registry hands out the preferred hash uid when free, the SAME
+    uid on repeat (stability), a DIFFERENT uid when two sids' hashes collide, and reuses
+    a freed slot after release."""
+    async def _t():
+        await db.init_db(tempfile.mktemp(suffix=".db"))
+        lo, hi = 700000, 700000 + 60000
+        # preferred free → returns preferred, and is STABLE across calls.
+        u1 = await db.claim_session_uid("aaaaaa", 700005, lo, hi)
+        assert u1 == 700005
+        assert await db.claim_session_uid("aaaaaa", 700005, lo, hi) == 700005
+        # DIFFERENT sids with the SAME preferred must each get a DISTINCT uid (probe).
+        u2 = await db.claim_session_uid("bbbbbb", 700005, lo, hi)
+        u3 = await db.claim_session_uid("cccccc", 700005, lo, hi)
+        assert len({u1, u2, u3}) == 3
+        assert all(lo <= u < hi for u in (u2, u3))
+        # release frees u1's slot → the next colliding sid reuses it.
+        await db.release_session_uid("aaaaaa")
+        assert await db.claim_session_uid("dddddd", 700005, lo, hi) == 700005
+        await db.close_db()
+
+    _run(_t)
+
+
+def test_claim_session_uid_exhaustion_falls_back():
+    """#221: when the whole window is taken, fall back to the clamped preferred rather
+    than fail the session (collisions become possible again only here)."""
+    async def _t():
+        await db.init_db(tempfile.mktemp(suffix=".db"))
+        lo, hi = 1000, 1002  # span = 2
+        a = await db.claim_session_uid("a", 1000, lo, hi)
+        b = await db.claim_session_uid("b", 1000, lo, hi)
+        assert {a, b} == {1000, 1001}
+        assert await db.claim_session_uid("c", 1000, lo, hi) == 1000
+        await db.close_db()
+
+    _run(_t)
+
+
+def test_uid_collisions_pure():
+    """#221 doctor: group sids by uid, report only uids shared by >1 sid."""
+    assert db._uid_collisions({"a": 700001, "b": 700002}) == {}
+    assert db._uid_collisions({"a": 700001, "b": 700001, "c": 700002}) == {700001: ["a", "b"]}
+    assert db._uid_collisions({}) == {}
+
+
+def test_sandbox_uid_collisions_scan():
+    """#221 doctor: two work dirs sharing an owner are reported; dirs without a work
+    subdir and non-dir entries are skipped; a lone session is clean."""
+    import os
+
+    base = tempfile.mkdtemp()
+    os.makedirs(os.path.join(base, "sidA", "work"))
+    os.makedirs(os.path.join(base, "sidB", "work"))  # same owner (test uid) → collide
+    os.makedirs(os.path.join(base, "sidC"))          # no work dir → skipped
+    with open(os.path.join(base, "loose.txt"), "w") as fh:
+        fh.write("x")                                # not a dir → skipped
+    assert db.sandbox_uid_collisions(base) == {os.getuid(): ["sidA", "sidB"]}
+
+    solo = tempfile.mkdtemp()
+    os.makedirs(os.path.join(solo, "sidX", "work"))
+    assert db.sandbox_uid_collisions(solo) == {}

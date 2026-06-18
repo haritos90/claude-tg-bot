@@ -11,6 +11,7 @@ no API key is present. We therefore strip those vars from the child env.
 
 import os
 import re
+import asyncio
 import logging
 import contextlib
 import shutil
@@ -407,6 +408,9 @@ class ClaudeSession:
         self.per_session_uid = bool(per_session_uid)
         self.uid_base = int(uid_base)
         self.uid_range = max(1, int(uid_range))
+        # #221: the registry-assigned host uid (claimed lazily in _ensure_client, then
+        # cached here). None until claimed; _enable_sandbox falls back to the bare hash.
+        self.host_uid: int | None = None
         # #168: SDK auto-compaction (ON by default = the CLI default). When False,
         # _build_env sets DISABLE_AUTO_COMPACT=1 (forwarded through the sandbox).
         self.auto_compact = bool(auto_compact)
@@ -460,6 +464,33 @@ class ClaudeSession:
     def _sandbox_launcher(self) -> str:
         """Absolute path to the committed bubblewrap launcher (deploy/)."""
         return str(Path(__file__).resolve().parent / "deploy" / "sandbox-claude.sh")
+
+    def _hash_uid(self) -> int:
+        """The deterministic per-session host uid from the sid — the PREFERRED value the
+        #221 registry hands out (and remaps only on collision). uid_base + sid % range."""
+        sid = Path(self.cwd).parent.name
+        try:
+            n = int(sid, 16)            # the sid is a 6-hex-char digest (db.session_sid)
+        except ValueError:
+            n = sum(sid.encode()) or 1  # fallback for non-sid cwds (e.g. tests)
+        return self.uid_base + (n % self.uid_range)
+
+    async def _claim_host_uid(self) -> int:
+        """#221: a stable, collision-free host uid via the db registry. The bare hash
+        (_hash_uid) is the PREFERRED value; the registry probes to a free uid when two
+        sids collide and remembers the assignment, so it stays stable across rebuilds.
+        Falls back to the bare hash if the registry is unavailable (prior behaviour)."""
+        preferred = self._hash_uid()
+        sid = Path(self.cwd).parent.name
+        try:
+            import db
+            return await db.claim_session_uid(
+                sid, preferred, self.uid_base, self.uid_base + self.uid_range
+            )
+        except Exception:
+            logger.warning("uid registry claim failed for sid=%s; using hash uid %d",
+                           sid, preferred, exc_info=True)
+            return preferred
 
     def _enable_sandbox(self, common: dict) -> None:
         """Route code mode through the bubblewrap launcher (#104): set cli_path and
@@ -517,12 +548,10 @@ class ClaudeSession:
         # session's (differently-owned) files. Deterministic so the uid is stable across
         # rebuilds (the on-disk chown stays valid).
         if self.per_session_uid:
-            sid = Path(self.cwd).parent.name
-            try:
-                n = int(sid, 16)            # the sid is a 6-hex-char digest (db.session_sid)
-            except ValueError:
-                n = sum(sid.encode()) or 1  # fallback for non-sid cwds (e.g. tests)
-            host_uid = self.uid_base + (n % self.uid_range)
+            # #221: prefer the registry-assigned uid (collision-free, claimed in
+            # _ensure_client); fall back to the bare deterministic hash when it hasn't
+            # been claimed yet (e.g. unit tests that build options directly).
+            host_uid = self.host_uid if self.host_uid is not None else self._hash_uid()
             env["SBX_HOST_UID"] = str(host_uid)
             env["SBX_HOST_GID"] = str(host_uid)
         common["env"] = env
@@ -593,6 +622,48 @@ class ClaudeSession:
             "The deployer has shared these personal instructions and notes with this "
             "session — treat them as standing guidance:\n\n" + mem
         )
+
+    async def run_shell(self, command: str, timeout: float = 60.0) -> tuple[int, str]:
+        """#224: run ONE shell command in THIS session's jail (no LLM, no tokens) and
+        return (returncode, combined stdout+stderr).
+
+        Requires the sandbox — refuses otherwise, since shell mode runs arbitrary user
+        commands and must stay confined (per-session uid + egress + seccomp + secrets).
+        Reuses the SBX_* env that `_enable_sandbox` builds; the launcher branches on
+        SBX_MODE=shell and execs `/bin/bash -lc "$SBX_SHELL_CMD"` instead of the CLI.
+        """
+        if not self.sandbox:
+            return (126, "Shell mode requires the sandbox, which is disabled for this session.")
+        if self.per_session_uid and self.host_uid is None:
+            with contextlib.suppress(Exception):
+                self.host_uid = await self._claim_host_uid()
+        with contextlib.suppress(OSError):
+            os.makedirs(self.cwd, exist_ok=True)
+            os.makedirs(str(Path(self.cwd).parent / "state"), exist_ok=True)
+        common: dict = {"env": dict(os.environ)}
+        self._enable_sandbox(common)
+        env = common["env"]
+        env["SBX_MODE"] = "shell"
+        env["SBX_SHELL_CMD"] = command
+        launcher = common["cli_path"]
+        proc = await asyncio.create_subprocess_exec(
+            launcher,
+            cwd=self.cwd,
+            env=env,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        try:
+            out, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except (asyncio.TimeoutError, TimeoutError):
+            with contextlib.suppress(Exception):
+                proc.kill()
+            with contextlib.suppress(Exception):
+                await proc.wait()
+            return (124, f"(timed out after {int(timeout)}s — process killed)")
+        text = (out or b"").decode("utf-8", "replace")
+        return (proc.returncode if proc.returncode is not None else -1, text)
 
     def _build_options(self) -> ClaudeAgentOptions:
         """Construct ClaudeAgentOptions for the current mode/model/cwd."""
@@ -757,6 +828,11 @@ class ClaudeSession:
             # recoverable — drop the dead id and retry ONCE with a fresh session, so
             # the user just keeps going instead of being wedged. Only retry on that
             # exact signature; never on a limit/auth/billing failure.
+            # #221: claim a stable, collision-free host uid for this jail BEFORE building
+            # options (the claim is async; _enable_sandbox/_build_options are sync). Cached
+            # on self.host_uid so rebuilds reuse it; no-op for non-sandbox/non-uid sessions.
+            if self.sandbox and self.per_session_uid and self.host_uid is None:
+                self.host_uid = await self._claim_host_uid()
             for attempt in (1, 2):
                 self._stderr_lines.clear()
                 client = ClaudeSDKClient(self._build_options())
