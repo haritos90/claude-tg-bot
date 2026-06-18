@@ -155,7 +155,9 @@ def test_effective_settings_soft_revoke_and_capability_gates(monkeypatch):
         eff = await sm._effective_settings(_state(5))
         assert eff["model"] == "claude-opus-4-8"        # read-only → global (soft revoke)
         assert eff["effort"] == "xhigh"                 # max not granted → downgraded
-        assert eff["permission_mode"] == "default"      # full-access owner-only → revert
+        # #212: full-access is owner-only; a non-owner reverts to the normal
+        # baseline, which is now acceptEdits (was "default"). Jail-backed default.
+        assert eff["permission_mode"] == "acceptEdits"   # full-access owner-only → revert to baseline
         assert eff["big_memory"] is False               # memory Hidden by default → off
 
         # The owner keeps their own values (always Delegated + full capability).

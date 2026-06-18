@@ -471,7 +471,10 @@ SETTINGS: dict[str, Setting] = {
         key="permission_mode",
         type=str,
         choices=_PERM_CHOICES,
-        default="default",
+        # was default="default" — relaxed to acceptEdits for #212: with the #119 jail
+        # as the hard containment layer, the sane baseline auto-runs in-jail work and
+        # only prompts for outbound/destructive actions (see permissions.py).
+        default="acceptEdits",
         scopes=(Scope.SESSION, Scope.USER),
         view_role=Role.CODE,
         edit_role=Role.CODE,
@@ -667,7 +670,10 @@ def get(key: str) -> Setting:
 # the session MODE (not the user's level): a code-level user in a chat session
 # should not see Permissions / Max turns / Sandbox. (The USER/GLOBAL tabs still
 # show them as defaults for future code sessions.)
-CODE_ONLY: frozenset[str] = frozenset({"permission_mode", "max_turns", "sandbox"})
+# #215: sandbox dropped from CODE_ONLY — #180 made the jail cover chat sessions too,
+# so the hub row must show in chat as well (the /sandbox command already has no mode
+# gate). was: frozenset({"permission_mode", "max_turns", "sandbox"})
+CODE_ONLY: frozenset[str] = frozenset({"permission_mode", "max_turns"})
 
 
 def is_code_only(key: str) -> bool:

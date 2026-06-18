@@ -382,7 +382,8 @@ class SessionManager:
         out = {
             "model": eff("model") or self.settings.default_model,
             "effort": eff("effort"),
-            "permission_mode": eff("permission_mode") or "default",
+            # was `or "default"` — #212 new baseline (jail-backed); see settings_schema.
+            "permission_mode": eff("permission_mode") or "acceptEdits",
             "max_turns": eff("max_turns"),
             "big_memory": bool(eff("memory")),
             # #167/#168: forced-on (default True) unless the owner delegated a disable.
@@ -397,7 +398,9 @@ class SessionManager:
         if out["effort"] == "max" and not self.allowlist.allow_max_effort_of(owner_uid, None):
             out["effort"] = "xhigh"
         if out["permission_mode"] == "bypassPermissions" and not is_owner:
-            out["permission_mode"] = "default"
+            # Soft-revoked full-access reverts to the normal non-owner baseline,
+            # which is acceptEdits since #212 (was "default") — same as a fresh user.
+            out["permission_mode"] = "acceptEdits"
         return out
 
     def _build_session(self, state: db.ThreadState, eff: dict | None = None) -> ClaudeSession:
