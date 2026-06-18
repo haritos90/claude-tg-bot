@@ -60,13 +60,18 @@ _BASH_APPROVAL_PATTERNS: tuple[re.Pattern, ...] = (
     re.compile(r"\btwine\s+upload\b"),
     re.compile(r"\bdocker\s+push\b"),
     re.compile(r"\b(?:ssh|scp|sftp)\b"),          # remote shell / copy
-    re.compile(r"\brsync\b.*(?:::|\S+@)"),         # rsync to a REMOTE target (local rsync is fine)
+    # was: re.compile(r"\brsync\b.*(?:::|\S+@)") — missed an ssh Host alias (host:/path, no @) — widened for #219
+    re.compile(r"\brsync\b.*(?:::|\S+@|rsync://|\s[\w.-]+:)"),  # rsync to a REMOTE target (local rsync is fine)
     # destructive: irreversible loss of in-workdir work
-    re.compile(r"\brm\s+-\w*r"),                   # recursive remove (rm -r / -rf / -fr)
+    # was: re.compile(r"\brm\s+-\w*r") — case-sensitive + short-option only; missed -R/-Rf/--recursive — widened for #219
+    re.compile(r"\brm\s+(?:-\w*[rR]|--recursive)"),   # recursive remove (rm -r/-R/-rf/-fr/--recursive)
     re.compile(r"\bgit\s+reset\s+--hard\b"),
-    re.compile(r"\bgit\s+clean\s+-\w*[fd]"),
+    # was: re.compile(r"\bgit\s+clean\s+-\w*[fd]") — missed the --force long form — widened for #219
+    re.compile(r"\bgit\s+clean\s+(?:-\w*[fd]|--force)"),
     re.compile(r"\bgit\s+restore\b"),
-    re.compile(r"\bgit\s+checkout\s+(?:--|\.)"),   # discard tracked changes
+    # was: re.compile(r"\bgit\s+checkout\s+(?:--|\.)") — only matched an immediate -- / . ; missed `checkout <ref> -- <path>` — widened for #219
+    re.compile(r"\bgit\s+checkout\s+\."),                       # discard all: `git checkout .` / `./path`
+    re.compile(r"\bgit\s+checkout\b[^&|;\n]*\s--(?:\s|$)"),     # discard a pathspec, incl. `git checkout <ref> -- <path>`
     re.compile(r"\b(?:dd|mkfs\w*|shred|truncate)\b"),
 )
 

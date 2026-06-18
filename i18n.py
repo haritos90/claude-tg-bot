@@ -444,18 +444,9 @@ CATALOG: dict[str, dict[str, str]] = {
     "sessions.search_toast": {"en": "Type a keyword.", "ru": "Введите слово."},
 
     # -- /mode -------------------------------------------------------------- #
-    "mode.show": {
-        "en": "This session is {glyph} <b>{mode}</b>. {tagline}",
-        "ru": "Эта сессия — {glyph} <b>{mode}</b>. {tagline}",
-    },
-    "mode.hint_upgrade": {
-        "en": "Need a terminal or files? Upgrade with /code — the conversation carries over.",
-        "ru": "Нужен терминал или файлы? Повысьте до /code — диалог сохранится.",
-    },
-    "mode.hint_downgrade": {
-        "en": "Back to a plain chat with /chat — workdir files are kept.",
-        "ru": "Вернуться к обычному чату — /chat — файлы рабочей папки сохранятся.",
-    },
+    # #220: mode.show / mode.hint_upgrade / mode.hint_downgrade removed — they were the
+    # pre-#218 "show current mode + how to switch" copy; /mode now toggles the type
+    # directly (#218a), so nothing rendered them (dead-key cleanup).
     "mode.upgraded": {
         "en": "{glyph} <b>Upgraded to a code session.</b>{defer}\n{tagline}",
         "ru": "{glyph} <b>Повышено до код-сессии.</b>{defer}\n{tagline}",
