@@ -38,10 +38,10 @@ are title-only history plus the **Resolution** note.
 header rows. Columns:
 
 - **Open** / **Backlog** — `| ID | Pri | Eff | Theme | Title |`
-- **Closed** — `| ID | Theme | Title | Resolution |`
+- **Closed** — `| ID | Theme | Title | Resolution | Release notes |`
 - **Deferred** — `| ID | Pri | Eff | Theme | Title | Reason |`
 
-**Next free ID:** 192
+**Next free ID:** 212
 
 ---
 
@@ -59,9 +59,104 @@ Not started; promote to Open when picked up.
 
 | ID | Pri | Eff | Theme | Title |
 |---|---|---|---|---|
-| — | — | — | — | _(empty — promote from Backlog when picking up new work)_ |
+| 192 | P1 | S | observability | Weighted usage units silently re-based the day/week token caps |
+| 193 | P2 | S | security | Credential broker forwards an empty body for chunked requests |
+| 194 | P2 | S | security | Credential broker has no inbound method/path allowlist |
+| 195 | P2 | S | security | Seccomp blob write is non-atomic and a stale blob is never cleared |
+| 196 | P3 | M | isolation | Sandbox ops hardening: startup off the pre-READY path, egress-apply check, broker timeout |
+| 197 | P3 | XS | core | Per-user session cap not enforced for group/topic sessions |
+| 198 | P2 | S | docs | isolation.md cross-references a threat model deleted from TODO #119 |
+| 199 | P2 | XS | docs | data-model.md threads schema omits the live stream_enabled column |
+| 200 | P2 | XS | docs | menu.md command matrix is missing /secret |
+| 201 | P3 | XS | docs | Spec-voice cleanup: first-person narration in isolation.md and TODO #189 |
 
 ### Details
+
+**#192 — Weighted usage units silently re-based the day/week token caps** (P1 · S · observability)
+
+`handlers.py:4336` switched per-user rate enforcement from `get_user_usage_tokens` to
+`get_user_usage_units` (#165 weighted units), but `set_rate` storage and the entry prompts
+(`usercard.prompt_day` / `usercard.prompt_week`, "Send the DAILY token cap, e.g. `500k`")
+still speak in raw tokens. Units run ~5× (Sonnet) to ~25× (Opus, with cache) larger than
+input+output tokens for the same work, so every previously-stored cap is now ~5–25× looser
+and a freshly-entered `500k` no longer means 500k tokens. Fix: either relabel the prompts as
+"units" and re-scale existing stored caps via a migration, or keep caps in tokens and compare
+against a token figure. At minimum the prompt wording must match `limits.units_note`.
+
+**#193 — Credential broker forwards an empty body for chunked requests** (P2 · S · security)
+
+`deploy/cred-broker.py:87` forwards a request body only when `content-length` is present, and
+`_DROP_REQ` strips `transfer-encoding`. If the inner client ever sends a chunked body (no
+`Content-Length`), the broker relays an EMPTY body upstream and the turn fails silently. It
+works today only because the CLI sends `Content-Length`. Fix: detect `transfer-encoding:
+chunked` and de-chunk `self.rfile`, or reject with 411 — never send a silently-empty body.
+
+**#194 — Credential broker has no inbound method/path allowlist** (P2 · S · security)
+
+`deploy/cred-broker.py:96` relays any method/path to the fixed upstream with the real OAuth
+bearer attached. The token cannot be extracted, but any process that reaches
+`127.0.0.1:8789` (the firewall allows the broker port) can drive authenticated calls to
+arbitrary `api.anthropic.com` endpoints, not just `/v1/messages`. Fix: allowlist method+path
+(e.g. only `POST /v1/messages*`) and reject the rest with 403, matching the no-bypass intent.
+
+**#195 — Seccomp blob write is non-atomic and a stale blob is never cleared** (P2 · S · security)
+
+`deploy/make-seccomp.py:88` writes the BPF blob with a plain `open(...,"wb")` — a crash
+mid-write leaves a truncated program that bwrap loads as malformed. On a non-x86_64 arch the
+script writes nothing, but `bot.py:137` still forwards any pre-existing blob (`os.path.exists`
+is true), applying an arch-mismatched filter. Fix: write atomically (temp + `os.replace`) and,
+on the non-x86 path, `os.remove` any existing output so a stale blob can never be applied.
+
+**#196 — Sandbox ops hardening follow-ups** (P3 · M · isolation)
+
+Three low-severity robustness items from the #119 audit:
+- `bot.py:135` runs `make-seccomp.py` + `egress-setup.sh` (each `subprocess.run`, timeout 30)
+  synchronously BEFORE `watchdog.ready()`. Local-only (no Telegram I/O, so the #158 rule
+  holds) and within `TimeoutStartSec=300`, but on a slow box it delays READY — move after
+  `ready()` or run via `asyncio.to_thread`.
+- `deploy/egress-setup.sh:55` depends on `-m conntrack` with no `modprobe`; if the module is
+  not autoloaded the insert fails and (suppressed in `bot.main`) egress is silently NOT
+  enforced while sessions still set `SBX_EGRESS=1`. It fails closed at the jail (launcher
+  cgroup-join guard), but a post-setup `iptables -C` verification should log whether it applied.
+- `deploy/cred-broker.py:108` uses a fixed 600 s upstream timeout with no idle-read cap; a
+  wedged upstream ties up a broker thread for up to 10 min. Add a smaller idle-read timeout.
+
+**#197 — Per-user session cap not enforced for group/topic sessions** (P3 · XS · core)
+
+`_session_limit_block` is checked in the DM create paths (`/new` private, `ses:new`, `/fork`)
+but `_new_session` for `chat.type != "private"` (supergroup topics) bypasses it
+(`handlers.py:1424`, `:2387`). If group sessions count toward the per-user cap this is a gap;
+if the cap is intentionally DM-only, add a one-line comment stating so.
+
+**#198 — isolation.md cross-references a threat model deleted from TODO #119** (P2 · S · docs)
+
+`isolation.md:6` states "TODO.md #119 holds the threat model + design rationale", but the
+commit moved #119 to Closed and deleted its Details block (threat model, exfil-channel
+analysis, Components 1–5, egress options A–E). That rationale now exists nowhere. Fix: migrate
+the threat model / design rationale INTO isolation.md (now the only deep reference) and point
+AGENTS/README/TODO at it; or drop the dangling claim.
+
+**#199 — data-model.md threads schema omits the live stream_enabled column** (P2 · XS · docs)
+
+`data-model.md:804` is the authoritative schema spec but its `threads` toggle list drops
+`stream_enabled`, which is still a real migrated column (`db.py:58`, ALTER at `db.py:189`,
+selected at `db.py:276`). Fix: add `stream_enabled` (mark retained-but-unused per #110 if
+desired) so the documented schema matches the table.
+
+**#200 — menu.md command matrix is missing /secret** (P2 · XS · docs)
+
+`commands.py` registers `/secret` (#119d, `scope="code"`, `in_menu=False`) with full
+`secret.*` i18n strings, but `menu.md` — the canonical command/structure doc mirrored by
+`assert_commands_consistent()` (#139) — has no `/secret` row. Fix: add it to the
+code-commands section of menu.md.
+
+**#201 — Spec-voice cleanup: first-person narration** (P3 · XS · docs)
+
+Make two spec passages declarative/impersonal. `isolation.md` (~934, ~1088): "We did **not**
+add an 'insecure' flag…" and "…we use `iptables -m cgroup --path`" → "No 'insecure' flag is
+added…" and "…the egress rule uses `iptables -m cgroup --path`". TODO.md #189 Deferred reason:
+"Our reaper… continuous context — our default… Marginal for us… we deliberately favour…" →
+restate without "our / us / we".
 
 ---
 
@@ -71,6 +166,16 @@ Title-only history.
 
 | ID | Theme | Title | Resolution | Release notes |
 |---|---|---|---|---|
+| 207 | docs | Cyrillic sample literal in tests/test_markup.py broke the English-only rule | The `ensure_text_bom` test used a Cyrillic string literal as its non-ASCII sample, violating golden rule 1 (English-only outside the i18n/commands/menu translation surfaces). Replaced with `"café"`; the helper keys off the filename, not the content, so the BOM assertions are unaffected. py_compile + pytest + ruff. | — |
+| 208 | isolation | ISOLATION_NOTE asserted cross-session privacy unconditionally | `engine.ISOLATION_NOTE` (#205), appended to every code session's system prompt, opened with an unconditional "an isolated, per-session sandbox … you cannot see or reach another session's files" — but that enforcement only holds when the sandbox layers (#104/#119/#180) are on. Reworded so only the always-true per-session SEPARATE directory (#181) is stated outright; filesystem confinement is now hedged ("may be") like the network clause. Old string kept commented. | The code agent no longer overstates isolation: it describes filesystem/network confinement as conditional and asserts only the always-true private per-session directory. |
+| 209 | core | Output-formatting helper nits (BOM case-match + menu newline note) | `markup.as_document` now matches the `.md`/`.txt` extension case-insensitively, mirroring `ensure_text_bom` (#206), so a `.MD`/`.TXT` is BOM'd identically by the long-reply and outbox paths. Added a note on `handlers._send_menu` that the `\n`→`<br>` rich-HTML conversion (#202) assumes menus carry no `<pre>`/preformatted content. py_compile + pytest + ruff. | — |
+| 210 | docs | TODO.md Closed-section legend omitted the Release notes column | The columns legend documented Closed as a 4-column table while the actual table carries a fifth `Release notes` column. Legend updated to match. | — |
+| 211 | ux | Session list row showed the mode word and creation date | The `/sessions` list printed `{icon} {name} — {mode} · {date}` per row; the icon already conveys chat/code and the date is list noise. `sessions.row` now renders just `{icon} {name}` plus the `⬅️ current` marker; the dead `mode`/`date` kwargs were dropped from the caller (old kept commented). py_compile + pytest + ruff. | The session list shows just the icon and name per row (plus a "current" marker) — no mode word or creation date. |
+| 202 | ux | Session list collapsed onto one line after the native-rich menu migration (#173) | Rich-message HTML folds raw newlines (HTML whitespace collapsing), so the #173 `_send_menu` / `_edit_menu` helpers rendered every multi-line menu — the `/sessions` list, session cards, settings pages — on a SINGLE line and lost indentation. Both helpers now convert `\n` → `<br>` for the rich `html` field; the classic-HTML fallback keeps the raw `\n` (which `parse_mode="HTML"` renders as a newline and which rejects `<br>`). Central fix, so it covers every `_send_menu` / `_edit_menu` surface, not just the session list. py_compile + import + pytest (148) + ruff, deployed. | Menus (session list, cards, settings) render on multiple lines again instead of collapsing into one. |
+| 203 | ux | Session description exposed the internal workdir path | The session card / options card / mode taglines printed a terminal-style `…/work $` line built from `mode_tagline(cwd=…)`. The path is an internal detail the user never interacts with, so the `tagline_where` append was removed from `mode_tagline` (old line kept commented per the audit convention; `cwd` stays in the signature for callers). Deployed. | Session cards no longer show the internal working-directory path. |
+| 204 | ux | Permission prompt showed the full absolute file path | The Allow/Deny prompt previewed the raw tool input, e.g. `/var/lib/.../<sid>/work/readme.md`. `permissions._preview_input` now relativizes path-like fields to the session workdir (→ `readme.md`) via the new `_rel_to_cwd`, with `cwd` plumbed through `make_callback` (`sessions.py`). A path OUTSIDE the workdir keeps its absolute form on purpose — a tool leaving the sandbox should stand out. +4 tests. Deployed. | Tool-approval prompts show a short path relative to the working directory instead of the full absolute path. |
+| 205 | ux | Code agent was not told it runs in a per-session isolated sandbox | Added `engine.ISOLATION_NOTE`, appended to the code-mode system-prompt preset alongside `OUTBOX_INSTRUCTION`, so the agent can accurately answer the user about privacy / where files live / whether others can see them. The per-session-private workdir claim is always true (#181); filesystem confinement and the network allowlist are hedged ("may be") since they depend on the sandbox layers (#119/#180) being enabled. Deployed. | In a code session the agent now knows it runs in an isolated per-session sandbox and explains this correctly if asked. |
+| 206 | ux | Agent-created `.md`/`.txt` files delivered via outbox shipped without a UTF-8 BOM (mobile mojibake) | The long-reply document path already BOMs via `markup.as_document`, but the outbox channel (#187) shipped the agent's file bytes verbatim, so a `.md`/`.txt` containing non-ASCII (Cyrillic, accents, CJK) rendered as mojibake on viewers that guess the charset. New `markup.ensure_text_bom(bytes, name)` prepends a UTF-8 BOM to `.md`/`.txt` (idempotent; no-op for other types); applied on outbox delivery in `sessions._deliver_outbox`. Done bot-side so it is automatic for every session and language — no per-session agent effort. +6 tests. Deployed. | Markdown/text files the bot sends now open with correct characters on phones, in any language — no more garbled Cyrillic. |
 | 119 | security | Fully-contained sandbox (e2e): credential broker + egress allowlist + per-session isolation + DoS limits | Completes the sandbox on top of the bwrap FS confinement (#104) + broker (#119b). **119c egress allowlist:** the jail's egress is hard-blocked to LOOPBACK ONLY by a cgroup-scoped iptables rule (`deploy/egress-setup.sh`: a dedicated `SBX_EGRESS` chain + ONE `OUTPUT` jump matched by `-m cgroup --path sbx` — never a global rule, never the policy; fully reverted by `egress-teardown.sh`). `claude` reaches Anthropic via the broker (loopback); the agent's tools reach an allowlisted dev-host set (github/pypi/npm/anthropic, extend via `EGRESS_ALLOW_HOSTS`) through a CONNECT proxy (`deploy/egress-proxy.py`, domain dot-suffix match, tunnels TLS — no MITM); all else is dropped, so the proxy is the only exit and there is no bypass (design option E). The jail joins the cgroup in `deploy/sandbox-claude.sh` via a MANUAL `/sys/fs/cgroup/sbx/<pid>` leaf — NOT `systemd-run --scope`, which forks the target under PID 1 so a SIGKILL would orphan the ~500 MB `claude` and defeat the #179 reaper; the manual leaf keeps the tree SDK→launcher/bwrap→claude so the existing kill/reap path still works. **119d per-session secrets:** `/secret NAME=VALUE` (code sessions) stores a user-supplied service credential in `<sid>/secrets.env` (root-owned 0600, a sibling of the workdir), injected as an env var into THAT session's jail only; the owner's own credentials never enter any jail. **119e DoS:** the same cgroup leaf carries `memory.max`/`cpu.max`/`pids.max` (`SANDBOX_MEM_MB`/`SANDBOX_CPU_PERCENT`/`SANDBOX_PIDS_MAX`) and an x86_64 seccomp denylist BPF (`deploy/make-seccomp.py`, `SANDBOX_SECCOMP`) refuses ~29 exotic syscalls (ptrace/bpf/kexec/keyctl/module-load/userfaultfd/…) via `bwrap --seccomp`. All OS/network mechanism lives in `deploy/` shell+standalone (Component 5); Python only sets `SBX_*` env + runs the sidecars (`bot.main` starts the broker + egress proxy, sets up/reverts the firewall, compiles the seccomp blob). SHIPPED OPT-IN (off by default, like the broker): enable with `CRED_BROKER=1` + `SANDBOX_EGRESS=1` (+ optional `SANDBOX_SECCOMP=1`, `SANDBOX_MEM_MB`, `SANDBOX_CPU_PERCENT`, `SANDBOX_PIDS_MAX`). Verified e2e through the real launcher: a real `claude` turn completed via the broker (`POST /v1/messages → 200`) with the jail credential = `BROKER-PLACEHOLDER` (real token ABSENT); allowlisted host reachable via the proxy, non-allowlisted host refused (proxy DENY/403), direct exfil bypassing the proxy BLOCKED, seccomp denied add_key/bpf/ptrace/userfaultfd (EPERM) while echo + `claude --version` (node) start clean. +6 tests, 140 green, ruff clean. | Optional full sandbox isolation (off by default): with it enabled, a code session's network is locked to an allowlist (your Claude usage + chosen dev hosts like GitHub/PyPI/npm), the subscription token never enters the sandbox (a host broker injects it from outside), each session can hold its own service credentials via `/secret`, and per-session memory/CPU/process limits + a syscall filter contain a misbehaving session. |
 | 191 | reliability | Proactive OAuth token refresh (stop the ~8h idle-expiry 401) | The on-disk subscription OAuth access token has a hard ~8h life and nothing rotated it: the idle reaper kills the `claude` subprocess in ~6 min, but a freshly-spawned one just re-reads the SAME on-disk token, and the SDK does not auto-refresh under subscription auth — so a turn after a >8h idle gap (e.g. overnight) 401'd until a manual re-login. New `token_refresh.py` owns the OAuth `refresh_token → access_token` exchange (endpoint `platform.claude.com/v1/oauth/token` + the public Claude Code client id, both read from the bundled CLI) and rewrites `~/.claude/.credentials.json` ATOMICALLY (temp + `os.replace`, mode 0600, all other fields preserved). `SessionManager.start_token_refresher` runs a fail-soft loop (sweep every 30 min, renew when <1h of life remains; cancelled in `aclose`), wired in `bot.main` next to the usage poller / reaper. P0-safe: OAuth only (refresh token + client id) — never an `ANTHROPIC_API_KEY`, so billing stays on the subscription. Fail-soft: any error leaves the creds untouched → falls back to the engine 401 self-heal / manual re-login. Tunable via `OAUTH_REFRESH` (kill-switch), `OAUTH_REFRESH_INTERVAL_SEC`, `OAUTH_REFRESH_SKEW_SEC`. Verified live: a forced refresh rotated the token, moved `expiresAt` +8h, and the new token authenticated against the account usage endpoint. +5 tests, 134 green, ruff clean, deployed (loop logged at startup). A lighter standalone carve-out of #119's broker OAuth-refresh component. | The bot now refreshes its subscription login automatically before it expires, so it no longer stops working after sitting idle (e.g. overnight) and needing a manual re-login. |
 | 173 | ux | Make the keyboard menus native rich too (full font consistency) | The inline-keyboard menus still used classic `parse_mode="HTML"` while replies/tables were native rich (#172/#164). Added `EditRichMessage(TelegramMethod)` to `rich_message.py` (Bot API 10.1 `editMessageText` + the `rich_message` param) and two `handlers` helpers — `_send_menu` (`sendRichMessage` + `reply_markup`, returns the sent Message for callers that need its id) and `_edit_menu` (`editMessageText` + `rich_message`, treating "message is not modified" as a no-op). Routed every inline-keyboard surface through them: the settings hub + choice pickers, Tools grid, Users list + per-user cards, Usage / Admin / retention sub-pages, language picker, session-options + sessions list, codesplit / working-plate toggles, and the model/language confirmations. Both helpers fall back to the classic send/edit on any failure (including a pre-rich message edited after deploy), so a menu is never lost. py_compile + import + pytest + ruff clean. | Button menus (settings, users, sessions) now render in the same native rich font as replies — consistent typography across the whole bot. |

@@ -81,10 +81,13 @@ def mode_glyph(mode: str) -> str:
 def mode_tagline(mode: str, cwd: str | None = None, lang: str = "en") -> str:
     """One-line description of what a session of this type does (HTML)."""
     if mode == "code":
-        where = (
-            i18n.t("mode.tagline_where", lang, cwd=markup.escape_html(cwd))
-            if cwd else ""
-        )
+        # #203: the workdir path is an internal detail the user never interacts with,
+        # so it is no longer appended to session descriptions (card / options / mode /
+        # created / upgraded). `cwd` stays in the signature for callers/compat.
+        # was (replaced for #203):
+        #   where = (i18n.t("mode.tagline_where", lang, cwd=markup.escape_html(cwd))
+        #            if cwd else "")
+        where = ""
         return i18n.t("mode.tagline_code", lang, glyph=mode_glyph("code"), where=where)
     return i18n.t("mode.tagline_chat", lang, glyph=mode_glyph("chat"))
 
@@ -310,8 +313,15 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         the ``html`` rich field. Returns the sent Message (callers may need its id), or
         None if both the rich and the classic fallback send fail — so a menu is never
         lost even when the rich API rejects the payload."""
+        # #202: rich-message HTML folds raw newlines (HTML whitespace collapsing),
+        # which squashed multi-line menus (session list, cards) onto ONE line. Convert
+        # \n → <br> for the rich html field; the classic fallback keeps the raw text
+        # (parse_mode="HTML" renders \n as a newline and doesn't support <br>).
+        # #209: assumes menu text carries no <pre>/preformatted blocks (none do today) —
+        # revisit this substitution if a menu ever includes preformatted content.
+        rich_html = text.replace("\n", "<br>")
         try:
-            return await bot(SendRichMessage(chat_id=chat_id, rich_message={"html": text},
+            return await bot(SendRichMessage(chat_id=chat_id, rich_message={"html": rich_html},
                                              reply_markup=kb, **send_kwargs))
         except Exception:
             pass
@@ -328,9 +338,10 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         modified") is a no-op. Any other failure (e.g. the message was opened classic
         before this shipped, or the rich edit is rejected) falls back to the classic
         ``edit_text`` — preserving exactly the prior behaviour."""
+        rich_html = text.replace("\n", "<br>")  # #202: see _send_menu (newline → <br>)
         try:
             await bot(EditRichMessage(chat_id=msg.chat.id, message_id=msg.message_id,
-                                      rich_message={"html": text}, reply_markup=kb))
+                                      rich_message={"html": rich_html}, reply_markup=kb))
             return
         except TelegramBadRequest as exc:
             if "not modified" in str(exc).lower():
@@ -1568,9 +1579,11 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             mark = i18n.t("sessions.current_mark", lang) if r["thread_id"] == current_key else ""
             icon = mode_glyph(r["mode"])
             lines.append(i18n.t(
+                # #211: drop {mode}/{date} — the icon conveys the mode and the date is
+                # list noise. was: mode=i18n.mode_word(r["mode"], lang),
+                #                  date=_fmt_date(r["created_at"]),
                 "sessions.row", lang, icon=icon,
-                name=markup.escape_html(name), mode=i18n.mode_word(r["mode"], lang),
-                date=_fmt_date(r["created_at"]), mark=mark,
+                name=markup.escape_html(name), mark=mark,
             ))
             lines.append(i18n.t("sessions.row_stats", lang, reqs=reqs, toks=toks))
             # The button is the session NAME (its sid + stats are in the text line
