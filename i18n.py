@@ -532,39 +532,46 @@ CATALOG: dict[str, dict[str, str]] = {
     },
 
     # -- /sandbox (owner per-session isolation opt-out; #104) --------------- #
-    "sandbox.show": {
-        "en": "🧪 Sandbox for this session: <b>{state}</b> · global SANDBOX_CODE: "
-              "<b>{glob}</b>.\n<code>/sandbox on|off</code> — run this code session "
-              "with or without isolation (owner test).",
-        "ru": "🧪 Песочница для этой сессии: <b>{state}</b> · глобально SANDBOX_CODE: "
-              "<b>{glob}</b>.\n<code>/sandbox on|off</code> — запускать эту код-сессию "
-              "с изоляцией или без (тест владельца).",
-    },
+    # #234: sandbox.show / sandbox.show_scoped / sandbox.set_on / sandbox.set_off are
+    # orphaned — they advertise the `/sandbox on|off` toggle retired in #231 (no live
+    # `.py` references; the handlers that used set_on/set_off are themselves commented
+    # out). Kept commented (not deleted) per the comment-out-with-task-ref rule; the live
+    # key is `sandbox.mandatory` below. Remove outright in a later cleanup if desired.
+    # "sandbox.show": {
+    #     "en": "🧪 Sandbox for this session: <b>{state}</b> · global SANDBOX_CODE: "
+    #           "<b>{glob}</b>.\n<code>/sandbox on|off</code> — run this code session "
+    #           "with or without isolation (owner test).",
+    #     "ru": "🧪 Песочница для этой сессии: <b>{state}</b> · глобально SANDBOX_CODE: "
+    #           "<b>{glob}</b>.\n<code>/sandbox on|off</code> — запускать эту код-сессию "
+    #           "с изоляцией или без (тест владельца).",
+    # },
     # #138 PART 2: sandbox shown with its RESOLVED value + the scope badge that
     # supplies it (replaces the confusing two-value sandbox.show line).
-    "sandbox.show_scoped": {
-        "en": "🧪 Sandbox: <b>{state}</b> <i>({scope})</i>.\n"
-              "<code>/sandbox on|off</code> — run this code session with or without "
-              "isolation (owner test).",
-        "ru": "🧪 Песочница: <b>{state}</b> <i>({scope})</i>.\n"
-              "<code>/sandbox on|off</code> — запускать эту код-сессию с изоляцией "
-              "или без (тест владельца).",
-    },
+    # "sandbox.show_scoped": {
+    #     "en": "🧪 Sandbox: <b>{state}</b> <i>({scope})</i>.\n"
+    #           "<code>/sandbox on|off</code> — run this code session with or without "
+    #           "isolation (owner test).",
+    #     "ru": "🧪 Песочница: <b>{state}</b> <i>({scope})</i>.\n"
+    #           "<code>/sandbox on|off</code> — запускать эту код-сессию с изоляцией "
+    #           "или без (тест владельца).",
+    # },
     # #231: the sandbox is mandatory now; the toggle is retired.
     "sandbox.mandatory": {
         "en": "🔒 The sandbox is <b>always on</b> for every session (chat and code) — it can't be turned off. Each session runs in its own isolated jail.",
         "ru": "🔒 Песочница <b>всегда включена</b> для каждой сессии (chat и code) — отключить нельзя. Каждая сессия работает в собственном изолированном джейле.",
     },
-    "sandbox.set_on": {
-        "en": "🧪 Sandbox <b>on</b> for this session — code runs isolated.{note}",
-        "ru": "🧪 Песочница <b>вкл</b> для этой сессии — код выполняется в изоляции.{note}",
-    },
-    "sandbox.set_off": {
-        "en": "🧪 Sandbox <b>off</b> for this session — code runs WITHOUT isolation "
-              "(owner test).{note}",
-        "ru": "🧪 Песочница <b>выкл</b> для этой сессии — код выполняется БЕЗ изоляции "
-              "(тест владельца).{note}",
-    },
+    # #234: orphaned with the #231 toggle retirement (callers in handlers.py are
+    # commented out). Kept commented per the comment-out-with-task-ref rule.
+    # "sandbox.set_on": {
+    #     "en": "🧪 Sandbox <b>on</b> for this session — code runs isolated.{note}",
+    #     "ru": "🧪 Песочница <b>вкл</b> для этой сессии — код выполняется в изоляции.{note}",
+    # },
+    # "sandbox.set_off": {
+    #     "en": "🧪 Sandbox <b>off</b> for this session — code runs WITHOUT isolation "
+    #           "(owner test).{note}",
+    #     "ru": "🧪 Песочница <b>выкл</b> для этой сессии — код выполняется БЕЗ изоляции "
+    #           "(тест владельца).{note}",
+    # },
 
     # -- /secret (per-session user-supplied service credentials; #119d) ----- #
     "secret.help": {
@@ -685,6 +692,25 @@ CATALOG: dict[str, dict[str, str]] = {
     "shell.accidental": {
         "en": "<i>(command not found — you're in shell mode; send /shell to exit)</i>",
         "ru": "<i>(команда не найдена — вы в режиме shell; отправьте /shell для выхода)</i>",
+    },
+    # #245 → #227b: line-interactive commands now work (input is forwarded). Only FULL-SCREEN
+    # TUIs (vim/top/…) can't render in a chat bubble, so those are refused.
+    "shell.interactive": {
+        "en": "🖥 Full-screen programs (<code>vim</code>, <code>top</code>, <code>less</code>, "
+              "<code>man</code>, …) can't render in a chat — they're not supported. Use a "
+              "non-TUI form (e.g. <code>cat</code> instead of <code>less</code>).",
+        "ru": "🖥 Полноэкранные программы (<code>vim</code>, <code>top</code>, <code>less</code>, "
+              "<code>man</code>, …) не отображаются в чате — не поддерживаются. Используй "
+              "не-TUI вариант (например <code>cat</code> вместо <code>less</code>).",
+    },
+    # #227b: a command paused for interactive input — the next message is forwarded to it.
+    "shell.awaiting": {
+        "en": "⌨️ <i>Waiting for input — use the keys below, or type to filter a list / send a "
+              "line. (Typed key fallback: <code>.up</code> <code>.down</code> <code>.enter</code>, "
+              "chainable: <code>.down .enter</code>.) /shell to cancel.</i>",
+        "ru": "⌨️ <i>Жду ввод — жми кнопки ниже, либо печатай для фильтра / отправь строку. "
+              "(Текстом тоже можно: <code>.up</code> <code>.down</code> <code>.enter</code>, "
+              "цепочкой: <code>.down .enter</code>.) /shell — отмена.</i>",
     },
     # #221: startup owner alert when the uid doctor finds an on-disk collision.
     "admin.uid_collision_alert": {
@@ -1511,6 +1537,16 @@ CATALOG: dict[str, dict[str, str]] = {
     },
 
     # -- /queue ------------------------------------------------------------- #
+    # #236: ack shown when a message is accepted WHILE a turn is running (queued at
+    # the turn boundary, not injected mid-turn), and the backlog-cap rejection.
+    "queue.queued_ack": {
+        "en": "📥 Queued — will run after the current reply ({n} waiting). /queue to manage.",
+        "ru": "📥 В очереди — выполню после текущего ответа (ждёт: {n}). /queue для управления.",
+    },
+    "queue.full_reject": {
+        "en": "⚠️ Too many queued ({n} max). Wait for the current reply, or /stop to interrupt.",
+        "ru": "⚠️ Слишком много в очереди (макс. {n}). Дождитесь ответа или /stop, чтобы прервать.",
+    },
     "queue.empty": {"en": "Queue is empty.", "ru": "Очередь пуста."},
     "queue.header": {"en": "<b>Queued prompts:</b> {n}", "ru": "<b>Запросов в очереди:</b> {n}"},
     "queue.cancel_btn": {"en": "✖ Cancel {i}", "ru": "✖ Отменить {i}"},
@@ -1595,6 +1631,11 @@ CATALOG: dict[str, dict[str, str]] = {
     "attach.default_doc_prompt": {
         "en": "Here is a document. Summarize the key points.",
         "ru": "Вот документ. Кратко изложи ключевые моменты.",
+    },
+    # #235: appended when an album exceeded the per-turn item cap.
+    "attach.album_dropped": {
+        "en": "[{n} more file(s) in this album were skipped — over the limit]",
+        "ru": "[ещё {n} файл(ов) из этого альбома пропущено — превышен лимит]",
     },
 
     # -- permission gate (permissions.py) ----------------------------------- #

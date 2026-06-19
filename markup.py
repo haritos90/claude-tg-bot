@@ -22,6 +22,10 @@ SAFE_LIMIT = 3900
 # md_to_html escaping/markup can expand a chunk past this; render_within_limit
 # re-splits so a rendered message never exceeds it (and gets silently dropped).
 HARD_LIMIT = 4096
+# #241: a RICH message (sendRichMessage / sendRichMessageDraft) allows up to 32768 UTF-8
+# chars — far above the classic 4096. The draft streams the whole growing reply up to this
+# (not just the classic ~3900 tail), and the rich final message is one bubble well past 4096.
+RICH_LIMIT = 32768
 # Above this length the caller may prefer to send a .md document instead of
 # spamming the chat with many chunks.
 FILE_THRESHOLD = SAFE_LIMIT * 3
@@ -283,6 +287,97 @@ def _tables_to_pre(text: str, stash) -> str:
             out.append(lines[i])
             i += 1
     return "\n".join(out)
+
+
+# --------------------------------------------------------------------------- #
+# Streaming-table rendering — history (see the TODO ledger for the full trail):
+#   #162 — markdown tables rendered as a <pre> monospace grid / PNG image. Wide
+#          multi-column grids wrap to mush on a phone. Replaced by #164.
+#   #164 — final tables sent as NATIVE Telegram rich tables (table_to_rich_html →
+#          sendRichMessage). #176 sends the whole reply as ONE {"markdown"} rich
+#          message; #172 streams the same {"markdown"} via sendRichMessageDraft.
+#   #226 — bug: a table mid-stream shows only its first row, the full table snaps in
+#          at finish. Attempt 1 re-rendered the table frontier as a <pre> grid (re-did
+#          #162's wrapping) and attempt 2 hid the table behind a placeholder line —
+#          BOTH rejected on-device. Those two helpers are kept commented just below.
+#   #237 — the live fix: clip_partial_table() below. The draft and finish() share the
+#          same {"markdown"} renderer, so a COMPLETE table renders identically; we only
+#          ever feed the draft a VALID prefix (drop the in-progress trailing row), so the
+#          native table grows row-by-row with no snap.
+#
+# was (#226, rejected — superseded by #237; kept per revert policy):
+# def contains_table(text: str) -> bool:
+#     if "|" not in text:
+#         return False
+#     lines = text.split("\n")
+#     for i in range(len(lines) - 1):
+#         if "|" in lines[i] and _TABLE_SEP_RE.match(lines[i + 1]):
+#             return True
+#     return False
+#
+# def placeholder_tables(text: str, placeholder: str = "📊 …") -> str:
+#     # replaced each table with one placeholder line (hid it during the stream).
+#     if "|" not in text:
+#         return text
+#     lines = text.split("\n")
+#     out: list[str] = []
+#     i, n = 0, len(lines)
+#     while i < n:
+#         nxt = lines[i + 1] if i + 1 < n else ""
+#         if "|" in lines[i] and _TABLE_SEP_RE.match(nxt):
+#             out.append(placeholder)
+#             j = i + 2
+#             while j < n and "|" in lines[j] and lines[j].strip():
+#                 j += 1
+#             i = j
+#         else:
+#             out.append(lines[i])
+#             i += 1
+#     return "\n".join(out)
+
+# A trailing line that is a PARTIAL table separator still being typed (e.g. "|---" or
+# "| :--" before the row is closed) — chars are only the separator alphabet, with at
+# least one dash. Used to clip an in-progress separator from a streaming draft.
+_PARTIAL_SEP_RE = re.compile(r"^[ \t]*[|+]?[ \t:|+-]*-[ \t:|+-]*$")
+
+
+def clip_partial_table(text: str) -> str:
+    """#237 (supersedes #226): for DRAFT streaming only — drop a still-being-typed final
+    table line so the draft never contains a half-built (invalid GFM) table.
+
+    The draft (`sendRichMessageDraft {"markdown": …}`) and the final message
+    (`_commit_rich_markdown` → `sendRichMessage {"markdown": full_text}`) use the SAME rich
+    renderer, so a COMPLETE-so-far markdown table renders identically in both. The old
+    "only the first row streams, the whole table snaps in at finish" came from the draft
+    carrying a row/separator mid-type — not valid GFM, so Telegram showed the header line
+    alone. By clipping the trailing in-progress line (the last line when the text doesn't
+    end in a newline) whenever it belongs to a table, every draft frame is a VALID PREFIX
+    of the final message: the native table grows row-by-row with no snap.
+
+    Only the trailing partial line is touched; a row that is already newline-terminated is
+    complete and kept. No-op when the text ends in a newline or has no table. Pure + testable.
+
+    CONFIRMED working on-device 2026-06-19 (#237): tables stream row-by-row with no snap. Do
+    NOT revert to the #162/#226 grid or placeholder approaches (see the history block above)."""
+    if "|" not in text or text.endswith("\n"):
+        return text
+    lines = text.split("\n")
+    last = lines[-1]
+    is_partial_row = "|" in last
+    is_partial_sep = bool(_PARTIAL_SEP_RE.match(last))
+    if not (is_partial_row or is_partial_sep):
+        return text
+    above = lines[:-1]
+    # Walk up the contiguous block of table-ish lines that the last line belongs to.
+    k = len(above)
+    while k > 0 and ("|" in above[k - 1] or _TABLE_SEP_RE.match(above[k - 1])):
+        k -= 1
+    block = above[k:]
+    established = any(_TABLE_SEP_RE.match(line) for line in block)   # header+separator seen
+    header_then_partial_sep = is_partial_sep and bool(block) and "|" in block[-1]
+    if established or header_then_partial_sep:
+        return "\n".join(above)
+    return text
 
 
 # --------------------------------------------------------------------------- #

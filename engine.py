@@ -307,6 +307,162 @@ def _error_key(error: object) -> str:
     return _ERROR_KEYS.get(key, "err.model_error")
 
 
+# #227a: unique marker a persistent-shell command emits when it finishes, carrying its exit
+# code, so the host can detect command completion + rc on the PTY (output before it is clean).
+_SHELL_SENTINEL = "__SBX_SH_DONE__"
+# Terminal control noise an interactive PTY program emits (CSI sequences incl. bracketed-paste
+# \x1b[?2004h/l and cursor moves; OSC title strings; TWO-char ESC escapes like ESC 7 / ESC 8 =
+# save/restore-cursor, ESC =, ESC c; and lone CR/BEL/BS). Stripped so output is clean text.
+# (Was: only \x1b[…CSI and \x1b]…OSC — it left the bare `7`/`8` of ESC 7 / ESC 8 visible, #227.)
+_TERM_NOISE_RE = re.compile(
+    r"\x1b\[[0-9;?]*[ -/]*[@-~]"          # CSI ... final
+    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"  # OSC ... BEL|ST
+    r"|\x1b[ -/]*[0-~]"                     # ESC (intermediate)* final — ESC 7/8/=/c/(B/#8/...
+    r"|[\r\x07\x08]"                        # CR, BEL, backspace
+)
+
+
+class PersistentShell:
+    """#227a: a long-lived login `bash` held on a PTY INSIDE the session's #119 jail. `cd`/env
+    persist across run() calls (it is one shell). The bwrap process owns the jail; we own the
+    PTY master on the host and drive the shell line-by-line.
+
+    Non-interactive at this stage: run() sends the command followed by a sentinel-printf and
+    reads the master until the sentinel (carrying the exit code). A command that blocks on input
+    never reaches the printf, so run() times out and sends Ctrl-C to recover (true line-
+    interactivity is #227b; #245 already refuses known-interactive commands fast)."""
+
+    def __init__(self, proc, master_fd: int) -> None:
+        self.proc = proc
+        self.master = master_fd
+        self._lock = asyncio.Lock()
+        self._inited = False
+
+    def alive(self) -> bool:
+        return self.proc.returncode is None
+
+    def _read_available(self) -> bytes:
+        chunks: list[bytes] = []
+        while True:
+            try:
+                d = os.read(self.master, 65536)
+            except (BlockingIOError, InterruptedError):
+                break
+            except OSError:
+                break
+            if not d:
+                break
+            chunks.append(d)
+        return b"".join(chunks)
+
+    async def _init(self) -> None:
+        # Quiet the shell so run() output is clean: no input echo, no prompt.
+        os.write(self.master, b"stty -echo 2>/dev/null; export PS1='' PS2=''\n")
+        await asyncio.sleep(0.3)
+        self._read_available()  # drain the login banner + the echo of this line
+        self._inited = True
+
+    async def _drive(self, write: bytes, settle: float, timeout: float) -> tuple[int | None, str, str]:
+        """Write `write` to the PTY, then read the master until one of:
+          - the sentinel appears        -> ("done", rc, clean output)
+          - output stalls for `settle`s after producing SOME output -> ("awaiting", None, …)
+            (the command likely paused for interactive input — #227b)
+          - the hard `timeout` elapses  -> ("timeout", 124, …) and Ctrl-C is sent to recover
+        A SILENT command (no output yet) is NOT flagged awaiting — it keeps running to the
+        sentinel/timeout, so a quiet `sleep`/compile isn't mistaken for an input prompt.
+        Returns (rc_or_None, output, status)."""
+        if write:
+            os.write(self.master, write)
+        buf = b""
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + timeout
+        last_out = loop.time()
+        seen_output = False
+        marker = (_SHELL_SENTINEL + ":").encode()
+        while True:
+            d = self._read_available()
+            if d:
+                buf += d
+                last_out = loop.time()
+                seen_output = True
+                if marker in buf:
+                    rc, out = self._parse(buf)
+                    return (rc, out, "done")
+            if not self.alive():
+                # #227c: the shell process died (e.g. close() killed it to break a hang) —
+                # return promptly instead of polling a dead PTY until the deadline.
+                return (self.proc.returncode or 137, self._clean(buf), "done")
+            now = loop.time()
+            if now > deadline:
+                with contextlib.suppress(OSError):
+                    os.write(self.master, b"\x03")  # Ctrl-C to try to recover the shell
+                return (124, self._clean(buf) + f"\n(timed out after {int(timeout)}s)", "timeout")
+            if seen_output and (now - last_out) > settle:
+                return (None, self._clean(buf), "awaiting")
+            await asyncio.sleep(0.04)
+
+    async def run(self, command: str, settle: float = 3.0, timeout: float = 60.0):
+        """Run one command. Returns (rc_or_None, output, status) — see _drive."""
+        async with self._lock:
+            if not self.alive():
+                return (137, "(shell exited)", "done")
+            if not self._inited:
+                await self._init()
+            self._read_available()  # drop anything stale before this command
+            # ONE input line: cmd, then the sentinel-printf. Must be one line (not two) so an
+            # interactive `read` inside cmd blocks for the USER's next line, not the printf.
+            line = f"{command}; printf '\\n{_SHELL_SENTINEL}:%d\\n' \"$?\"\n"
+            return await self._drive(line.encode("utf-8"), settle, timeout)
+
+    async def send_input(self, text: str, settle: float = 1.5, timeout: float = 60.0):
+        """#227b: send a line of INPUT (text + Enter) to the program currently awaiting it (no
+        sentinel-printf — the pending one from the original command fires when it exits)."""
+        return await self.send_raw((text + "\n").encode("utf-8"), settle, timeout)
+
+    async def send_raw(self, data: bytes, settle: float = 1.5, timeout: float = 60.0):
+        """#227b: write RAW bytes to the PTY (key sequences — arrows, Enter, Tab, Ctrl-C),
+        no appended newline. Returns (rc_or_None, output, status)."""
+        async with self._lock:
+            if not self.alive():
+                return (137, "(shell exited)", "done")
+            return await self._drive(data, settle, timeout)
+
+    async def interrupt(self) -> str:
+        """#227c: send Ctrl-C to the shell (best-effort). NOTE: without the PTY as the
+        controlling tty this delivers the 0x03 BYTE, which a line-reading program treats as
+        input; a true SIGINT to the foreground group needs a controlling tty (future work).
+        Returns whatever drained afterwards."""
+        async with self._lock:
+            with contextlib.suppress(OSError):
+                os.write(self.master, b"\x03")
+            await asyncio.sleep(0.2)
+            return self._clean(self._read_available())
+
+    @staticmethod
+    def _clean(buf: bytes) -> str:
+        return _TERM_NOISE_RE.sub("", buf.decode("utf-8", "replace")).strip("\n")
+
+    def _parse(self, buf: bytes) -> tuple[int, str]:
+        text = buf.decode("utf-8", "replace")
+        idx = text.rfind(_SHELL_SENTINEL + ":")
+        rc = 0
+        if idx >= 0:
+            m = re.match(r"\s*(-?\d+)", text[idx + len(_SHELL_SENTINEL) + 1:])
+            if m:
+                rc = int(m.group(1))
+            text = text[:idx]
+        return (rc, _TERM_NOISE_RE.sub("", text).strip("\n"))
+
+    async def close(self) -> None:
+        with contextlib.suppress(Exception):
+            if self.alive():
+                self.proc.kill()
+        with contextlib.suppress(Exception):
+            await self.proc.wait()
+        with contextlib.suppress(OSError):
+            os.close(self.master)
+
+
 class ClaudeSession:
     """One SDK session bound to a single Telegram thread.
 
@@ -418,6 +574,9 @@ class ClaudeSession:
         # options.resume so a freshly-built client continues the prior session.
         self.session_id: str | None = resume_session_id
         self.client: ClaudeSDKClient | None = None
+        # #227a: the session's persistent jailed shell (lazily started by shell_run); held so
+        # cd/env persist across messages and torn down with the session (aclose).
+        self._shell: "PersistentShell | None" = None
         # #137: rolling buffer of the child CLI's stderr (filled by _on_stderr, wired
         # via ClaudeAgentOptions.stderr). The SDK only pipes the child's stderr when
         # this callback is set — otherwise a non-zero exit raised a ProcessError whose
@@ -664,6 +823,72 @@ class ClaudeSession:
             return (124, f"(timed out after {int(timeout)}s — process killed)")
         text = (out or b"").decode("utf-8", "replace")
         return (proc.returncode if proc.returncode is not None else -1, text)
+
+    async def shell_run(self, command: str, timeout: float = 60.0):
+        """#227a: run a command in this session's PERSISTENT jailed shell so cd/env persist
+        across messages. Lazily starts the held PTY shell; raises on a spawn failure so the
+        caller can fall back to the one-shot run_shell. Returns (rc_or_None, output, status)."""
+        if not self.sandbox:
+            return (126, "Shell mode requires the sandbox, which is disabled for this session.", "done")
+        sh = self._shell
+        if sh is None or not sh.alive():
+            sh = await self._start_shell()
+            self._shell = sh
+        return await sh.run(command, timeout=timeout)
+
+    async def shell_send_input(self, text: str, timeout: float = 60.0):
+        """#227b: forward a line of input to the program awaiting it in the persistent shell.
+        Returns (rc_or_None, output, status); ('','no shell','done') if none is running."""
+        sh = self._shell
+        if sh is None or not sh.alive():
+            return (0, "", "done")
+        return await sh.send_input(text, timeout=timeout)
+
+    async def shell_send_keys(self, data: bytes, timeout: float = 60.0):
+        """#227b: forward raw key bytes (arrows/Enter/Tab/Ctrl-C) to the awaiting program."""
+        sh = self._shell
+        if sh is None or not sh.alive():
+            return (0, "", "done")
+        return await sh.send_raw(data, timeout=timeout)
+
+    async def shell_interrupt(self) -> str:
+        """#227c: send Ctrl-C to the persistent shell (best-effort)."""
+        sh = self._shell
+        if sh is None or not sh.alive():
+            return ""
+        return await sh.interrupt()
+
+    async def _start_shell(self) -> "PersistentShell":
+        """#227a: spawn the held login-bash on a PTY inside this session's jail."""
+        if self.per_session_uid and self.host_uid is None:
+            with contextlib.suppress(Exception):
+                self.host_uid = await self._claim_host_uid()
+        with contextlib.suppress(OSError):
+            os.makedirs(self.cwd, exist_ok=True)
+            os.makedirs(str(Path(self.cwd).parent / "state"), exist_ok=True)
+        common: dict = {"env": dict(os.environ)}
+        self._enable_sandbox(common)
+        env = common["env"]
+        env["SBX_MODE"] = "shell_persist"      # launcher execs `bash -i` on the PTY
+        launcher = common["cli_path"]
+        master, slave = os.openpty()
+        os.set_blocking(master, False)
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                launcher, cwd=self.cwd, env=env,
+                stdin=slave, stdout=slave, stderr=slave, start_new_session=True,
+            )
+        finally:
+            with contextlib.suppress(OSError):
+                os.close(slave)  # the child holds its own dup; we keep only the master
+        return PersistentShell(proc, master)
+
+    async def _close_shell(self) -> None:
+        """#227a: kill + forget the persistent shell (best-effort)."""
+        sh, self._shell = self._shell, None
+        if sh is not None:
+            with contextlib.suppress(Exception):
+                await sh.close()
 
     def _build_options(self) -> ClaudeAgentOptions:
         """Construct ClaudeAgentOptions for the current mode/model/cwd."""
@@ -1101,6 +1326,7 @@ class ClaudeSession:
         """Disconnect and drop the underlying client."""
         # was: inline disconnect + self.client = None — replaced for #137
         await self._drop_client()
+        await self._close_shell()  # #227a: tear down the persistent jailed shell too
 
     def set_model(self, model: str) -> None:
         """Update the model, applied on the next client build.

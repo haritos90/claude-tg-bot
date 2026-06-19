@@ -343,3 +343,94 @@ def test_outbox_no_dir_is_noop(tmp_path):
     rec = sessions._ThreadRecord(session=SimpleNamespace(cwd=str(tmp_path)), mode="chat")
     asyncio.run(sm._deliver_outbox(rec, 123, None))
     assert bot.photos == [] and bot.docs == [] and bot.messages == []
+
+
+# ----------------------------------------------- #236 queue status + backlog cap
+
+def test_handle_text_queue_status_and_cap(monkeypatch):
+    """#236: handle_text() reports whether a prompt started immediately, was queued
+    behind a running turn (returning the waiting count), or was rejected at the
+    per-session backlog cap. Uses a fake worker that never drains so the session
+    stays 'busy' for the whole test."""
+    import contextlib
+
+    async def _noop(*a, **k):
+        return None
+
+    async def _ensure(*a, **k):
+        return SimpleNamespace()
+
+    async def _slow_worker(*a, **k):
+        await asyncio.sleep(3600)  # never consumes the queue → session stays busy
+
+    monkeypatch.setattr(db, "ensure_thread", _ensure)
+    monkeypatch.setattr(db, "set_kv", _noop)
+
+    sm = sessions.SessionManager(
+        bot=SimpleNamespace(),
+        settings=SimpleNamespace(default_model="m"),
+        gate=SimpleNamespace(),
+    )
+    monkeypatch.setattr(sm, "_default_cwd", lambda tid: "/tmp/x")
+    monkeypatch.setattr(sm, "_get_session", _noop)
+    monkeypatch.setattr(sm, "_worker", _slow_worker)
+
+    async def _body():
+        chat, tid = 100, 5
+        # Idle session → runs now.
+        assert await sm.handle_text(chat, tid, "a") == sessions.SUBMIT_STARTED
+        rec = sm._records[tid]
+        # Simulate the worker pulling the running item off the queue.
+        rec.queue.get_nowait()
+        # Now busy: each follow-up is queued and reports the waiting count.
+        assert await sm.handle_text(chat, tid, "b") == 1
+        assert await sm.handle_text(chat, tid, "c") == 2
+        last = None
+        for _ in range(3):
+            last = await sm.handle_text(chat, tid, "x")
+        assert last == sessions.MAX_QUEUED_MESSAGES  # backlog now full (5 waiting)
+        # Over the cap → rejected, NOT enqueued.
+        assert await sm.handle_text(chat, tid, "y") == sessions.SUBMIT_QUEUE_FULL
+        assert rec.queue.qsize() == sessions.MAX_QUEUED_MESSAGES
+        rec.worker.cancel()
+        with contextlib.suppress(BaseException):
+            await rec.worker
+
+    asyncio.run(_body())
+
+
+# ----------------------------------------------- #245/#227b full-screen TUI guard
+
+def test_is_fullscreen_tui_cmd():
+    """#245/#227b: only full-screen TUIs are refused; line-interactive commands now run
+    (their input is forwarded via the await-input flow)."""
+    tui = ["vim foo.py", "/usr/bin/nano x", "top", "htop", "less file", "man ls", "watch date"]
+    ok = ["gh auth login", "sudo apt update", "python", "node", "ls -la", "pytest -q",
+          "echo hi", "cat foo.txt", "git rebase -i HEAD~3", "read x"]
+    for c in tui:
+        assert sessions._is_fullscreen_tui_cmd(c) is True, c
+    for c in ok:
+        assert sessions._is_fullscreen_tui_cmd(c) is False, c
+
+
+def test_shell_input_keys_parsing():
+    """#227b: a pure key-token message (`.`-prefixed, not `:` → no emoji popup) → raw key
+    bytes; literal text → None."""
+    assert sessions._shell_input_keys(".enter") == b"\r"
+    assert sessions._shell_input_keys(".down .enter") == b"\x1b[B\r"
+    assert sessions._shell_input_keys(".UP") == b"\x1b[A"    # case-insensitive
+    assert sessions._shell_input_keys(".ctrl-c") == b"\x03"
+    assert sessions._shell_input_keys("GitHub.com") is None  # literal text → typed as input
+    assert sessions._shell_input_keys(".down foo") is None   # mixed → literal
+    assert sessions._shell_input_keys("") is None
+
+
+def test_shell_keypad_builds():
+    """#227b: the inline keypad builds primary + 'more' layouts with shk: callbacks. Primary
+    layout (#227 owner request): Esc ↑ Enter / ← ↓ → / Tab ^C ⋯more."""
+    datas = [b.callback_data for row in sessions.shell_keypad().inline_keyboard for b in row]
+    for cb in ("shk:esc", "shk:up", "shk:enter", "shk:left", "shk:down", "shk:right",
+               "shk:tab", "shk:ctrlc", "shk:more"):
+        assert cb in datas, cb
+    mdatas = [b.callback_data for row in sessions.shell_keypad(more=True).inline_keyboard for b in row]
+    assert "shk:space" in mdatas and "shk:less" in mdatas and "shk:pgup" in mdatas

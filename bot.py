@@ -138,9 +138,12 @@ async def main() -> None:
     # (the pollers are background tasks). The watchdog still pings WATCHDOG=1 only after a
     # successful get_me, well within WatchdogSec. No-op when not under systemd.
     # (#158 invariant preserved: still NO synchronous network I/O before this line.)
+    # #234: this init is the finally's guard. The watchdog TASK is created as the FIRST
+    # statement inside the try below (it used to be created right here, OUTSIDE the try,
+    # so a raise during the sandbox setup that follows could leak it). watchdog.ready()
+    # stays here — before the local sandbox setup — so that setup can't delay READY.
     wd_task: asyncio.Task | None = None
     watchdog.ready()
-    wd_task = asyncio.create_task(watchdog.run(bot))
 
     # #119b: when the credential broker is enabled, run it as a host sidecar so the
     # subscription token can stay OUT of every session jail (the jail gets a dummy token
@@ -166,8 +169,9 @@ async def main() -> None:
     # no-ops on other arches). The engine points bwrap's --seccomp fd at this file per jail.
     if getattr(settings, "sandbox_seccomp", False) and settings.sandbox_seccomp_path:
         with contextlib.suppress(Exception):
-            # #196: off the event loop so a slow compile can't block the loop (and so the
-            # already-running watchdog task stays responsive). Runs post-READY now.
+            # #196: off the event loop so a slow compile can't block the loop. Runs
+            # post-READY (#234: now also pre-watchdog-task; READY=1 is already sent so a
+            # slow compile can't trip the start-timeout regardless).
             await asyncio.to_thread(
                 subprocess.run,
                 [sys.executable, str(_deploy / "make-seccomp.py"),
@@ -249,10 +253,15 @@ async def main() -> None:
     dp.callback_query.outer_middleware(language_mw)
 
     try:
-        # #196: watchdog.ready() + the watchdog task are started ABOVE, before the local
-        # sandbox setup, so that setup can't delay READY. The watchdog governs ongoing
-        # reachability and force-restarts only after a PROLONGED outage, never a startup
-        # blip; it pings WATCHDOG=1 only after the get_me below succeeds.
+        # #196/#234: watchdog.ready() (READY=1) is sent ABOVE, before the local sandbox
+        # setup, so that setup can't delay READY. The watchdog TASK is created HERE — the
+        # first statement inside the try — so the finally reliably cancels it. Creating it
+        # is instant and non-blocking; it runs its own Telegram probe loop and pings
+        # WATCHDOG=1 only after a successful get_me (never during setup), so creating it
+        # just after the few seconds of sandbox setup is well within WatchdogSec. The
+        # watchdog governs ongoing reachability and force-restarts only after a PROLONGED
+        # outage, never a startup blip.
+        wd_task = asyncio.create_task(watchdog.run(bot))
 
         # Identify the bot (nice log + early bad-token detection). A network blip
         # here is NOT fatal — polling retries on its own — but a real auth error

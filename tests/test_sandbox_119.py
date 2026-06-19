@@ -164,3 +164,24 @@ def test_chat_session_skips_egress_but_keeps_broker(tmp_path):
     assert env["SBX_BROKER_URL"] == "http://127.0.0.1:8789"
     assert env["SBX_SECCOMP"] == str(blob)
     assert env["SBX_SECRETS_ENV"].endswith("/sid/secrets.env")
+
+
+# ------------------------------------------------------ cred-broker path allowlist (119b)
+_broker = _load("cred-broker.py")
+
+
+def test_cred_broker_path_allowlist():
+    """#234: the inbound path allowlist matches by path segment, not a bare prefix —
+    only `/v1/messages` itself and `/v1/messages/...` sub-paths pass, never a sibling
+    like `/v1/messages_evil`. The query string is ignored."""
+    f = _broker._path_allowed
+    # allowed: the exact path, sub-paths (e.g. count_tokens), and with a query string
+    assert f("POST", "/v1/messages") is True
+    assert f("POST", "/v1/messages/count_tokens") is True
+    assert f("POST", "/v1/messages?beta=true") is True
+    # blocked: a bare-prefix sibling that the old startswith() let through, a different
+    # method, and an unrelated path
+    assert f("POST", "/v1/messages_evil") is False
+    assert f("POST", "/v1/messagesX") is False
+    assert f("GET", "/v1/messages") is False
+    assert f("POST", "/v1/other") is False

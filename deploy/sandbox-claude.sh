@@ -190,6 +190,14 @@ if [ "${SBX_MODE:-}" = "shell" ]; then
   set -- -lc "${SBX_SHELL_CMD:-true}"
 fi
 
+# #227a: persistent shell — exec an INTERACTIVE login bash that reads from the PTY the host
+# holds (its stdin/stdout/stderr are the pty slave). The host drives it line-by-line so cd/env
+# persist across messages. Same SBX_* isolation as above (target-agnostic); only the target.
+if [ "${SBX_MODE:-}" = "shell_persist" ]; then
+  CLAUDE="/bin/bash"
+  set -- -i
+fi
+
 if [ -n "${SBX_HOST_UID:-}" ]; then
   _huid="$SBX_HOST_UID"; _hgid="${SBX_HOST_GID:-$SBX_HOST_UID}"
   # The per-session parent (<sid>/) stays root-owned but must be TRAVERSABLE by the

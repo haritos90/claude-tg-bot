@@ -233,7 +233,7 @@ Conventions legend).
 | `/permissions` | Code tool policy: auto-edits · plan · full-access | Политика инструментов кода: auto-edits · plan · full-access | none → picker | 🟦 |
 | `/tools` | Configure this session's tools | Настроить инструменты сессии | none → grid | 🟦 |
 | `/secret` | 🔐 Set a per-session service credential (code) | 🔐 Учётные данные сервиса для сессии (код) | prompts (capture) | 🟦 |
-| `/shell` | ⌨️ Toggle shell mode — run commands in the jail (code) | ⌨️ Режим shell — команды в песочнице (код) | none → toggle | 🟦 |
+| `/shell` | ⌨️ Toggle a persistent jailed shell — cd/env persist, interactive prompts get a key keypad; toggle = detach (code) | ⌨️ Постоянный shell в песочнице — cd/env сохраняются, интерактив с клавиатурой-кнопками; переключение = detach (код) | none → toggle | 🟦 |
 
 ### Tier E — Meta & secondary
 

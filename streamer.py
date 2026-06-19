@@ -69,20 +69,92 @@ _CATCHUP = 5
 # get genuine streaming instead of the once-a-second write-head. The draft is
 # ephemeral (≈30s preview); finish() sends the real, persisted message at the end.
 #
-# draft_id must be NON-ZERO; reusing one id per chat means each update animates in
-# place. Turns are serial per chat (one worker), so a single constant id is safe.
-_DRAFT_ID = 1
+# draft_id must be NON-ZERO; reusing one id means each update animates in place.
+# was (#238): _DRAFT_ID = 1 — a SINGLE global id shared by every DM turn. Turns are serial
+#   per chat, but the previous turn's draft is an ephemeral ~30s preview, so a NEW turn that
+#   reused id 1 animated FROM that leftover draft — a cross-turn collision that compounded
+#   into lag/stutter on rapid successive turns (e.g. repeated /test). Replaced by a UNIQUE
+#   per-Streamer id so each turn's draft is independent.
+_DRAFT_ID_SEQ = 0
+
+
+def _next_draft_id() -> int:
+    """#238: a unique non-zero draft id per Streamer (process-monotonic; wraps within int32,
+    skips 0). Each turn gets its own draft so it never animates from a prior turn's leftover."""
+    global _DRAFT_ID_SEQ
+    _DRAFT_ID_SEQ = (_DRAFT_ID_SEQ + 1) % 2_000_000_000
+    return _DRAFT_ID_SEQ + 1
 # Sustainable draft cadence (≈5/sec). Measured against the live API: short bursts
 # up to ~25/sec pass, but sustained sending below ~110ms/update trips a 3-second
 # RetryAfter penalty (which reads as stutter). At ~5/sec the client still has
 # plenty of keyframes to animate the appended characters letter-by-letter.
 _DRAFT_INTERVAL = 0.2
+# #242: a draft is an ephemeral ~30s preview. If the content doesn't change for that long
+# (a long tool run holding one phase, or a mid-reply pause) the draft — and the <tg-thinking>
+# indicator — would expire. Re-send the current draft if nothing changed for this many seconds
+# (< 30s) to keep it alive until content resumes.
+_DRAFT_KEEPALIVE_SECS = 20.0
 # Optional console cursor appended at the typing frontier. Default OFF (""):
 # Telegram's native draft animation owns the frontier and largely absorbs a
 # trailing glyph — a rotating one just flickers and vanishes, and even a steady
 # block is barely visible — so a custom caret adds little here. Telegram draws its
 # own streaming indicator. Set e.g. "▌" to force a console cursor back on.
 _DRAFT_CURSOR = ""
+# #239: the documented draft-ONLY "Thinking…" placeholder (RichBlockThinking, the custom
+# <tg-thinking> tag). Shown via sendRichMessageDraft until the first real content replaces
+# it (same draft_id animates). It is DRAFT-ONLY and must NEVER appear in the final
+# sendRichMessage — finish() uses {"markdown": full_text}, so it can't leak. Custom emoji
+# from t.me/addemoji/AIActions are optional. (Was: an empty plain draft showing Telegram's
+# own native "Thinking…" — replaced for #239 to follow the documented rich block.)
+_THINKING_HTML = "<tg-thinking>Thinking…</tg-thinking>"
+# #240: Claude-Code-style "thinking" gerunds, rotated in the <tg-thinking> block before the
+# first content arrives so the placeholder ANIMATES (instead of a static "Thinking…"). Each
+# is shown for _THINKING_ROTATE_SECS; dedup on the rendered html means ~1 draft update per
+# rotation (flood-safe). Whimsical on purpose — these are the Claude Code spinner words.
+_THINKING_WORDS = (
+    "Thinking", "Pondering", "Ruminating", "Cogitating", "Mulling", "Noodling",
+    "Percolating", "Marinating", "Deliberating", "Contemplating", "Brewing",
+    "Churning", "Synthesizing", "Reasoning", "Considering", "Puzzling", "Untangling",
+)
+_THINKING_ROTATE_SECS = 4.0
+
+
+def _thinking_label(elapsed: float) -> str:
+    """#240: pick the gerund for the animated <tg-thinking> placeholder by elapsed time."""
+    return _THINKING_WORDS[int(elapsed // _THINKING_ROTATE_SECS) % len(_THINKING_WORDS)]
+
+
+# #240b: map an agent TOOL call to a short live phase shown in the <tg-thinking> block while
+# the tool runs ("what the agent is doing now"). Plain text + a leading unicode emoji (free,
+# renders everywhere — bots can't use premium custom emoji); the caller HTML-escapes it.
+_TOOL_PHASES = {
+    "Read": ("📖", "Reading"), "Write": ("✏️", "Writing"), "Edit": ("✏️", "Editing"),
+    "MultiEdit": ("✏️", "Editing"), "NotebookEdit": ("✏️", "Editing"),
+    "Grep": ("🔍", "Searching code"), "Glob": ("🔍", "Finding files"),
+    "LS": ("📂", "Listing files"), "WebSearch": ("🌐", "Searching the web"),
+    "WebFetch": ("🌐", "Reading a page"), "TodoWrite": ("🧠", "Planning"),
+}
+
+
+def tool_phase_label(tool_name: str, tool_input: dict | None) -> str:
+    """#240b: a short 'doing X' phase for a tool call, e.g. '⚙️ Running pytest -q…' /
+    '📖 Reading sessions.py…'. Plain text (HTML-escaped by the streamer before send)."""
+    inp = tool_input or {}
+    if tool_name == "Bash":
+        cmd = (inp.get("command") or "").strip().splitlines()[0:1]
+        cmd = cmd[0] if cmd else ""
+        if len(cmd) > 40:
+            cmd = cmd[:39] + "…"
+        return f"⚙️ Running {cmd}…" if cmd else "⚙️ Running a command…"
+    if tool_name in ("Read", "Write", "Edit", "MultiEdit", "NotebookEdit"):
+        fp = inp.get("file_path") or inp.get("notebook_path") or ""
+        base = fp.rsplit("/", 1)[-1]
+        emoji, verb = _TOOL_PHASES[tool_name]
+        return f"{emoji} {verb} {base}…" if base else f"{emoji} {verb}…"
+    if tool_name in _TOOL_PHASES:
+        emoji, verb = _TOOL_PHASES[tool_name]
+        return f"{emoji} {verb}…"
+    return f"⚙️ Running {tool_name}…" if tool_name else "💭 Thinking…"
 
 # A DM draft can't carry an inline button (send_message_draft has no reply_markup),
 # so the ⏹ Stop affordance lives on a SEPARATE control message. To avoid flicker on
@@ -146,6 +218,14 @@ class Streamer:
         # Drafts stream at a fixed, flood-safe cadence; Telegram animates the newly
         # appended characters between updates (the native letter-by-letter effect).
         self._draft_interval = _DRAFT_INTERVAL
+        # #238: unique draft id for THIS turn (no cross-turn animation collision), and a
+        # flood backoff: while >0 and in the future, skip draft frames (set on RetryAfter)
+        # instead of dropping to the grid fallback.
+        self._draft_id = _next_draft_id()
+        self._draft_retry_after: float = 0.0
+        # #240b: the current live "phase" shown in the <tg-thinking> block while the agent
+        # works (set from tool events). None → the placeholder rotates a gerund instead.
+        self._phase: str | None = None
 
         self.message_id: int | None = None
         self._start_time: float = 0.0
@@ -312,6 +392,12 @@ class Streamer:
         # else: caught up — the caret spins in place (no new characters revealed).
         await self._render_frame()
 
+    def set_phase(self, label: str | None) -> None:
+        """#240b: set the live phase shown in the <tg-thinking> placeholder (e.g. from a
+        tool event). Synchronous + cheap; the animation loop picks it up on the next tick.
+        Cleared automatically once real content streams."""
+        self._phase = label or None
+
     async def _render_draft(self) -> None:
         """Push the current text as a native message draft (DM streaming).
 
@@ -330,9 +416,56 @@ class Streamer:
         for long output we render the frontier chunk (the tail). No real message is
         touched here — finish() posts the persisted message once the turn ends.
         """
-        body = self._full[: self._shown].strip()
+        # Streaming-table history (see the TODO ledger):
+        #   #172 — stream the reply as raw markdown via sendRichMessageDraft (already
+        #          formatted as it generates); finish() (#176) posts the whole reply as ONE
+        #          {"markdown"} rich message — SAME renderer as the draft.
+        #   #226 — bug: a table mid-stream shows only its first row, then the full table
+        #          snaps in at finish. Two fixes tried and REJECTED on-device:
+        #            was (attempt 1): render the table frontier as a <pre> grid via
+        #              markup.md_to_html (re-did #162's wide-table wrapping).
+        #            was (attempt 2):
+        #              draft_md = (markup.placeholder_tables(frontier)
+        #                          if markup.contains_table(frontier) else frontier)
+        #              # → replaced the table with a placeholder line (hid it while streaming).
+        #   #237 — live fix below: the draft and finish() share the {"markdown"} renderer, so
+        #          a COMPLETE table renders identically; clip_partial_table() drops the
+        #          in-progress trailing row so each draft frame is a VALID prefix and the
+        #          native table grows row-by-row with no snap. CONFIRMED working on-device
+        #          2026-06-19 — tables stream header→row→row, no empty-snap. (Spec:
+        #          rich-message-spec.md; re-verify via the /verify-rich-draft command.)
+        # #238: under a flood backoff, skip this frame (a RetryAfter set the deadline). The
+        # next tick resumes once it passes; finish() always sends the correct final message.
+        if self._draft_retry_after and time.monotonic() < self._draft_retry_after:
+            return
+        body = markup.clip_partial_table(self._full[: self._shown]).strip()
         if not body:
-            return  # nothing yet — the empty "Thinking…" draft already shows
+            # #240a/#240b: animate the <tg-thinking> placeholder. If a live PHASE was set
+            # (from a tool event), show it ("⚙️ Running pytest…"); otherwise rotate a
+            # Claude-Code-style gerund (Thinking… → Pondering… → …). Dedup on the rendered
+            # html → ~1 draft update per change. (was: a static "Thinking…".)
+            inner = (markup.escape_html(self._phase) if self._phase
+                     else f"💭 {_thinking_label(time.monotonic() - self._start_time)}…")
+            html = f"<tg-thinking>{inner}</tg-thinking>"
+            # #242: skip only if unchanged AND sent recently; otherwise re-send to keep the
+            # ephemeral ~30s draft alive (a static phase during a long tool would else expire).
+            if html == self._rendered_text and (time.monotonic() - self._last_edit) < _DRAFT_KEEPALIVE_SECS:
+                return
+            try:
+                await self.bot(
+                    SendRichMessageDraft(
+                        chat_id=self.chat_id, draft_id=self._draft_id,
+                        rich_message={"html": html},
+                    )
+                )
+                self._rendered_text = html
+                self._last_edit = time.monotonic()
+            except TelegramRetryAfter as exc:
+                self._draft_retry_after = time.monotonic() + float(getattr(exc, "retry_after", 1) or 1)
+            except Exception:
+                pass
+            return
+        self._phase = None  # #240b: real content is streaming — drop any live tool phase
         # #172: stream the RAW markdown via sendRichMessageDraft, so the draft is
         # ALREADY FORMATTED as it generates (Durov's GIF) instead of plain text that
         # snaps to rich at the end. Split raw first so a fence cut at the tail stays
@@ -341,26 +474,36 @@ class Streamer:
         # partial-markdown parse hiccup) we fall back to a plain HTML draft for that
         # frame so streaming never goes dark; the final finish() message is always
         # correct on every client.
-        raw_chunks = markup.split_markdown(body, limit=markup.SAFE_LIMIT)
+        # #241: drafts are RICH messages → use the 32768 limit, not the classic 3900. For a
+        # normal reply the whole growing text is one chunk (streams in full); only a >32768
+        # reply splits and we track the tail frontier.
+        raw_chunks = markup.split_markdown(body, limit=markup.RICH_LIMIT)
         frontier = raw_chunks[-1] if raw_chunks else body
-        if frontier == self._rendered_text:
+        # #242: re-send an unchanged frontier before the ~30s draft expiry (e.g. a mid-reply
+        # pause) so the streamed text doesn't vanish; otherwise skip (dedup).
+        if frontier == self._rendered_text and (time.monotonic() - self._last_edit) < _DRAFT_KEEPALIVE_SECS:
             return
-        # #176→owner pref: stream the WHOLE reply as rich (code included → monospace
-        # in the draft, matching the final rich message). On any failure fall back to a
-        # plain HTML draft for that frame so streaming never goes dark.
         try:
             await self.bot(
                 SendRichMessageDraft(
                     chat_id=self.chat_id,
-                    draft_id=_DRAFT_ID,
+                    draft_id=self._draft_id,
                     rich_message={"markdown": frontier},
                 )
             )
+        except TelegramRetryAfter as exc:
+            # #238: flood — back off and SKIP this frame. Do NOT drop to the md_to_html/<pre>
+            # grid fallback (that degraded the table to a wrapped grid + added a retry sleep on
+            # rapid /test runs). The next tick resumes after the backoff; finish() is correct.
+            self._draft_retry_after = time.monotonic() + float(getattr(exc, "retry_after", 1) or 1)
+            return
         except Exception:
+            # A genuine (non-flood) rich-draft failure — last-resort plain draft so streaming
+            # isn't dark. Rare on a rich-capable DM client; the final finish() is always correct.
             chunk = markup.md_to_html(frontier) or "…"
             await self._safe(
                 lambda: self.bot.send_message_draft(
-                    chat_id=self.chat_id, draft_id=_DRAFT_ID,
+                    chat_id=self.chat_id, draft_id=self._draft_id,
                     text=f"{chunk}{_DRAFT_CURSOR}", parse_mode="HTML",
                 )
             )
@@ -505,15 +648,20 @@ class Streamer:
             self._closed = False
 
             if self.use_drafts:
-                # Probe once: an empty draft shows Telegram's native "Thinking…".
-                # ONLY a definitive BadRequest (drafts genuinely unsupported here,
-                # e.g. not a private chat) drops us to the write-head. A transient
-                # error (RetryAfter / network blip) keeps drafts ON — the animation
-                # loop just retries — so a brief throttle never silently reverts a
-                # DM to the chunky 1/sec write-head mid-conversation.
+                # #239: probe with the documented <tg-thinking> placeholder block (draft-only).
+                # It shows an animated "Thinking…" until the first real content replaces it.
+                # ONLY a definitive BadRequest (drafts genuinely unsupported here, e.g. not a
+                # private chat) drops us to the write-head. A transient error (RetryAfter /
+                # network blip) keeps drafts ON — the animation loop just retries — so a brief
+                # throttle never silently reverts a DM to the chunky 1/sec write-head.
+                # was: await self.bot.send_message_draft(chat_id=…, draft_id=…, text="")
+                #      — an empty plain draft (Telegram's own native "Thinking…"); #239.
                 try:
-                    await self.bot.send_message_draft(
-                        chat_id=self.chat_id, draft_id=_DRAFT_ID, text=""
+                    await self.bot(
+                        SendRichMessageDraft(
+                            chat_id=self.chat_id, draft_id=self._draft_id,
+                            rich_message={"html": _THINKING_HTML},
+                        )
                     )
                 except TelegramBadRequest:
                     self.use_drafts = False
@@ -559,11 +707,14 @@ class Streamer:
             if len(full_text) >= len(self._full):
                 self._full = full_text
 
-    async def finish(self, full_text: str, footer: str = "", notify: bool = True) -> None:
+    async def finish(self, full_text: str, footer: str = "", notify: bool = True,
+                     reply_markup=None) -> None:
         """Final flush for the turn: stop the loops and commit the persisted text.
 
         notify controls whether the FIRST committed message pings the user — True
         for the final answer (it is ready), False for an intermediate segment.
+        reply_markup (#227b) attaches an inline keyboard to the committed rich message
+        (used by the interactive-shell keypad).
         """
         async with self._lock:
             # Reveal everything and stop the loops so neither can fire after we
@@ -574,7 +725,7 @@ class Streamer:
             self._stop_typing()
             self._stop_anim()
             self._closed = True
-            await self._commit(full_text, footer, notify)
+            await self._commit(full_text, footer, notify, reply_markup=reply_markup)
             self._last_edit = time.monotonic()
         # Outside the lock: tear down the Stop control message for this turn.
         await self._remove_control()
@@ -620,11 +771,15 @@ class Streamer:
         self._rendered_text = ""
         self.message_id = None
         if self.use_drafts:
-            # Reset the draft to Telegram's native "Thinking…" for the next
-            # segment; the committed message stands permanently above it.
+            # #239: reset the draft to the <tg-thinking> placeholder for the next segment;
+            # the committed message stands permanently above it.
+            # was: await self.bot.send_message_draft(chat_id=…, draft_id=…, text="")  (#239)
             with contextlib.suppress(Exception):
-                await self.bot.send_message_draft(
-                    chat_id=self.chat_id, draft_id=_DRAFT_ID, text=""
+                await self.bot(
+                    SendRichMessageDraft(
+                        chat_id=self.chat_id, draft_id=self._draft_id,
+                        rich_message={"html": _THINKING_HTML},
+                    )
                 )
         else:
             msg = await self._safe(
@@ -703,7 +858,8 @@ class Streamer:
             )
         )
 
-    async def _commit_rich_markdown(self, full_text: str, footer: str, silent: bool) -> bool:
+    async def _commit_rich_markdown(self, full_text: str, footer: str, silent: bool,
+                                    reply_markup=None) -> bool:
         """#169/#172: post the ENTIRE reply as ONE native rich message (the markdown
         field): Telegram renders headings / lists / tables / quotes natively, with NO
         splitting. Returns True on success; False (→ classic fallback) on any error.
@@ -726,6 +882,7 @@ class Streamer:
                     chat_id=self.chat_id,
                     rich_message={"markdown": md},
                     disable_notification=silent,
+                    reply_markup=reply_markup,
                     **self._kwargs(),
                 )
             )
@@ -802,7 +959,7 @@ class Streamer:
                 )
         self._rendered_text = full_text
 
-    async def _commit(self, full_text: str, footer: str, notify: bool) -> None:
+    async def _commit(self, full_text: str, footer: str, notify: bool, reply_markup=None) -> None:
         """Render full_text and post it as permanent message(s). Caller holds the
         lock and owns the streaming flags. Links never preview; only the FIRST
         message may ping (notify), the rest are silent.
@@ -821,7 +978,7 @@ class Streamer:
         # bubbles, and when Telegram styles code this needs no change. The split-by-
         # segment path (_commit_mixed / markup.split_code_blocks) is kept, un-called, to
         # flip back if the trade-off is revisited.
-        if await self._commit_rich_markdown(full_text, footer, silent_first):
+        if await self._commit_rich_markdown(full_text, footer, silent_first, reply_markup=reply_markup):
             return
         # # was (#176): split a code reply → rich prose/tables + classic code block:
         # if markup.has_code_block(full_text):
