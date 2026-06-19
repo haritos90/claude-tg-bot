@@ -100,3 +100,19 @@ def test_big_memory_1m_models_env_override(monkeypatch):
     son = engine.ClaudeSession(mode="chat", model="claude-sonnet-4-6", cwd="/tmp",
                                big_memory=True)._build_options()
     assert son.model == "claude-sonnet-4-6[1m]"
+
+
+# ------------------------------------------------ #227a persistent-shell parsing
+
+def test_persistent_shell_parse_strips_noise_and_extracts_rc():
+    """#227a: _parse pulls the exit code from the sentinel and strips terminal noise
+    (bracketed-paste escapes, carriage returns); output before the sentinel is clean."""
+    import types
+    sh = engine.PersistentShell(types.SimpleNamespace(returncode=None), -1)
+    rc, out = sh._parse(b"\x1b[?2004l\r\nhello\n\x1b[?2004h__SBX_SH_DONE__:0\n")
+    assert rc == 0 and out == "hello"
+    rc, out = sh._parse(b"\x1b[?2004l\r\noops\n__SBX_SH_DONE__:7\n\x1b[?2004h")
+    assert rc == 7 and out == "oops"
+    # no sentinel (timeout/partial) → rc 0, cleaned text
+    rc, out = sh._parse(b"\x1b[?2004lpartial output\r\n")
+    assert rc == 0 and out == "partial output"

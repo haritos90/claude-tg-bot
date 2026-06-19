@@ -55,7 +55,7 @@ Created on `db.init` and migrated **forward in place** — only additive, guarde
 
 | Table | Key | Holds |
 |---|---|---|
-| `threads` | `thread_id` (PK) | One row per session: `chat_id`, `mode` (`chat`/`code`), `model`, `cwd`, the resumable `code_session_id` / `chat_session_id`, `name`, `created_by`, `created_at`, and per-session toggles added by migration (`permission_mode`, `effort`, `max_turns`, `big_memory`, `favorite`, `no_sandbox`, `tools_enabled`, `add_dirs`, `fork_pending`, `auto_compact`, `hot_cache_timer`). |
+| `threads` | `thread_id` (PK) | One row per session: `chat_id`, `mode` (`chat`/`code`), `model`, `cwd`, the resumable `code_session_id` / `chat_session_id`, `name`, `created_by`, `created_at`, and per-session toggles added by migration (`permission_mode`, `effort`, `max_turns`, `big_memory`, `favorite`, `no_sandbox`, `tools_enabled`, `add_dirs`, `fork_pending`, `auto_compact`, `hot_cache_timer`, `stream_enabled`). `stream_enabled` is still read live (it gates whether replies stream) but its user-facing toggle was retired in #144 — streaming is always-on. |
 | `usage` | `id` (PK) | One row per turn: `thread_id`, `ts`, `input_tokens`, `output_tokens`, `cache_read`, `cache_creation`, `cost_usd`, `model`, `context_tokens`. Per-user totals roll up via `JOIN threads ON chat_id`. |
 | `messages` | `id` (PK) | Conversation log (`thread_id`, `ts`, `role`, `text`) feeding `/last` / `/recap` / `/history`; indexed `(thread_id, id)`. |
 | `kv` | `key` (PK) | Small key-value state: per-user current session (`dm_current:<uid>`), `dm_seq`, usage-display mode, pinned-message id, per-user `lang:<uid>`, access overrides, user defaults, `archive_retention_days`, `max_sessions_default`. |

@@ -41,7 +41,7 @@ header rows. Columns:
 - **Closed** — `| ID | Theme | Title | Resolution | Release notes |`
 - **Deferred** — `| ID | Pri | Eff | Theme | Title | Reason |`
 
-**Next free ID:** 232
+**Next free ID:** 235
 
 ---
 
@@ -51,7 +51,7 @@ Current, actionable work — promote from Backlog when picked up.
 
 | ID | Pri | Eff | Theme | Title |
 |---|---|---|---|---|
-| — | — | — | — | _(empty — promote from Backlog when picking up new work)_ |
+| 240 | P2 | L | ux | Full-rich live "thinking" — 240a/b/d done; only 240c (reasoning stream) remains |
 
 ## Backlog
 
@@ -60,14 +60,56 @@ Not started; promote to Open when picked up.
 | ID | Pri | Eff | Theme | Title |
 |---|---|---|---|---|
 | 197 | P3 | XS | core | Per-user session cap not enforced for group/topic sessions |
-| 198 | P2 | S | docs | isolation.md cross-references a threat model deleted from TODO #119 |
-| 199 | P2 | XS | docs | data-model.md threads schema omits the live stream_enabled column |
 | 201 | P3 | XS | docs | Spec-voice cleanup: first-person narration in isolation.md and TODO #189 |
-| 227 | P2 | L | features | Shell mode phase 2: persistent tmux/PTY shell + lifecycle |
-| 226 | P2 | M | ux | Rich-draft tables: only the first row streams; full table snaps in at finish |
 | 229 | P3 | M | features | Surface a code session's live task list in Telegram (rich to-do list) |
+| 243 | P2 | M | ux | Tables >20 columns: verify behavior, fall back to PNG, and tell the agent the limit |
+| 244 | P3 | S | ux | Decide when to set `skip_entity_detection` on rich sends |
+| 246 | P3 | M | features | Shell: real Ctrl-C via controlling-tty + smoother full-screen TUI/picker handling |
 
 ### Details
+
+**#240 — Full-rich live "thinking": drive `<tg-thinking>` from agent activity** (P2 · L · ux)
+
+Use Telegram's native rich `<tg-thinking>` block (Bot API 10.1, draft-only, RichBlockThinking)
+to show a live "what the agent is doing" indicator that self-cleans at finish (never in history).
+cc-connect is NOT a reference here — it uses the classic edit-in-place card with tool-step rows
+and does NOT use rich drafts / `<tg-thinking>` / native tables at all. Sub-parts:
+- **240a (DONE)** — animate the placeholder: rotate Claude-Code-style gerunds (Thinking… →
+  Pondering… → …) in `<tg-thinking>` before the first content (`streamer._THINKING_WORDS`,
+  `_thinking_label`, the no-body branch of `_render_draft`). Dedup → ~1 update per rotation.
+- **240b (DONE)** — drive the block from live TOOL activity: the `tool` EngineEvent
+  (`.tool_name`/`.tool_input`) is mapped by `streamer.tool_phase_label` to a short phase
+  ("⚙️ Running pytest…", "📖 Reading sessions.py…", "🌐 Searching the web…") and pushed via
+  `streamer.set_phase` from `sessions._run_one` (code mode, on the tool event). `_render_draft`
+  shows the phase in `<tg-thinking>` (HTML-escaped) instead of the gerund, and clears it once
+  real content streams. Tested (`tests/test_streamer.py`). NOTE: a long tool run (>30s) will let
+  the ephemeral draft expire until #242 (keepalive) lands.
+- **240c** — stream the model's REASONING/extended-thinking content (the "unfurling" text) in
+  the block as it arrives (dim/collapsed), replaced by the answer once output starts.
+- **240d (DONE via unicode)** — phase emoji. The AIActions pack is PREMIUM custom emoji, which a
+  bot cannot render (rich `{"html"}` + classic HTML `<tg-emoji>` tests both showed only the
+  fallback; IDs saved in `deploy/aiactions-emoji.json`). Resolved with plain UNICODE emoji baked
+  into `tool_phase_label` / the gerund (💭🔍📖🧠⚙️🌐✏️📂) — free, universal, no custom-emoji
+  machinery. (A bot-OWNED custom-emoji set via `createNewStickerSet` remains a possible future
+  upgrade, but needs uploaded art; a free third-party pack via `<tg-emoji>` would need its short
+  name. Neither needed now.)
+Keep DRAFT-ONLY throughout: `finish()` stays `{"markdown": full_text}` with no thinking block.
+
+**#243 — Tables >20 columns: verify behavior, fall back to PNG, and tell the agent** (P2 · M · ux)
+
+The rich table limit is 20 columns. We must (a) VERIFY what Telegram does with a >20-column
+markdown table (reject? auto-image?) — use `/verify-rich-draft` with a 21-col table; (b) guard:
+route a >20-column table to the PNG path (`table_image.render_table_png`, the #162 mechanism)
+instead of a native table; (c) append to the agent's session system prompt (`engine`
+`CHAT_SYSTEM_PROMPT` / code append) that the client shows at most 20 columns natively and a wider
+table is delivered as a PNG image — so the model formats accordingly.
+
+**#244 — Decide when to set `skip_entity_detection` on rich sends** (P3 · S · ux)
+
+`InputRichMessage.skip_entity_detection` disables auto-detection of URLs / mentions / hashtags /
+phone numbers / bank cards. Decide the scenarios where we want it on (e.g. code-heavy replies, or
+to stop spurious linkification of file paths / @handles in output) vs off (normal prose where
+auto-links help). Likely a per-send heuristic. Design first.
 
 **#197 — Per-user session cap not enforced for group/topic sessions** (P3 · XS · core)
 
@@ -76,21 +118,6 @@ but `_new_session` for `chat.type != "private"` (supergroup topics) bypasses it
 (`handlers.py:1424`, `:2387`). If group sessions count toward the per-user cap this is a gap;
 if the cap is intentionally DM-only, add a one-line comment stating so.
 
-**#198 — isolation.md cross-references a threat model deleted from TODO #119** (P2 · S · docs)
-
-`isolation.md:6` states "TODO.md #119 holds the threat model + design rationale", but the
-commit moved #119 to Closed and deleted its Details block (threat model, exfil-channel
-analysis, Components 1–5, egress options A–E). That rationale now exists nowhere. Fix: migrate
-the threat model / design rationale INTO isolation.md (now the only deep reference) and point
-AGENTS/README/TODO at it; or drop the dangling claim.
-
-**#199 — data-model.md threads schema omits the live stream_enabled column** (P2 · XS · docs)
-
-`data-model.md:804` is the authoritative schema spec but its `threads` toggle list drops
-`stream_enabled`, which is still a real migrated column (`db.py:58`, ALTER at `db.py:189`,
-selected at `db.py:276`). Fix: add `stream_enabled` (mark retained-but-unused per #110 if
-desired) so the documented schema matches the table.
-
 **#201 — Spec-voice cleanup: first-person narration** (P3 · XS · docs)
 
 Make two spec passages declarative/impersonal. `isolation.md` (~934, ~1088): "We did **not**
@@ -98,72 +125,6 @@ add an 'insecure' flag…" and "…we use `iptables -m cgroup --path`" → "No '
 added…" and "…the egress rule uses `iptables -m cgroup --path`". TODO.md #189 Deferred reason:
 "Our reaper… continuous context — our default… Marginal for us… we deliberately favour…" →
 restate without "our / us / we".
-
-**#227 — Shell mode phase 2: persistent tmux/PTY shell + lifecycle** (P2 · L · features)
-
-Phase 1 (#224, shipped) gave the frame + a ONE-SHOT jailed runner (each message runs in a fresh
-`bash -lc` in the session's #119 jail). Phase 2 makes the shell PERSISTENT and interactive
-(`cd`/env survive between commands; line-interactive flows like password prompts / `gh auth
-login` work) and adds the lifecycle controls a long-lived shell needs.
-
-Design nuance (found in phase 1): a persistent tmux SERVER can't be reached across separate
-`bwrap` invocations — each is a fresh user/PID namespace + tmpfs, so a second `tmux send-keys`
-call can't see the first jail's server. Persistence therefore needs ONE long-lived jailed
-process the runner HOLDS — i.e. a held PTY subprocess (bash, or tmux on that pty), driven by
-writing the command to the pty and reading until a quiescence/sentinel. Reuse the
-`SBX_MODE=shell` launcher branch + `engine.run_shell`'s env, but keep the process alive instead
-of one-shot, store its handle on the `_ThreadRecord`, and add the items below.
-
-Execution (tmux-backed persistent shell):
-- Each toggled-on session gets a PERSISTENT shell hosted in `tmux` INSIDE its #119 jail, so
-  `cd`/env persist between messages and input can be sent to a RUNNING process (the interactive
-  path a one-shot `bash -lc` can't do). Reuse `deploy/sandbox-claude.sh`: add an exec branch that
-  launches `tmux` (new-session + a login shell) under the same SBX_* setup
-  (uid/egress/secrets/cgroup/seccomp) instead of `$CLAUDE`. A thin runner (no `ClaudeSDKClient`)
-  drives it: `tmux send-keys` feeds the user's line as keystrokes, and output is read by polling
-  `tmux capture-pane`; a prompt/quiescence heuristic decides when the command has settled before
-  replying. Output as a monospace block; long output truncated + attached as `.txt` (reuse
-  `markup.as_document` / outbox).
-- Catch-all text, when a code session has shell_mode on, routes to the runner instead of
-  `session.run`. A ⏹ Stop control sends Ctrl-C (`send-keys C-c`) to interrupt a foreground
-  command (mirror the existing turn-stop control).
-- No approval gate: the user is the principal (no confused-deputy) and the jail is the hard
-  boundary — they run only in their own session. Gate the toggle to code-level users.
-- Limits: fundamental — a smooth live full-screen TUI (`vim`/`top`) can't render in a chat bubble
-  (capture-pane is snapshot-and-send, laggy for fast refreshers). But LINE-interactive flows
-  (password prompts, `gh auth login` device step, `read`) DO work via send-keys. Document the
-  boundary. A degenerate one-shot mode (`bash -lc`, no persistence) is the trivial fallback if
-  tmux proves too heavy.
-
-Lifecycle & resources (MUST resolve before build):
-- **RAM:** an idle tmux server + login shell is light (order of a few MB RSS each) but NOT free
-  and CANNOT be held forever per session — many concurrent [shell] sessions add up, and whatever
-  the user leaves running (a dev server, `tail -f`) keeps consuming. Account/cap a persistent
-  shell like the claude subprocess.
-- **No direct close (the toggle gap):** a single `/shell` toggle gives the user no obvious way to
-  KILL a shell that hangs in PARALLEL to their session (a stuck/long command, an orphaned server).
-  Resolve with: (a) an IDLE REAPER that kills the tmux session after N min of no activity — reuse
-  the #179 reaper machinery so an abandoned shell can't linger; (b) tie the tmux session lifetime
-  to the bot session — killed on session delete and on bot restart; (c) the ⏹ Stop / Ctrl-C control
-  for a hanging foreground command; (d) toggle-OFF semantics — keep the tmux session alive for
-  re-toggle persistence (cd/env survive) and rely on the idle reaper, OR kill on OFF (simpler, no
-  orphans, loses persistence). Recommend (a)+(b)+(c) with toggle-OFF keeping the session until the
-  idle reaper collects it; revisit if RAM pressure shows up.
-- **Caps:** count a live shell against the per-session #119e cgroup mem/pids caps, and add a
-  max-concurrent-[shell] ceiling so a fleet of idle shells can't exhaust host RAM.
-
-**#226 — Rich-draft tables: only the first row streams; full table snaps in at finish** (P2 · M · ux)
-
-While a reply streams, a markdown table shows only its first row; the whole RENDERED table appears
-only when the message finishes. During draft streaming the streamer pushes RAW markdown (#172,
-`streamer.py`), and a markdown table is atomic — not a valid/renderable table until the header +
-separator + all rows exist, so mid-stream the user sees a partial/raw table and `finish()` snaps to
-the rendered one. Hypothesis: the table content may be emitted in an order that delays a
-renderable state; consider revealing it row-by-row (emit each row as it completes) or streaming the
-table as plain pre-formatted text until complete, then snapping to the rich table. Look at how
-tables render (`markup.py` / `rich_message` / the #162 `table_image` path) and whether a partial
-table can be shown incrementally. Likely shares the draft/streamer path with #225 — root-cause #225
-first.
 
 **#229 — Surface a code session's live task list in Telegram (rich to-do list)** (P3 · M · features)
 
@@ -191,16 +152,42 @@ Design notes:
 
 ---
 
+**#246 — Shell: real Ctrl-C via controlling-tty + smoother full-screen TUI/picker handling** (P3 · M · features)
+
+Follow-ups from #227 on-device use. (1) Ctrl-C is currently the `\x03` BYTE — without the PTY
+as the jailed bash's controlling terminal it won't deliver SIGINT to a foreground process group,
+so a hung command (e.g. a browser-flow `gh auth login` polling forever) can't be interrupted by
+^C (only reaped on idle / killed on session delete). Give the jailed bash a controlling tty
+(setsid + TIOCSCTTY under bwrap+setpriv, mindful of the #179 cgroup/reaper invariant) so ^C is a
+real interrupt. (2) An arrow-key picker that REDRAWS the whole screen (gh's auth-method list)
+streams as snapshots; consider detecting the alternate-screen / heavy-redraw case and showing
+only the latest frame, or a hint to prefer a non-interactive form (`gh auth login --with-token`).
+
 ## Closed
 
 Title-only history.
 
 | ID | Theme | Title | Resolution | Release notes |
 |---|---|---|---|---|
+| 227 | features | Shell mode phase 2: persistent PTY shell + interactivity + lifecycle | A held login `bash -i` per code session on a host-driven PTY (`engine.PersistentShell`; launcher branch `SBX_MODE=shell_persist`), reusing the #119 jail. (227a) `shell_run` writes `cmd; printf <sentinel>:$?` as ONE line and reads the master until the sentinel → `(rc, output)`; `stty -echo`/`PS1=` + `_TERM_NOISE_RE` (CSI/OSC + two-char ESC like ESC 7/8) give clean output; cd/env persist. (227b) `_drive` returns `done`/`awaiting`(settle after output)/`timeout`; a paused command flips the session to await-input and the next message is forwarded as input/keys. Telegram-native UX: `_run_shell_command` attaches an inline KEYPAD (Esc ↑ Enter / ← ↓ → / Tab ^C ⋯more; `shell_keypad` + `handlers.on_shell_key` callback edits the message in place via `shell_key`→`shell_send_keys`); `streamer.finish`/`_commit` gained `reply_markup`. Typed key fallback `.up`/`.down`/`.enter` (prefix `.`, not `:`). #245 relaxed → only full-screen TUIs refused (`_is_fullscreen_tui_cmd`). (227c) `/shell` toggle = DETACH (shell + running command stay alive in the background, agent resumes; re-attach keeps cd/env + await state); torn down on session delete/evict (`aclose` `_close_shell`) + #179 idle reaper; cgroup mem/pids caps apply via the jail. Local PTY tests confirm cd/env persistence, rc, clean output, and the chained prompt→input→prompt→input flow; +tests (parse, keypad, key-tokens, TUI guard). py_compile + ruff + suite (167) clean; live restart "Run polling"; keypad confirmed on-device. CAVEATS (→ #246): Ctrl-C is the `\x03` byte (no controlling tty → not a true SIGINT, so a hung command is reaped on idle / killed on delete); a full-redraw arrow picker streams as snapshots. For GitHub auth prefer a token over the browser flow. | The jailed shell is now persistent and interactive: `cd`/env survive between messages, prompts (incl. arrow-key pickers) are driven by an on-screen key keypad, and `/shell` detaches so a long command / server keeps running while the agent continues. |
+| 239 | ux | Use the documented `<tg-thinking>` draft block for the generating placeholder | Replaced the empty plain "Thinking…" draft with the documented `<tg-thinking>` RichBlockThinking block (`_THINKING_HTML`), sent via `sendRichMessageDraft` in `start()` + the segment reset. Draft-only by construction (finish() uses `{"markdown"}`). Built on by #240 (animated gerunds + live tool phases). Confirmed on-device ("thinking/pondering" visible). py_compile + ruff + i18n clean; live restart "Run polling". | The "generating" placeholder uses Telegram's native animated Thinking block. |
+| 238 | ux | Streaming-draft lag on rapid turns: global draft_id + flood→grid fallback | Two compounding causes fixed in `streamer.py`: a single global `_DRAFT_ID = 1` shared by every DM turn (a new turn animated from the previous turn's leftover ephemeral draft → cross-turn stutter) → now a UNIQUE per-`Streamer` id (`_next_draft_id`); and the rich-draft `except` dropping to the `md_to_html` `<pre>` grid on flood (`TelegramRetryAfter` on rapid turns degraded the table + slept the retry) → now backs off (`_draft_retry_after`) and SKIPS the frame instead of falling to the grid. py_compile + ruff + suite clean; live restart "Run polling". | Calling something like `/test` several times in a row no longer lags or degrades the table — each turn streams on its own draft and flood is handled by skipping frames, not falling back to the old grid. |
+| 245 | reliability | One-shot shell hangs the session on an interactive command (e.g. `gh auth login`) | Shell phase 1 (#224) runs `bash -lc` with `stdin=/dev/null` + a 60s timeout, so an interactive command (gh auth login device-flow, editors, REPLs, ssh, sudo) can't read input and HUNG the session's worker for the full 60s — every other message queued (#236) and the bot looked dead until the timeout killed it (the reported case). Added `sessions._is_interactive_shell_cmd` (heuristic on the first command word + REPLs + a few phrases like `gh auth login` / `git rebase -i` / `sudo` without `-n`); `_run_shell_command` now refuses such commands INSTANTLY with the new `shell.interactive` hint (suggesting a non-interactive form, e.g. `gh auth login --with-token`) instead of running them. True interactivity remains #227 (persistent shell). +test `test_is_interactive_shell_cmd`. py_compile + import + ruff + suite (164) + i18n round-trip clean; live restart "Run polling". | Interactive shell commands (like `gh auth login`) no longer freeze the session for a minute — the bot replies immediately that the one-shot shell can't take interactive input and suggests a non-interactive alternative. |
+| 242 | reliability | Draft keepalive: re-send within the ephemeral 30s window during long gaps | A draft is a ~30s ephemeral preview; if `_render_draft`'s content didn't change for that long (a static `<tg-thinking>` phase during a long tool run, or a mid-reply pause) the draft — and the indicator — expired, leaving only typing dots. Added `_DRAFT_KEEPALIVE_SECS` (20s): both draft paths (the thinking-placeholder branch and the content-frontier branch) now skip a send only when the content is unchanged AND it was sent < 20s ago; otherwise they re-send the same draft to keep it alive before the 30s expiry. The thinking branch now also stamps `_last_edit` on send. (Also: the thinking gerunds gained a 💭 prefix for a visible icon.) py_compile + ruff + suite (163) clean; live restart "Run polling". | The "thinking"/working indicator and streamed text no longer vanish during a long tool call or pause — the draft is kept alive until the reply continues. |
+| 241 | ux | Use the rich 32768-char limit for drafts/streaming (not the classic 4096) | Rich messages allow 32768 chars vs the classic 4096, but the draft frontier was split at `markup.SAFE_LIMIT` (3900) so a long reply streamed only its ~3900-char tail. Added `markup.RICH_LIMIT = 32768`; `_render_draft` now splits the draft body at `RICH_LIMIT`, so a normal reply streams in FULL (one chunk) and only a >32768 reply tracks the tail. The rich final message (`_commit_rich_markdown`) already sent the whole reply as one bubble; the classic 4096 split / `.md`-document fallback stays only on the failure path. py_compile + ruff + suite (163) clean; live restart "Run polling". | Long replies now stream the whole growing text in the draft (not just the last ~3900 chars). | 
+| 237 | ux | Stream markdown tables row-by-row (valid-prefix drafts), supersedes #226 | The real fix for the #226 table-streaming bug, CONFIRMED working on-device 2026-06-19. Grounding (verified against the official docs, captured in `rich-message-spec.md`): the streaming draft (`streamer._render_draft` → `sendRichMessageDraft {"markdown": frontier}`) and the final message (`_commit_rich_markdown` → `sendRichMessage {"markdown": full_text}`) use the SAME Rich Markdown renderer, so a COMPLETE table renders identically in both; the "first row only, snaps at finish" symptom was the draft carrying a table mid-row (a half-typed row/separator is invalid GFM → Telegram shows the header line alone). Fix: `markup.clip_partial_table` drops the in-progress trailing table line so every draft frame is a VALID prefix — the native table grows header→row→row with no snap, in the same style as the finished message. Rejected approaches kept COMMENTED with a #237 ref (the #162/#226-attempt-1 `<pre>` grid wraps on wide tables; the #226-attempt-2 placeholder hid the table). Also added the `/verify-rich-draft` command + `rich-message-spec.md` (verbatim doc extract) + `deploy/verify-rich-draft.py` (live API draft→final test, bypasses aiogram/streamer to isolate glitches) so future agents ground table/draft work in the spec instead of guessing. Pure helper `clip_partial_table` + unit tests (`tests/test_markup.py`); py_compile + ruff clean; full suite 161 passed (1 pre-existing PIL font failure); live restart confirmed "Run polling"; on-device confirmed row-by-row. | Tables now build up row-by-row as a reply streams (header, then each row), in the same native style as the finished message — no broken partial grid and no snap at the end. |
+| 226 | ux | Rich-draft tables: only the first row streams; full table snaps in at finish | While streaming, `_render_draft` (`streamer.py`) pushed the frontier as a rich-markdown draft (`SendRichMessageDraft {"markdown": …}`, #172); Telegram's rich renderer shows a still-incomplete markdown table as only its first row, then the native rich table snapped in at `finish()`. A first attempt rendered the table frontier as a `<pre>` grid (`md_to_html`/`_tables_to_pre`) — but a WIDE multi-column table wraps to mush on a phone, so that regressed the look (confirmed on-device). Final approach: while a (possibly partial) table is in the frontier, `_render_draft` replaces it with a compact placeholder line via the new pure `markup.placeholder_tables` (detected by `markup.contains_table` — a `|` row followed by a GFM or ASCII separator, firing even on a partial header+separator) and keeps streaming the surrounding prose as a rich-markdown draft; `finish()` renders the real table via the native rich-table path (#164). Dedup now keys on the actually-sent draft text. try/except plain-HTML fallback retained so streaming never goes dark. SUPERSEDED by #237: the placeholder was rejected on-device (it hides the table instead of revealing it row-by-row), and the grid attempt re-did the already-rejected #162 grid. The real fix (clip in-progress rows so the draft is a valid growing prefix) is tracked and implemented in #237; the #226 helpers `contains_table`/`placeholder_tables` and their tests are kept COMMENTED with a #237 ref. | While a reply streams, a table is shown via the #237 row-by-row approach (the #226 placeholder/grid attempts were reverted). |
+| 236 | features | Follow-up-while-busy: queue at the turn boundary with a Claude-Code-style UX | The session already queued follow-ups behind a running turn (`rec.queue`, task chaining) but gave no feedback and had no backlog bound. Design was settled by the `cc-connect-design-reference` memory: do NOT inject mid-turn (the reference, used by thousands, documents that a mid-turn stdin message makes the agent CLI hang waiting for a second result) — what Claude Code shows as "added while answering" is queue-at-boundary + UX. So `handle_text` now returns a status: `SUBMIT_STARTED` (0) when the worker was idle and it runs now, a positive count of prompts WAITING when it was queued behind a running turn, or `SUBMIT_QUEUE_FULL` (-1) when the per-session backlog cap (`MAX_QUEUED_MESSAGES`=5, mirroring cc-connect) is hit and the prompt is NOT enqueued. The handlers (`on_text`, `_submit`/attachments incl. #235 albums) ack via `_ack_queue`: a queued message replies `queue.queued_ack` ("📥 Queued — will run after the current reply (N waiting)"), an over-cap one replies `queue.full_reject`; an immediate start stays silent. Added `tests/test_sessions.py::test_handle_text_queue_status_and_cap`. NON-goal kept: mid-turn injection / parallel turns on one session. Deferred (optional, not needed for the ask): a staleness watermark (Telegram doesn't redeliver like the Feishu case the reference guards) and merging consecutive queued texts into one turn. py_compile + import + ruff clean; full suite 160 passed (1 pre-existing unrelated PIL font failure); live restart confirmed "Run polling". | When you send another message while the bot is still replying, it now confirms the message was queued and will run next — and caps a runaway backlog — instead of silently stacking up. |
+| 235 | ux | Coalesce a Telegram media-group (album) into ONE turn instead of N | Telegram delivers an album as separate updates sharing a `media_group_id`, so `on_photo`/`on_document` fired once per item → N independent turns (a 4-file album = 4–5 turns) and the model never saw the files together. Added a debounce coalescer in `handlers.build_router`: the attachment handlers now route through `_route_attachment`, which for a `media_group_id` buffers each item in `album_buf` keyed by `(chat, thread, media_group_id)` and (re)arms an `ALBUM_DEBOUNCE_SECS` (0.8 s) timer; when it fires, `_flush_album` submits ONE turn. The session-key await is resolved before the get-or-create so concurrent item handlers can't double-create the buffer (no await inside the mutation). Combining math is the pure, unit-tested `_combine_album_parts` (sorts by message_id, concatenates image/PDF blocks, joins text/code `--- name ---` segments under one caption header, caps combined inline at MAX_TEXT_INLINE_CHARS, caps count at MAX_ALBUM_ITEMS=20 with a no-silent-truncation dropped note via new `attach.album_dropped` i18n key). Standalone (non-album) attachments are unchanged. v1 keeps a caption sent as a separate text message as its own turn. Added `tests/test_handlers.py` (4 cases). py_compile + import + ruff clean; full suite 159 passed (1 pre-existing unrelated PIL font failure); live restart confirmed "Run polling". | Sending several files/photos at once (a Telegram album) is now handled as a single message — the bot reads them together and replies once, instead of firing a separate answer per file. |
+| 234 | core | Post-#231 cleanup nits: broker allowlist, watchdog task init, orphaned i18n key | Three cleanups from the #231 review. (1) `deploy/cred-broker.py` `_path_allowed` matched the inbound allowlist by bare prefix (`base.startswith("/v1/messages")`), so a sibling like `/v1/messages_evil` also passed; tightened to `base == p or base.startswith(p + "/")` so only `/v1/messages` and `/v1/messages/...` (e.g. `/v1/messages/count_tokens`) match. Added `test_cred_broker_path_allowlist` in `tests/test_sandbox_119.py`. (2) `bot.py` watchdog task: it was created outside the try whose finally cancels it (a raise during sandbox setup could leak it). Moved the `asyncio.create_task(watchdog.run(...))` to the first statement inside the try, keeping `watchdog.ready()` before the sandbox setup (the #158/#196 invariant — READY must precede local setup) and the pre-try `wd_task = None` as the finally's guard; updated the seccomp comment that referenced the (formerly) already-running task. (3) `i18n.py`: commented out the orphaned `sandbox.show` / `sandbox.show_scoped` / `sandbox.set_on` / `sandbox.set_off` keys that still advertised the `/sandbox on|off` toggle retired in #231 (no live `.py` callers; `sandbox.mandatory` is the live key), tagged `#234` per the comment-out-with-task-ref rule. py_compile + import + pytest (155 passed, 1 pre-existing unrelated PIL font failure) + ruff clean; live restart confirmed "Run polling" with the watchdog probing post-setup as intended. | Hardening + tidy: the credential broker's path allowlist now rejects look-alike paths, the watchdog task can't leak on a startup error, and the stale `/sandbox` toggle strings are gone from the catalog. |
+| 233 | docs | Doc-hygiene nits: isolation.md section cross-ref + TODO spec-voice/order | Three documentation fixes from the #231 diff: (1) `isolation.md` intro cited "the egress allowlist + cgroup DoS limits (§5–§6)" — wrong sections (egress is §4, DoS is §6, §5 is per-session secrets); corrected to `(§4 + §6)`. (2) the #225 Closed Resolution closed with first-person narration ("our") that violates spec voice; restated neutrally to name the credential broker. (3) the Backlog table + Details blocks had #227 ahead of #226 (out of ascending-ID order per the line-32 rule); reordered both so the tail reads 226, 227, 229, 234. | Documentation only — the sandbox reference's section cross-ref is correct, the changelog reads in neutral spec voice, and the Backlog is back in ascending-ID order. |
+| 199 | docs | data-model.md threads schema omits the live stream_enabled column | The `threads` schema spec (`data-model.md:58`) listed the per-session migration toggles but dropped `stream_enabled`, a real migrated column (`db.py` ALTER + select + `set_stream_enabled`, read live in `sessions.py` to gate reply streaming). Added `stream_enabled` to the documented toggle list with a one-line note that the column is still read live but its user-facing toggle was retired in #144 (streaming is always-on). Stale line refs in the task (db.py:58/189/276, data-model.md:804) were pre-move; the doc is now 92 lines and the schema sits at line 58. | The data model reference now documents the `stream_enabled` column, matching the actual table. |
+| 198 | docs | isolation.md cross-references a threat model deleted from TODO #119 | `isolation.md:6` pointed at "TODO.md #119 holds the threat model + design rationale", but #119's Details block (threat model, exfil-channel analysis, components, egress options) was deleted when it moved to Closed — the rationale existed nowhere. Migrated it into isolation.md as a new `## 12. Threat model & design rationale` section (assets, adversary, non-goal, the four exfil channels and the core conclusion that no egress control protects a token living inside the jail → the broker keeps it host-side; plus the domain-proxy-over-IP and cgroup-scoped-not-global rationales, cross-referencing §3/§4/§6). Rewrote it in the doc's present-tense spec voice rather than pasting the historical deliberation (options A–E "pick when reviving"), with a short historical note that the build options are settled. Fixed the line-6 reference to point at §12; AGENTS/README carried no copy of the dangling claim so needed no repoint. | The sandbox deep-reference (isolation.md) now carries the full threat model and design rationale that previously lived only in a closed TODO task. |
+| 232 | core | test_sandbox_uid_collisions_scan regresses under the #231 uid==0 guard | The #231 root-exclusion (`if uid == 0: continue` in `_uid_collisions`) made the scan return `{}` for root-owned work dirs, but `test_sandbox_uid_collisions_scan` still asserted `{os.getuid(): [...]}` — failing on a root host (this VPS runs as uid 0), where the test's own dirs are root-owned. Updated `tests/test_db.py`: the scan assertion now branches on `os.getuid()` (root host → expect `{}` since root is excluded; non-root → expect the collision), and `test_uid_collisions_pure` gained explicit root-exclusion cases (`{"a": 0, "b": 0}` → `{}`; a root pair plus a real non-root collision returns only the non-root one). Behavior was already correct; only the test lagged. Old assertion kept commented with the #232 ref. py_compile + ruff clean; `pytest tests/test_db.py` 14 passed; full suite 154 passed (one pre-existing unrelated PIL font-load failure in test_markup). | None — test-only fix; no runtime change. The sandbox uid-collision doctor's test now passes on a root host. |
 | 231 | isolation | Sandbox is mandatory for all sessions; retire the per-session toggle; alert only on real uid collisions | The bubblewrap jail already covered BOTH chat and code (`_build_options` calls `_enable_sandbox` for any session with `sandbox` on; per-session uid + seccomp + broker apply to all modes, egress + cgroup limits to code only) — but a per-session opt-out (`no_sandbox`, set via `/sandbox` + the `/settings` Sandbox row) and a debug toggle still existed. Made the sandbox MANDATORY with no exceptions: removed the `sandbox` row from `PAGE_ORDER` (gone from every `/settings` scope), retired the `/sandbox` command (`commands.py` entry + `cmd_sandbox` now a no-op that replies `sandbox.mandatory`; old toggle logic kept commented), so `no_sandbox` is never set again (all live sessions already had it 0). The `sandbox` Setting + adapters stay (drive resolution) and `SANDBOX_CODE` stays the deployer kill-switch. Also fixed the #221 uid-doctor to alert only on a GENUINE break: `_uid_collisions` now EXCLUDES uid 0 (root) — root ownership is the routine pre-first-turn / no-jail default (a workdir is root-owned until a session's first turn chowns it to its claimed per-session uid; it never indicates the birthday-collision the doctor catches, two sessions sharing the same ASSIGNED non-root uid), so a benign warning no longer fired the owner on every restart. Docs updated (CLAUDE.md, isolation.md) to state the jail is mandatory for all sessions. py_compile + import + doctor/i18n/PAGE_ORDER checks; live, doctor logs clean, polling. | The sandbox is now always on for every session (chat and code) and can't be turned off — the per-session toggle and `/sandbox` command are gone. The startup isolation check no longer pings the owner for the harmless just-migrated state, only for a real per-session uid clash. |
 | 230 | observability | Stamp the #221 sandbox-uid alert with a UTC time | The startup uid-doctor owner DM (`admin.uid_collision_alert`) had no timestamp, so a recurring alert (every restart re-runs the doctor over the same not-yet-self-healed workdirs) was indistinguishable from a genuinely new collision. Added a `{ts}` field — `datetime.now(timezone.utc)` formatted `YYYY-MM-DD HH:MM:SS UTC` — to the alert header (en + ru), computed in `bot.main` at send time. py_compile + i18n round-trip; live, polling. | The sandbox uid-isolation alert now shows the UTC time it was checked, so repeat alerts can be told apart and pinned to a restart. |
 | 228 | isolation | Credential broker buffered the whole SSE reply, breaking live streaming | The #119b broker (`deploy/cred-broker.py`) relayed the upstream response in its forward loop with `resp.read(65536)` — a `BufferedReader`-backed read that blocks until 65536 bytes arrive or the upstream closes. Any SSE reply under 64 KB (the common case) was accumulated whole and emitted only at end-of-stream, so the jailed CLI received no incremental `text_delta` events and the bot rendered each answer as one finished message. This was the real root cause behind #225's symptom, surfaced once the broker was enabled in production (streaming was unaffected before, when the CLI reached the API directly). Fix: `resp.read1(65536)` — at most one underlying socket read per iteration, returning bytes as soon as they arrive, so SSE frames stream through the broker unbuffered; the old line is kept commented with the #228 tag. Verified live: replies stream token-by-token again through the broker; py_compile + clean restart (broker up, polling). | DM streaming works again through the credential broker — replies stream token-by-token instead of arriving whole. |
-| 225 | ux | Streaming: DM replies arrived whole instead of token-by-token | MISDIAGNOSED first as an external Telegram-side draft-rendering outage with "no code change" — that conclusion was WRONG. Real cause found in #228: the #119b credential broker (`deploy/cred-broker.py`), newly enabled on this deployment, relayed the upstream response in its forward loop with `resp.read(65536)`, a `BufferedReader`-backed read that BLOCKS until 64 KB accumulate or the upstream closes. A short SSE reply (< 64 KB — the common case) was therefore buffered whole and flushed only at end-of-stream, starving the jailed CLI of incremental `text_delta` events, so the bot rendered each answer as one finished message. Drafts (`sendRichMessageDraft`, Bot API 10.1) animate correctly — the break was UPSTREAM of the draft call, which is why the symptom appeared the day the broker went live and on every server running that code. Fixed in #228 (`resp.read1(65536)` — at most one socket read per iteration, streaming frames as they arrive). The bot still streams via drafts by design (never the ~1/sec `editMessageText` write-head). | Fixed via #228 — live token-by-token streaming restored through the credential broker. The earlier "Telegram stopped rendering drafts" conclusion was incorrect; the cause was a buffering bug on our side. |
+| 225 | ux | Streaming: DM replies arrived whole instead of token-by-token | MISDIAGNOSED first as an external Telegram-side draft-rendering outage with "no code change" — that conclusion was WRONG. Real cause found in #228: the #119b credential broker (`deploy/cred-broker.py`), newly enabled on this deployment, relayed the upstream response in its forward loop with `resp.read(65536)`, a `BufferedReader`-backed read that BLOCKS until 64 KB accumulate or the upstream closes. A short SSE reply (< 64 KB — the common case) was therefore buffered whole and flushed only at end-of-stream, starving the jailed CLI of incremental `text_delta` events, so the bot rendered each answer as one finished message. Drafts (`sendRichMessageDraft`, Bot API 10.1) animate correctly — the break was UPSTREAM of the draft call, which is why the symptom appeared the day the broker went live and on every server running that code. Fixed in #228 (`resp.read1(65536)` — at most one socket read per iteration, streaming frames as they arrive). The bot still streams via drafts by design (never the ~1/sec `editMessageText` write-head). | Fixed via #228 — live token-by-token streaming restored through the credential broker. The earlier "Telegram stopped rendering drafts" conclusion was incorrect; the cause was a buffering bug in the credential broker. |
 | 224 | features | Shell mode for code sessions (phase 1): `/shell` toggle + one-shot jailed runner | A `/shell` single-toggle overlay on code sessions (`threads.shell_mode`, mirrored on the live `_ThreadRecord`; does NOT change the session type — stays `code`). When on, the catch-all routes each message to `engine.ClaudeSession.run_shell` — a ONE-SHOT `bash -lc` in the session's #119 jail (per-session uid + egress + seccomp + injected `/secret` env, no LLM, no tokens) via a new `SBX_MODE=shell` branch in `deploy/sandbox-claude.sh`; output posts as a code block (60k cap + truncate). A `[shell]` marker shows in the status / session-card / options headers; a not-found command (exit 127) appends a one-line "you're in shell mode — /shell to exit" hint. Code-only gated; routing-only flag (no session rebuild). Verified: jailed exec runs as the per-session host uid with the workdir chowned correctly (direct launcher test, both uid paths), shell_mode db roundtrip, pytest (155), ruff, `bash -n`; live on the bot. Persistent `cd`/env + interactivity + Ctrl-C + idle-reaper/RAM caps deferred to #227. | Code sessions can toggle `/shell` to run shell commands straight in their sandbox — no AI, no tokens (e.g. git/gh with a `/secret` token). Each command runs one-shot (no `cd`/env persistence yet); a `[shell]` tag marks the session. |
 | 221 | isolation | Per-session uid collision: hash mapped two sessions to one host uid | `engine.py` derived each jail's host uid as `uid_base + (int(sid,16) % uid_range)` (60000 buckets) — deterministic but birthday-colliding: two sessions (even different users, since `thread_id` is global) could map to one uid, making their `0700` workdirs mutually readable/writable. Added a `session_uid(sid PK, uid UNIQUE)` registry + `db.claim_session_uid(sid, preferred, lo, hi)`: returns the recorded uid (stable across rebuilds), else the preferred hash uid if free, else linear-probes `[lo,hi)` for a free slot and records it (serialised by `_lock`; `UNIQUE(uid)` is the backstop). `ClaudeSession._ensure_client` claims the uid async — before the sync `_build_options`/`_enable_sandbox` — and caches it on `self.host_uid`; `_enable_sandbox` reads it, falling back to the bare hash if unclaimed (tests) or the registry is down. `delete_dm_session` frees the slot (`release_session_uid`). Migration is near-free: preferred == the existing hash uid, so live sessions keep their uid (no re-chown) and only a pre-existing collision self-heals on the bumped session's next turn via the launcher's stat-guarded `chown -R`. A startup "doctor" (`db.sandbox_uid_collisions`, run in `bot.main` off the pre-READY path) scans on-disk workdirs for any host uid shared by >1 session and logs + DMs the owner if found (self-heals on the affected sessions' next turn). +4 db tests. py_compile + pytest (155) + ruff; registry table + clean doctor verified on the live db, bot re-polling. | Two sessions can no longer be assigned the same sandbox uid — each session's host uid is reserved in a registry that probes past collisions, so per-session file isolation holds even when the uid hash collides. |
 | 222 | ux | `/secret` was hard to discover and under-explained | `/secret` was registered and in the "/" command menu (code scope) but absent from the in-app `/settings` hub, and its prompt gave only a terse blurb. Added a "🔐 Session secrets" row to the hub Session tab (code only, `sx:secret`) that opens the arg-capture prompt; the prompt now carries a "📖 How to use" button → a detailed bilingual guide (`secret.guide`) with a GitHub-over-HTTPS walkthrough (fine-grained PAT → `GH_TOKEN=` → `gh`/git over HTTPS), an explicit "SSH is not supported" note, other-service examples, and a host-operator trust note. Dropped the "owner's credentials are never shared" clause from `secret.help` (a user need not know an owner exists). py_compile + i18n + commands-consistency + pytest (151) + ruff. | `/secret` is reachable from the settings menu and has a built-in "How to use" guide (with a GitHub HTTPS setup walkthrough) in both languages. |

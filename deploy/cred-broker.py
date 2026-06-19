@@ -64,7 +64,11 @@ def _path_allowed(method: str, path: str) -> bool:
     """True iff (method, path) matches the inbound allowlist (path matched by prefix,
     query string ignored). Pure + testable."""
     base = path.split("?", 1)[0]
-    return any(method == m and base.startswith(p) for m, p in _ALLOW)
+    # #234: was `base.startswith(p)` — a bare prefix also let `/v1/messages_evil` through.
+    # Tighten to an exact match or a true path-segment prefix so only `/v1/messages` and
+    # `/v1/messages/...` (e.g. `/v1/messages/count_tokens`) pass.
+    # was: return any(method == m and base.startswith(p) for m, p in _ALLOW)
+    return any(method == m and (base == p or base.startswith(p + "/")) for m, p in _ALLOW)
 
 
 class _Creds:

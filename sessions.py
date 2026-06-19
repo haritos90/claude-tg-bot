@@ -33,7 +33,7 @@ import token_refresh
 import usage
 import settings_schema
 from engine import ClaudeSession
-from streamer import Streamer, resolve_speed
+from streamer import Streamer, resolve_speed, tool_phase_label
 from permissions import PermissionGate
 
 # The Anthropic prompt cache stays warm for ~5 minutes after the last request.
@@ -82,14 +82,23 @@ Second paragraph: lists stream already marked up too.
 - second item
 - third item
 
-Third paragraph — below is a 5×5 table and an x86 disassembly snippet (as when reversing a DLL).
+Third paragraph — below is a wider table and an x86 disassembly snippet (as when reversing a DLL). Watch it fill in ROW BY ROW as the reply streams, not snap in at the end.
 
 | Address | Opcode | Mnemonic | Operands | Comment |
 |:-------|:--------|:-----------|:-----------|:-------------|
 | 0x1000 | 55 | push | ebp | prologue |
-| 0x1001 | 8B EC | mov | ebp, esp | stack frame |
-| 0x1003 | 83 EC 40 | sub | esp, 40h | locals |
-| 0x1006 | FF 75 0C | push | [ebp+0Ch] | lpProcName |
+| 0x1001 | 8B EC | mov | ebp, esp | set up stack frame |
+| 0x1003 | 83 EC 40 | sub | esp, 40h | reserve locals |
+| 0x1006 | FF 75 0C | push | [ebp+0Ch] | arg: lpProcName |
+| 0x1009 | FF 75 08 | push | [ebp+08h] | arg: hModule |
+| 0x100C | FF 15 ... | call | ds:GetProcAddress | resolve import |
+| 0x1012 | 85 C0 | test | eax, eax | null check |
+| 0x1014 | 74 09 | jz | loc_load_fail | bail if not found |
+| 0x1016 | 8B E5 | mov | esp, ebp | tear down frame |
+| 0x1018 | 5D | pop | ebp | restore ebp |
+| 0x1019 | C2 08 00 | retn | 8 | return, stdcall |
+
+This paragraph streams AFTER the table — so by the time you read it the whole table is already rendered above, proving the table appears mid-stream and does not wait for the end of the message.
 
 ```asm
 ; --- excerpt: kernel32.dll!GetProcAddress thunk ---
@@ -116,6 +125,91 @@ _REAPER_INTERVAL = 60.0
 # #178: how often the archive-retention purge sweeps (seconds). Deleted-session
 # bundles are slow-moving, so once a day is plenty; it also runs once at startup.
 _ARCHIVE_PURGE_INTERVAL = 86400.0
+
+# #236: cap on prompts WAITING behind a running turn (per session). A burst of
+# follow-ups past this is rejected so a session can't accumulate an unbounded
+# backlog; the running turn itself does not count. Mirrors cc-connect's default.
+# handle_text() return codes for the caller's queued/full UX (see #236):
+MAX_QUEUED_MESSAGES = 5
+SUBMIT_STARTED = 0      # ran immediately — the worker was idle
+SUBMIT_QUEUE_FULL = -1  # rejected — too many prompts already waiting
+# any value > 0 == queued behind a running turn, at that many waiting
+
+# #245 → #227b: line-interactive commands (gh auth login, sudo, REPLs, `read`, password
+# prompts) now WORK — the persistent shell forwards the next message as their input. Only
+# FULL-SCREEN TUIs can't render in a chat bubble (capture is snapshot-and-send), so just those
+# are refused. Heuristic on the FIRST command word (chains/pipes past it aren't inspected).
+_SHELL_TUI_CMDS = {
+    "vim", "vi", "nvim", "nano", "emacs", "pico", "less", "more", "man", "top", "htop",
+    "btop", "watch", "tmux", "screen", "vimdiff",
+}
+
+
+def _is_fullscreen_tui_cmd(cmd: str) -> bool:
+    """#245/#227b: True if the command is a full-screen TUI that can't render in a chat."""
+    parts = cmd.split()
+    if not parts:
+        return False
+    base = parts[0].rsplit("/", 1)[-1].lower()
+    return base in _SHELL_TUI_CMDS
+
+
+# #227b: while a program awaits input, these tokens let the user press keys that can't be typed
+# in a chat (arrow-key list pickers like `gh auth login`, Enter to confirm, Ctrl-C). A message
+# made ENTIRELY of these tokens is sent as the raw key bytes; anything else is sent as a line of
+# text (+ Enter). Several tokens in one message chain, e.g. ".down .down .enter". The prefix is
+# "." (NOT ":" — Telegram pops up emoji search on ":"); the inline keypad (shell_keypad) is the
+# primary way to press keys, these tokens are the typed fallback.
+_SHELL_KEYS = {
+    ".enter": b"\r", ".return": b"\r", ".up": b"\x1b[A", ".down": b"\x1b[B",
+    ".left": b"\x1b[D", ".right": b"\x1b[C", ".tab": b"\t", ".esc": b"\x1b",
+    ".space": b" ", ".bs": b"\x7f", ".ctrl-c": b"\x03", ".c-c": b"\x03",
+    ".pgup": b"\x1b[5~", ".pgdn": b"\x1b[6~", ".home": b"\x1b[H", ".end": b"\x1b[F",
+}
+# Inline-keypad buttons → the same key bytes, keyed by a short callback token (#227b UI).
+_SHELL_CB_KEYS = {
+    "up": b"\x1b[A", "down": b"\x1b[B", "left": b"\x1b[D", "right": b"\x1b[C",
+    "enter": b"\r", "esc": b"\x1b", "tab": b"\t", "space": b" ", "bs": b"\x7f",
+    "ctrlc": b"\x03", "pgup": b"\x1b[5~", "pgdn": b"\x1b[6~", "home": b"\x1b[H", "end": b"\x1b[F",
+}
+
+
+def shell_keypad(more: bool = False):
+    """#227b: inline keypad for the interactive shell (Terminus-style key row). Each button
+    sends one keystroke via the `shk:<key>` callback; ``more`` flips to the extra keys."""
+    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+    b = InlineKeyboardButton
+    if more:
+        rows = [
+            [b(text="␣ Space", callback_data="shk:space"), b(text="⌫ Bksp", callback_data="shk:bs"),
+             b(text="« keys", callback_data="shk:less")],
+            [b(text="⇞ PgUp", callback_data="shk:pgup"), b(text="⇟ PgDn", callback_data="shk:pgdn")],
+            [b(text="⤒ Home", callback_data="shk:home"), b(text="⤓ End", callback_data="shk:end")],
+        ]
+    else:
+        rows = [
+            [b(text="⎋ Esc", callback_data="shk:esc"), b(text="↑", callback_data="shk:up"),
+             b(text="⏎ Enter", callback_data="shk:enter")],
+            [b(text="←", callback_data="shk:left"), b(text="↓", callback_data="shk:down"),
+             b(text="→", callback_data="shk:right")],
+            [b(text="⇥ Tab", callback_data="shk:tab"), b(text="^C", callback_data="shk:ctrlc"),
+             b(text="⋯ more", callback_data="shk:more")],
+        ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _shell_input_keys(text: str) -> bytes | None:
+    """#227b: parse a key-token message into raw bytes, or None if it isn't all key tokens."""
+    toks = text.split()
+    if not toks:
+        return None
+    out = b""
+    for t in toks:
+        k = _SHELL_KEYS.get(t.lower())
+        if k is None:
+            return None
+        out += k
+    return out
 
 
 @dataclass
@@ -163,9 +257,12 @@ class _ThreadRecord:
     # behavior (live streaming). last_prompt holds the most recent submitted
     # prompt for this thread (used by /retry).
     stream_enabled: bool = True
-    # #224: shell-mode overlay (route text → one-shot jailed command). Mirrors the
-    # persisted ThreadState.shell_mode; re-synced on rebuild like stream_enabled.
+    # #224: shell-mode overlay (route text → jailed command). Mirrors the persisted
+    # ThreadState.shell_mode; re-synced on rebuild like stream_enabled.
     shell_mode: bool = False
+    # #227b: True when the persistent shell paused for interactive input — the NEXT message
+    # is forwarded to the running program instead of being run as a new command.
+    shell_awaiting: bool = False
     # Most recent (text, attachments) submitted for this thread (used by /retry).
     last_prompt: tuple | None = None
     # #167/#168: effective forced-on toggles the live session was built for, plus the
@@ -560,13 +657,19 @@ class SessionManager:
         thread_id: int,
         text: str,
         attachments: list | None = None,
-    ) -> None:
+    ) -> int:
         """Queue a prompt (optionally with attachments) and ensure the worker runs.
 
         thread_id is the real storage key (0 for General). attachments, when given,
         is a list of Anthropic content-block dicts (image/document) sent with the
-        turn. The message is always enqueued; if a run is in progress it executes
-        next in the SAME session (task chaining), else the worker starts.
+        turn. If no run is in progress the worker starts and the prompt runs now;
+        if a run is in progress the prompt is enqueued and executes next in the SAME
+        session (task chaining).
+
+        #236: returns a status for the caller's queued/full UX —
+        ``SUBMIT_STARTED`` (0) when it runs immediately, a positive count of prompts
+        now WAITING when it was queued behind a running turn, or ``SUBMIT_QUEUE_FULL``
+        (-1) when the per-session backlog cap is hit and the prompt was NOT enqueued.
         """
         # Remember the chat we are talking in so the pinned usage message can be
         # created/updated there. Persist only on change (best effort).
@@ -591,6 +694,13 @@ class SessionManager:
             async with rec.lock:
                 if self._records.get(thread_id) is not rec:
                     continue  # reset() popped it while we waited — retry
+                # #236: is a turn currently running on this session? If so this prompt
+                # waits behind it (task chaining); enforce the backlog cap and report
+                # the queued depth so the caller can ack. The running turn already
+                # pulled its item off the queue, so qsize() == prompts still waiting.
+                busy = rec.worker is not None and not rec.worker.done()
+                if busy and rec.queue.qsize() >= MAX_QUEUED_MESSAGES:
+                    return SUBMIT_QUEUE_FULL
                 # Build/refresh the session up front so config changes apply before
                 # the prompt is enqueued and consumed by the worker.
                 await self._get_session(rec, state)
@@ -603,7 +713,8 @@ class SessionManager:
                     rec.worker = asyncio.create_task(
                         self._worker(thread_id, chat_id)
                     )
-                break
+                # #236: 0 when it runs now (idle worker), else the waiting count.
+                return rec.queue.qsize() if busy else SUBMIT_STARTED
 
     # ------------------------------------------------------------------ worker
 
@@ -721,30 +832,82 @@ class SessionManager:
     async def _run_shell_command(
         self, rec: "_ThreadRecord", thread_id: int, prompt: str, streamer: Streamer
     ) -> None:
-        """#224: execute `prompt` as a one-shot shell command in the session's jail and
-        post the output. No model, no tokens. A not-found command (exit 127) appends a
-        one-line hint — the user most likely toggled /shell on by accident."""
+        """#224/#227: execute `prompt` in the session's PERSISTENT jailed shell and post the
+        output. No model, no tokens. cd/env persist (#227a); a command that pauses for input
+        flips the session to await-input (#227b) so the next message is forwarded to it."""
         session = rec.session
         lang = i18n.cached_lang(streamer.chat_id)
         cmd = (prompt or "").strip()
         if session is None or not cmd:
             return
+        rec.last_activity = time.monotonic()
+        awaiting = rec.shell_awaiting
+        # #245/#227b: refuse only FULL-SCREEN TUIs (can't render in chat). Line-interactive
+        # commands now work via the await-input flow. Skip the guard while forwarding input.
+        if not awaiting and _is_fullscreen_tui_cmd(cmd):
+            with contextlib.suppress(Exception):
+                await db.log_message(thread_id, "user", cmd)
+            with contextlib.suppress(Exception):
+                await streamer.finish(i18n.t("shell.interactive", lang), notify=True)
+            return
         with contextlib.suppress(Exception):
             await db.log_message(thread_id, "user", cmd)
-        rec.last_activity = time.monotonic()
+        status = "done"
         try:
-            rc, out = await session.run_shell(cmd)
-        except Exception as exc:  # never let a shell failure kill the worker
-            rc, out = (-1, f"shell error: {exc}")
-        body = out.replace("\r\n", "\n").rstrip("\n")
+            if awaiting:
+                # #227b: forward this message to the program awaiting input. A message of pure
+                # key tokens (":down :enter") goes as raw key bytes (arrow pickers, Enter, Ctrl-C);
+                # anything else as a line of text + Enter.
+                keys = _shell_input_keys(cmd)
+                if keys is not None:
+                    rc, out, status = await session.shell_send_keys(keys)
+                else:
+                    rc, out, status = await session.shell_send_input(cmd)
+            else:
+                # #227a: persistent shell (cd/env persist across messages).
+                rc, out, status = await session.shell_run(cmd)
+        except Exception:
+            # Persistent shell unavailable (spawn/PTY error) → fall back to the #224 one-shot.
+            rec.shell_awaiting = False
+            try:
+                rc, out = await session.run_shell(cmd)
+            except Exception as exc:  # never let a shell failure kill the worker
+                rc, out = (-1, f"shell error: {exc}")
+        rec.shell_awaiting = (status == "awaiting")  # #227b: next message → forwarded as input
+        rendered = self._render_shell(out, rc, status, lang)
+        kb = shell_keypad() if rec.shell_awaiting else None  # #227b: inline key keypad
+        with contextlib.suppress(Exception):
+            await streamer.finish(rendered, notify=True, reply_markup=kb)
+
+    @staticmethod
+    def _render_shell(out: str, rc, status: str, lang: str) -> str:
+        """#227: render a shell result as a monospace block + a status hint."""
+        body = (out or "").replace("\r\n", "\n").rstrip("\n")
         cap = 60_000  # output cap (chars) — a runaway command can't flood the chat
         if len(body) > cap:
             body = body[:cap] + "\n... (truncated)"
         rendered = "```\n" + (body or "(no output)") + "\n```"
-        if rc == 127:  # command not found → likely an accidental /shell
+        if status == "awaiting":
+            rendered += "\n" + i18n.t("shell.awaiting", lang)
+        elif status != "timeout" and rc == 127:  # not found → likely accidental /shell
             rendered += "\n" + i18n.t("shell.accidental", lang)
-        with contextlib.suppress(Exception):
-            await streamer.finish(rendered, notify=True)
+        return rendered
+
+    async def shell_key(self, thread_id: int, key_token: str, lang: str = "en"):
+        """#227b: a keypad button press — send the keystroke to the persistent shell and
+        return (rendered_output, still_awaiting) so the caller can edit the message."""
+        rec = self._records.get(thread_id)
+        data = _SHELL_CB_KEYS.get(key_token)
+        if rec is None or rec.session is None or data is None:
+            return (None, bool(rec and rec.shell_awaiting))
+        rec.last_activity = time.monotonic()
+        try:
+            rc, out, status = await rec.session.shell_send_keys(data)
+        except Exception as exc:
+            rec.shell_awaiting = False
+            return (self._render_shell(f"shell error: {exc}", -1, "done", lang), False)
+        rec.shell_awaiting = (status == "awaiting")
+        return (self._render_shell(out, rc, status, lang), rec.shell_awaiting)
 
     async def _run_one(
         self,
@@ -823,11 +986,16 @@ class SessionManager:
                     # Code mode: commit the text produced before this tool as its
                     # own message so each burst is visible, then stream the next
                     # burst fresh. (Chat mode has no tools, so this never fires.)
-                    if stream and rec.mode == "code" and running_text.strip():
+                    if stream and rec.mode == "code":
+                        if running_text.strip():
+                            with contextlib.suppress(Exception):
+                                await streamer.segment_break()
+                            running_text = ""
+                            segmented = True
+                        # #240b: show the live tool phase in the <tg-thinking> block while
+                        # the tool runs ("⚙️ Running pytest…", "📖 Reading sessions.py…").
                         with contextlib.suppress(Exception):
-                            await streamer.segment_break()
-                        running_text = ""
-                        segmented = True
+                            streamer.set_phase(tool_phase_label(ev.tool_name, ev.tool_input))
                 elif kind == "rate_limit":
                     rec.rate = ev.rate
                     # Accumulate per-window account-wide rate state. Persisting to
@@ -1235,6 +1403,13 @@ class SessionManager:
         """#224: toggle the shell-mode overlay for a code session (text → jailed
         command). Mirrors set_stream: update the live record + persist."""
         rec = self._record(thread_id)
+        # #227c: toggling shell mode is a DETACH, like leaving a tmux session — the persistent
+        # shell (and ANY command still running in it: a server, a long build, a program awaiting
+        # input) stays ALIVE in the background, and the agent (LLM) takes over. /shell on later
+        # re-attaches with cd/env + the running command intact; `shell_awaiting` is preserved so a
+        # paused program still receives the next message's input. The shell is only torn down on
+        # session delete/evict (aclose) or the #179 idle reaper. To interrupt a running command,
+        # use the ^C key; a truly stuck one is reaped when the session goes idle.
         rec.shell_mode = bool(on)
         with contextlib.suppress(Exception):
             await db.set_shell_mode(thread_id, on)

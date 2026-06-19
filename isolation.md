@@ -3,12 +3,12 @@
 How a session is contained: what an untrusted `code`-level user (driving the
 agent) **cannot** do, and the mechanism behind each guarantee. This is the deep
 reference; [`AGENTS.md`](AGENTS.md) §5 *Sandbox* is the summary and
-[`TODO.md`](TODO.md) #119 holds the threat model + design rationale.
+[§12](#12-threat-model--design-rationale) holds the threat model + design rationale.
 
 **The jail is MANDATORY for every session — chat AND code, no exceptions (#231).** There
 is no per-session opt-out and no toggle (the `/sandbox` command and the `/settings` Sandbox
 row were retired in #231; `no_sandbox` is never set). `claude` is jailed identically in both
-modes; the only mode difference is that the egress allowlist + cgroup DoS limits (§5–§6)
+modes; the only mode difference is that the egress allowlist + cgroup DoS limits (§4 + §6)
 apply to **code** sessions only — a `chat` session has no Bash/file surface to leak and needs
 open egress for `WebFetch`. The jail, per-session uid, broker (§3) and seccomp (§6) apply to
 **all** modes regardless.
@@ -301,3 +301,66 @@ See the memory note `sandbox-119-build-gotchas` and [`AGENTS.md`](AGENTS.md) §5
 traps (manual cgroup vs `systemd-run`; the seccomp fall-through-must-be-ALLOW bug; the
 `iptables -m cgroup --path` "dir must exist + module loaded" requirement; the
 egress-proxy ASCII-decode trap).
+
+---
+
+## 12. Threat model & design rationale
+
+Why the layers above exist, and why this particular shape. The goal is a sandbox a
+semi- to untrusted **code**-level user (driving the agent and seeing its output) cannot
+use to (a) break the server, (b) steal the owner's data — above all the **subscription
+token** — or (c) read **other sessions'** data, all **without stripping the session's
+capabilities**: it keeps full tools and reaches its chosen services; the design contains
+blast radius, not features.
+
+**Assets.** (1) the owner's subscription OAuth token (`~/.claude/.credentials.json`) —
+must be UN-extractable by any session; (2) host integrity — no breakout, no using the box
+to attack others, no resource-DoS of the bot; (3) other sessions' workdir + transcript
+(invisible across sessions); (4) the bot's own secrets (`.env`: Telegram token,
+allowlist).
+
+**Adversary.** A code-level user the owner granted access to (semi-trusted → untrusted),
+driving the agent and reading its output, plus the agent itself misbehaving.
+
+**Non-goal.** Reducing capability — the agent still runs Bash/edits and reaches chosen
+services. Containment is of blast radius, not of features.
+
+**The exfil channels — close ALL or the asset leaks.** Token/data can leave a jail via:
+(1) *filesystem* — host files (other sessions, `/root`, `.env`) → closed by the bwrap FS
+confinement (§2: only the session's own workdir is mounted); (2) *network egress* → the
+allowlist (§4); (3) *the bot's own output* — the agent `cat`s a secret and the bot streams
+it back to the user (`Read` is auto-allowed) — **a firewall cannot close this**; (4) *an
+allowed destination* — permitting GitHub turns GitHub into an exfil store. Channels (3)
+and (4) prove the core point: **no egress control can protect a token that lives inside
+the jail.** So the token must not be in the jail at all — which is exactly what the
+credential broker (§3) guarantees: the real bearer stays host-side, the jail holds only a
+placeholder, and channels (3)+(4) become moot — there is nothing to read, print, or POST.
+
+**Why a domain proxy, not an IP allowlist (§4).** Anthropic's API is CDN-fronted: its IPs
+rotate, and a single CDN range hosts thousands of unrelated sites. An *IP* allowlist is
+therefore both fragile (constant refresh) and leaky (allowlisting the CDN range allows
+every other site behind it — an exfil path). A *domain*-based filter (a CONNECT proxy that
+tunnels TLS by the hostname in the CONNECT line, no MITM cert needed) is the stronger
+boundary, and is paired with a hard cgroup-scoped egress block so the agent cannot ignore
+`HTTPS_PROXY` and dial out directly — the proxy is the only exit.
+
+**Why cgroup-scoped, never a global rule.** The jail runs `--unshare-user --uid 65534`, so
+from the host kernel's view the egress socket's owner is the *outer* mapped uid (root) — a
+per-uid `skuid` match won't fire. Egress is therefore filtered by **cgroup match**
+(`iptables -m cgroup --path sbx`), which sidesteps the userns-uid problem and, critically,
+scopes the rule to the jail only: a botched rule never locks the bot or the operator out
+of the live VPS. The matching teardown (`egress-teardown.sh`) removes the jump + chain
+cleanly. See §11 for the build traps this implies.
+
+**Per-session secrets (§5).** Services that need auth (e.g. `git push`) take the **user's
+own** credential via `/secret`, scoped to that one jail's HOME — the owner's creds never
+enter any jail. A user leaking their own credential is their problem, not the owner's.
+
+**Host integrity / DoS (§6).** Per-jail memory/CPU/pid caps plus an x86_64 syscall
+denylist (seccomp) bound what a single session can consume or call (e.g. `ptrace` is
+denied → no `strace`/`gdb` inside a code session).
+
+> Historical note: this section preserves the threat model and design rationale that
+> originally lived in the TODO #119 umbrella task (closed once the design shipped). The
+> deliberated build options (proxy vs netns vs slirp) are settled — the deployment runs
+> the CONNECT proxy + hard cgroup egress block described in §4.

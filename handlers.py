@@ -18,6 +18,7 @@ mode (see AGENTS.md §5).
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import contextlib
 import inspect
@@ -48,6 +49,7 @@ import db
 import engine
 import i18n
 import markup
+import sessions as _sessions  # module (build_router's `sessions` param is the instance)
 import settings_schema as ss
 import usage
 from allowlist import normalize_date
@@ -104,6 +106,38 @@ MAX_TEXT_BYTES = 1 * 1024 * 1024
 # A text/code file is inlined into the prompt; cap the characters so a huge file
 # cannot blow up the context window.
 MAX_TEXT_INLINE_CHARS = 200_000
+
+# #235: a Telegram album (media_group) is delivered as separate updates that share a
+# media_group_id; we buffer the items for a short window and submit them as ONE turn.
+# The window is (re)started on each arriving item so a slow album still coalesces; it is
+# short enough to stay invisible for a normal burst. Combined inline text is capped at
+# MAX_TEXT_INLINE_CHARS total, and the item count at MAX_ALBUM_ITEMS, with a dropped-note
+# (no silent truncation).
+ALBUM_DEBOUNCE_SECS = 0.8
+MAX_ALBUM_ITEMS = 20
+
+
+def _combine_album_parts(parts, header, truncated_label):
+    """#235 (pure + testable): combine buffered album items into one turn's (text, blocks).
+
+    ``parts`` is a list of ``(message_id, {"blocks": [...] | None, "inline": str})``; items
+    are ordered by message_id so the model sees them in send order. Image/PDF blocks are
+    concatenated; text/code ``inline`` segments are joined under ``header``. If the joined
+    inline text exceeds MAX_TEXT_INLINE_CHARS it is cut and ``truncated_label`` appended.
+    Any dropped-over-cap note is added by the caller. Returns ``(text, blocks)``.
+    """
+    blocks: list = []
+    inlines: list[str] = []
+    for _mid, part in sorted(parts, key=lambda p: p[0]):
+        if part.get("blocks"):
+            blocks.extend(part["blocks"])
+        if part.get("inline"):
+            inlines.append(part["inline"])
+    combined = "\n\n".join(inlines)
+    if len(combined) > MAX_TEXT_INLINE_CHARS:
+        combined = combined[:MAX_TEXT_INLINE_CHARS] + f"\n\n{truncated_label}"
+    text = f"{header}\n\n{combined}" if combined else header
+    return text, blocks
 
 # Friendly /permissions names <-> SDK permission_mode values (code mode only).
 # Per-name help text lives in the l10n table under "perm.help.<name>".
@@ -390,6 +424,31 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             cur = await db.get_dm_current(cb.from_user.id)
             return cur if cur is not None else 0
         return thread_key(msg) if msg is not None else 0
+
+    @router.callback_query(F.data.startswith("shk:"))
+    async def on_shell_key(cb: CallbackQuery) -> None:
+        """#227b: interactive-shell keypad. A key button sends ONE keystroke to the session's
+        persistent shell and re-renders this message with the new output; `more`/`less` just
+        flip the keypad between the primary and extra keys."""
+        msg = cb.message
+        if msg is None:
+            await cb.answer()
+            return
+        token = (cb.data or "shk:").split(":", 1)[1]
+        if token in ("more", "less"):
+            with contextlib.suppress(Exception):
+                await msg.edit_reply_markup(reply_markup=_sessions.shell_keypad(more=(token == "more")))
+            await cb.answer()
+            return
+        rendered, awaiting = await sessions.shell_key(await _callback_key(cb), token, _lang(cb))
+        if rendered is None:
+            await cb.answer()
+            return
+        kb = _sessions.shell_keypad() if awaiting else None
+        with contextlib.suppress(Exception):
+            await bot(EditRichMessage(chat_id=msg.chat.id, message_id=msg.message_id,
+                                      rich_message={"markdown": rendered}, reply_markup=kb))
+        await cb.answer()
 
     def _command_arg(message: Message) -> str:
         """Return the text after the command word, stripped (may be empty)."""
@@ -1282,6 +1341,13 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
     # (Telegram sends a picked command immediately). Keyed by (chat, thread, user);
     # consumed by the next plain message or cleared by /cancel.
     pending: dict[tuple, str] = {}
+
+    # #235: media-group (album) coalescing buffer, keyed by (chat_id, thread_key,
+    # media_group_id). Each value is a dict: {"parts": [(message_id, part)], "caption":
+    # str, "msg": Message (representative reply target), "lang": str, "timer": Task,
+    # "dropped": int}. A `part` is {"blocks": [...], "inline": str}. Filled by the
+    # attachment handlers and flushed by _flush_album once the debounce window closes.
+    album_buf: dict[tuple, dict] = {}
 
     def _pkey(message: Message) -> tuple:
         uid = message.from_user.id if message.from_user else 0
@@ -4347,7 +4413,8 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             await reply(message, block)
             return
         try:
-            await sessions.handle_text(message.chat.id, key, text)
+            status = await sessions.handle_text(message.chat.id, key, text)
+            await _ack_queue(message, status, _lang(message))
         except Exception as exc:
             await reply(
                 message,
@@ -4355,6 +4422,20 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             )
 
     # -------------------------------------------------------- attachments
+
+    async def _ack_queue(message: Message, status: int, lang: str) -> None:
+        """#236: surface handle_text()'s queued/full status to the user. Silent when the
+        prompt started immediately (the common case); a positive status is the number of
+        prompts now waiting behind the running turn; SUBMIT_QUEUE_FULL means it was
+        rejected. Best-effort: a failed ack must not break the (already accepted) turn."""
+        try:
+            if status == _sessions.SUBMIT_QUEUE_FULL:
+                await reply(message, i18n.t("queue.full_reject", lang,
+                                            n=_sessions.MAX_QUEUED_MESSAGES))
+            elif status and status > 0:
+                await reply(message, i18n.t("queue.queued_ack", lang, n=status))
+        except Exception:
+            pass
 
     async def _submit(message: Message, text: str, attachments=None) -> None:
         """Route a turn (text + optional content blocks) into the thread session."""
@@ -4366,14 +4447,68 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             await reply(message, block)
             return
         try:
-            await sessions.handle_text(
+            status = await sessions.handle_text(
                 message.chat.id, key, text, attachments=attachments
             )
+            await _ack_queue(message, status, _lang(message))
         except Exception as exc:
             await reply(
                 message,
                 i18n.t("attach.process_error", _lang(message), err=markup.escape_html(str(exc))),
             )
+
+    async def _route_attachment(message, caption, blocks, inline, default_key, lang):
+        """#235: send ONE attachment item to the model. A standalone item submits its own
+        turn (unchanged behavior). An album item (``media_group_id`` set) is buffered with
+        the others sharing that id and the whole group is submitted as a single turn once
+        the debounce window closes."""
+        mgid = getattr(message, "media_group_id", None)
+        if not mgid:
+            header = caption or i18n.t(default_key, lang)
+            text = f"{header}\n\n{inline}" if inline else header
+            await _submit(message, text, blocks or None)
+            return
+        # Album: resolve the (only) await BEFORE touching the buffer so the get-or-create
+        # below runs without an await — concurrent item handlers can't double-create it.
+        skey = await _session_key(message)
+        key = (message.chat.id, skey, mgid)
+        buf = album_buf.get(key)
+        if buf is None:
+            buf = {"parts": [], "caption": "", "msg": message, "lang": lang,
+                   "default_key": default_key, "timer": None, "dropped": 0}
+            album_buf[key] = buf
+        if caption and not buf["caption"]:
+            buf["caption"] = caption
+        if len(buf["parts"]) >= MAX_ALBUM_ITEMS:
+            buf["dropped"] += 1
+        else:
+            buf["parts"].append((message.message_id, {"blocks": blocks, "inline": inline}))
+        if buf["timer"] is not None:
+            buf["timer"].cancel()
+        buf["timer"] = asyncio.create_task(_album_after(key))
+
+    async def _album_after(key):
+        """#235: debounce timer body — flush the album once no new item has arrived for
+        ALBUM_DEBOUNCE_SECS. Cancelled (and replaced) by each new item in the group."""
+        try:
+            await asyncio.sleep(ALBUM_DEBOUNCE_SECS)
+        except asyncio.CancelledError:
+            return
+        await _flush_album(key)
+
+    async def _flush_album(key):
+        """#235: combine all buffered items of one album into a single turn — image/PDF
+        blocks concatenated, text/code segments joined under one caption header."""
+        buf = album_buf.pop(key, None)
+        if buf is None or not buf["parts"]:
+            return
+        lang = buf["lang"]
+        header = buf["caption"] or i18n.t(buf["default_key"], lang)
+        text, blocks = _combine_album_parts(
+            buf["parts"], header, i18n.t("attach.truncated", lang))
+        if buf["dropped"]:
+            text += "\n\n" + i18n.t("attach.album_dropped", lang, n=buf["dropped"])
+        await _submit(buf["msg"], text, blocks or None)
 
     async def _download(downloadable, limit: int, file_size: int | None, lang: str = "en"):
         """Download a Telegram file to bytes. Returns (bytes, None) on success or
@@ -4411,7 +4546,8 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             "source": {"type": "base64", "media_type": "image/jpeg", "data": b64},
         }
         caption = (message.caption or "").strip()
-        await _submit(message, caption or i18n.t("attach.default_image_prompt", lang), [block])
+        # #235: route through the album coalescer (no-op for a standalone photo).
+        await _route_attachment(message, caption, [block], "", "attach.default_image_prompt", lang)
 
     @router.message(F.document)
     async def on_document(message: Message) -> None:
@@ -4444,7 +4580,8 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 "type": "image",
                 "source": {"type": "base64", "media_type": mime, "data": b64},
             }
-            await _submit(message, caption or i18n.t("attach.default_image_prompt", lang), [block])
+            await _route_attachment(message, caption, [block], "",
+                                    "attach.default_image_prompt", lang)
             return
 
         # PDF → document block (native PDF understanding: text + page images).
@@ -4462,7 +4599,8 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                     "data": b64,
                 },
             }
-            await _submit(message, caption or i18n.t("attach.default_doc_prompt", lang), [block])
+            await _route_attachment(message, caption, [block], "",
+                                    "attach.default_doc_prompt", lang)
             return
 
         # Text/code file → inline the decoded content into the prompt.
@@ -4479,8 +4617,11 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         if len(content) > MAX_TEXT_INLINE_CHARS:
             content = content[:MAX_TEXT_INLINE_CHARS]
             note = f"\n\n{i18n.t('attach.truncated', lang)}"
-        header = caption or i18n.t("attach.default_doc_prompt", lang)
-        await _submit(message, f"{header}\n\n--- {fname} ---\n{content}{note}")
+        # #235: pass the file body as an inline SEGMENT (no header) so the album coalescer
+        # can join several files under one caption header; standalone files are unchanged.
+        inline = f"--- {fname} ---\n{content}{note}"
+        await _route_attachment(message, caption, None, inline,
+                                "attach.default_doc_prompt", lang)
 
     # ------------------------------------------------- permission callbacks
 

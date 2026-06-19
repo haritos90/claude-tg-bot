@@ -269,6 +269,10 @@ def test_uid_collisions_pure():
     assert db._uid_collisions({"a": 700001, "b": 700002}) == {}
     assert db._uid_collisions({"a": 700001, "b": 700001, "c": 700002}) == {700001: ["a", "b"]}
     assert db._uid_collisions({}) == {}
+    # #232: uid 0 (root) is the no-jail / unassigned default, never a collision — even
+    # when shared by >1 sid it must be excluded (added in #231).
+    assert db._uid_collisions({"a": 0, "b": 0}) == {}
+    assert db._uid_collisions({"a": 0, "b": 0, "c": 700001, "d": 700001}) == {700001: ["c", "d"]}
 
 
 def test_sandbox_uid_collisions_scan():
@@ -282,7 +286,14 @@ def test_sandbox_uid_collisions_scan():
     os.makedirs(os.path.join(base, "sidC"))          # no work dir → skipped
     with open(os.path.join(base, "loose.txt"), "w") as fh:
         fh.write("x")                                # not a dir → skipped
-    assert db.sandbox_uid_collisions(base) == {os.getuid(): ["sidA", "sidB"]}
+    # was: assert db.sandbox_uid_collisions(base) == {os.getuid(): ["sidA", "sidB"]}
+    #   — replaced for #232. The work dirs are owned by the test process's uid; under the
+    #   #231 root-exclusion that owner only counts as a collision when it is NON-root. On a
+    #   root host (this VPS runs as uid 0) the scan now correctly returns {}, so branch.
+    if os.getuid() == 0:
+        assert db.sandbox_uid_collisions(base) == {}     # root owner excluded (#231)
+    else:
+        assert db.sandbox_uid_collisions(base) == {os.getuid(): ["sidA", "sidB"]}
 
     solo = tempfile.mkdtemp()
     os.makedirs(os.path.join(solo, "sidX", "work"))

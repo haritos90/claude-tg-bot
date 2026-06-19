@@ -364,3 +364,38 @@ def test_ensure_text_bom():  # #206
     png = b"\x89PNG\r\n"
     assert markup.ensure_text_bom(png, "chart.png") == png
     assert markup.ensure_text_bom(b"#!/bin/sh\n", "run.sh") == b"#!/bin/sh\n"
+
+
+# was (#226, rejected — superseded by #237; kept per the revert policy):
+# def test_contains_table_detects_full_partial_and_rejects_non_tables():
+#     full = "| A | B |\n|---|---|\n| 1 | 2 |\n| 3 | 4 |"
+#     assert markup.contains_table(full) is True
+#     assert markup.contains_table("| A | B |") is False
+# def test_placeholder_tables_replaces_table_keeps_prose():
+#     body = "Intro line\n\n| A | B |\n|---|---|\n| 1 | 2 |\n\nAfter text"
+#     assert markup.placeholder_tables(body, placeholder="[T]") == "Intro line\n\n[T]\n\nAfter text"
+
+
+def test_clip_partial_table_keeps_only_complete_rows():
+    """#237: for draft streaming, a still-being-typed final table line is clipped so the
+    draft is always a VALID table prefix (complete rows only); a newline-terminated table
+    and non-table text are left untouched."""
+    # mid-row (no trailing newline) → drop the in-progress last row
+    streaming = "| A | B |\n|---|---|\n| 1 | 2 |\n| 3"
+    assert markup.clip_partial_table(streaming) == "| A | B |\n|---|---|\n| 1 | 2 |"
+    # row just completed (trailing newline) → keep everything
+    done_row = "| A | B |\n|---|---|\n| 1 | 2 |\n"
+    assert markup.clip_partial_table(done_row) == done_row
+    # header typed, separator still in progress → drop the partial separator
+    sep_partial = "| A | B |\n|---"
+    assert markup.clip_partial_table(sep_partial) == "| A | B |"
+    # a "complete"-looking last row with NO trailing newline can't be told apart from one
+    # still being typed mid-stream, so it is conservatively clipped — it rejoins one token
+    # later when its newline arrives (this is the safe row-by-row behavior).
+    no_nl = "| A | B |\n|---|---|\n| 1 | 2 |"
+    assert markup.clip_partial_table(no_nl) == "| A | B |\n|---|---|"
+    # no table → unchanged (even mid-word)
+    assert markup.clip_partial_table("just some prose be") == "just some prose be"
+    # prose before a streaming table: prose kept, in-progress row dropped
+    mixed = "Intro\n\n| A | B |\n|---|---|\n| 9"
+    assert markup.clip_partial_table(mixed) == "Intro\n\n| A | B |\n|---|---|"
