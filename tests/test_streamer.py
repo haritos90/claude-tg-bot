@@ -20,6 +20,24 @@ def test_tool_phase_label_maps_tools_to_phrases():
     assert streamer.tool_phase_label("", None) == "💭 Thinking…"
 
 
+def test_add_reasoning_accumulates_caps_and_clears_phase():
+    """#240c: reasoning deltas accumulate (tail-capped) and resuming reasoning drops a
+    stale tool phase so the live block reflects current activity."""
+    s = streamer.Streamer(None, 123, None)
+    s.set_phase("⚙️ Running pytest…")
+    s.add_reasoning("Let me think about ")
+    s.add_reasoning("the problem.")
+    assert s._reasoning == "Let me think about the problem."
+    assert s._phase is None              # resuming reasoning cleared the phase
+    # empty delta is a no-op
+    s.add_reasoning("")
+    assert s._reasoning == "Let me think about the problem."
+    # retained reasoning is tail-capped
+    s.add_reasoning("z" * (streamer._REASONING_MAX + 500))
+    assert len(s._reasoning) == streamer._REASONING_MAX
+    assert s._reasoning.endswith("z")
+
+
 def test_thinking_label_rotates():
     """#240a: the placeholder gerund advances with elapsed time and wraps."""
     first = streamer._thinking_label(0.0)

@@ -286,6 +286,8 @@ CATALOG: dict[str, dict[str, str]] = {
     "settings.row_hot_cache_timer": {"en": "🔥 Warm-cache note: {val}", "ru": "🔥 Заметка о тёплом кэше: {val}"},
     "settings.row_auto_compact": {"en": "📦 Auto-compact: {val}", "ru": "📦 Автокомпакт: {val}"},
     "settings.row_ctx_status": {"en": "🧠 Live context size: {val}", "ru": "🧠 Размер контекста в плашке: {val}"},
+    # #229: live task-list card toggle (code sessions).
+    "settings.row_todo_card": {"en": "📋 Live task list: {val}", "ru": "📋 Живой список задач: {val}"},
     "stream.context": {"en": "🧠 context {n}", "ru": "🧠 контекст {n}"},
     # #147: bare name for the usage-display picker title (sx: hub sub-page).
     "settings.usage_name": {"en": "📊 Usage display", "ru": "📊 Использование"},
@@ -711,6 +713,14 @@ CATALOG: dict[str, dict[str, str]] = {
         "ru": "⌨️ <i>Жду ввод — жми кнопки ниже, либо печатай для фильтра / отправь строку. "
               "(Текстом тоже можно: <code>.up</code> <code>.down</code> <code>.enter</code>, "
               "цепочкой: <code>.down .enter</code>.) /shell — отмена.</i>",
+    },
+    # #250: the persistent shell died while a program was awaiting input — the message was
+    # INPUT (not a command), so it is dropped (never run as a one-shot command) with this notice.
+    "shell.ended": {
+        "en": "⚠️ <i>The shell ended while a program was waiting for input, so your input "
+              "was discarded (not run as a command). Re-run the command to continue.</i>",
+        "ru": "⚠️ <i>Shell завершился, пока программа ждала ввод — ваш ввод отброшен (не "
+              "выполнен как команда). Запустите команду заново, чтобы продолжить.</i>",
     },
     # #221: startup owner alert when the uid doctor finds an on-disk collision.
     "admin.uid_collision_alert": {
@@ -1496,6 +1506,15 @@ CATALOG: dict[str, dict[str, str]] = {
     },
 
     # -- /close (frozen group path) + topic errors -------------------------- #
+    # #253: supergroup / forum-topic support is paused (rich-draft streaming does not work in
+    # supergroups — TEXTDRAFT_PEER_INVALID, #3/#39). The topic create/rename/close paths reply
+    # with this instead. Revive with the deferred #253 task.
+    "topic.disabled": {
+        "en": "🚧 Group (forum-topic) sessions are paused for now — please use this bot in a "
+              "direct message (DM). Rich streaming isn't supported in supergroups yet.",
+        "ru": "🚧 Сессии в группах (темах форума) пока приостановлены — пользуйтесь ботом в "
+              "личных сообщениях (DM). Богатый стриминг в супергруппах пока не поддерживается.",
+    },
     "topic.not_a_topic_rename": {
         "en": "This is not a forum topic; nothing to rename.",
         "ru": "Это не тема форума; переименовывать нечего.",
@@ -1572,6 +1591,69 @@ CATALOG: dict[str, dict[str, str]] = {
         "en": "📄 Response too long — sent as a file.",
         "ru": "📄 Ответ слишком длинный — отправлен файлом.",
     },
+    # #243: a >20-column table can't render as a native rich table, so it is sent as a PNG
+    # image; this note replaces the table in the rich-MARKDOWN body (so plain text, no HTML/
+    # markdown emphasis) and points at the image below.
+    "stream.wide_table": {
+        "en": "📊 Table {n} ({cols} columns) — too wide to display inline; sent as an image below.",
+        "ru": "📊 Таблица {n} ({cols} столбцов) — слишком широкая для встроенного показа; отправлена изображением ниже.",
+    },
+    # #229: header of the live task-list card ({n} total, {done} completed, {open} not done).
+    "todo.card_header": {
+        "en": "📋 {n} tasks ({done} done, {open} open)",
+        "ru": "📋 {n} задач ({done} готово, {open} осталось)",
+    },
+    # #188: recurring scheduled prompts.
+    "schedule.usage": {
+        "en": "⏰ <b>Schedule a recurring prompt</b>\nFormat: <code>/schedule &lt;when&gt; | &lt;prompt&gt;</code>\n"
+              "Examples:\n• <code>/schedule every day at 9:00 | summarize my GitHub notifications</code>\n"
+              "• <code>/schedule every monday at 18:00 | weekly review</code>\n"
+              "• <code>/schedule every 2 hours | check the deploy status</code>\n"
+              "Times use the server clock. See your schedules with /schedules.",
+        "ru": "⏰ <b>Запланировать повторяющийся запрос</b>\nФормат: <code>/schedule &lt;когда&gt; | &lt;запрос&gt;</code>\n"
+              "Примеры:\n• <code>/schedule every day at 9:00 | сводка по GitHub-уведомлениям</code>\n"
+              "• <code>/schedule every monday at 18:00 | недельный обзор</code>\n"
+              "• <code>/schedule every 2 hours | проверь статус деплоя</code>\n"
+              "Время — по часам сервера. Список — /schedules.",
+    },
+    "schedule.parse_error": {
+        "en": "⚠️ Could not read that schedule: {err}\nTry /schedule for the format.",
+        "ru": "⚠️ Не удалось разобрать расписание: {err}\nФормат — /schedule.",
+    },
+    "schedule.created": {
+        "en": "✅ Scheduled <b>{when}</b> — next run {next}.\nManage with /schedules.",
+        "ru": "✅ Запланировано <b>{when}</b> — следующий запуск {next}.\nУправление — /schedules.",
+    },
+    "schedule.cap_reached": {
+        "en": "⚠️ You already have {n} schedules (the max). Delete one with /schedules first.",
+        "ru": "⚠️ У вас уже {n} расписаний (максимум). Сначала удалите одно через /schedules.",
+    },
+    "schedule.list_empty": {
+        "en": "⏰ No schedules yet. Create one with /schedule.",
+        "ru": "⏰ Расписаний пока нет. Создайте через /schedule.",
+    },
+    "schedule.list_header": {
+        "en": "⏰ <b>Your schedules</b> ({n}/{cap}):",
+        "ru": "⏰ <b>Ваши расписания</b> ({n}/{cap}):",
+    },
+    "schedule.list_item": {
+        "en": "{state} <b>{when}</b> — next {next}\n   <i>{prompt}</i>",
+        "ru": "{state} <b>{when}</b> — далее {next}\n   <i>{prompt}</i>",
+    },
+    "schedule.run_notice": {
+        "en": "⏰ <i>Running scheduled task:</i> {prompt}",
+        "ru": "⏰ <i>Выполняю запланированную задачу:</i> {prompt}",
+    },
+    "schedule.deleted": {"en": "🗑 Schedule deleted.", "ru": "🗑 Расписание удалено."},
+    "schedule.paused": {"en": "⏸ Schedule paused.", "ru": "⏸ Расписание приостановлено."},
+    "schedule.resumed": {"en": "▶️ Schedule resumed.", "ru": "▶️ Расписание возобновлено."},
+    "schedule.prompt": {
+        "en": "Send the schedule as <code>&lt;when&gt; | &lt;prompt&gt;</code> (or /cancel).",
+        "ru": "Пришлите расписание как <code>&lt;когда&gt; | &lt;запрос&gt;</code> (или /cancel).",
+    },
+    "btn.sched_pause": {"en": "⏸ Pause", "ru": "⏸ Пауза"},
+    "btn.sched_resume": {"en": "▶️ Resume", "ru": "▶️ Возобновить"},
+    "btn.sched_delete": {"en": "🗑 Delete", "ru": "🗑 Удалить"},
 
     # -- /retry ------------------------------------------------------------- #
     "retry.error": {

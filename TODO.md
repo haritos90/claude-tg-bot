@@ -41,7 +41,7 @@ header rows. Columns:
 - **Closed** — `| ID | Theme | Title | Resolution | Release notes |`
 - **Deferred** — `| ID | Pri | Eff | Theme | Title | Reason |`
 
-**Next free ID:** 235
+**Next free ID:** 254
 
 ---
 
@@ -51,7 +51,6 @@ Current, actionable work — promote from Backlog when picked up.
 
 | ID | Pri | Eff | Theme | Title |
 |---|---|---|---|---|
-| 240 | P2 | L | ux | Full-rich live "thinking" — 240a/b/d done; only 240c (reasoning stream) remains |
 
 ## Backlog
 
@@ -59,109 +58,17 @@ Not started; promote to Open when picked up.
 
 | ID | Pri | Eff | Theme | Title |
 |---|---|---|---|---|
-| 197 | P3 | XS | core | Per-user session cap not enforced for group/topic sessions |
-| 201 | P3 | XS | docs | Spec-voice cleanup: first-person narration in isolation.md and TODO #189 |
-| 229 | P3 | M | features | Surface a code session's live task list in Telegram (rich to-do list) |
-| 243 | P2 | M | ux | Tables >20 columns: verify behavior, fall back to PNG, and tell the agent the limit |
 | 244 | P3 | S | ux | Decide when to set `skip_entity_detection` on rich sends |
-| 246 | P3 | M | features | Shell: real Ctrl-C via controlling-tty + smoother full-screen TUI/picker handling |
 
 ### Details
-
-**#240 — Full-rich live "thinking": drive `<tg-thinking>` from agent activity** (P2 · L · ux)
-
-Use Telegram's native rich `<tg-thinking>` block (Bot API 10.1, draft-only, RichBlockThinking)
-to show a live "what the agent is doing" indicator that self-cleans at finish (never in history).
-cc-connect is NOT a reference here — it uses the classic edit-in-place card with tool-step rows
-and does NOT use rich drafts / `<tg-thinking>` / native tables at all. Sub-parts:
-- **240a (DONE)** — animate the placeholder: rotate Claude-Code-style gerunds (Thinking… →
-  Pondering… → …) in `<tg-thinking>` before the first content (`streamer._THINKING_WORDS`,
-  `_thinking_label`, the no-body branch of `_render_draft`). Dedup → ~1 update per rotation.
-- **240b (DONE)** — drive the block from live TOOL activity: the `tool` EngineEvent
-  (`.tool_name`/`.tool_input`) is mapped by `streamer.tool_phase_label` to a short phase
-  ("⚙️ Running pytest…", "📖 Reading sessions.py…", "🌐 Searching the web…") and pushed via
-  `streamer.set_phase` from `sessions._run_one` (code mode, on the tool event). `_render_draft`
-  shows the phase in `<tg-thinking>` (HTML-escaped) instead of the gerund, and clears it once
-  real content streams. Tested (`tests/test_streamer.py`). NOTE: a long tool run (>30s) will let
-  the ephemeral draft expire until #242 (keepalive) lands.
-- **240c** — stream the model's REASONING/extended-thinking content (the "unfurling" text) in
-  the block as it arrives (dim/collapsed), replaced by the answer once output starts.
-- **240d (DONE via unicode)** — phase emoji. The AIActions pack is PREMIUM custom emoji, which a
-  bot cannot render (rich `{"html"}` + classic HTML `<tg-emoji>` tests both showed only the
-  fallback; IDs saved in `deploy/aiactions-emoji.json`). Resolved with plain UNICODE emoji baked
-  into `tool_phase_label` / the gerund (💭🔍📖🧠⚙️🌐✏️📂) — free, universal, no custom-emoji
-  machinery. (A bot-OWNED custom-emoji set via `createNewStickerSet` remains a possible future
-  upgrade, but needs uploaded art; a free third-party pack via `<tg-emoji>` would need its short
-  name. Neither needed now.)
-Keep DRAFT-ONLY throughout: `finish()` stays `{"markdown": full_text}` with no thinking block.
-
-**#243 — Tables >20 columns: verify behavior, fall back to PNG, and tell the agent** (P2 · M · ux)
-
-The rich table limit is 20 columns. We must (a) VERIFY what Telegram does with a >20-column
-markdown table (reject? auto-image?) — use `/verify-rich-draft` with a 21-col table; (b) guard:
-route a >20-column table to the PNG path (`table_image.render_table_png`, the #162 mechanism)
-instead of a native table; (c) append to the agent's session system prompt (`engine`
-`CHAT_SYSTEM_PROMPT` / code append) that the client shows at most 20 columns natively and a wider
-table is delivered as a PNG image — so the model formats accordingly.
 
 **#244 — Decide when to set `skip_entity_detection` on rich sends** (P3 · S · ux)
 
 `InputRichMessage.skip_entity_detection` disables auto-detection of URLs / mentions / hashtags /
-phone numbers / bank cards. Decide the scenarios where we want it on (e.g. code-heavy replies, or
-to stop spurious linkification of file paths / @handles in output) vs off (normal prose where
+phone numbers / bank cards. Decide the scenarios where it should be enabled (e.g. code-heavy
+replies, or to stop spurious linkification of file paths / @handles in output) vs disabled (normal prose where
 auto-links help). Likely a per-send heuristic. Design first.
 
-**#197 — Per-user session cap not enforced for group/topic sessions** (P3 · XS · core)
-
-`_session_limit_block` is checked in the DM create paths (`/new` private, `ses:new`, `/fork`)
-but `_new_session` for `chat.type != "private"` (supergroup topics) bypasses it
-(`handlers.py:1424`, `:2387`). If group sessions count toward the per-user cap this is a gap;
-if the cap is intentionally DM-only, add a one-line comment stating so.
-
-**#201 — Spec-voice cleanup: first-person narration** (P3 · XS · docs)
-
-Make two spec passages declarative/impersonal. `isolation.md` (~934, ~1088): "We did **not**
-add an 'insecure' flag…" and "…we use `iptables -m cgroup --path`" → "No 'insecure' flag is
-added…" and "…the egress rule uses `iptables -m cgroup --path`". TODO.md #189 Deferred reason:
-"Our reaper… continuous context — our default… Marginal for us… we deliberately favour…" →
-restate without "our / us / we".
-
-**#229 — Surface a code session's live task list in Telegram (rich to-do list)** (P3 · M · features)
-
-A code session's agent maintains a structured to-do list (the SDK's task/todo events — a turn ends
-with a summary like the one below). Today none of it reaches Telegram; the user only sees prose.
-Surface it as a compact, LIVE-updating checklist so progress on a multi-step task is visible at a
-glance, e.g.:
-
-    4 tasks (0 done, 4 open)
-    open  Fix speed inet@/laptop/gost returning ~0
-    open  Wire ansible --check + local actions to execute from panel
-    open  Filter gost-redirect targets to 3proxy-role servers
-    open  Add a server via the panel GUI
-
-Design notes:
-- Source the items from the SDK stream (the task/to-do tool events surfaced in `engine.run`), not by
-  scraping prose. Map each to open / done with a `N tasks (X done, Y open)` header.
-- Render via a rich message (`rich_message.SendRichMessage` / `EditRichMessage`) so it can be EDITED
-  in place as tasks flip done — a single card per turn, not a new message per update. A rich block
-  list is the natural fit; a plain monospace fallback covers clients that don't style it.
-- Keep it OFF the draft typewriter path (#225/#226): the answer text streams via drafts, the task
-  card is a separate edited message so the two don't fight over the same draft frontier.
-- Make it a delegated per-session toggle (`settings_schema.py`, default OFF) — not every session wants
-  the extra card. Code sessions only.
-
----
-
-**#246 — Shell: real Ctrl-C via controlling-tty + smoother full-screen TUI/picker handling** (P3 · M · features)
-
-Follow-ups from #227 on-device use. (1) Ctrl-C is currently the `\x03` BYTE — without the PTY
-as the jailed bash's controlling terminal it won't deliver SIGINT to a foreground process group,
-so a hung command (e.g. a browser-flow `gh auth login` polling forever) can't be interrupted by
-^C (only reaped on idle / killed on session delete). Give the jailed bash a controlling tty
-(setsid + TIOCSCTTY under bwrap+setpriv, mindful of the #179 cgroup/reaper invariant) so ^C is a
-real interrupt. (2) An arrow-key picker that REDRAWS the whole screen (gh's auth-method list)
-streams as snapshots; consider detecting the alternate-screen / heavy-redraw case and showing
-only the latest frame, or a hint to prefer a non-interactive form (`gh auth login --with-token`).
 
 ## Closed
 
@@ -169,6 +76,20 @@ Title-only history.
 
 | ID | Theme | Title | Resolution | Release notes |
 |---|---|---|---|---|
+| 247 | ux | Shell keypad lost when a rich send falls back: `reply_markup` not threaded into fallback paths | `streamer.finish(reply_markup=...)` carries the #227b interactive-shell keypad, but `_commit` forwarded it only on the rich-markdown path. The fallback paths now thread it too: the long-output `send_document` branch passes `reply_markup`, and the legacy md_to_html chunk path attaches it to the FIRST text message via a `kb_pending` flag (consumed on the first `edit_message_text`/`send_message`, so it lands on exactly one bubble). A paused shell command driven through a fallback bubble keeps its keypad. py_compile + import + ruff clean; suite 167 passed (1 pre-existing PIL font failure); live restart "Run polling". | A paused shell command keeps its on-screen key keypad even when the rich message send falls back to the plain path. |
+| 248 | engine | PTY master fd leaked when `PersistentShell` spawn fails | `engine._start_shell` opened a PTY (`os.openpty()`) and the `finally` closed only `slave`; if `create_subprocess_exec` raised, `master` leaked — one fd per failed attempt until exhaustion. Added an `except BaseException` that closes `master` before re-raising (the `finally` still closes `slave`). py_compile + import + ruff clean; suite 167 passed (1 pre-existing PIL font failure); live restart "Run polling". | A failed shell start no longer leaks a file descriptor. |
+| 249 | isolation | Verify session delete/evict reaps in-jail shell children (escaped background processes) | Verified — no code change needed. `PersistentShell.close()` → `proc.kill()` SIGKILLs `self.proc`, which exec-chains (`setpriv→`) into `bwrap --unshare-pid` (same PID), making it PID 1 of the jail's PID namespace; the kernel then SIGKILLs every process in that namespace, including a `setsid`-DETACHED background process (a server/build the shell started) that escaped the process group. Confirmed empirically (a setsid'd bg process dies with the namespace). Documented the guarantee in `close()` so it is not re-flagged; no separate cgroup/process-group sweep is required. | A background process started inside the shell is reliably killed when the session ends — none survive teardown. |
+| 183 | security | Sandbox-only run mode + an owner "unrestricted" jailed user | Resolved — no code change needed. Part 1 (sandbox-only, no on/off) shipped in #231 (the jail is mandatory for every session, owner included; the `/sandbox` toggle + `no_sandbox` were retired). Part 2 (an "unrestricted" owner profile replacing a root-on-host fallback) is moot: `deploy/sandbox-claude.sh` runs EVERY session under `--unshare-user` + a per-session non-root host uid (#119, `SANDBOX_PER_SESSION_UID`) with no owner branch — there is no root-on-host path left to replace, and the owner is already a jailed non-root uid like everyone. Deliberately NOT relaxing the jail (egress/seccomp/caps) for the owner — the per-session-uid sandbox contains all sessions safely as-is. Full-access (bypassPermissions) is already delegated to code users and sandbox-contained (#223); the lone `is_owner` line in the permission soft-revoke is correct logic, not a privilege. | No change — the owner runs in the same per-session non-root jail as everyone; no special un-sandboxed path exists. |
+| 188 | features | Natural-language scheduled tasks — recurring prompts set from chat | Unblocked now #165 (usage attribution) + #119 (sandbox) shipped. New pure `schedules.py` parses `<when> \| <prompt>` (daily/weekly/interval, 12h/24h times; `parse_schedule`/`next_run_after`/`describe`) with a 15-min interval floor. `db.schedules` table + CRUD (add/list/count/due/enable/update_run/delete). A runner loop (`sessions._schedule_loop` + `start_scheduler`, started in `bot.main` beside the reaper) sweeps every 30 s, advances `next_run` FIRST (no tight re-fire), posts a `schedule.run_notice`, and submits the prompt into its session via `handle_text` (so it streams + posts like a normal turn; per-session queue serializes). `/schedule <when> \| <prompt>` (arg-capture #101) with a per-user cap (5) and usage help; `/schedules` lists with inline pause/resume (recomputes next_run on resume) + delete, owner-scoped callbacks. `reply()` gained `reply_markup`. i18n (en+ru) + command-menu entries. +12 parser unit tests; DB CRUD integration-checked (due-filter/pause/update/delete). py_compile + import + i18n parity + ruff clean; **suite 191 passed**; live restart "Run polling"; `schedules` table created. On-device run of a fired schedule pending. | Schedule a recurring prompt from chat — e.g. `/schedule every day at 9:00 \| summarize my GitHub notifications` — and manage them with /schedules (pause/resume/delete). |
+| 246 | features | Shell: real Ctrl-C via controlling-tty + smoother full-screen TUI/picker handling | Two #227 on-device follow-ups. **246a — real Ctrl-C**: `engine._start_shell` gives the jailed bash a CONTROLLING TTY via `os.login_tty(slave)` in `preexec_fn` (+ `pass_fds=(slave,)`), replacing `start_new_session=True` (login_tty's setsid keeps it a session leader, so the #179 reaper/cgroup invariant is unchanged); bwrap is not `--new-session`, so the tty persists through setpriv→bwrap→bash even across `--unshare-pid`. The 0x03 byte is now a REAL SIGINT to the foreground group — a hung command (polling `gh auth login`) is actually interrupted. Validated e2e (sync / bwrap `--unshare-pid --dev /dev` / asyncio → RC=130). **246b — full-redraw TUI**: `engine._latest_frame` collapses an ALT-SCREEN TUI (sets `ESC[?1049h`) to its latest frame (split on screen-clear / cursor-home / alt-screen toggle, keep the last visible segment), wired into `_clean`/`_parse`; GATED on the alt-screen marker so ordinary output — even a bare `clear` — is untouched. +unit tests (`_latest_frame`, `add_reasoning` analog). py_compile + import + ruff clean; **suite 179 passed**; live restart "Run polling". On-device `/shell` ^C + picker confirmation pending. | Ctrl-C now really interrupts a stuck shell command, and a full-screen picker shows its current screen instead of a pile of redraw snapshots. | 
+| 240 | ux | Full-rich live "thinking" — drive `<tg-thinking>` from agent activity (240a/b/c/d) | The draft-only `<tg-thinking>` block (Bot API 10.1) is a live "what the agent is doing" indicator that self-cleans at finish. 240a (DONE): rotating Claude-Code gerunds before first content. 240b (DONE): live TOOL phase ("⚙️ Running pytest…") from the `tool` event via `streamer.set_phase`. 240d (DONE via unicode): plain-unicode phase emoji (the AIActions pack is premium custom emoji a bot can't render). **240c (this change): stream the model's REASONING/extended-thinking** — `engine.run` surfaces `content_block_delta.thinking` as a new `thinking_delta` event (not added to the answer text); `sessions._run_one` forwards it to `streamer.add_reasoning`, which accumulates the tail and shows it in `<tg-thinking>` ("💭 …unfurling…"). Render priority in the no-body draft branch: reasoning → tool phase → gerund; cleared once real answer content streams (and on segment reset). Tail-capped; DM-draft-only; best-effort. DRAFT-ONLY throughout — `finish()` stays `{"markdown": full_text}` with no thinking block. +streamer unit test. py_compile + import + ruff clean; **suite 178 passed**; live restart "Run polling". On-device render of streamed reasoning pending (needs an extended-thinking turn). | The "thinking" indicator now shows the model's live reasoning as it unfurls, then is replaced by the answer — and never stays in history. |
+| 229 | features | Surface a code session's live task list in Telegram (rich to-do list) | The agent's `TodoWrite` tool events (already on the engine stream as `tool` events with `tool_input.todos`) are surfaced as a compact, live-updating card. `sessions._run_one` (code mode, toggle on) extracts the todos and calls `streamer.update_todo_card`, which sends ONE rich message on the first TodoWrite of a turn and EDITS it in place on later ones (a fresh Streamer per turn = one card per turn) — a SEPARATE bubble, off the draft typewriter path. `markup.summarize_todos` (pure, tested) renders `📋 {n} tasks ({done} done, {open} open)` + one glyph line per task (✅ done / 🔄 in-progress / ⬜ pending), content truncated for compactness. Delegated per-session+user bool `todo_card` (default OFF, CODE-only): new threads column + migration, `settings_schema` Setting (PAGE_ORDER + CODE_ONLY), `settings.row_todo_card` + `todo.card_header` i18n (en+ru). All sends best-effort (a failure never disturbs the answer). +4 markup tests. py_compile + import + i18n symmetry/placeholder parity + ruff clean; **full suite 177 passed**; live restart "Run polling"; migration verified (`todo_card` column added). On-device render of a real TodoWrite turn pending. | Code sessions can show a live, self-updating checklist of the agent's task list (opt-in via /settings → Live task list). |
+| 201 | docs | Spec-voice cleanup: first-person narration in isolation.md and TODO #189 | Removed first-person voice from two spec surfaces. `isolation.md`: "We did **not** add an 'insecure' flag" → "No 'insecure' flag is added"; "we use `iptables -m cgroup --path`" → "the egress rule uses `iptables -m cgroup --path`". TODO #189 (Deferred reason + Details): "Our reaper" → "The reaper", "our default" → "the project default", "Marginal for us" → "Marginal here", "we deliberately favour" → "the project deliberately favours". Verified no `we/our/us` remains in either. Docs-only, no code change. | No user-facing change — documentation voice cleanup. |
+| 197 | core | Per-user session cap not enforced for group/topic sessions | By design — not a gap. The cap is a per-USER limit and `_session_limit_block` counts `db.browse_threads(uid)`, i.e. threads keyed by the user's id (their DM surface). Supergroup forum-topic sessions are keyed by the GROUP's chat_id (a shared group resource, not a per-user session), so they are outside the per-user cap by construction; the non-private `_do_new` branch deliberately does not call the check. Documented the intent in `_session_limit_block`'s docstring and at the forum-topic create branch. No behavior change. py_compile + import + ruff clean; suite 173 passed; live restart "Run polling". | No change — the per-user session limit applies to your private (DM) sessions; group-topic sessions are a shared group resource and are not counted. |
+| 243 | ux | Tables >20 columns: verify behavior, fall back to PNG, and tell the agent the limit | A native rich table caps at 20 columns (rich-message-spec.md:82). (b) GUARD: `markup.extract_wide_tables` pulls every >20-column markdown table out of the reply body, leaves a localized `stream.wide_table` note (en+ru) where it was, and `streamer._commit` sends the rich markdown then each wide table as a PNG photo (`table_image.render_table_png`); a render failure degrades to a `<pre>` grid via the new `_send_wide_table_image` so data is never lost. (c) MODEL: new `engine.TABLE_FORMAT_NOTE` appended to BOTH the chat and code system prompts states the 20-column limit and the PNG fallback so the model formats accordingly. (a) VERIFY: `deploy/verify-rich-draft.py --wide [--cols N]` sends an over-limit table draft+final for live owner confirmation; the guard makes the bot never emit an over-limit NATIVE table regardless of the client's raw behavior. Fixed the long-missing PNG font dependency: installed `fonts-dejavu-core` on the host and made `table_image._load_font` fall back to PIL's bundled font when the TTF is absent (this also fixes the previously pre-existing `test_table_image_renders_png_bytes` failure). +unit tests (`extract_wide_tables`, `table_col_count`). py_compile + import + i18n symmetry/placeholder parity + ruff clean; **full suite 173 passed (0 failures)**; live restart "Run polling". | A table wider than 20 columns is now delivered as a clear image (with a note in the text) instead of breaking, and the assistant is told to expect that. |
+| 252 | docs | Comment-accuracy and spec-voice nits across sessions/sandbox/rich-spec/broker | Four no-behavior corrections: `sessions.py` key-token example `":down :enter"` → `".down .enter"` (the `.` prefix is used because `:` triggers Telegram emoji search); `deploy/sandbox-claude.sh` comment "INTERACTIVE login bash" → "INTERACTIVE bash (`-i`, non-login)" to match the actual flags; `rich-message-spec.md` first-person "we pass…/we do NOT yet drive…/we do not add" → declarative spec voice; `deploy/cred-broker.py` dropped the duplicated `was \`base.startswith(p)\`` prose (the canonical `# was:` line still records the old code). py_compile + bash -n + import + ruff clean; suite 167 passed (1 pre-existing PIL font failure); live restart "Run polling". | Internal comment/doc cleanup only — no user-facing change. |
+| 251 | engine | Shell `_drive` busy-polls every 40 ms for the whole command lifetime | `engine._drive` woke every 40 ms (`asyncio.sleep(0.04)`) for a command's whole lifetime, so a quiet long command (compile, `sleep 300`) spun the event loop ~25×/s for minutes. Added adaptive backoff: poll fast (~40 ms) while output flows and for the first ~1 s of silence, then 0.2 s, then 0.5 s; any new output resets to fast. The `settle` (>=1.5 s) and hard-deadline checks still fire within one slow poll, so await-input detection and timeouts are unaffected. py_compile + import + ruff clean; suite 167 passed (1 pre-existing PIL font failure); live restart "Run polling". | A long-running shell command no longer wastes CPU polling 25 times a second while it is quiet. |
+| 250 | engine | Persistent-shell death fallback runs an await-input line as a one-shot command | In `sessions._run_shell_command`, the `except` fallback to the #224 one-shot reset `shell_awaiting=False` and ran `run_shell(cmd)`. If the persistent shell died WHILE awaiting input, `cmd` was the user's INPUT (a password, a menu choice) — not a command — and got executed as a standalone shell command. Now, on fallback while `awaiting`, the input is DROPPED with a new `shell.ended` notice (en+ru) instead of being run. py_compile + import + i18n symmetry + ruff clean; suite 167 passed (1 pre-existing PIL font failure); live restart "Run polling". | If the shell ends while a program is waiting for input, your typed input is discarded instead of being run as a shell command. |
 | 227 | features | Shell mode phase 2: persistent PTY shell + interactivity + lifecycle | A held login `bash -i` per code session on a host-driven PTY (`engine.PersistentShell`; launcher branch `SBX_MODE=shell_persist`), reusing the #119 jail. (227a) `shell_run` writes `cmd; printf <sentinel>:$?` as ONE line and reads the master until the sentinel → `(rc, output)`; `stty -echo`/`PS1=` + `_TERM_NOISE_RE` (CSI/OSC + two-char ESC like ESC 7/8) give clean output; cd/env persist. (227b) `_drive` returns `done`/`awaiting`(settle after output)/`timeout`; a paused command flips the session to await-input and the next message is forwarded as input/keys. Telegram-native UX: `_run_shell_command` attaches an inline KEYPAD (Esc ↑ Enter / ← ↓ → / Tab ^C ⋯more; `shell_keypad` + `handlers.on_shell_key` callback edits the message in place via `shell_key`→`shell_send_keys`); `streamer.finish`/`_commit` gained `reply_markup`. Typed key fallback `.up`/`.down`/`.enter` (prefix `.`, not `:`). #245 relaxed → only full-screen TUIs refused (`_is_fullscreen_tui_cmd`). (227c) `/shell` toggle = DETACH (shell + running command stay alive in the background, agent resumes; re-attach keeps cd/env + await state); torn down on session delete/evict (`aclose` `_close_shell`) + #179 idle reaper; cgroup mem/pids caps apply via the jail. Local PTY tests confirm cd/env persistence, rc, clean output, and the chained prompt→input→prompt→input flow; +tests (parse, keypad, key-tokens, TUI guard). py_compile + ruff + suite (167) clean; live restart "Run polling"; keypad confirmed on-device. CAVEATS (→ #246): Ctrl-C is the `\x03` byte (no controlling tty → not a true SIGINT, so a hung command is reaped on idle / killed on delete); a full-redraw arrow picker streams as snapshots. For GitHub auth prefer a token over the browser flow. | The jailed shell is now persistent and interactive: `cd`/env survive between messages, prompts (incl. arrow-key pickers) are driven by an on-screen key keypad, and `/shell` detaches so a long command / server keeps running while the agent continues. |
 | 239 | ux | Use the documented `<tg-thinking>` draft block for the generating placeholder | Replaced the empty plain "Thinking…" draft with the documented `<tg-thinking>` RichBlockThinking block (`_THINKING_HTML`), sent via `sendRichMessageDraft` in `start()` + the segment reset. Draft-only by construction (finish() uses `{"markdown"}`). Built on by #240 (animated gerunds + live tool phases). Confirmed on-device ("thinking/pondering" visible). py_compile + ruff + i18n clean; live restart "Run polling". | The "generating" placeholder uses Telegram's native animated Thinking block. |
 | 238 | ux | Streaming-draft lag on rapid turns: global draft_id + flood→grid fallback | Two compounding causes fixed in `streamer.py`: a single global `_DRAFT_ID = 1` shared by every DM turn (a new turn animated from the previous turn's leftover ephemeral draft → cross-turn stutter) → now a UNIQUE per-`Streamer` id (`_next_draft_id`); and the rich-draft `except` dropping to the `md_to_html` `<pre>` grid on flood (`TelegramRetryAfter` on rapid turns degraded the table + slept the retry) → now backs off (`_draft_retry_after`) and SKIPS the frame instead of falling to the grid. py_compile + ruff + suite clean; live restart "Run polling". | Calling something like `/test` several times in a row no longer lags or degrades the table — each turn streams on its own draft and flood is handled by skipping frames, not falling back to the old grid. |
@@ -409,14 +330,13 @@ Parked work (revive by moving back to Backlog/Open).
 
 | ID | Pri | Eff | Theme | Title | Reason |
 |---|---|---|---|---|---|
-| 183 | P2 | L | security | Sandbox-only run mode + an owner "unrestricted" jailed user | After #119 (credential broker + egress allowlist) the un-jailed path can be dropped entirely so EVERY session is ALWAYS sandboxed (no on/off). The owner gets an "unrestricted" profile — still inside bubblewrap (NOT host root), but a jailed user with broad in-jail privileges — replacing today's root-on-host fallback. Depends on #119. |
 | 184 | P3 | S | ux | "Waking up…" placeholder when a reaped session re-spawns | Polish gated on observed behaviour: only worth building if first-token latency after idle eviction (#179) proves noticeable. Revive when re-spawn delay is measured to be slow enough that an immediate rich "waking up…" placeholder (updated in place with the real answer) would improve the experience. |
 | 16 | P3 | L | features | optional voice-note input (transcribe → route as text) | Not supported by the SDK: no subscription-safe STT (no `ANTHROPIC_API_KEY` allowed; chat mode is tool-free). Needs an owner-chosen transcription backend (e.g. a local `faster-whisper`) before it's worth building. |
 | 62 | P3 | L | features | "Pro" command layer — remainder: `/rewind`, `/resume`, `/mcp`, `/budget`, `/continue` | The safe subset shipped (#23). Remainder deferred after SDK introspection: `/rewind` needs `enable_file_checkpointing` + `replay-user-messages` + `UserMessage.uuid` capture (files-only); `/mcp` conflicts with the tool-free/isolation posture (code-mode only); `/budget` (`max_budget_usd`) is likely a no-op under subscription auth; `/resume`+`/continue` are redundant with the bot's own per-session resume. |
 | 186 | P3 | XL | features | Pluggable agent backend — drive coding agents OTHER than the `claude` CLI behind one adapter | The engine is hardwired to the `claude` CLI / Agent SDK (`engine.py`). A thin agent-adapter layer (one interface for spawn / stream / tool-permission / resume) would let the same Telegram front-end drive other local coding agents. Big surface and no demand yet, and it cuts against the subscription-only + deep-sandbox focus — every backend needs its OWN auth + jail + billing story (and our P0 is subscription-only, no API key). Parked until there's a concrete second backend worth wiring; if so, the boundary to carve is the `engine.ClaudeSession` interface. |
-| 188 | P2 | M | features | Natural-language scheduled tasks — recurring cron jobs set from chat | Let a user say e.g. "every day at 9:00, collect GitHub trending" and have the bot register a recurring job that wakes a session, runs the prompt, and posts the result back. Needs: an NL→schedule parser, a persisted job store, a scheduler loop (APScheduler or an asyncio timer in `bot.main`, next to the reaper/usage pollers), per-user caps so a schedule can't silently drain the subscription windows, and a `/schedules` manager (list / pause / delete, arg-capture per #101). Defer until the usage-attribution (#165) and sandbox (#119) work settles — UNATTENDED runs amplify exactly the cost-attribution and blast-radius questions those tasks address. |
-| 189 | P3 | S | ux | Auto-start a FRESH session after long idle (anti context-drift) — opt-in | NOT about respawn latency (that's #184) and NOT "context isn't saved": the idea is to start CLEAN on purpose after a long gap, to avoid context-DRIFT — dragging a morning's failed-build / debugging noise into an afternoon's unrelated request via resume. Our reaper (#179) instead RESUMES the same transcript (continuous context — our default); old sessions stay retrievable via `/sessions`. So this is the INVERSE default: "after a long gap the next ask is probably a new task → start fresh, keep the old one switchable". Marginal for us — `/new` already gives a manual clean slate and we deliberately favour preserve-and-resume; the only delta is making fresh the AUTOMATIC default after long idle (opt-in, default OFF). Cheap (a last-activity timestamp check when rebuilding an evicted record). Kept as a user-configurable DELEGATED setting (`settings_schema.py`): user sees + toggles it, own default + per-session override (like `hot_cache_timer`/`language`), default OFF; owner can leave it delegated so each user opts in. Full design in Details below. |
+| 189 | P3 | S | ux | Auto-start a FRESH session after long idle (anti context-drift) — opt-in | NOT about respawn latency (that's #184) and NOT "context isn't saved": the idea is to start CLEAN on purpose after a long gap, to avoid context-DRIFT — dragging a morning's failed-build / debugging noise into an afternoon's unrelated request via resume. The reaper (#179) instead RESUMES the same transcript (continuous context — the project default); old sessions stay retrievable via `/sessions`. So this is the INVERSE default: "after a long gap the next ask is probably a new task → start fresh, keep the old one switchable". Marginal here — `/new` already gives a manual clean slate and the project deliberately favours preserve-and-resume; the only delta is making fresh the AUTOMATIC default after long idle (opt-in, default OFF). Cheap (a last-activity timestamp check when rebuilding an evicted record). Kept as a user-configurable DELEGATED setting (`settings_schema.py`): user sees + toggles it, own default + per-session override (like `hot_cache_timer`/`language`), default OFF; owner can leave it delegated so each user opts in. Full design in Details below. |
 | 190 | P2 | S | reliability | Archive browser — inspect / restore / delete bundles from `_archive/` (+ optional size cap) | Lower-priority polish on cold storage. Retention / auto-purge already shipped (#178: `archive.purge_expired` + the daily loop + the owner retention picker). Revive to add (1) an optional SIZE cap (keep the archive dir under N MB, oldest-first) layered on the age purge, and (2) an owner-facing browser (under `/sessions` or a new `/archive`) listing archived sessions from the `.json` sidecars, RESTORING one (un-tar back to a fresh session) and DELETING one for good. Owner-only. |
+| 253 | P2 | L | features | Supergroup (forum-topic) sessions — re-enable once rich streaming works there | Rich-draft streaming is private-chat-only (`TEXTDRAFT_PEER_INVALID` in supergroups, #3/#39), so the supergroup surface can't get the rich UI; not touching this area for now. The active forum-topic implementation is commented out (DM-only): `_do_new` create, `_do_rename` rename, and `cmd_close` now reply with `topic.disabled` instead of calling `create_forum_topic`/`edit_forum_topic`/`close_forum_topic` (each old block kept commented with a `#253` ref). The dormant topic-routing (sign-convention keys, `message_thread_id` send-kwargs) is left in place as a no-op for DM. Revive: uncomment those three blocks (+ verify routing/streaming) when supergroup rich streaming is solved. |
 
 ### Details
 
@@ -430,7 +350,7 @@ an unrelated new task). The previous session is NOT destroyed: it stays switchab
 
 **How it differs from neighbours.** NOT the respawn-latency placeholder (#184); NOT
 memory eviction (#179's reaper unloads from RAM but RESUMES the same transcript —
-continuous context, our default). This is the INVERSE default: fresh-on-return instead
+continuous context, the project default). This is the INVERSE default: fresh-on-return instead
 of resume-on-return. `/new` already gives the manual clean slate; #189 only makes
 "fresh" the AUTOMATIC behaviour after a long gap.
 

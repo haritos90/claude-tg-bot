@@ -333,6 +333,91 @@ def test_split_rich_tables_narrow_table_also_native():
     assert any(isinstance(it, markup.RichTable) for it in items)
 
 
+# --- #243: route >20-column tables to the PNG image path ----------------------
+
+def _wide_md(ncols: int, nrows: int = 2) -> str:
+    header = "| " + " | ".join(f"C{i}" for i in range(ncols)) + " |"
+    sep = "|" + "|".join([":--"] * ncols) + "|"
+    rows = ["| " + " | ".join(f"r{r}c{i}" for i in range(ncols)) + " |" for r in range(nrows)]
+    return "\n".join([header, sep, *rows])
+
+
+def test_table_col_count():
+    rows = markup.split_rich_tables(_wide_md(5))[0].rows
+    assert markup.table_col_count(rows) == 5
+    assert markup.table_col_count([]) == 0
+
+
+def test_extract_wide_tables_pulls_over_limit_only():
+    text = (
+        "Intro.\n\n"
+        + _wide_md(3)            # narrow → stays inline
+        + "\n\nMiddle.\n\n"
+        + _wide_md(21)           # wide → extracted
+        + "\n\nOutro."
+    )
+    new_text, wide = markup.extract_wide_tables(text)
+    assert len(wide) == 1
+    assert markup.table_col_count(wide[0].rows) == 21
+    # the wide table is replaced by exactly one token; the narrow table stays verbatim.
+    assert new_text.count(markup.WIDE_TABLE_TOKEN) == 1
+    assert "| C0 | C1 | C2 |" in new_text          # narrow table preserved
+    assert "C20" not in new_text                    # wide table's cells are gone from the body
+    assert "Intro." in new_text and "Outro." in new_text
+
+
+def test_extract_wide_tables_at_limit_stays_inline():
+    # Exactly 20 columns is within the native limit → not extracted.
+    new_text, wide = markup.extract_wide_tables(_wide_md(20))
+    assert wide == []
+    assert new_text == _wide_md(20)
+
+
+def test_extract_wide_tables_no_table_is_identity():
+    assert markup.extract_wide_tables("just prose, no pipe") == ("just prose, no pipe", [])
+
+
+def test_extract_wide_tables_token_reconstruction():
+    # The token split must reconstruct the doc order: prose | note | prose.
+    text = "Before.\n\n" + _wide_md(25) + "\n\nAfter."
+    new_text, wide = markup.extract_wide_tables(text)
+    parts = new_text.split(markup.WIDE_TABLE_TOKEN)
+    assert len(parts) == 2
+    assert "Before." in parts[0] and "After." in parts[1]
+    assert markup.table_col_count(wide[0].rows) == 25
+
+
+# --- #229: live task-list card (TodoWrite summary) ----------------------------
+
+def test_summarize_todos_counts_and_glyphs():
+    todos = [
+        {"content": "Fix X", "status": "completed"},
+        {"content": "Do Y", "status": "in_progress"},
+        {"content": "Do Z", "status": "pending"},
+    ]
+    total, done, open_, body = markup.summarize_todos(todos)
+    assert (total, done, open_) == (3, 1, 2)
+    assert "✅ Fix X" in body and "🔄 Do Y" in body and "⬜ Do Z" in body
+
+
+def test_summarize_todos_skips_blank_and_invalid():
+    total, done, open_, body = markup.summarize_todos(
+        [{"content": "", "status": "pending"}, "not-a-dict", {"status": "completed"}]
+    )
+    assert total == 0 and done == 0 and open_ == 0 and body == ""
+
+
+def test_summarize_todos_truncates_long_content():
+    long = "x" * 200
+    total, _, _, body = markup.summarize_todos([{"content": long, "status": "pending"}])
+    assert total == 1 and body.endswith("…") and len(body) < 120
+
+
+def test_summarize_todos_unknown_status_is_open():
+    total, done, open_, body = markup.summarize_todos([{"content": "Q", "status": "weird"}])
+    assert (total, done, open_) == (1, 0, 1) and body.startswith("⬜")
+
+
 # --- #176: split a reply into rich (non-code) + classic (code) segments -------
 
 def test_split_code_blocks_separates_code_from_prose():

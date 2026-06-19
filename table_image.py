@@ -4,6 +4,10 @@ Telegram has no <table>, and a wide monospace <pre> grid wraps / runs off the bu
 (reads as "кривая"). For tables too wide to show as text, we draw a real table image
 with DejaVu Sans Mono (full Cyrillic coverage) so the columns always line up and the
 client simply scales the picture to the screen. Narrow tables keep the text grid.
+
+Requires the DejaVu Sans Mono TTFs (Debian/Ubuntu: ``apt install fonts-dejavu-core``).
+If they are missing, rendering falls back to PIL's bundled default font (proportional,
+so columns may not line up perfectly) rather than failing — see _load_font.
 """
 from io import BytesIO
 
@@ -18,11 +22,24 @@ _GRID = (203, 209, 216)
 _TEXT = (24, 26, 28)
 
 
+def _load_font(path: str, size: int):
+    """DejaVu Sans Mono if installed (apt: fonts-dejavu-core), else PIL's bundled default
+    so PNG rendering never hard-fails on a host without the font (#243). The default font
+    is proportional, so the monospace column math is approximate in that fallback."""
+    try:
+        return ImageFont.truetype(path, size)
+    except OSError:
+        try:
+            return ImageFont.load_default(size)
+        except TypeError:  # very old Pillow: load_default() takes no size argument
+            return ImageFont.load_default()
+
+
 def render_table_png(rows: list[list[str]], font_size: int = 28) -> bytes:
     """Draw ``rows`` (first row = header) as a bordered table PNG; return the bytes.
     Cells are plain text (already emphasis-stripped); the header row is bold + shaded."""
-    font = ImageFont.truetype(_FONT, font_size)
-    bold = ImageFont.truetype(_FONT_BOLD, font_size)
+    font = _load_font(_FONT, font_size)
+    bold = _load_font(_FONT_BOLD, font_size)
     ncol = max(len(r) for r in rows)
     rows = [list(r) + [""] * (ncol - len(r)) for r in rows]
 

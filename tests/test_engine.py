@@ -63,7 +63,8 @@ def test_no_memory_file_means_no_injection(monkeypatch, tmp_path):
     assert s._global_memory_block() == ""
     opts = s._build_options()
     assert opts.setting_sources == []
-    assert opts.system_prompt == engine.CHAT_SYSTEM_PROMPT
+    # #243: the table-format note is always appended; with no memory file nothing else is.
+    assert opts.system_prompt == engine.CHAT_SYSTEM_PROMPT + engine.TABLE_FORMAT_NOTE
 
 
 # ----------------------------------------------------------- big_memory 1M (#134)
@@ -116,3 +117,19 @@ def test_persistent_shell_parse_strips_noise_and_extracts_rc():
     # no sentinel (timeout/partial) → rc 0, cleaned text
     rc, out = sh._parse(b"\x1b[?2004lpartial output\r\n")
     assert rc == 0 and out == "partial output"
+
+
+def test_latest_frame_collapses_alt_screen_redraws():
+    """#246b: a full-redraw alt-screen TUI keeps only the latest frame; ordinary output
+    (no alt-screen, even with a bare clear) is left untouched."""
+    # Alt-screen picker: enter, draw frame 1, clear, draw frame 2 (current).
+    raw = "\x1b[?1049h\x1b[H> Login with a web browser\n  Paste a token\x1b[2J\x1b[H> Paste a token\n  Login with a web browser"
+    assert engine._latest_frame(raw).strip().startswith("> Paste a token")
+    assert "Login with a web browser\n  Paste a token" not in engine._latest_frame(raw)
+    # After exiting the alt screen, the final post-exit output wins.
+    raw2 = "\x1b[?1049h\x1b[Hpicking…\x1b[?1049l\n✓ Logged in"
+    assert "Logged in" in engine._latest_frame(raw2)
+    assert "picking" not in engine._latest_frame(raw2)
+    # No alt-screen → unchanged (a bare `clear` uses ESC[2J but not ?1049h).
+    plain = "line one\n\x1b[2J\x1b[Hline two"
+    assert engine._latest_frame(plain) == plain

@@ -32,8 +32,8 @@ from aiogram.types import (
 
 import i18n
 import markup
-import table_image  # noqa: F401  — kept for the commented-out #162 PNG-table revert path
-from rich_message import SendRichMessage, SendRichMessageDraft
+import table_image  # #243: wide (>20-col) tables → PNG; also the #162 PNG-table revert path
+from rich_message import EditRichMessage, SendRichMessage, SendRichMessageDraft
 
 logger = logging.getLogger("streamer")
 
@@ -117,6 +117,11 @@ _THINKING_WORDS = (
     "Churning", "Synthesizing", "Reasoning", "Considering", "Puzzling", "Untangling",
 )
 _THINKING_ROTATE_SECS = 4.0
+# #240c: extended-thinking (reasoning) shown in the <tg-thinking> block. Keep only the
+# tail (the block is a compact live indicator, not a transcript) and retain a little more
+# than is shown so the frontier animates smoothly as deltas arrive.
+_REASONING_MAX = 4000        # cap retained reasoning text
+_REASONING_DRAFT_TAIL = 600  # how much of the tail to show in the block
 
 
 def _thinking_label(elapsed: float) -> str:
@@ -211,6 +216,12 @@ class Streamer:
         # guard here so a stray call in a group can never try (and fail) drafts.
         # start() probes once and falls back to the write-head if drafts error.
         self.use_drafts = bool(use_drafts) and chat_id > 0
+        # #229: message id of the live task-list card (a SEPARATE bubble from the answer,
+        # edited in place across the turn). None until the first TodoWrite event.
+        self._todo_msg_id: int | None = None
+        # #240c: accumulated extended-thinking (reasoning) text, shown (tail) in the
+        # <tg-thinking> draft block until real answer content starts. Capped to the tail.
+        self._reasoning: str = ""
         # Whether finish() isolates each fenced code block into its OWN message
         # (default — easy mobile copy); owner-toggleable via /codesplit. Off →
         # code stays inline in the reply.
@@ -398,6 +409,16 @@ class Streamer:
         Cleared automatically once real content streams."""
         self._phase = label or None
 
+    def add_reasoning(self, delta: str) -> None:
+        """#240c: append a chunk of the model's extended-thinking (reasoning) text. Its tail
+        is shown in the <tg-thinking> draft block until real answer content starts (then it
+        is cleared). Resuming reasoning also drops any stale tool phase so the live block
+        reflects the current activity. Synchronous + cheap; the draft loop renders it."""
+        if not delta:
+            return
+        self._reasoning = (self._reasoning + delta)[-_REASONING_MAX:]
+        self._phase = None
+
     async def _render_draft(self) -> None:
         """Push the current text as a native message draft (DM streaming).
 
@@ -440,12 +461,17 @@ class Streamer:
             return
         body = markup.clip_partial_table(self._full[: self._shown]).strip()
         if not body:
-            # #240a/#240b: animate the <tg-thinking> placeholder. If a live PHASE was set
-            # (from a tool event), show it ("⚙️ Running pytest…"); otherwise rotate a
-            # Claude-Code-style gerund (Thinking… → Pondering… → …). Dedup on the rendered
-            # html → ~1 draft update per change. (was: a static "Thinking…".)
-            inner = (markup.escape_html(self._phase) if self._phase
-                     else f"💭 {_thinking_label(time.monotonic() - self._start_time)}…")
+            # Animate the <tg-thinking> placeholder. Priority (most → least specific):
+            #   #240c: live REASONING (extended-thinking) text — show its tail, "unfurling";
+            #   #240b: a live tool PHASE ("⚙️ Running pytest…") when no reasoning is streaming;
+            #   #240a: otherwise a rotating Claude-Code-style gerund (Thinking… → Pondering…).
+            # Dedup on the rendered html → ~1 draft update per change.
+            if self._reasoning:
+                inner = "💭 " + markup.escape_html(self._reasoning[-_REASONING_DRAFT_TAIL:])
+            elif self._phase:
+                inner = markup.escape_html(self._phase)
+            else:
+                inner = f"💭 {_thinking_label(time.monotonic() - self._start_time)}…"
             html = f"<tg-thinking>{inner}</tg-thinking>"
             # #242: skip only if unchanged AND sent recently; otherwise re-send to keep the
             # ephemeral ~30s draft alive (a static phase during a long tool would else expire).
@@ -466,6 +492,7 @@ class Streamer:
                 pass
             return
         self._phase = None  # #240b: real content is streaming — drop any live tool phase
+        self._reasoning = ""  # #240c: answer started — clear reasoning (a later segment refills)
         # #172: stream the RAW markdown via sendRichMessageDraft, so the draft is
         # ALREADY FORMATTED as it generates (Durov's GIF) instead of plain text that
         # snaps to rich at the end. Split raw first so a fence cut at the tail stays
@@ -858,6 +885,73 @@ class Streamer:
             )
         )
 
+    async def _send_wide_table_image(self, table) -> None:
+        """#243: send one wide (>20-column) table as its own PNG photo — a native rich table
+        caps at 20 columns. If PNG rendering is unavailable (e.g. the table-image font is not
+        installed), fall back to a monospace <pre> grid so the data is never lost. Always a
+        silent intermediate (it follows the already-sent reply bubble)."""
+        try:
+            esc = [[markup._strip_cell_emphasis(c) for c in r] for r in table.rows]
+            png = table_image.render_table_png(esc)
+        except Exception:
+            logger.warning("#243 wide-table PNG render failed; <pre> grid fallback", exc_info=True)
+            grid = [[markup.escape_html(markup._strip_cell_emphasis(c)) for c in r] for r in table.rows]
+            await self._safe(
+                lambda: self.bot.send_message(
+                    chat_id=self.chat_id,
+                    text=markup._render_table_pre(grid),
+                    parse_mode="HTML",
+                    disable_notification=True,
+                    link_preview_options=_NO_PREVIEW,
+                    **self._kwargs(),
+                )
+            )
+            return
+        await self._safe(
+            lambda: self.bot.send_photo(
+                chat_id=self.chat_id,
+                photo=BufferedInputFile(png, filename="table.png"),
+                disable_notification=True,
+                **self._kwargs(),
+            )
+        )
+
+    async def update_todo_card(self, todos: list, lang: str = "en") -> None:
+        """#229: render/refresh the live task-list card from the agent's TodoWrite ``todos``.
+        It is a SEPARATE rich message (NOT on the draft typewriter path) sent on the first
+        TodoWrite event of the turn and EDITED IN PLACE on later ones — one card per turn
+        (a fresh Streamer per turn resets ``_todo_msg_id``). Best-effort: a send/edit failure
+        is swallowed so it never breaks the answer. A native rich markdown body, so clients
+        that don't style it still show a readable glyph list."""
+        total, done, open_, body = markup.summarize_todos(todos)
+        if total == 0:
+            return
+        header = i18n.t("todo.card_header", lang, n=total, done=done, open=open_)
+        rich = {"markdown": f"{header}\n{body}"}
+        try:
+            if self._todo_msg_id is None:
+                msg = await self.bot(
+                    SendRichMessage(
+                        chat_id=self.chat_id,
+                        rich_message=rich,
+                        disable_notification=True,
+                        **self._kwargs(),
+                    )
+                )
+                self._todo_msg_id = getattr(msg, "message_id", None)
+            else:
+                await self.bot(
+                    EditRichMessage(
+                        chat_id=self.chat_id,
+                        message_id=self._todo_msg_id,
+                        rich_message=rich,
+                    )
+                )
+        except Exception:
+            # Edits fail if the content is unchanged ("message is not modified") or the
+            # card was deleted — neither should disturb the turn.
+            logger.debug("#229 todo card update failed", exc_info=True)
+
     async def _commit_rich_markdown(self, full_text: str, footer: str, silent: bool,
                                     reply_markup=None) -> bool:
         """#169/#172: post the ENTIRE reply as ONE native rich message (the markdown
@@ -978,7 +1072,21 @@ class Streamer:
         # bubbles, and when Telegram styles code this needs no change. The split-by-
         # segment path (_commit_mixed / markup.split_code_blocks) is kept, un-called, to
         # flip back if the trade-off is revisited.
-        if await self._commit_rich_markdown(full_text, footer, silent_first, reply_markup=reply_markup):
+        #
+        # #243: a native rich table caps at 20 columns. Pull each WIDER table out of the body,
+        # leave a note where it was, send the rich markdown, then send each wide table as a PNG
+        # image (rich tables ≤20 cols stream/render natively as before).
+        rich_text, wide_tables = markup.extract_wide_tables(full_text)
+        if wide_tables:
+            lang = i18n.cached_lang(self.chat_id)
+            parts = rich_text.split(markup.WIDE_TABLE_TOKEN)
+            rich_text = parts[0]
+            for idx, tbl in enumerate(wide_tables):
+                rich_text += i18n.t("stream.wide_table", lang, n=idx + 1,
+                                    cols=markup.table_col_count(tbl.rows)) + parts[idx + 1]
+        if await self._commit_rich_markdown(rich_text, footer, silent_first, reply_markup=reply_markup):
+            for tbl in wide_tables:  # empty unless a >20-col table was extracted (#243)
+                await self._send_wide_table_image(tbl)
             return
         # # was (#176): split a code reply → rich prose/tables + classic code block:
         # if markup.has_code_block(full_text):
@@ -1006,6 +1114,7 @@ class Streamer:
                     chat_id=self.chat_id,
                     document=document,
                     disable_notification=silent_first,
+                    reply_markup=reply_markup,  # #247: keep the shell keypad on fallback
                     **self._kwargs(),
                 )
             )
@@ -1054,6 +1163,7 @@ class Streamer:
         # may ping the user; the rest are silent intermediates.
         placeholder_used = False
         first_send = True
+        kb_pending = reply_markup  # #247: attach the keypad to the first text message
         for kind, payload in sendables:
             silent = silent_first if first_send else True
             if kind == "rich":
@@ -1070,25 +1180,29 @@ class Streamer:
                     )
                 )
             elif self.message_id is not None and not placeholder_used:
+                kb, kb_pending = kb_pending, None  # #247: first text gets the keypad
                 await self._safe(
-                    lambda t=payload: self.bot.edit_message_text(
+                    lambda t=payload, k=kb: self.bot.edit_message_text(
                         text=t,
                         chat_id=self.chat_id,
                         message_id=self.message_id,
                         parse_mode="HTML",
                         link_preview_options=_NO_PREVIEW,
+                        reply_markup=k,
                     )
                 )
                 self._rendered_text = payload
                 placeholder_used = True
             else:
+                kb, kb_pending = kb_pending, None  # #247: first text gets the keypad
                 await self._safe(
-                    lambda t=payload, s=silent: self.bot.send_message(
+                    lambda t=payload, s=silent, k=kb: self.bot.send_message(
                         chat_id=self.chat_id,
                         text=t,
                         parse_mode="HTML",
                         disable_notification=s,
                         link_preview_options=_NO_PREVIEW,
+                        reply_markup=k,
                         **self._kwargs(),
                     )
                 )

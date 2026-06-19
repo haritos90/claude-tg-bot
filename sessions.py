@@ -125,6 +125,8 @@ _REAPER_INTERVAL = 60.0
 # #178: how often the archive-retention purge sweeps (seconds). Deleted-session
 # bundles are slow-moving, so once a day is plenty; it also runs once at startup.
 _ARCHIVE_PURGE_INTERVAL = 86400.0
+# #188: how often the schedule runner sweeps for due recurring prompts (seconds).
+_SCHEDULE_INTERVAL = 30.0
 
 # #236: cap on prompts WAITING behind a running turn (per session). A burst of
 # follow-ups past this is rejected so a session can't accumulate an unbounded
@@ -260,6 +262,9 @@ class _ThreadRecord:
     # #224: shell-mode overlay (route text → jailed command). Mirrors the persisted
     # ThreadState.shell_mode; re-synced on rebuild like stream_enabled.
     shell_mode: bool = False
+    # #229: live task-list card toggle (code-only). Re-synced from the effective settings
+    # on every _ensure (no rebuild needed — it's a display option). Default OFF.
+    todo_card: bool = False
     # #227b: True when the persistent shell paused for interactive input — the NEXT message
     # is forwarded to the running program instead of being run as a new command.
     shell_awaiting: bool = False
@@ -346,6 +351,8 @@ class SessionManager:
         self._reaper_task: asyncio.Task | None = None
         # #178: background task purging expired archive bundles (retention).
         self._archive_purge_task: asyncio.Task | None = None
+        # #188: background task firing due recurring schedules.
+        self._schedule_task: asyncio.Task | None = None
         # #191: background task refreshing the subscription OAuth token before it
         # expires (the on-disk token has a hard ~8h life; nothing else rotates it).
         self._token_refresh_task: asyncio.Task | None = None
@@ -467,7 +474,7 @@ class SessionManager:
             access_exc = self.allowlist.access_of(owner_uid, None)
         user_defaults: dict = {}
         for skey in ("model", "effort", "permission_mode", "max_turns", "memory",
-                     "auto_compact", "ctx_status"):  # #167/#168
+                     "auto_compact", "ctx_status", "todo_card"):  # #167/#168/#229
             with contextlib.suppress(Exception):
                 user_defaults[skey] = await db.get_user_default(owner_uid, skey)
         ctx = settings_schema.make_ctx(
@@ -489,6 +496,7 @@ class SessionManager:
             # #167/#168: forced-on (default True) unless the owner delegated a disable.
             "auto_compact": bool(eff("auto_compact")),
             "ctx_status": bool(eff("ctx_status")),
+            "todo_card": bool(eff("todo_card")),  # #229
         }
         # 151d — capability gates applied to the EFFECTIVE values (mirror the per-turn
         # gate in handlers._access_block, so a revoked grant takes effect at run time).
@@ -596,6 +604,7 @@ class SessionManager:
         # triggers a rebuild and applies from the next message.
         eff = await self._effective_settings(state)
         rec.idle_ttl = await self._resolve_idle_ttl(state)  # #182: per-user idle-TTL
+        rec.todo_card = bool(eff.get("todo_card", False))   # #229: display toggle, no rebuild
         needs_rebuild = (
             rec.session is None
             or rec.mode != state.mode
@@ -856,7 +865,7 @@ class SessionManager:
         try:
             if awaiting:
                 # #227b: forward this message to the program awaiting input. A message of pure
-                # key tokens (":down :enter") goes as raw key bytes (arrow pickers, Enter, Ctrl-C);
+                # key tokens (".down .enter") goes as raw key bytes (arrow pickers, Enter, Ctrl-C);
                 # anything else as a line of text + Enter.
                 keys = _shell_input_keys(cmd)
                 if keys is not None:
@@ -869,6 +878,14 @@ class SessionManager:
         except Exception:
             # Persistent shell unavailable (spawn/PTY error) → fall back to the #224 one-shot.
             rec.shell_awaiting = False
+            if awaiting:
+                # #250: `cmd` was INPUT for a program that was awaiting it (a password, a menu
+                # choice) — NOT a shell command. The persistent shell died mid-await, so running
+                # it via the one-shot jail would EXECUTE the input as a command. Drop it with a
+                # notice instead.
+                with contextlib.suppress(Exception):
+                    await streamer.finish(i18n.t("shell.ended", lang), notify=True)
+                return
             try:
                 rc, out = await session.run_shell(cmd)
             except Exception as exc:  # never let a shell failure kill the worker
@@ -982,6 +999,13 @@ class SessionManager:
                                 rec, streamer, running_text
                             )
                             segmented = segmented or _flushed
+                elif kind == "thinking_delta":
+                    # #240c: stream the model's extended-thinking (reasoning) into the live
+                    # <tg-thinking> draft block; cleared automatically once real answer content
+                    # starts. Only meaningful on the DM draft path (the streamer no-ops it
+                    # otherwise). Cheap/sync — the draft loop renders it on its next tick.
+                    if stream:
+                        streamer.add_reasoning(ev.text)
                 elif kind == "tool":
                     # Code mode: commit the text produced before this tool as its
                     # own message so each burst is visible, then stream the next
@@ -996,6 +1020,14 @@ class SessionManager:
                         # the tool runs ("⚙️ Running pytest…", "📖 Reading sessions.py…").
                         with contextlib.suppress(Exception):
                             streamer.set_phase(tool_phase_label(ev.tool_name, ev.tool_input))
+                    # #229: live task-list card from the agent's TodoWrite events — a SEPARATE
+                    # rich message edited in place (off the draft path). Code-only, opt-in.
+                    if rec.mode == "code" and rec.todo_card and ev.tool_name == "TodoWrite":
+                        todos = (ev.tool_input or {}).get("todos") or []
+                        with contextlib.suppress(Exception):
+                            await streamer.update_todo_card(
+                                todos, i18n.cached_lang(streamer.chat_id)
+                            )
                 elif kind == "rate_limit":
                     rec.rate = ev.rate
                     # Accumulate per-window account-wide rate state. Persisting to
@@ -1881,6 +1913,60 @@ class SessionManager:
         if self._reaper_task is None or self._reaper_task.done():
             self._reaper_task = asyncio.create_task(self._reaper_loop())
 
+    # --------------------------------------------------- schedule runner (#188)
+
+    async def _fire_schedule(self, row: dict) -> None:
+        """Run one due schedule: advance next_run FIRST (so a slow/failing run can't
+        re-fire in a tight loop), post a small notice, then submit the prompt into its
+        session via the normal queue. All best-effort — errors are stamped, not raised."""
+        import schedules  # local import: pure module, avoids a top-level cycle risk
+        sid = int(row["id"])
+        now = time.time()
+        status = "ok"
+        try:
+            spec = json.loads(row["spec"])
+            nxt = schedules.next_run_after(spec, now)
+        except Exception:
+            # Corrupt spec → disable it rather than spin; surfaces in /schedules.
+            await db.set_schedule_enabled(sid, False)
+            await db.update_schedule_run(sid, now, now, "bad-spec")
+            return
+        await db.update_schedule_run(sid, nxt, now, "running")
+        try:
+            lang = i18n.cached_lang(int(row["chat_id"]))
+            with contextlib.suppress(Exception):
+                await self.bot.send_message(
+                    int(row["chat_id"]),
+                    i18n.t("schedule.run_notice", lang,
+                           prompt=markup.escape_html((row["prompt"] or "")[:80])),
+                    parse_mode="HTML",
+                )
+            await self.handle_text(int(row["chat_id"]), int(row["thread_id"]), row["prompt"])
+        except Exception:
+            status = "error"
+        with contextlib.suppress(Exception):
+            await db.update_schedule_run(sid, nxt, now, status)
+
+    async def _schedule_loop(self) -> None:
+        """Fire due recurring schedules (#188). Sweeps every _SCHEDULE_INTERVAL; all
+        errors swallowed so the loop never dies. Each due row is fired sequentially so a
+        burst can't spawn many concurrent turns (the per-session queue serializes too)."""
+        while True:
+            try:
+                await asyncio.sleep(_SCHEDULE_INTERVAL)
+            except asyncio.CancelledError:
+                break
+            with contextlib.suppress(Exception):
+                due = await db.due_schedules(time.time())
+                for row in due:
+                    with contextlib.suppress(Exception):
+                        await self._fire_schedule(row)
+
+    def start_scheduler(self) -> None:
+        """Start the recurring-schedule runner (idempotent). Called once at startup."""
+        if self._schedule_task is None or self._schedule_task.done():
+            self._schedule_task = asyncio.create_task(self._schedule_loop())
+
     # ------------------------------------------------- archive retention (#178)
 
     async def _resolve_archive_retention_days(self) -> int:
@@ -2075,6 +2161,11 @@ class SessionManager:
             self._archive_purge_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._archive_purge_task
+        # #188: stop the schedule runner too.
+        if self._schedule_task is not None and not self._schedule_task.done():
+            self._schedule_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._schedule_task
         # #191: stop the OAuth token refresher too.
         if self._token_refresh_task is not None and not self._token_refresh_task.done():
             self._token_refresh_task.cancel()

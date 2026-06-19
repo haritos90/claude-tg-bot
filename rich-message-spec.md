@@ -85,7 +85,7 @@ A table can be expressed in EITHER form (server converts both to a `RichBlockTab
 ## How THIS bot maps onto the spec
 
 - `rich_message.py` — `SendRichMessage` / `EditRichMessage` / `SendRichMessageDraft`
-  (`TelegramMethod`s); `rich_message` is an `InputRichMessage` dict (we pass `{"markdown": …}`
+  (`TelegramMethod`s); `rich_message` is an `InputRichMessage` dict (the bot passes `{"markdown": …}`
   for replies/drafts, `{"html": …}` for menus and the native-table fallback `table_to_rich_html`).
 - `streamer._render_draft` — `SendRichMessageDraft({"markdown": frontier})`, one fixed
   `_DRAFT_ID`, ~5/sec. **Must send only valid markdown** → `markup.clip_partial_table`
@@ -125,8 +125,8 @@ moves between phases; replace it with real content once output starts.
 **How THIS bot uses it now (#239):** `streamer.py` sends
 `SendRichMessageDraft({"html": "<tg-thinking>Thinking…</tg-thinking>"})` (constant
 `_THINKING_HTML`) as the initial `start()` placeholder and on the segment reset between tool
-calls. It is static "Thinking…" — we do NOT yet drive its `text` from the live tool activity,
-and we do not add custom emoji or localize it (the `Streamer` has no `lang`).
+calls. It is static "Thinking…" — the block's `text` is not yet driven from the live tool activity,
+and no custom emoji is added and it is not localized (the `Streamer` has no `lang`).
 
 **Potential (not done):** route the agent's tool-status / phase into the `<tg-thinking>` `text`
 so the block shows the live action (and AIActions emoji), instead of (or alongside) the separate

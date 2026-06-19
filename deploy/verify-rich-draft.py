@@ -23,6 +23,8 @@ Usage (run on the host; reads TELEGRAM_BOT_TOKEN + OWNER_ID from ../.env):
     python3 deploy/verify-rich-draft.py                 # markdown table, draft→final
     python3 deploy/verify-rich-draft.py --thinking      # open with a <tg-thinking> draft
     python3 deploy/verify-rich-draft.py --html          # same table via the HTML <table> form
+    python3 deploy/verify-rich-draft.py --wide          # #243: a 21-column table (over the 20 limit)
+    python3 deploy/verify-rich-draft.py --wide --cols 25
     python3 deploy/verify-rich-draft.py --chat 12345    # target chat (default: OWNER_ID)
     python3 deploy/verify-rich-draft.py --step 0.7      # seconds between draft frames
 
@@ -103,6 +105,18 @@ def _markdown_frames() -> list[str]:
     return frames
 
 
+def _wide_markdown(ncols: int = 21) -> str:
+    """#243: a markdown table with `ncols` columns (default 21 — one over the documented
+    20-column limit). Use this to verify what the client does with an over-limit table:
+    reject the send, truncate to 20, or auto-convert to an image."""
+    header = "| " + " | ".join(f"C{i + 1}" for i in range(ncols)) + " |"
+    sep = "|" + "|".join([":--"] * ncols) + "|"
+    row1 = "| " + " | ".join(f"r1c{i + 1}" for i in range(ncols)) + " |"
+    row2 = "| " + " | ".join(f"r2c{i + 1}" for i in range(ncols)) + " |"
+    intro = f"#243 over-limit check — this table has **{ncols} columns** (limit is 20):"
+    return f"{intro}\n\n{header}\n{sep}\n{row1}\n{row2}"
+
+
 def _html_table() -> str:
     cells = "".join(f"<th>{h.strip()}</th>" for h in HEADER.strip("|").split("|"))
     rows = "<tr>" + cells + "</tr>"
@@ -120,6 +134,9 @@ def main() -> None:
                     help="open with a <tg-thinking> draft (draft-only block)")
     ap.add_argument("--html", action="store_true",
                     help="use the HTML <table> form instead of markdown")
+    ap.add_argument("--wide", action="store_true",
+                    help="#243: send a >20-column table (default 21) to verify over-limit behavior")
+    ap.add_argument("--cols", type=int, default=21, help="column count for --wide (default 21)")
     args = ap.parse_args()
 
     token = _env("TELEGRAM_BOT_TOKEN")
@@ -132,6 +149,16 @@ def main() -> None:
         print("thinking draft:")
         _draft(token, chat, markdown="<tg-thinking>Generating…</tg-thinking>")
         time.sleep(args.step)
+
+    if args.wide:
+        # #243: send an over-limit (>20-col) table draft + final and report what the client does.
+        full = _wide_markdown(args.cols)
+        print(f"wide table: {args.cols} columns (limit 20) — draft then final:")
+        _draft(token, chat, markdown=full)
+        time.sleep(args.step)
+        _final(token, chat, markdown=full)
+        print("done — report: did the API reject it, truncate to 20 columns, or show an image?")
+        return
 
     if args.html:
         # HTML form streams the whole <table> as one valid block per frame.

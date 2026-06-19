@@ -94,6 +94,7 @@ BASE_ACCESS_DEFAULTS: dict[str, Access] = {
     "usage_display": Access.READONLY,    # account-wide; owner delegates
     "tools": Access.DELEGATED,
     "hot_cache_timer": Access.DELEGATED,  # #164: every user may toggle their note
+    "todo_card": Access.DELEGATED,        # #229: code users toggle the live task-list card
     "auto_compact": Access.HIDDEN,        # #168: forced-on; owner delegates to disable
     "ctx_status": Access.HIDDEN,          # #167: forced-on; owner delegates to disable
 }
@@ -613,6 +614,28 @@ SETTINGS: dict[str, Setting] = {
             Scope.USER: _user_setter("hot_cache_timer"),
         },
     ),
+    # #229: live task-list card from the agent's TodoWrite events. Per-session + per-user
+    # delegated bool, default OFF, CODE-only (the card only renders in code mode; chat has no
+    # tools). Same SESSION+USER shape as hot_cache_timer.
+    "todo_card": Setting(
+        key="todo_card",
+        type=bool,
+        choices=(True, False),
+        default=False,
+        scopes=(Scope.SESSION, Scope.USER),
+        view_role=Role.CODE,
+        edit_role=Role.CODE,
+        name_key="settings.row_todo_card",
+        value_labels={},
+        get={
+            Scope.SESSION: _session_attr_get("todo_card"),
+            Scope.USER: _bool_user_get("todo_card"),
+        },
+        set={
+            Scope.SESSION: _session_attr_setter("set_todo_card"),
+            Scope.USER: _user_setter("todo_card"),
+        },
+    ),
     # #168: SDK auto-compaction. Forced ON by default (the CLI default) but
     # DISABLEABLE when the owner delegates it (Access). USER-scope ONLY: a per-session
     # bool column defaults to off and would wrongly override the forced-on default,
@@ -675,7 +698,7 @@ def get(key: str) -> Setting:
 # #215: sandbox dropped from CODE_ONLY — #180 made the jail cover chat sessions too,
 # so the hub row must show in chat as well (the /sandbox command already has no mode
 # gate). was: frozenset({"permission_mode", "max_turns", "sandbox"})
-CODE_ONLY: frozenset[str] = frozenset({"permission_mode", "max_turns"})
+CODE_ONLY: frozenset[str] = frozenset({"permission_mode", "max_turns", "todo_card"})
 
 
 def is_code_only(key: str) -> bool:
@@ -696,6 +719,8 @@ PAGE_ORDER: tuple[str, ...] = (
     # #164: warm-cache note (delegated) + auto-compact + live context (forced-on,
     # delegate-to-disable; #167/#168).
     "hot_cache_timer", "auto_compact", "ctx_status",
+    # #229: live task-list card (delegated, code-only).
+    "todo_card",
 )
 
 
