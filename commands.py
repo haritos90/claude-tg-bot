@@ -83,6 +83,10 @@ COMMANDS: tuple[Cmd, ...] = (
                   "ru": "Повторить последний запрос"}, help_group="run"),
     Cmd("status", {"en": "Current session info",
                    "ru": "Сведения о текущей сессии"}, help_group="sessions"),
+    Cmd("schedule", {"en": "⏰ Schedule a recurring prompt",
+                     "ru": "⏰ Запланировать повторяющийся запрос"}, help_group="run"),
+    Cmd("schedules", {"en": "List / pause / delete schedules",
+                      "ru": "Список / пауза / удаление расписаний"}, help_group="run"),
     # — Tier C · occasional · settings (pickers/toggles; also in the /settings hub) —
     Cmd("model", {"en": "Switch model: opus | sonnet | haiku",
                   "ru": "Сменить модель: opus | sonnet | haiku"}, help_group="settings"),

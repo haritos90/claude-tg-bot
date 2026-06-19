@@ -23,6 +23,7 @@ import base64
 import contextlib
 import inspect
 import io
+import json
 import re
 # import shutil  # unused after #177 — session-delete teardown moved to archive.py
 import time
@@ -49,6 +50,7 @@ import db
 import engine
 import i18n
 import markup
+import schedules
 import sessions as _sessions  # module (build_router's `sessions` param is the instance)
 import settings_schema as ss
 import usage
@@ -255,7 +257,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
     """
     router = Router(name="main")
 
-    async def reply(message: Message, text: str) -> None:
+    async def reply(message: Message, text: str, reply_markup=None) -> None:
         """Send `text` (already Telegram HTML) back into the same topic.
 
         Command handlers author their own HTML directly (<b>, <code>, and values
@@ -263,6 +265,9 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         run it through md_to_html — that would HTML-escape the tags again and
         Telegram would show literal "<b>" / "&lt;". Long text is split; very long
         becomes a .md document. (Model output is rendered elsewhere, in Streamer.)
+
+        reply_markup (#188): an optional inline keyboard attached to the message
+        (e.g. the /schedules pause/delete controls).
         """
         # Reply into the same place the message came from: a supergroup topic
         # keeps its message_thread_id; a private chat (DM) has no thread. We use
@@ -279,7 +284,8 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         # doc/chunked path below on any failure, so a reply is never lost.
         try:
             await bot(SendRichMessage(chat_id=message.chat.id,
-                                      rich_message={"html": text}, **send_kwargs))
+                                      rich_message={"html": text},
+                                      reply_markup=reply_markup, **send_kwargs))
             return
         except Exception:
             pass
@@ -301,14 +307,17 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         # `text` is already valid Telegram HTML — send as-is, only splitting if
         # it exceeds the size limit (command replies are short, so this is
         # almost always a single chunk).
+        _kb_pending = reply_markup  # #188: attach to the first chunk only
         for chunk in markup.split_message(text):
             if not chunk:
                 continue
+            _kb, _kb_pending = _kb_pending, None
             try:
                 await bot.send_message(
                     chat_id=message.chat.id,
                     text=chunk,
                     parse_mode="HTML",
+                    reply_markup=_kb,
                     **send_kwargs,
                 )
             except Exception:
@@ -1392,7 +1401,13 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
     async def _session_limit_block(uid: int, uname: str | None, lang: str) -> str | None:
         """If the user is at/over their session cap, return the block message (which
         offers to delete or /clear an existing session); else None. The cap counts ALL
-        of the user's sessions (chat + code)."""
+        of the user's DM sessions (chat + code).
+
+        #197: this is intentionally DM-ONLY. The cap is a per-USER limit and
+        `browse_threads(uid)` counts threads keyed by the user's id (their DM surface).
+        Supergroup forum-topic sessions are keyed by the GROUP's chat_id (a shared group
+        resource, not a per-user session), so they live outside this cap by design — the
+        non-private create path (forum-topic creation) deliberately does not call this."""
         cap = await _effective_max_sessions(uid, uname)
         if cap <= 0:
             return None
@@ -1451,19 +1466,27 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 txt += "\n" + i18n.t("session.upgrade_hint", lang)
             await reply(message, txt)
             return
-        try:
-            topic = await bot.create_forum_topic(chat_id=message.chat.id, name=name)
-        except Exception as exc:
-            await reply(
-                message,
-                i18n.t("topic.create_error", lang, err=markup.escape_html(str(exc))),
-            )
-            return
-        created_name = getattr(topic, "name", name)
-        await reply(
-            message,
-            i18n.t("topic.created", lang, name=markup.escape_html(created_name)),
-        )
+        # #253: supergroup support PAUSED — rich-draft streaming doesn't work in supergroups
+        # (TEXTDRAFT_PEER_INVALID, #3/#39), so the forum-topic create path is disabled and the
+        # bot is DM-only for now. Reply with the paused notice instead of creating a topic.
+        # (#197 note: when revived, the per-user cap stays DM-only by design — a topic session
+        # is keyed by the group's chat_id, outside the per-USER cap. See _session_limit_block.)
+        await reply(message, i18n.t("topic.disabled", lang))
+        return
+        # was (revive with #253): non-private → create a forum TOPIC.
+        # try:
+        #     topic = await bot.create_forum_topic(chat_id=message.chat.id, name=name)
+        # except Exception as exc:
+        #     await reply(
+        #         message,
+        #         i18n.t("topic.create_error", lang, err=markup.escape_html(str(exc))),
+        #     )
+        #     return
+        # created_name = getattr(topic, "name", name)
+        # await reply(
+        #     message,
+        #     i18n.t("topic.created", lang, name=markup.escape_html(created_name)),
+        # )
 
     async def _do_rename(message: Message, name: str, key: int | None = None) -> None:
         # DM: rename a bot-managed session (the given key, else the current one).
@@ -1482,24 +1505,28 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 i18n.t("session.renamed", lang, name=markup.escape_html(name)),
             )
             return
-        if not message.message_thread_id:
-            await reply(message, i18n.t("topic.not_a_topic_rename", lang))
-            return
-        try:
-            await bot.edit_forum_topic(
-                chat_id=message.chat.id,
-                message_thread_id=message.message_thread_id,
-                name=name,
-            )
-        except Exception as exc:
-            await reply(
-                message,
-                i18n.t("topic.rename_error", lang, err=markup.escape_html(str(exc))),
-            )
-            return
-        await reply(
-            message, i18n.t("topic.renamed", lang, name=markup.escape_html(name))
-        )
+        # #253: supergroup paused — forum-topic rename disabled (see _do_new). DM-only for now.
+        await reply(message, i18n.t("topic.disabled", lang))
+        return
+        # was (revive with #253): rename the forum topic.
+        # if not message.message_thread_id:
+        #     await reply(message, i18n.t("topic.not_a_topic_rename", lang))
+        #     return
+        # try:
+        #     await bot.edit_forum_topic(
+        #         chat_id=message.chat.id,
+        #         message_thread_id=message.message_thread_id,
+        #         name=name,
+        #     )
+        # except Exception as exc:
+        #     await reply(
+        #         message,
+        #         i18n.t("topic.rename_error", lang, err=markup.escape_html(str(exc))),
+        #     )
+        #     return
+        # await reply(
+        #     message, i18n.t("topic.renamed", lang, name=markup.escape_html(name))
+        # )
 
     async def _run_pending(action: str, message: Message, text: str) -> None:
         if action == "new":
@@ -1530,6 +1557,8 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             await _open_sessions(message, keyword=text)
         elif action == "secret":
             await _do_secret(message, text)
+        elif action == "schedule":
+            await _do_schedule(message, text)
 
     @router.message(Command("cancel"))
     async def cmd_cancel(message: Message) -> None:
@@ -1539,6 +1568,129 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             await reply(message, i18n.t("common.cancelled", lang))
         else:
             await reply(message, i18n.t("common.nothing_cancel", lang))
+
+    # --------------------------------------------------- recurring schedules (#188)
+
+    _MAX_SCHEDULES_PER_USER = 5
+
+    def _fmt_when(ts: float | None, lang: str) -> str:
+        """Short local-time label for a next-run timestamp."""
+        if not ts:
+            return "—"
+        return datetime.fromtimestamp(ts).strftime("%a %m-%d %H:%M")
+
+    async def _do_schedule(message: Message, text: str) -> None:
+        """Parse and persist a `<when> | <prompt>` schedule for the current session."""
+        lang = _lang(message)
+        uid = message.from_user.id if message.from_user else 0
+        try:
+            spec, prompt = schedules.parse_schedule(text)
+        except schedules.ScheduleError as exc:
+            await reply(message, i18n.t("schedule.parse_error", lang,
+                                        err=markup.escape_html(str(exc))))
+            return
+        if await db.count_schedules(uid) >= _MAX_SCHEDULES_PER_USER:
+            await reply(message, i18n.t("schedule.cap_reached", lang,
+                                        n=_MAX_SCHEDULES_PER_USER))
+            return
+        now = time.time()
+        nxt = schedules.next_run_after(spec, now)
+        thread_id = await _session_key(message)
+        await db.add_schedule(thread_id, message.chat.id, uid, json.dumps(spec),
+                              prompt, nxt, now)
+        await reply(message, i18n.t("schedule.created", lang,
+                                    when=markup.escape_html(schedules.describe(spec)),
+                                    next=_fmt_when(nxt, lang)))
+
+    @router.message(Command("schedule"))
+    async def cmd_schedule(message: Message) -> None:
+        """Create a recurring scheduled prompt. With no arg, prompt + capture (#101)."""
+        await _ensure_state(message)
+        lang = _lang(message)
+        arg = _command_arg(message)
+        if not arg:
+            await reply(message, i18n.t("schedule.usage", lang))
+            pending[_pkey(message)] = "schedule"
+            await reply(message, i18n.t("schedule.prompt", lang))
+            return
+        await _do_schedule(message, arg)
+
+    def _schedules_keyboard(rows: list[dict], lang: str) -> InlineKeyboardMarkup | None:
+        """Per-schedule pause/resume + delete buttons."""
+        kb: list[list[InlineKeyboardButton]] = []
+        for r in rows:
+            sid = int(r["id"])
+            toggle = ("btn.sched_pause" if r["enabled"] else "btn.sched_resume")
+            kb.append([
+                InlineKeyboardButton(text=i18n.t(toggle, lang), callback_data=f"sch:tog:{sid}"),
+                InlineKeyboardButton(text=i18n.t("btn.sched_delete", lang), callback_data=f"sch:del:{sid}"),
+            ])
+        return InlineKeyboardMarkup(inline_keyboard=kb) if kb else None
+
+    async def _render_schedules(uid: int, lang: str) -> tuple[str, InlineKeyboardMarkup | None]:
+        rows = await db.list_schedules(uid)
+        if not rows:
+            return i18n.t("schedule.list_empty", lang), None
+        lines = [i18n.t("schedule.list_header", lang, n=len(rows), cap=_MAX_SCHEDULES_PER_USER)]
+        for r in rows:
+            try:
+                spec = json.loads(r["spec"])
+                when = schedules.describe(spec)
+            except Exception:
+                when = "?"
+            state = "🟢" if r["enabled"] else "⏸"
+            lines.append(i18n.t("schedule.list_item", lang, state=state,
+                                when=markup.escape_html(when),
+                                next=(_fmt_when(r["next_run"], lang) if r["enabled"] else "—"),
+                                prompt=markup.escape_html((r["prompt"] or "")[:80])))
+        return "\n".join(lines), _schedules_keyboard(rows, lang)
+
+    @router.message(Command("schedules"))
+    async def cmd_schedules(message: Message) -> None:
+        """List the user's schedules with pause/resume/delete controls."""
+        await _ensure_state(message)
+        lang = _lang(message)
+        uid = message.from_user.id if message.from_user else 0
+        text, kb = await _render_schedules(uid, lang)
+        await reply(message, text, reply_markup=kb)
+
+    @router.callback_query(F.data.startswith("sch:"))
+    async def on_schedules_cb(cb: CallbackQuery) -> None:
+        """Pause/resume or delete a schedule, then re-render the list in place."""
+        lang = _lang(cb)
+        uid = cb.from_user.id if cb.from_user else 0
+        try:
+            _, verb, sid_s = cb.data.split(":", 2)
+            sid = int(sid_s)
+        except (ValueError, AttributeError):
+            await cb.answer()
+            return
+        row = await db.get_schedule(sid)
+        # Ownership check: only the schedule's owner may touch it.
+        if row is None or int(row["owner_uid"]) != uid:
+            await cb.answer(i18n.t("common.error", lang))
+            return
+        if verb == "del":
+            await db.delete_schedule(sid)
+            await cb.answer(i18n.t("schedule.deleted", lang))
+        elif verb == "tog":
+            now_on = not bool(row["enabled"])
+            if now_on:
+                # Resuming: recompute the next run from now so it doesn't fire for every
+                # missed slot while paused.
+                with contextlib.suppress(Exception):
+                    spec = json.loads(row["spec"])
+                    await db.update_schedule_run(
+                        sid, schedules.next_run_after(spec, time.time()),
+                        row["last_run"] or 0, row["last_status"] or "")
+            await db.set_schedule_enabled(sid, now_on)
+            await cb.answer(i18n.t("schedule.resumed" if now_on else "schedule.paused", lang))
+        else:
+            await cb.answer()
+            return
+        text, kb = await _render_schedules(uid, lang)
+        with contextlib.suppress(Exception):
+            await cb.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
 
     # --------------------------------------------------------- session browser
     # /sessions: browse + search + (DM) switch to a session. Paginated to respect
@@ -4194,24 +4346,28 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
 
     @router.message(Command("close"))
     async def cmd_close(message: Message) -> None:
-        """Close the current forum topic (only valid inside a real topic)."""
+        """Close the current forum topic (only valid inside a real topic).
+        #253: supergroup paused — disabled, DM-only for now (see _do_new)."""
         await _ensure_state(message)
         lang = _lang(message)
-        if not message.message_thread_id:
-            await reply(message, i18n.t("topic.not_a_topic_close", lang))
-            return
-        try:
-            await bot.close_forum_topic(
-                chat_id=message.chat.id,
-                message_thread_id=message.message_thread_id,
-            )
-        except Exception as exc:
-            await reply(
-                message,
-                i18n.t("topic.close_error", lang, err=markup.escape_html(str(exc))),
-            )
-            return
-        await reply(message, i18n.t("topic.closed", lang))
+        await reply(message, i18n.t("topic.disabled", lang))
+        return
+        # was (revive with #253): close the forum topic.
+        # if not message.message_thread_id:
+        #     await reply(message, i18n.t("topic.not_a_topic_close", lang))
+        #     return
+        # try:
+        #     await bot.close_forum_topic(
+        #         chat_id=message.chat.id,
+        #         message_thread_id=message.message_thread_id,
+        #     )
+        # except Exception as exc:
+        #     await reply(
+        #         message,
+        #         i18n.t("topic.close_error", lang, err=markup.escape_html(str(exc))),
+        #     )
+        #     return
+        # await reply(message, i18n.t("topic.closed", lang))
 
     async def _render_queue(key: int, lang: str = "en") -> tuple[str, InlineKeyboardMarkup | None]:
         """Build the /queue view: each pending prompt with a ✖ cancel button."""

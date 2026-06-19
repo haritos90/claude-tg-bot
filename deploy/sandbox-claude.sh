@@ -190,7 +190,7 @@ if [ "${SBX_MODE:-}" = "shell" ]; then
   set -- -lc "${SBX_SHELL_CMD:-true}"
 fi
 
-# #227a: persistent shell — exec an INTERACTIVE login bash that reads from the PTY the host
+# #227a: persistent shell — exec an INTERACTIVE bash (`-i`, non-login) that reads from the PTY the host
 # holds (its stdin/stdout/stderr are the pty slave). The host drives it line-by-line so cd/env
 # persist across messages. Same SBX_* isolation as above (target-agnostic); only the target.
 if [ "${SBX_MODE:-}" = "shell_persist" ]; then

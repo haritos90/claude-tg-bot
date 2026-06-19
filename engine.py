@@ -106,6 +106,18 @@ CHAT_SYSTEM_PROMPT = (
     "(e.g. ×, ÷, ≈, ≤, ≥, ², ₂, √, π, ½, →, ∞)."
 )
 
+# #243: appended to BOTH the chat and code system prompts. The Telegram client renders a
+# Markdown table natively only up to 20 columns; the bot routes any wider table to a PNG
+# image automatically. Telling the model keeps it from assuming a >20-col table will render
+# inline — it can format accordingly (short cells, transpose, or split).
+TABLE_FORMAT_NOTE = (
+    "\n\nTables: the Telegram client renders a Markdown table natively only up to 20 "
+    "columns. A table with MORE than 20 columns is delivered to the user as a PNG image "
+    "automatically (not as an inline table). Prefer tables with 20 or fewer columns; if "
+    "the data genuinely needs more, keep cell text short, or transpose/split the table — "
+    "and expect that wide one to arrive as an image."
+)
+
 # #187: the host drains files the agent drops in <cwd>/outbox/ to the user's Telegram
 # chat after each turn (then removes them) — the agent's only channel to hand a SPECIFIC
 # file to the user (orthogonal to /export, which zips the whole workdir). Appended to the
@@ -240,6 +252,8 @@ class EngineEvent:
 
     kind is one of:
       text_delta  -> .text holds the incremental delta
+      thinking_delta -> .text holds an extended-thinking (reasoning) delta (#240c);
+                     NOT part of the answer — for the live <tg-thinking> indicator only
       text_full   -> .text holds the full accumulated assistant text so far
       tool        -> .tool_name / .tool_input describe a requested tool call
       status      -> .text holds a human-readable status line
@@ -321,6 +335,32 @@ _TERM_NOISE_RE = re.compile(
     r"|[\r\x07\x08]"                        # CR, BEL, backspace
 )
 
+# #246b: a full-screen / alt-screen TUI (an arrow-key picker like `gh auth login`) REDRAWS
+# the whole screen on every keystroke, so the raw PTY stream piles up many full snapshots that
+# _clean would otherwise concatenate into a garbled wall. When the program switched to the
+# ALTERNATE screen (ESC[?1049h), keep only the LATEST frame — the text after the last
+# screen-clear / cursor-home / alt-screen toggle. GATED on the alt-screen marker so ordinary
+# multi-line output (and a bare `clear`, which uses ESC[2J but not ?1049h) is never touched.
+_ALT_SCREEN_RE = re.compile(r"\x1b\[\?1049[hl]")
+_FRAME_SPLIT_RE = re.compile(
+    r"\x1b\[[0-3]?J"                  # erase display (J / 0J / 1J / 2J / 3J)
+    r"|\x1b\[\?1049[hl]"             # alternate-screen enter / exit
+    r"|\x1b\[(?:H|0?;?0?[Hf]|1;1[Hf])"  # cursor home (top-left)
+)
+
+
+def _latest_frame(text: str) -> str:
+    """#246b: collapse a full-redraw alt-screen TUI to its latest frame. No-op unless the
+    alternate screen was entered (ESC[?1049h). Returns the last frame that has visible text
+    after noise-stripping (so an empty trailing clear doesn't blank the output)."""
+    if not _ALT_SCREEN_RE.search(text):
+        return text
+    parts = _FRAME_SPLIT_RE.split(text)
+    for seg in reversed(parts):
+        if _TERM_NOISE_RE.sub("", seg).strip():
+            return seg
+    return text
+
 
 class PersistentShell:
     """#227a: a long-lived login `bash` held on a PTY INSIDE the session's #119 jail. `cd`/env
@@ -379,12 +419,14 @@ class PersistentShell:
         last_out = loop.time()
         seen_output = False
         marker = (_SHELL_SENTINEL + ":").encode()
+        idle_polls = 0  # #251: consecutive polls with no new output (drives backoff below)
         while True:
             d = self._read_available()
             if d:
                 buf += d
                 last_out = loop.time()
                 seen_output = True
+                idle_polls = 0  # #251: output flowing → poll fast again
                 if marker in buf:
                     rc, out = self._parse(buf)
                     return (rc, out, "done")
@@ -399,7 +441,14 @@ class PersistentShell:
                 return (124, self._clean(buf) + f"\n(timed out after {int(timeout)}s)", "timeout")
             if seen_output and (now - last_out) > settle:
                 return (None, self._clean(buf), "awaiting")
-            await asyncio.sleep(0.04)
+            # #251: adaptive backoff — a quiet long-running command (compile, `sleep 300`) must
+            # not spin the event loop at 25 Hz for minutes. Poll fast (~40 ms) while output flows
+            # and for the first ~1 s of silence, then 0.2 s, then 0.5 s; any new output resets to
+            # fast. settle (>=1.5 s) and the deadline are still caught within one slow poll.
+            # was: await asyncio.sleep(0.04)  # replaced for #251
+            idle_polls += 1
+            delay = 0.5 if idle_polls > 50 else 0.2 if idle_polls > 25 else 0.04
+            await asyncio.sleep(delay)
 
     async def run(self, command: str, settle: float = 3.0, timeout: float = 60.0):
         """Run one command. Returns (rc_or_None, output, status) — see _drive."""
@@ -428,10 +477,10 @@ class PersistentShell:
             return await self._drive(data, settle, timeout)
 
     async def interrupt(self) -> str:
-        """#227c: send Ctrl-C to the shell (best-effort). NOTE: without the PTY as the
-        controlling tty this delivers the 0x03 BYTE, which a line-reading program treats as
-        input; a true SIGINT to the foreground group needs a controlling tty (future work).
-        Returns whatever drained afterwards."""
+        """#227c/#246: send Ctrl-C to the shell. The jailed bash now has a CONTROLLING TTY
+        (see _start_shell), so the 0x03 byte is a REAL SIGINT to the foreground process group
+        — a hung foreground command (e.g. a polling `gh auth login`) is actually interrupted,
+        not just fed an input byte. Returns whatever drained afterwards."""
         async with self._lock:
             with contextlib.suppress(OSError):
                 os.write(self.master, b"\x03")
@@ -440,7 +489,8 @@ class PersistentShell:
 
     @staticmethod
     def _clean(buf: bytes) -> str:
-        return _TERM_NOISE_RE.sub("", buf.decode("utf-8", "replace")).strip("\n")
+        text = _latest_frame(buf.decode("utf-8", "replace"))  # #246b: collapse alt-screen redraws
+        return _TERM_NOISE_RE.sub("", text).strip("\n")
 
     def _parse(self, buf: bytes) -> tuple[int, str]:
         text = buf.decode("utf-8", "replace")
@@ -451,9 +501,16 @@ class PersistentShell:
             if m:
                 rc = int(m.group(1))
             text = text[:idx]
-        return (rc, _TERM_NOISE_RE.sub("", text).strip("\n"))
+        return (rc, _TERM_NOISE_RE.sub("", _latest_frame(text)).strip("\n"))  # #246b
 
     async def close(self) -> None:
+        # #249: self.proc is the launcher, which exec-chains (setpriv→) into `bwrap
+        # --unshare-pid` (deploy/sandbox-claude.sh) — same PID, so proc.kill() SIGKILLs
+        # bwrap, which is PID 1 of the jail's PID namespace. The kernel then SIGKILLs
+        # EVERY process in that namespace, including a setsid-DETACHED background process
+        # (a server/build the shell started) that escaped the process group. So this
+        # single kill reaps the whole jail — no separate cgroup/process-group sweep is
+        # needed. (Verified empirically: a setsid'd bg process dies with the namespace.)
         with contextlib.suppress(Exception):
             if self.alive():
                 self.proc.kill()
@@ -852,7 +909,7 @@ class ClaudeSession:
         return await sh.send_raw(data, timeout=timeout)
 
     async def shell_interrupt(self) -> str:
-        """#227c: send Ctrl-C to the persistent shell (best-effort)."""
+        """#227c/#246: send Ctrl-C to the persistent shell — a real SIGINT (controlling tty)."""
         sh = self._shell
         if sh is None or not sh.alive():
             return ""
@@ -873,11 +930,29 @@ class ClaudeSession:
         launcher = common["cli_path"]
         master, slave = os.openpty()
         os.set_blocking(master, False)
+        # #246: give the jailed bash a CONTROLLING TTY so Ctrl-C (the 0x03 byte) is a REAL
+        # SIGINT to the foreground process group — not just an ignorable byte (the #227c caveat).
+        # os.login_tty(slave) runs in the child (setsid + TIOCSCTTY + dup slave→0,1,2); pass_fds
+        # keeps `slave` open across subprocess's fd-closing so login_tty can use it. bwrap is NOT
+        # --new-session, so the controlling tty persists through setpriv→bwrap→bash, even across
+        # --unshare-pid (verified e2e). login_tty's setsid makes the launcher a session leader,
+        # so this replaces start_new_session=True with no change to the #179 reaper/cgroup invariant.
+        # was: start_new_session=True  (replaced for #246 — login_tty does the setsid)
+        def _ctty() -> None:
+            os.login_tty(slave)
         try:
             proc = await asyncio.create_subprocess_exec(
                 launcher, cwd=self.cwd, env=env,
-                stdin=slave, stdout=slave, stderr=slave, start_new_session=True,
+                stdin=slave, stdout=slave, stderr=slave,
+                preexec_fn=_ctty, pass_fds=(slave,),
             )
+        except BaseException:
+            # #248: on spawn failure the master fd would leak (the finally only
+            # closes slave) — close it too, else a repeatedly-failing _start_shell
+            # exhausts fds one master per attempt.
+            with contextlib.suppress(OSError):
+                os.close(master)
+            raise
         finally:
             with contextlib.suppress(OSError):
                 os.close(slave)  # the child holds its own dup; we keep only the master
@@ -947,7 +1022,7 @@ class ClaudeSession:
             # only set system_prompt when mem_block was non-empty (#130).
             # #205: also state the per-session isolation so the agent can answer the
             # user accurately if asked about privacy / where their files live.
-            append = OUTBOX_INSTRUCTION + ISOLATION_NOTE + (("\n\n" + mem_block) if mem_block else "")
+            append = OUTBOX_INSTRUCTION + ISOLATION_NOTE + TABLE_FORMAT_NOTE + (("\n\n" + mem_block) if mem_block else "")
             code_extra["system_prompt"] = {
                 "type": "preset", "preset": "claude_code", "append": append,
             }
@@ -996,7 +1071,7 @@ class ClaudeSession:
         return ClaudeAgentOptions(
             # #130: append the owner's CLAUDE.md/memory directly (mem_block is "" when
             # global memory is off or empty), instead of loading it via setting_sources.
-            system_prompt=CHAT_SYSTEM_PROMPT + mem_block,
+            system_prompt=CHAT_SYSTEM_PROMPT + TABLE_FORMAT_NOTE + mem_block,
             # Chat now runs in the per-session workdir too (#133), so its conversation
             # transcript lives in the SAME project as code mode — that's what lets a
             # session upgrade chat→code (or back) and keep one continuous conversation.
@@ -1176,6 +1251,14 @@ class ClaudeSession:
                         if piece:
                             running_text += piece
                             yield EngineEvent(kind="text_delta", text=piece)
+                        else:
+                            # #240c: extended-thinking deltas arrive as the SAME event with a
+                            # `thinking_delta` (delta.thinking) instead of text. Surface them so
+                            # the consumer can stream the reasoning into the <tg-thinking> block.
+                            # NOT added to running_text — reasoning is not the answer.
+                            think = delta.get("thinking")
+                            if think:
+                                yield EngineEvent(kind="thinking_delta", text=think)
                     continue
 
                 # --- Assistant message: text blocks + tool-use blocks ---

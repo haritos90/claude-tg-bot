@@ -109,7 +109,7 @@ inside the jail — there is nothing real to print, `cat`, or POST.
 
 ### Why plaintext HTTP to the broker is correct (and safe)
 
-We did **not** add an "insecure" flag. The Claude Code CLI (Node/undici) simply honours
+No "insecure" flag is added. The Claude Code CLI (Node/undici) simply honours
 the **scheme of `ANTHROPIC_BASE_URL`**: an `http://` base URL ⇒ a plaintext HTTP
 request; `https://` ⇒ TLS. Recon #119a confirmed the CLI honours `ANTHROPIC_BASE_URL`
 under OAuth/subscription auth and POSTs `/v1/messages?beta=true` with
@@ -263,7 +263,7 @@ System tools (already present on a typical Debian/systemd VPS):
   (auto-`modprobe`d by `egress-setup.sh`) — only for `SANDBOX_EGRESS`.
 - **cgroup v2** (the unified hierarchy, standard under systemd) — for egress + DoS
   limits.
-- `nftables` is **not** required (we use `iptables -m cgroup --path`).
+- `nftables` is **not** required (the egress rule uses `iptables -m cgroup --path`).
 
 ---
 

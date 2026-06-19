@@ -79,6 +79,9 @@ class ThreadState:
     # auto-compaction (hidden/owner-only for now). See settings_schema + TODO #164.
     hot_cache_timer: bool = False
     auto_compact: bool = False
+    # #229: live task-list card from the agent's TodoWrite events (delegated, code-only,
+    # default OFF). See settings_schema + streamer.update_todo_card.
+    todo_card: bool = False
 
 
 def _require_conn() -> aiosqlite.Connection:
@@ -160,6 +163,28 @@ async def init_db(db_path: str) -> None:
         )
         await _conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(thread_id, id)"
+        )
+        # #188: recurring scheduled prompts. spec = JSON (schedules.parse_schedule); the
+        # runner loop (sessions._schedule_loop) fires due+enabled rows into their session.
+        await _conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS schedules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                thread_id INTEGER,
+                chat_id INTEGER,
+                owner_uid INTEGER,
+                spec TEXT,
+                prompt TEXT,
+                next_run REAL,
+                enabled INTEGER DEFAULT 1,
+                created_at REAL,
+                last_run REAL,
+                last_status TEXT
+            )
+            """
+        )
+        await _conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_schedules_due ON schedules(enabled, next_run)"
         )
         # Append-only subscription rate-limit history (feeds the /status trend).
         await _conn.execute(
@@ -244,6 +269,11 @@ async def init_db(db_path: str) -> None:
             await _conn.execute(
                 "ALTER TABLE threads ADD COLUMN auto_compact INTEGER DEFAULT 0"
             )
+        # #229: per-session live task-list card toggle.
+        if "todo_card" not in existing:
+            await _conn.execute(
+                "ALTER TABLE threads ADD COLUMN todo_card INTEGER DEFAULT 0"
+            )
         # #165: the per-turn MODEL and the live CONTEXT size are needed to compute the
         # weighted "usage units" metric (a cost-aware proxy for the official windows;
         # see get_user_usage_units). Older rows have NULL model / 0 context — they
@@ -301,7 +331,8 @@ async def get_thread(thread_id: int) -> ThreadState | None:
             "COALESCE(shell_mode, 0) AS shell_mode, "
             "tools_enabled, "
             "COALESCE(hot_cache_timer, 0) AS hot_cache_timer, "
-            "COALESCE(auto_compact, 0) AS auto_compact "
+            "COALESCE(auto_compact, 0) AS auto_compact, "
+            "COALESCE(todo_card, 0) AS todo_card "
             "FROM threads WHERE thread_id = ?",
             (thread_id,),
         )
@@ -333,6 +364,7 @@ async def get_thread(thread_id: int) -> ThreadState | None:
         tools_enabled=_parse_tools_enabled(row["tools_enabled"]),
         hot_cache_timer=bool(row["hot_cache_timer"]),
         auto_compact=bool(row["auto_compact"]),
+        todo_card=bool(row["todo_card"]),
     )
 
 
@@ -443,6 +475,109 @@ async def set_hot_cache_timer(thread_id: int, on: bool) -> None:
             "UPDATE threads SET hot_cache_timer = ? WHERE thread_id = ?",
             (1 if on else 0, thread_id),
         )
+
+
+async def set_todo_card(thread_id: int, on: bool) -> None:
+    """Persist the per-session live task-list card toggle (#229)."""
+    conn = _require_conn()
+    async with _lock:
+        await conn.execute(
+            "UPDATE threads SET todo_card = ? WHERE thread_id = ?",
+            (1 if on else 0, thread_id),
+        )
+
+
+# ---------------------------------------------------------- schedules (#188)
+
+async def add_schedule(thread_id: int, chat_id: int, owner_uid: int, spec_json: str,
+                       prompt: str, next_run: float, created_at: float) -> int:
+    """Insert a recurring schedule; returns its new id."""
+    conn = _require_conn()
+    async with _lock:
+        cur = await conn.execute(
+            "INSERT INTO schedules (thread_id, chat_id, owner_uid, spec, prompt, "
+            "next_run, enabled, created_at) VALUES (?, ?, ?, ?, ?, ?, 1, ?)",
+            (thread_id, chat_id, owner_uid, spec_json, prompt, next_run, created_at),
+        )
+        await conn.commit()
+        return int(cur.lastrowid)
+
+
+async def list_schedules(owner_uid: int) -> list[dict]:
+    """All schedules owned by ``owner_uid``, oldest first."""
+    conn = _require_conn()
+    async with _lock:
+        cur = await conn.execute(
+            "SELECT * FROM schedules WHERE owner_uid = ? ORDER BY id", (owner_uid,)
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+    return [dict(r) for r in rows]
+
+
+async def count_schedules(owner_uid: int) -> int:
+    """How many schedules ``owner_uid`` has (for the per-user cap)."""
+    conn = _require_conn()
+    async with _lock:
+        cur = await conn.execute(
+            "SELECT COUNT(*) AS n FROM schedules WHERE owner_uid = ?", (owner_uid,)
+        )
+        row = await cur.fetchone()
+        await cur.close()
+    return int(row["n"])
+
+
+async def get_schedule(schedule_id: int) -> dict | None:
+    """One schedule by id, or None."""
+    conn = _require_conn()
+    async with _lock:
+        cur = await conn.execute("SELECT * FROM schedules WHERE id = ?", (schedule_id,))
+        row = await cur.fetchone()
+        await cur.close()
+    return dict(row) if row else None
+
+
+async def due_schedules(now: float) -> list[dict]:
+    """Enabled schedules whose next_run has passed (the runner's work list)."""
+    conn = _require_conn()
+    async with _lock:
+        cur = await conn.execute(
+            "SELECT * FROM schedules WHERE enabled = 1 AND next_run <= ? ORDER BY next_run",
+            (now,),
+        )
+        rows = await cur.fetchall()
+        await cur.close()
+    return [dict(r) for r in rows]
+
+
+async def set_schedule_enabled(schedule_id: int, on: bool) -> None:
+    """Pause/resume a schedule."""
+    conn = _require_conn()
+    async with _lock:
+        await conn.execute(
+            "UPDATE schedules SET enabled = ? WHERE id = ?", (1 if on else 0, schedule_id)
+        )
+        await conn.commit()
+
+
+async def update_schedule_run(schedule_id: int, next_run: float, last_run: float,
+                              last_status: str) -> None:
+    """Record a fire: advance next_run and stamp the last run + status."""
+    conn = _require_conn()
+    async with _lock:
+        await conn.execute(
+            "UPDATE schedules SET next_run = ?, last_run = ?, last_status = ? WHERE id = ?",
+            (next_run, last_run, last_status, schedule_id),
+        )
+        await conn.commit()
+
+
+async def delete_schedule(schedule_id: int) -> None:
+    """Remove a schedule for good."""
+    conn = _require_conn()
+    async with _lock:
+        await conn.execute("DELETE FROM schedules WHERE id = ?", (schedule_id,))
+        await conn.commit()
         await conn.commit()
 
 

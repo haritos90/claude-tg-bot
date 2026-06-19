@@ -26,6 +26,9 @@ HARD_LIMIT = 4096
 # chars — far above the classic 4096. The draft streams the whole growing reply up to this
 # (not just the classic ~3900 tail), and the rich final message is one bubble well past 4096.
 RICH_LIMIT = 32768
+# #243: a native Telegram rich table renders at most 20 columns (rich-message-spec.md:82).
+# A wider table is routed to the PNG-image path instead (extract_wide_tables + render_table_png).
+RICH_TABLE_MAX_COLS = 20
 # Above this length the caller may prefer to send a .md document instead of
 # spamming the chat with many chunks.
 FILE_THRESHOLD = SAFE_LIMIT * 3
@@ -515,6 +518,80 @@ def split_rich_tables(text: str):
     if buf:
         items.append("\n".join(buf))
     return items or [text]
+
+
+def table_col_count(rows: list[list[str]]) -> int:
+    """Column count of a parsed table = the widest row's cell count (#243)."""
+    return max((len(r) for r in rows), default=0)
+
+
+# #229: glyphs for the live task-list card (TodoWrite statuses).
+_TODO_GLYPH = {"completed": "✅", "in_progress": "🔄", "pending": "⬜"}
+_TODO_CELL_MAX = 90  # cap each task line so the card stays compact
+
+
+def summarize_todos(todos: list) -> tuple[int, int, int, str]:
+    """#229: turn a TodoWrite ``todos`` list into ``(total, done, open, body)`` for the
+    live task-list card. Each item is a dict with ``content`` (+ ``status``:
+    pending|in_progress|completed). Returns the body as one glyph-prefixed line per task;
+    blank/invalid entries are skipped. ``total`` is the count of rendered lines."""
+    lines: list[str] = []
+    done = 0
+    for t in todos or []:
+        if not isinstance(t, dict):
+            continue
+        status = str(t.get("status") or "pending")
+        content = str(t.get("content") or t.get("activeForm") or "").strip()
+        if not content:
+            continue
+        content = content.replace("\n", " ")
+        if len(content) > _TODO_CELL_MAX:
+            content = content[: _TODO_CELL_MAX - 1] + "…"
+        if status == "completed":
+            done += 1
+        lines.append(f"{_TODO_GLYPH.get(status, '⬜')} {content}")
+    total = len(lines)
+    return total, done, total - done, "\n".join(lines)
+
+
+# #243: a sentinel marking where a >20-column table was removed from the rich-markdown
+# body. NUL never appears in model text, so split/replace on it is unambiguous. The caller
+# replaces each occurrence with a localized "sent as an image" note (the table itself goes
+# as a PNG photo) — see streamer._commit.
+WIDE_TABLE_TOKEN = "\x00WIDE_TABLE\x00"
+
+
+def extract_wide_tables(text: str, max_cols: int = RICH_TABLE_MAX_COLS):
+    """#243: pull out markdown tables with MORE than ``max_cols`` columns (a native rich
+    table caps at 20 — rich-message-spec.md:82). Each wide table is replaced IN PLACE by
+    ``WIDE_TABLE_TOKEN`` on its own line; narrow tables and all other text are kept verbatim.
+    Returns ``(new_text, [RichTable, ...])`` in document order. When nothing is wide returns
+    ``(text, [])`` so the common case is untouched."""
+    if "|" not in text:
+        return text, []
+    lines = text.split("\n")
+    out: list[str] = []
+    wide: list[RichTable] = []
+    i, n = 0, len(lines)
+    while i < n:
+        nxt = lines[i + 1] if i + 1 < n else ""
+        if "|" in lines[i] and _TABLE_SEP_RE.match(nxt):
+            rows = [_split_table_row_raw(lines[i])]
+            aligns = _parse_table_aligns(nxt)
+            j = i + 2
+            while j < n and "|" in lines[j] and lines[j].strip():
+                rows.append(_split_table_row_raw(lines[j]))
+                j += 1
+            if table_col_count(rows) > max_cols:
+                wide.append(RichTable(rows, aligns))
+                out.append(WIDE_TABLE_TOKEN)
+            else:
+                out.extend(lines[i:j])  # narrow table → keep the original markdown verbatim
+            i = j
+        else:
+            out.append(lines[i])
+            i += 1
+    return "\n".join(out), wide
 
 
 def has_code_block(text: str) -> bool:

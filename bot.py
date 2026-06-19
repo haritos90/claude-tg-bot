@@ -124,6 +124,11 @@ async def main() -> None:
     with contextlib.suppress(Exception):
         sessions.start_archive_purger()
 
+    # #188: start the recurring-schedule runner (fires due /schedule prompts into their
+    # sessions). Best-effort; the loop swallows its own errors.
+    with contextlib.suppress(Exception):
+        sessions.start_scheduler()
+
     # #191: start the proactive OAuth token refresher so the on-disk subscription token
     # is renewed before its ~8h expiry — a turn after a long idle gap never 401s on a
     # stale token (the reaper kills the subprocess but never rotates the credential).
