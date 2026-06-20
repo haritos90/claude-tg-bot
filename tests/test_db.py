@@ -73,6 +73,55 @@ def test_stream_flag_persists():
     _run(_t)
 
 
+def test_session_name_auto_then_manual_pin(tmp_path):
+    # #260: a new session is auto-namable; the auto-namer (manual=False) writes the
+    # label and leaves name_auto on; a manual /rename (manual=True) pins the name and
+    # turns auto OFF, after which the auto-namer is a no-op.
+    async def _t():
+        # #292: tmp_path (pytest auto-cleans) instead of tempfile.mktemp (leaks .db files).
+        await db.init_db(str(tmp_path / "names.db"))
+        k = await db.allocate_dm_session(1, "s", "m", "/tmp", mode="code")
+        st = await db.get_thread(k)
+        assert st.name_auto is True          # default: auto on
+        await db.set_session_name(k, "Auto title", manual=False)
+        st = await db.get_thread(k)
+        assert st.name == "Auto title" and st.name_auto is True
+        await db.set_session_name(k, "My name")   # manual /rename (default)
+        st = await db.get_thread(k)
+        assert st.name == "My name" and st.name_auto is False
+        await db.set_session_name(k, "Late auto", manual=False)  # no-op once pinned
+        st = await db.get_thread(k)
+        assert st.name == "My name"
+        await db.close_db()
+
+    _run(_t)
+
+
+def test_last_active_and_idle_rotation_keeps_messages(tmp_path):
+    # #261: last_active roundtrips; rotate_session_for_idle drops the resume ids but
+    # keeps the message log + cwd (unlike reset_thread, which wipes messages).
+    async def _t():
+        # #292: tmp_path (pytest auto-cleans) instead of tempfile.mktemp (leaks .db files).
+        await db.init_db(str(tmp_path / "idle.db"))
+        k = await db.allocate_dm_session(1, "s", "m", "/tmp/wd", mode="code")
+        cwd_before = (await db.get_thread(k)).cwd
+        assert (await db.get_thread(k)).last_active == 0.0
+        await db.set_last_active(k, 12345.0)
+        assert (await db.get_thread(k)).last_active == 12345.0
+        await db.set_code_session(k, "code-1")
+        await db.set_chat_session(k, "chat-1")
+        await db.log_message(k, "user", "remember me")
+        await db.rotate_session_for_idle(k)
+        st = await db.get_thread(k)
+        assert st.code_session_id is None and st.chat_session_id is None  # context dropped
+        assert st.cwd == cwd_before                                       # workdir kept
+        msgs = await db.get_recent_messages(k)
+        assert [(m["role"], m["text"]) for m in msgs] == [("user", "remember me")]
+        await db.close_db()
+
+    _run(_t)
+
+
 def test_message_log_recall_and_reset():
     async def _t():
         await db.init_db(tempfile.mktemp(suffix=".db"))
@@ -164,12 +213,35 @@ def test_forward_migration_adds_columns_with_defaults():
         await db.init_db(path)
         st = await db.get_thread(-1)
         assert st is not None
-        assert st.permission_mode == "default"
+        # #278: the legacy/added 'default' permission mode is migrated to the acceptEdits
+        # baseline (so a code session auto-accepts file edits instead of prompting).
+        assert st.permission_mode == "acceptEdits"
         assert st.big_memory is False
         assert st.stream_enabled is True
         assert st.favorite is False
         assert st.fork_pending is False
         assert st.add_dirs == []
+        await db.close_db()
+
+    _run(_t)
+
+
+def test_legacy_default_permission_mode_migrated_to_accept_edits(tmp_path):
+    # #278: a code session stored with the legacy 'default' (ask-for-EVERY-tool) is
+    # migrated to 'acceptEdits' on init, so file creation/edits stop prompting.
+    async def _t():
+        path = str(tmp_path / "perm.db")
+        await db.init_db(path)
+        await db._require_conn().execute(
+            "INSERT INTO threads (thread_id, chat_id, mode, model, cwd, permission_mode, created_at) "
+            "VALUES (-9, 7, 'code', 'm', '/tmp', 'default', 0)"
+        )
+        await db._require_conn().commit()
+        await db.close_db()
+        # Re-open → the data migration runs.
+        await db.init_db(path)
+        st = await db.get_thread(-9)
+        assert st.permission_mode == "acceptEdits"
         await db.close_db()
 
     _run(_t)
@@ -208,18 +280,21 @@ def test_usage_units_weighting_and_breakdown():
              "cache_creation_input_tokens": 200, "cache_read_input_tokens": 10000},
             0.0, model="claude-opus-4-8", context_tokens=42000,
         )
-        # Raw metric ignores cache + model weight: 1000 + 100 = 1100.
-        assert await db.get_user_usage_tokens(uid) == 1100
+        # #293: raw metric ignores cache + model weight: 1000 + 100 = 1100.
+        assert await db.get_user_usage_window(uid, measure="raw") == 1100
         # Units = 5.0 * (1000 + 5*100 + 1.25*200 + 0.1*10000)
         #       = 5.0 * (1000 + 500 + 250 + 1000) = 13750.
-        assert await db.get_user_usage_units(uid) == 13750
+        assert await db.get_user_usage_window(uid) == 13750   # default measure = units
         # A NULL-model row weights at the default (Sonnet) baseline 1.0.
         await db.add_usage(key, {"input_tokens": 10, "output_tokens": 0}, 0.0)
-        assert await db.get_user_usage_units(uid) == 13750 + 10
-        bd = await db.get_user_units_breakdown(uid)
+        assert await db.get_user_usage_window(uid) == 13750 + 10
+        bd = await db.get_user_breakdown(uid, "units")
         assert bd["day"] == 13760 and bd["week"] == 13760 and bd["total"] == 13760
+        # The raw breakdown over the same rows: 1100 + 10 = 1110, 2 requests.
+        rawbd = await db.get_user_breakdown(uid)   # default measure = raw
+        assert rawbd["total"] == 1110 and rawbd["requests"] == 2
         # A different user sees none of it.
-        assert await db.get_user_usage_units(999) == 0
+        assert await db.get_user_usage_window(999) == 0
         await db.close_db()
 
     _run(_t)

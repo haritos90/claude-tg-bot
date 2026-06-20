@@ -20,6 +20,23 @@ def test_tool_phase_label_maps_tools_to_phrases():
     assert streamer.tool_phase_label("", None) == "💭 Thinking…"
 
 
+def test_wide_table_notes_replaces_token_and_is_noop_when_narrow():
+    """#256: the draft + final paths share _wide_table_notes — a >20-col table's token is
+    swapped for the localized note (so the draft matches the final bubble); no-op when none."""
+    import markup
+    s = streamer.Streamer(None, 123, None)
+    header = "| " + " | ".join(f"c{i}" for i in range(21)) + " |"
+    sep = "|" + "---|" * 21
+    rowline = "| " + " | ".join("x" for _ in range(21)) + " |"
+    body, wide = markup.extract_wide_tables("\n".join([header, sep, rowline]))
+    assert wide and markup.WIDE_TABLE_TOKEN in body
+    out = s._wide_table_notes(body, wide)
+    assert markup.WIDE_TABLE_TOKEN not in out      # token expanded
+    assert "21" in out                             # the column count is surfaced
+    # no-op fast path when nothing is wide
+    assert s._wide_table_notes("plain text", []) == "plain text"
+
+
 def test_add_reasoning_accumulates_caps_and_clears_phase():
     """#240c: reasoning deltas accumulate (tail-capped) and resuming reasoning drops a
     stale tool phase so the live block reflects current activity."""

@@ -123,8 +123,10 @@ CATALOG: dict[str, dict[str, str]] = {
     "btn.export_files": {"en": "📦 Export files", "ru": "📦 Экспорт файлов"},
     "btn.favorite": {"en": "⭐ Favorite", "ru": "⭐ В избранное"},
     "btn.unfavorite": {"en": "☆ Unfavorite", "ru": "☆ Из избранного"},
-    "btn.new_chat": {"en": "💬 New chat", "ru": "💬 Новый чат"},
-    "btn.new_code": {"en": "🟩 New code", "ru": "🟩 Новый код"},
+    # #282: ➕ marks these as CREATE actions, distinct from a fresh session's name (an
+    # empty session is now "Untitled"/"Без названия", not "New chat" — no more collision).
+    "btn.new_chat": {"en": "➕ New chat", "ru": "➕ Новый чат"},
+    "btn.new_code": {"en": "➕ New code", "ru": "➕ Новый код"},
 
     # -- session mode words / taglines -------------------------------------- #
     "mode.word_chat": {"en": "chat", "ru": "чат"},
@@ -264,6 +266,19 @@ CATALOG: dict[str, dict[str, str]] = {
     },
     "admin.gsl_saved": {"en": "✓ Global session limit: {val} per user.",
                         "ru": "✓ Глобальный лимит сессий: {val} на пользователя."},
+    # #261: global idle → fresh-session window (owner-set in Admin).
+    "admin.idle_btn": {"en": "💤 New session after idle: {val} ▸",
+                       "ru": "💤 Новая сессия после простоя: {val} ▸"},
+    "admin.idle_title": {
+        "en": "💤 <b>New session after idle</b>\nAfter this long with no activity, the next "
+              "message starts a fresh session (clean context; workdir files are kept):",
+        "ru": "💤 <b>Новая сессия после простоя</b>\nПосле такого простоя следующее сообщение "
+              "начинает новую сессию (чистый контекст; файлы в рабочей папке сохраняются):"},
+    "admin.idle_saved": {"en": "✓ New session after idle: {val}",
+                         "ru": "✓ Новая сессия после простоя: {val}"},
+    "admin.idle_off": {"en": "Off (never)", "ru": "Выкл (никогда)"},
+    "admin.idle_mins": {"en": "{n} min", "ru": "{n} мин"},
+    "admin.idle_hours": {"en": "{n} h", "ru": "{n} ч"},
     "admin.ret_never": {"en": "♾ Never (keep forever)", "ru": "♾ Никогда (хранить всегда)"},
     "admin.ret_1mo": {"en": "1 month", "ru": "1 месяц"},
     "admin.ret_3mo": {"en": "3 months", "ru": "3 месяца"},
@@ -272,6 +287,8 @@ CATALOG: dict[str, dict[str, str]] = {
     "admin.ret_days": {"en": "{n} days", "ru": "{n} дн."},
     "admin.tog_codesplit": {"en": "🧩 Code split: {val}", "ru": "🧩 Разбивка кода: {val}"},
     "admin.tog_workingplate": {"en": "⏳ Working plate: {val}", "ru": "⏳ Плашка работы: {val}"},
+    "admin.name_codesplit": {"en": "🧩 Code split", "ru": "🧩 Разбивка кода"},          # #275
+    "admin.name_workingplate": {"en": "⏳ Working plate", "ru": "⏳ Плашка работы"},     # #275
     "admin.btn_allow": {"en": "➕ Allow", "ru": "➕ Разрешить"},
     "admin.btn_deny": {"en": "➖ Deny", "ru": "➖ Удалить"},
     "admin.btn_level": {"en": "🎚 Level", "ru": "🎚 Уровень"},
@@ -375,9 +392,22 @@ CATALOG: dict[str, dict[str, str]] = {
         "en": "✏️ Send the new session name (or /cancel).",
         "ru": "✏️ Отправьте новое имя сессии (или /cancel).",
     },
-    "session.default_name_chat": {"en": "Chat session", "ru": "Чат-сессия"},
-    "session.default_name_code": {"en": "Code session", "ru": "Код-сессия"},
-    "session.first_default": {"en": "Session 1", "ru": "Сессия 1"},
+    # #261: RESERVED — idle rotation is currently SILENT (an auto-notice reads as spam).
+    # Kept for if/when announcing the reset is wanted; not referenced by code right now.
+    "session.idle_reset": {
+        "en": "🆕 Started a fresh session — the previous one was idle for over {mins} min, "
+              "so I'm not carrying its context. Files in the workdir are kept.",
+        "ru": "🆕 Начал новую сессию — предыдущая простаивала больше {mins} мин, поэтому её "
+              "контекст не переношу. Файлы в рабочей папке сохранены.",
+    },
+    # #273: default names lead with "New …" so it's clear the session was just started
+    # and is empty (no auto-title yet — #260 renames it once it has a conversation).
+    # #282: a fresh, never-used session reads as a placeholder ("Untitled") — the mode
+    # glyph (💬/🟩) already conveys chat vs code, and #260 auto-names it once it has a
+    # conversation. Avoids colliding with the "➕ New chat/code" create buttons.
+    "session.default_name_chat": {"en": "Untitled", "ru": "Без названия"},
+    "session.default_name_code": {"en": "Untitled", "ru": "Без названия"},
+    "session.first_default": {"en": "Untitled", "ru": "Без названия"},
     "session.fork_name": {"en": "{base} (fork)", "ru": "{base} (форк)"},
     "session.limit_reached": {
         "en": "🔢 You've reached your session limit (<b>{total}/{cap}</b>). Delete a session "
@@ -418,6 +448,10 @@ CATALOG: dict[str, dict[str, str]] = {
     "sessions.head_group": {"en": "🗂 <b>Topics</b>", "ru": "🗂 <b>Темы</b>"},
     "sessions.head_search": {"en": " · search “{kw}”", "ru": " · поиск «{kw}»"},
     "sessions.head_total": {"en": " · {total} total", "ru": " · всего {total}"},
+    "sessions.idle_rotated": {  # #271: passive note shown when /sessions auto-rotated
+        "en": "🆕 <i>Started a fresh session after a break — your previous one is saved below.</i>",
+        "ru": "🆕 <i>Начата новая сессия после перерыва — предыдущая сохранена ниже.</i>",
+    },
     "sessions.row": {
         # #136: dropped the leading <code>{sid}</code> — the public id is noise to
         # the user; the list now leads with the icon + name.
@@ -679,13 +713,18 @@ CATALOG: dict[str, dict[str, str]] = {
     },
     "shell.on": {
         "en": "⌨️ <b>Shell mode ON.</b> Every message now runs as a command in this "
-              "session's sandbox — no AI, no tokens. Send <code>/shell</code> again to "
-              "exit. Non-interactive commands only; <code>cd</code>/env don't persist "
-              "between commands yet.",
+              "session's sandbox — no AI, no tokens. <code>cd</code> and environment "
+              "persist between commands, and commands that ask for input work (you'll get "
+              "a key keypad). Full-screen apps (<code>vim</code>, <code>top</code>) aren't "
+              "supported. Send <code>/shell</code> again to detach — the shell (and any "
+              "running command) keeps going in the background.",
         "ru": "⌨️ <b>Режим shell ВКЛ.</b> Каждое сообщение теперь выполняется как команда "
-              "в песочнице сессии — без ИИ и без токенов. Отправьте <code>/shell</code> "
-              "ещё раз, чтобы выйти. Только неинтерактивные команды; <code>cd</code>/env "
-              "пока не сохраняются между командами.",
+              "в песочнице сессии — без ИИ и без токенов. <code>cd</code> и переменные "
+              "окружения сохраняются между командами, а команды, запрашивающие ввод, "
+              "работают (появится клавиатура клавиш). Полноэкранные программы "
+              "(<code>vim</code>, <code>top</code>) не поддерживаются. Отправьте "
+              "<code>/shell</code> ещё раз, чтобы отсоединиться — shell (и запущенная "
+              "команда) продолжит работать в фоне.",
     },
     "shell.off": {
         "en": "⌨️ <b>Shell mode OFF.</b> Back to talking with the agent.",
@@ -957,15 +996,15 @@ CATALOG: dict[str, dict[str, str]] = {
     # --- #164: /limits (own / account), /userstats table, working-plate line,
     #     warm-cache note. ---
     "limits.header": {"en": "📊 <b>Your limits</b>", "ru": "📊 <b>Ваши лимиты</b>"},
-    "limits.today": {"en": "Today", "ru": "Сегодня"},
+    "limits.today": {"en": "Last 5h", "ru": "За 5ч"},
     "limits.week": {"en": "This week", "ru": "За неделю"},
     "limits.requests": {"en": "Requests", "ru": "Запросов"},
     "limits.no_cap": {"en": "no cap", "ru": "без лимита"},
     "limits.sessions": {"en": "Sessions: <b>{used}</b> / {cap}", "ru": "Сессии: <b>{used}</b> / {cap}"},
     "limits.unlimited_word": {"en": "∞", "ru": "∞"},
     "limits.rolling_note": {
-        "en": "<i>Windows are rolling (trailing 24h / 7d).</i>",
-        "ru": "<i>Окна скользящие (последние 24ч / 7д).</i>",
+        "en": "<i>Windows are rolling (trailing 5h / 7d, matching Anthropic's reset).</i>",
+        "ru": "<i>Окна скользящие (последние 5ч / 7д, как сброс у Anthropic).</i>",
     },
     "limits.units_note": {
         "en": "<i>Usage is in weighted units (cost-aware: model, output and cache); caps are in units too.</i>",
@@ -979,13 +1018,13 @@ CATALOG: dict[str, dict[str, str]] = {
     "userstats.title": {"en": "User statistics", "ru": "Статистика пользователей"},
     "userstats.empty": {"en": "👥 No usage recorded yet.", "ru": "👥 Пока нет записанного использования."},
     "userstats.col_user": {"en": "User", "ru": "Пользователь"},
-    "userstats.col_day": {"en": "Day", "ru": "День"},
+    "userstats.col_day": {"en": "5h", "ru": "5ч"},
     "userstats.col_week": {"en": "Week", "ru": "Неделя"},
     "userstats.col_total": {"en": "Total", "ru": "Всего"},
     "userstats.col_req": {"en": "Req", "ru": "Запр"},
     "userstats.col_last": {"en": "Last", "ru": "Актив."},
     "stream.usage_line": {"en": "📊 {pct}% {kind}", "ru": "📊 {pct}% {kind}"},
-    "stream.kind_day": {"en": "of daily limit", "ru": "дневного лимита"},
+    "stream.kind_day": {"en": "of 5h limit", "ru": "5-часового лимита"},
     "stream.kind_week": {"en": "of weekly limit", "ru": "недельного лимита"},
     "hotcache.note": {
         "en": "🔥 Warm cache ~{mins} min — reply soon to reuse it (cheaper).",
@@ -1201,7 +1240,9 @@ CATALOG: dict[str, dict[str, str]] = {
     },
 
     "users.header": {"en": "<b>Allowed users</b>", "ru": "<b>Разрешённые пользователи</b>"},
-    "users.owner_id": {"en": "Owner id: <code>{id}</code>", "ru": "Id владельца: <code>{id}</code>"},
+    # #272: the list now shows friendly name + @username (the numeric id moved to the
+    # per-user card). was: "Owner id: <code>{id}</code>" / "• <code>{id}</code>{uname} …".
+    "users.owner_id": {"en": "👑 <b>{who}</b>", "ru": "👑 <b>{who}</b>"},
     "users.ids": {"en": "Ids: {ids}", "ru": "Id: {ids}"},
     "users.ids_none": {"en": "Ids: (none)", "ru": "Id: (нет)"},
     "users.usernames": {"en": "Usernames: {names}", "ru": "Username: {names}"},
@@ -1214,14 +1255,37 @@ CATALOG: dict[str, dict[str, str]] = {
         "en": "<i>(no other users)</i>",
         "ru": "<i>(других пользователей нет)</i>",
     },
+    # #277: unknown-user access request → owner notice + one-tap grant.
+    "access.request_owner": {
+        "en": "👤 <b>Access request</b>\n{who} (id <code>{id}</code>) tried to use the bot. Allow them?",
+        "ru": "👤 <b>Запрос доступа</b>\n{who} (id <code>{id}</code>) пытается использовать бота. Разрешить?",
+    },
+    "access.req_allow_chat": {"en": "✅ Allow (chat)", "ru": "✅ Разрешить (чат)"},
+    "access.req_allow_code": {"en": "✅ Allow (code)", "ru": "✅ Разрешить (код)"},
+    "access.req_granted": {
+        "en": "✅ Granted <code>{id}</code> — level <b>{level}</b>.",
+        "ru": "✅ Выдан доступ <code>{id}</code> — уровень <b>{level}</b>.",
+    },
+    "access.req_granted_toast": {"en": "Granted — {level}", "ru": "Доступ выдан — {level}"},
+    # #290: a stale Allow tap when the user is already allowed — don't silently re-set their
+    # level; tell the owner to change it from /users instead.
+    "access.req_already": {
+        "en": "ℹ️ <code>{id}</code> already has <b>{level}</b> access — change it from /users.",
+        "ru": "ℹ️ <code>{id}</code> уже имеет доступ <b>{level}</b> — измените его в /users.",
+    },
+    "access.req_already_toast": {
+        "en": "Already allowed — {level}", "ru": "Уже разрешён — {level}"},
+    # #286: exp/caps fold into {meta} — shown only when the user is actually limited/capped.
     "users.entry": {
-        "en": "• <code>{id}</code>{uname} — <b>{level}</b> · exp: {expiry} · caps: {quota}",
-        "ru": "• <code>{id}</code>{uname} — <b>{level}</b> · истекает: {expiry} · лимиты: {quota}",
+        "en": "• {who} — <b>{level}</b>{meta}",
+        "ru": "• {who} — <b>{level}</b>{meta}",
     },
     "users.pending": {
-        "en": "• @{name} — <b>{level}</b> · exp: {expiry} · caps: {quota} <i>(unpinned)</i>",
-        "ru": "• @{name} — <b>{level}</b> · истекает: {expiry} · лимиты: {quota} <i>(не привязан)</i>",
+        "en": "• {who} — <b>{level}</b>{meta} <i>(unpinned)</i>",
+        "ru": "• {who} — <b>{level}</b>{meta} <i>(не привязан)</i>",
     },
+    "users.meta_exp": {"en": " · exp: {expiry}", "ru": " · истекает: {expiry}"},
+    "users.meta_caps": {"en": " · caps: {quota}", "ru": " · лимиты: {quota}"},
     "users.never": {"en": "never", "ru": "никогда"},
     "users.unlimited": {"en": "∞", "ru": "∞"},
     "access.code_denied": {
@@ -1235,8 +1299,8 @@ CATALOG: dict[str, dict[str, str]] = {
 
     # -- #120 rolling rate limits + per-user effort/permissions gates ------- #
     "access.rate_day_exceeded": {
-        "en": "🔒 Daily usage limit reached (<b>{used}/{cap}</b> units). It frees up as your last 24h of usage ages out.",
-        "ru": "🔒 Дневной лимит исчерпан (<b>{used}/{cap}</b> ед.). Освободится по мере устаревания последних 24 часов.",
+        "en": "🔒 5-hour usage limit reached (<b>{used}/{cap}</b> units). It frees up as your last 5h of usage ages out.",
+        "ru": "🔒 5-часовой лимит исчерпан (<b>{used}/{cap}</b> ед.). Освободится по мере устаревания последних 5 часов.",
     },
     "access.rate_week_exceeded": {
         "en": "🔒 Weekly usage limit reached (<b>{used}/{cap}</b> units). It frees up as your last 7 days age out.",
@@ -1257,14 +1321,15 @@ CATALOG: dict[str, dict[str, str]] = {
         "ru": "<i>Нажмите на пользователя: память, лимиты, effort, инструменты, срок доступа и статистика.</i>",
     },
     "users.entry_usage": {
-        "en": "   ↳ used: day {day} · week {week} · total {total}",
-        "ru": "   ↳ расход: день {day} · неделя {week} · всего {total}",
+        "en": "   ↳ used: 5h {day} · week {week} · total {total}",
+        "ru": "   ↳ расход: 5ч {day} · неделя {week} · всего {total}",
     },
     "users.btn_owner": {"en": "👑 You (owner)", "ru": "👑 Вы (владелец)"},
+    "users.btn_owner_bare": {"en": "Owner", "ru": "Владелец"},  # #272: owner label fallback
     "users.btn_add": {"en": "➕ Add user", "ru": "➕ Добавить"},
     "users.btn_stats": {"en": "📊 Statistics", "ru": "📊 Статистика"},
     "users.btn_entry": {"en": "{who} · {level}", "ru": "{who} · {level}"},
-    "users.btn_pending": {"en": "@{name} · {level} (unpinned)", "ru": "@{name} · {level} (не привязан)"},
+    "users.btn_pending": {"en": "{who} · {level} (unpinned)", "ru": "{who} · {level} (не привязан)"},
     "usercard.title": {
         "en": "<b>User</b> <code>{who}</code> {kind}",
         "ru": "<b>Пользователь</b> <code>{who}</code> {kind}",
@@ -1274,16 +1339,16 @@ CATALOG: dict[str, dict[str, str]] = {
     "usercard.level": {"en": "Level: <b>{level}</b>", "ru": "Уровень: <b>{level}</b>"},
     "usercard.expiry": {"en": "Access expires: <b>{expiry}</b>", "ru": "Доступ истекает: <b>{expiry}</b>"},
     "usercard.rate": {
-        "en": "Limits: day <b>{day}</b> · week <b>{week}</b>",
-        "ru": "Лимиты: день <b>{day}</b> · неделя <b>{week}</b>",
+        "en": "Limits: 5h <b>{day}</b> · week <b>{week}</b>",
+        "ru": "Лимиты: 5ч <b>{day}</b> · неделя <b>{week}</b>",
     },
     "usercard.memory": {"en": "Global memory: <b>{state}</b>", "ru": "Глобальная память: <b>{state}</b>"},
     "usercard.maxeffort": {"en": "Max effort allowed: <b>{state}</b>", "ru": "Разрешён max effort: <b>{state}</b>"},
     "usercard.tools": {"en": "Tools allowed: <b>{tools}</b>", "ru": "Разрешено инструментов: <b>{tools}</b>"},
     "usercard.cap_all": {"en": "all", "ru": "все"},
     "usercard.usage": {
-        "en": "Used: day <b>{day}</b> · week <b>{week}</b> · total <b>{total}</b> ({reqs} req)",
-        "ru": "Израсходовано: день <b>{day}</b> · неделя <b>{week}</b> · всего <b>{total}</b> ({reqs} зап.)",
+        "en": "Used: 5h <b>{day}</b> · week <b>{week}</b> · total <b>{total}</b> ({reqs} req)",
+        "ru": "Израсходовано: 5ч <b>{day}</b> · неделя <b>{week}</b> · всего <b>{total}</b> ({reqs} зап.)",
     },
     "usercard.memory_warn": {
         "en": "<i>⚠️ Global memory loads your ~/.claude for this user — not just CLAUDE.md/memory but your <b>settings</b> (permission allow-rules + env). Grant only to fully-trusted users, and keep secrets / allow-rules out of ~/.claude/settings.json.</i>",
@@ -1294,10 +1359,13 @@ CATALOG: dict[str, dict[str, str]] = {
         "ru": "<i>Владелец всегда code и не истекает. Лимиты ниже — самоограничения для теста; сбросьте их, чтобы снова стать без лимитов.</i>",
     },
     "usercard.not_found": {"en": "User not found.", "ru": "Пользователь не найден."},
-    "usercard.btn_level": {"en": "Level: {level} → {next}", "ru": "Уровень: {level} → {next}"},
+    "usercard.btn_level": {"en": "Level: {level} ▸", "ru": "Уровень: {level} ▸"},  # #275: opens picker
     # #154: 🗄 for memory/context (🧠 is reserved for MODEL across all surfaces).
     "usercard.btn_memory": {"en": "🗄 Memory: {state}", "ru": "🗄 Память: {state}"},
     "usercard.btn_maxeffort": {"en": "⚡ Max effort: {state}", "ru": "⚡ Max effort: {state}"},
+    "usercard.pick_memory": {"en": "🗄 Global memory", "ru": "🗄 Глобальная память"},   # #275
+    "usercard.pick_maxeffort": {"en": "⚡ Max effort", "ru": "⚡ Max effort"},           # #275
+    "usercard.pick_level": {"en": "Access level", "ru": "Уровень доступа"},             # #275
     "usercard.btn_tools": {"en": "🧰 Tools: {val}", "ru": "🧰 Инструменты: {val}"},
     # #151: per-user access EXCEPTIONS (menu.md §3.4/§4).
     "usercard.btn_access": {"en": "🔑 Access", "ru": "🔑 Доступ"},
@@ -1315,7 +1383,7 @@ CATALOG: dict[str, dict[str, str]] = {
     },
     "usercard.btn_name": {"en": "✏️ Friendly name…", "ru": "✏️ Имя…"},
     "usercard.btn_expiry": {"en": "⏳ Set expiry…", "ru": "⏳ Срок доступа…"},
-    "usercard.btn_day": {"en": "📊 Day limit…", "ru": "📊 Лимит/день…"},
+    "usercard.btn_day": {"en": "📊 5h limit…", "ru": "📊 Лимит/5ч…"},
     "usercard.btn_week": {"en": "📅 Week limit…", "ru": "📅 Лимит/неделя…"},
     "usercard.btn_idle": {"en": "⏳ Idle: {val}", "ru": "⏳ Простой: {val}"},
     "usercard.idle_default": {"en": "default", "ru": "по умолч."},
@@ -1341,10 +1409,10 @@ CATALOG: dict[str, dict[str, str]] = {
     },
     # #192: caps are compared against WEIGHTED USAGE UNITS (#165), not raw tokens, so the
     # entry prompt must say "units" (a unit ≈ a Sonnet-input-token-equivalent; Opus + cache
-    # run ~5–25× raw tokens). was (#120): "Send the DAILY token cap (e.g. 500k, …)".
+    # run ~5–25× raw tokens). #264: the short window is 5h (Anthropic's reset), not a day.
     "usercard.prompt_day": {
-        "en": "Send the DAILY usage cap in <b>units</b> (e.g. <code>500k</code>, or <code>off</code>; /cancel). Caps and usage are weighted units, not raw tokens.",
-        "ru": "Отправьте ДНЕВНОЙ лимит в <b>единицах</b> (напр. <code>500k</code>, или <code>off</code>; /cancel). Лимиты и расход — во взвешенных единицах, не в сырых токенах.",
+        "en": "Send the 5-HOUR usage cap in <b>units</b> (e.g. <code>500k</code>, or <code>off</code>; /cancel). Caps and usage are weighted units, not raw tokens.",
+        "ru": "Отправьте 5-ЧАСОВОЙ лимит в <b>единицах</b> (напр. <code>500k</code>, или <code>off</code>; /cancel). Лимиты и расход — во взвешенных единицах, не в сырых токенах.",
     },
     # was (#120): "Send the WEEKLY token cap (e.g. 2m, …)". Relabelled to units for #192.
     "usercard.prompt_week": {
@@ -1365,8 +1433,8 @@ CATALOG: dict[str, dict[str, str]] = {
               "безлимита, или <code>default</code> чтобы наследовать глобальный. /cancel — отмена.",
     },
     "whoami.usage": {
-        "en": "Usage — day <b>{day}</b> · week <b>{week}</b> · total <b>{total}</b>",
-        "ru": "Расход — день <b>{day}</b> · неделя <b>{week}</b> · всего <b>{total}</b>",
+        "en": "Usage — 5h <b>{day}</b> · week <b>{week}</b> · total <b>{total}</b>",
+        "ru": "Расход — 5ч <b>{day}</b> · неделя <b>{week}</b> · всего <b>{total}</b>",
     },
     "whoami.caps": {"en": "Limits: <b>{caps}</b>", "ru": "Лимиты: <b>{caps}</b>"},
 
@@ -1456,6 +1524,17 @@ CATALOG: dict[str, dict[str, str]] = {
     "recap.empty": {
         "en": "No conversation logged yet in this session.",
         "ru": "В этой сессии ещё нет записанного разговора.",
+    },
+    # #270: /recap on a session with no logged turns — don't burn a model turn producing a
+    # confused "we've never talked" recap. After a long idle gap a fresh session starts
+    # automatically, so the earlier conversation is likely a separate entry under /sessions.
+    "recap.empty_session": {
+        "en": "🆕 Nothing to recap — this session has no earlier messages. After a long idle "
+              "gap a fresh session starts automatically, so your previous conversation is "
+              "kept as a separate entry: open /sessions to switch back to it.",
+        "ru": "🆕 Нечего пересказывать — в этой сессии ещё нет сообщений. После долгого "
+              "простоя автоматически начинается новая сессия, поэтому предыдущий разговор "
+              "сохранён отдельно: откройте /sessions, чтобы вернуться к нему.",
     },
     "recap.empty_has_context": {
         "en": "No transcript is saved for this session yet — earlier turns predate "

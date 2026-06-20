@@ -248,6 +248,10 @@ class Streamer:
         self._full: str = ""
         self._shown: int = 0
         self._rendered_text: str = ""       # what is currently shown (for dedupe)
+        # #291: memoize the per-frame wide-table substitution so an unchanged body
+        # (keepalive re-send / throttled tick that didn't advance) skips re-parsing
+        # the whole table structure. (cache_key_body, substituted_body).
+        self._wide_cache: tuple[str, str] | None = None
 
         # Whether a turn is actively streaming.
         self._streaming = False
@@ -460,6 +464,19 @@ class Streamer:
         if self._draft_retry_after and time.monotonic() < self._draft_retry_after:
             return
         body = markup.clip_partial_table(self._full[: self._shown]).strip()
+        # #256: a >20-col table can't render as a native rich DRAFT (cap is 20). Swap each wide
+        # table for the same localized note _commit uses, so the draft matches the final bubble
+        # (the table goes as a PNG only at finish()). Cheap no-op when nothing is wide.
+        if "|" in body:
+            # #291: reuse the last substitution when this frame's body is identical to the
+            # previous one (keepalive / throttled re-send) — skip the table re-parse.
+            if self._wide_cache is not None and self._wide_cache[0] == body:
+                body = self._wide_cache[1]
+            else:
+                _in = body
+                body, _wide = markup.extract_wide_tables(body)
+                body = self._wide_table_notes(body, _wide)
+                self._wide_cache = (_in, body)
         if not body:
             # Animate the <tg-thinking> placeholder. Priority (most → least specific):
             #   #240c: live REASONING (extended-thinking) text — show its tail, "unfurling";
@@ -885,6 +902,22 @@ class Streamer:
             )
         )
 
+    def _wide_table_notes(self, rich_text: str, wide_tables: list) -> str:
+        """Replace each ``WIDE_TABLE_TOKEN`` left by ``markup.extract_wide_tables`` with the
+        localized ``stream.wide_table`` note (the table itself is sent separately as a PNG).
+        Shared by the final commit (#243) and the draft path (#256) so a streaming wide table
+        shows the SAME note it will have in the final bubble, instead of being sent verbatim as
+        an over-cap native draft that the client may reject. No-op when nothing is wide."""
+        if not wide_tables:
+            return rich_text
+        lang = i18n.cached_lang(self.chat_id)
+        parts = rich_text.split(markup.WIDE_TABLE_TOKEN)
+        out = parts[0]
+        for idx, tbl in enumerate(wide_tables):
+            out += i18n.t("stream.wide_table", lang, n=idx + 1,
+                          cols=markup.table_col_count(tbl.rows)) + parts[idx + 1]
+        return out
+
     async def _send_wide_table_image(self, table) -> None:
         """#243: send one wide (>20-column) table as its own PNG photo — a native rich table
         caps at 20 columns. If PNG rendering is unavailable (e.g. the table-image font is not
@@ -892,7 +925,9 @@ class Streamer:
         silent intermediate (it follows the already-sent reply bubble)."""
         try:
             esc = [[markup._strip_cell_emphasis(c) for c in r] for r in table.rows]
-            png = table_image.render_table_png(esc)
+            # #285: PIL raster is synchronous CPU — run it off the event loop so a wide-table
+            # reply doesn't freeze every other user's stream for tens-to-hundreds of ms.
+            png = await asyncio.to_thread(table_image.render_table_png, esc)
         except Exception:
             logger.warning("#243 wide-table PNG render failed; <pre> grid fallback", exc_info=True)
             grid = [[markup.escape_html(markup._strip_cell_emphasis(c)) for c in r] for r in table.rows]
@@ -1077,13 +1112,9 @@ class Streamer:
         # leave a note where it was, send the rich markdown, then send each wide table as a PNG
         # image (rich tables ≤20 cols stream/render natively as before).
         rich_text, wide_tables = markup.extract_wide_tables(full_text)
-        if wide_tables:
-            lang = i18n.cached_lang(self.chat_id)
-            parts = rich_text.split(markup.WIDE_TABLE_TOKEN)
-            rich_text = parts[0]
-            for idx, tbl in enumerate(wide_tables):
-                rich_text += i18n.t("stream.wide_table", lang, n=idx + 1,
-                                    cols=markup.table_col_count(tbl.rows)) + parts[idx + 1]
+        # was (#243): inline token→note expansion here — factored to _wide_table_notes so the
+        # draft path (#256) reuses the SAME substitution and draft↔final stay consistent.
+        rich_text = self._wide_table_notes(rich_text, wide_tables)
         if await self._commit_rich_markdown(rich_text, footer, silent_first, reply_markup=reply_markup):
             for tbl in wide_tables:  # empty unless a >20-col table was extracted (#243)
                 await self._send_wide_table_image(tbl)

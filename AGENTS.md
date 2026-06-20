@@ -41,6 +41,25 @@ Work the task you were handed, or an **Open** one.
 - **Closing** a task → move it to **Closed**, fill the **Resolution** column,
   delete its Details block.
 
+**Docs are part of the change, not an afterthought — always update them, never
+break their structure.** Every change ships with the doc updates it implies, in
+the SAME batch:
+
+- **Always update.** A DB/schema change updates [`data-model.md`](data-model.md);
+  a UX/menu/command change updates [`menu.md`](menu.md); a config/env or
+  operational change updates `README.md` (and the `CLAUDE.md` "Operating" notes);
+  every task moves through the `TODO.md` ledger. A code change with no matching
+  doc update is incomplete — treat the docs as the spec, not as commentary.
+- **Never break structure.** Each doc has a documented shape — obey it. For
+  `TODO.md`: keep the row/Details/Resolution forms, the column sets, table
+  ordering, never delete a section's header row, and **keep the next-free-ID
+  counter in sync** (it is the max allocated ID + 1 — verify against the actual
+  rows, don't trust a stale value). Re-read a doc's own "how this works" / format
+  preamble before editing it, rather than guessing the format.
+- **Spec voice, English only.** Declarative, present-tense, no first-person, no
+  provenance / chat quotes / dated "owner said" lines — see Golden rule 1 and the
+  `TODO.md` preamble. State the decision as a neutral fact.
+
 ---
 
 ## 2. Golden rules
@@ -53,6 +72,13 @@ Work the task you were handed, or an **Open** one.
    handler; add a row to the `i18n.CATALOG` table and render it with
    `i18n.t(key, lang, …)`. Only the **bot's own UI** is localized; Claude's
    model output is not (the model already mirrors the user's language).
+   **Non-English text (e.g. Cyrillic) is allowed ONLY in the three translation
+   surfaces** — `i18n.py` `ru` values, `commands.py` `ru` labels, `menu.md`
+   bilingual label tables — and NOWHERE else, including comments, docstrings,
+   `TODO.md`, and every other `.md`. This holds even when you are *describing* an
+   i18n change: don't paste the localized string into prose or a ledger
+   Resolution to show what changed — reference it by its `i18n.CATALOG` key and
+   give only the English. Describe a violation; never reproduce it.
 2. **Secrets and identities stay out of code and git.** Secrets live in `.env`
    and the user list in `allowlist.json` — **both gitignored**. Never hardcode a
    token, an `OWNER_ID`, or a user id. Never log the token.

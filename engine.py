@@ -106,59 +106,42 @@ CHAT_SYSTEM_PROMPT = (
     "(e.g. ×, ÷, ≈, ≤, ≥, ², ₂, √, π, ½, →, ∞)."
 )
 
-# #243: appended to BOTH the chat and code system prompts. The Telegram client renders a
-# Markdown table natively only up to 20 columns; the bot routes any wider table to a PNG
-# image automatically. Telling the model keeps it from assuming a >20-col table will render
-# inline — it can format accordingly (short cells, transpose, or split).
-TABLE_FORMAT_NOTE = (
-    "\n\nTables: the Telegram client renders a Markdown table natively only up to 20 "
-    "columns. A table with MORE than 20 columns is delivered to the user as a PNG image "
-    "automatically (not as an inline table). Prefer tables with 20 or fewer columns; if "
-    "the data genuinely needs more, keep cell text short, or transpose/split the table — "
-    "and expect that wide one to arrive as an image."
+# #269: the table-format note (#243), the outbox file-delivery instructions (#187), and the
+# per-session isolation/privacy note (#205/#208) were all FOLDED INTO the agent_context.md
+# project document (loaded below) — so the agent's ENTIRE self-description lives in one
+# editable place instead of several hardcoded prompt strings. Their content now appears in
+# that doc's Files / "Your environment & privacy" / Rendering sections.
+#
+# #265/#269: tell the agent WHAT it is — a Telegram-bot frontend — and what it (and the
+# user) can do, so it guides the user to the right mode/command instead of refusing or
+# hallucinating. The text is maintained as a PROJECT DOCUMENT (agent_context.md) and loaded
+# from there, so the bot's self-description can be edited without touching code. Appended to
+# BOTH the chat and code system prompts (a restart picks up doc edits). A short built-in
+# fallback keeps the bot working if the file is ever missing.
+_AGENT_CONTEXT_FILE = Path(__file__).resolve().parent / "agent_context.md"
+_BOT_CONTEXT_FALLBACK = (
+    "\n\n## About you (this bot)\n"
+    "You are running as a Telegram bot — a frontend to Claude / Claude Code. CHAT mode has "
+    "read-only web tools but no terminal/files; CODE mode has the full Claude Code toolset "
+    "in a sandbox. /code switches chat→code (and /chat back); /shell opens a jailed shell in "
+    "a code session. Point the user at the right command instead of refusing or pretending; "
+    "only describe features that actually exist."
 )
 
-# #187: the host drains files the agent drops in <cwd>/outbox/ to the user's Telegram
-# chat after each turn (then removes them) — the agent's only channel to hand a SPECIFIC
-# file to the user (orthogonal to /export, which zips the whole workdir). Appended to the
-# code-mode system prompt so the agent knows the mechanism exists and how to use it.
-OUTBOX_INSTRUCTION = (
-    "\n\n## Sending a file to the user\n"
-    "You are running behind a Telegram bot. To deliver a specific file (an image, PDF, "
-    "chart, CSV, archive, …) to the user's chat, put a copy in the `outbox/` directory "
-    "inside your working directory — e.g. `cp report.pdf outbox/`, or save directly to "
-    "it like `outbox/chart.png`. Everything in `outbox/` is sent to the user "
-    "automatically when your turn ends, then removed. Only put files there that the user "
-    "should actually receive — do not dump build artefacts or large logs. Images up to "
-    "5 MB arrive as photos; other files up to ~49 MB as documents (larger ones are "
-    "skipped). To hand over the WHOLE workdir at once (an alternative to /export), "
-    "archive it into outbox/ — e.g. `tar czf outbox/project.tar.gz --exclude=./outbox .` "
-    "(the --exclude stops the archive from recursing into itself)."
-)
 
-# #205: appended to the code-mode system prompt so the agent can answer the user
-# accurately about isolation (privacy / where files live / whether others can see them)
-# instead of guessing. The per-session-private workdir is ALWAYS true (#181 layout);
-# the FS-confinement / network-allowlist parts are hedged ("may be") since they depend
-# on whether the sandbox layers (#119/#180) are enabled.
-# #208: the opening previously asserted isolation unconditionally ("inside an isolated,
-# per-session sandbox … you cannot see or reach another session's files"), but that
-# enforcement only holds when the sandbox layers are on, so it is hedged too now. Only
-# the per-session SEPARATE directory (#181 layout) is stated as always-true. was:
-#   "You run inside an isolated, per-session sandbox. Your working directory is "
-#   "PRIVATE to this session — it is not shared with any other user or session, and "
-#   "you cannot see or reach another session's files (each session gets its own "
-#   "separate directory). Your filesystem access is confined to this working directory "
-ISOLATION_NOTE = (
-    "\n\n## Your environment\n"
-    "You run in a per-session sandbox. Your working directory is PRIVATE to this "
-    "session — each session is given its own separate directory, not shared with any "
-    "other user or session. Filesystem access may be confined to this working directory "
-    "(paths outside it may be read-only or unavailable), and network access may be "
-    "restricted to an allowlist of hosts. If the user asks whether their files are "
-    "private, whether other people can see them, or where their work lives, explain "
-    "this per-session isolation accurately rather than guessing."
-)
+def _load_bot_context() -> str:
+    """Load the agent self-description from agent_context.md (#269), prefixed with the blank
+    lines that separate it from the preceding prompt section. Falls back to a short built-in
+    string if the file is missing/unreadable, so a bad deploy never strips the agent's
+    self-awareness entirely."""
+    try:
+        text = _AGENT_CONTEXT_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        return _BOT_CONTEXT_FALLBACK
+    return ("\n\n" + text) if text else _BOT_CONTEXT_FALLBACK
+
+
+BOT_CONTEXT_NOTE = _load_bot_context()
 
 # The full universe of tools the model may CALL in code mode (the `tools`
 # option). Availability != auto-permission: dangerous tools here are NOT in
@@ -474,7 +457,23 @@ class PersistentShell:
         async with self._lock:
             if not self.alive():
                 return (137, "(shell exited)", "done")
+            # #279: drop output the program emitted while we were NOT reading (e.g. a fresh
+            # prompt printed while shell mode was toggled off / the agent answered a message),
+            # so the read after THIS input captures the program's RESPONSE — not a stale prompt
+            # that would make the forwarded keystroke look ignored. `run()` drains the same way.
+            self._read_available()
             return await self._drive(data, settle, timeout)
+
+    async def peek(self, settle: float = 0.4) -> tuple[int | None, str, str]:
+        """#279: read whatever the program has printed since we last read — WITHOUT sending
+        any input — and report it. Used on /shell re-attach to surface output the program
+        emitted while detached (e.g. it advanced to a new prompt). Quick: a short settle, no
+        wait for a sentinel. Returns (None, output, "awaiting") — empty output if nothing new."""
+        async with self._lock:
+            if not self.alive():
+                return (137, "(shell exited)", "done")
+            await asyncio.sleep(min(0.3, max(0.05, settle / 2)))  # let in-flight bytes land
+            return (None, self._clean(self._read_available()), "awaiting")
 
     async def interrupt(self) -> str:
         """#227c/#246: send Ctrl-C to the shell. The jailed bash now has a CONTROLLING TTY
@@ -558,8 +557,12 @@ class ClaudeSession:
         uid_base: int = 700000,
         uid_range: int = 60000,
         auto_compact: bool = True,
+        user_level: str | None = None,
     ) -> None:
         self.mode = mode
+        # #276: the session OWNER's access level ("chat" | "code" | None=unknown). Drives the
+        # dynamic "this session right now" note so the model knows whether the user can /code.
+        self.user_level = user_level
         self.model = model
         self.cwd = cwd
         self.can_use_tool = can_use_tool
@@ -893,6 +896,13 @@ class ClaudeSession:
             self._shell = sh
         return await sh.run(command, timeout=timeout)
 
+    async def shell_peek(self) -> tuple[int | None, str, str]:
+        """#279: non-intrusive read of the persistent shell's pending output (no input sent)."""
+        sh = self._shell
+        if sh is None or not sh.alive():
+            return (0, "", "done")
+        return await sh.peek()
+
     async def shell_send_input(self, text: str, timeout: float = 60.0):
         """#227b: forward a line of input to the program awaiting it in the persistent shell.
         Returns (rc_or_None, output, status); ('','no shell','done') if none is running."""
@@ -965,6 +975,52 @@ class ClaudeSession:
             with contextlib.suppress(Exception):
                 await sh.close()
 
+    def has_live_shell(self) -> bool:
+        """#274: True if this session holds a still-running persistent shell."""
+        return self._shell is not None and self._shell.alive()
+
+    def detach_shell(self):
+        """#274: hand off the live persistent shell WITHOUT closing it, so it can survive
+        a client rebuild/reap (the ~500 MB claude client is freed; the ~3 MB jailed shell —
+        with the user's cd/env + any running command — is preserved). Returns it or None."""
+        sh, self._shell = self._shell, None
+        return sh
+
+    def adopt_shell(self, sh) -> None:
+        """#274: re-attach a previously-detached persistent shell (cd/env/running cmd intact)."""
+        if sh is not None and self._shell is None:
+            self._shell = sh
+
+    def _session_state_note(self) -> str:
+        """#276: a short, DYNAMIC note telling the model the CURRENT session's mode and what
+        the user can do about it (the static doc only describes the modes in general). Appended
+        to both system prompts so the model gives accurate guidance instead of guessing."""
+        if self.mode == "code":
+            return (
+                "\n\n## This session right now\n"
+                "This is a **CODE** session: you have the full Claude Code toolset (Bash, "
+                "read/write/edit files) in a sandbox, and the user can enter a persistent jailed "
+                "terminal with **/shell**. The user can switch this session back to plain chat with "
+                "**/chat**."
+            )
+        if self.user_level == "code":
+            return (
+                "\n\n## This session right now\n"
+                "This is a **CHAT** session: conversation plus read-only web tools only — no shell, "
+                "files, or code execution. The user HAS code access: if they want to run commands or "
+                "edit files, tell them to send **/code** to turn THIS session into a full Claude Code "
+                "session (then **/shell** for a terminal), and **/chat** to switch back. Don't pretend "
+                "to run anything here — point them to /code."
+            )
+        return (
+            "\n\n## This session right now\n"
+            "This is a **CHAT** session: conversation plus read-only web tools only — no shell, files, "
+            "or code execution. The user's access level is **chat-only**, so they CANNOT upgrade to code "
+            "themselves — do NOT tell them to use /code. Only the bot's owner can grant code access. If "
+            "they need to run commands or edit files, explain that the owner must grant them code access "
+            "first."
+        )
+
     def _build_options(self) -> ClaudeAgentOptions:
         """Construct ClaudeAgentOptions for the current mode/model/cwd."""
         env = self._build_env()
@@ -1022,7 +1078,9 @@ class ClaudeSession:
             # only set system_prompt when mem_block was non-empty (#130).
             # #205: also state the per-session isolation so the agent can answer the
             # user accurately if asked about privacy / where their files live.
-            append = OUTBOX_INSTRUCTION + ISOLATION_NOTE + TABLE_FORMAT_NOTE + (("\n\n" + mem_block) if mem_block else "")
+            # #269: outbox/isolation/table notes are now part of BOT_CONTEXT_NOTE (the doc).
+            append = (BOT_CONTEXT_NOTE + self._session_state_note()
+                      + (("\n\n" + mem_block) if mem_block else ""))
             code_extra["system_prompt"] = {
                 "type": "preset", "preset": "claude_code", "append": append,
             }
@@ -1071,7 +1129,7 @@ class ClaudeSession:
         return ClaudeAgentOptions(
             # #130: append the owner's CLAUDE.md/memory directly (mem_block is "" when
             # global memory is off or empty), instead of loading it via setting_sources.
-            system_prompt=CHAT_SYSTEM_PROMPT + TABLE_FORMAT_NOTE + mem_block,
+            system_prompt=CHAT_SYSTEM_PROMPT + BOT_CONTEXT_NOTE + self._session_state_note() + mem_block,
             # Chat now runs in the per-session workdir too (#133), so its conversation
             # transcript lives in the SAME project as code mode — that's what lets a
             # session upgrade chat→code (or back) and keep one continuous conversation.

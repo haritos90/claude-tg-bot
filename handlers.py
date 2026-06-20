@@ -449,7 +449,9 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 await msg.edit_reply_markup(reply_markup=_sessions.shell_keypad(more=(token == "more")))
             await cb.answer()
             return
-        rendered, awaiting = await sessions.shell_key(await _callback_key(cb), token, _lang(cb))
+        # #291: resolve the session key once (was awaited twice → two get_dm_current reads).
+        key = await _callback_key(cb)
+        rendered, awaiting = await sessions.shell_key(key, token, _lang(cb))
         if rendered is None:
             await cb.answer()
             return
@@ -457,6 +459,12 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         with contextlib.suppress(Exception):
             await bot(EditRichMessage(chat_id=msg.chat.id, message_id=msg.message_id,
                                       rich_message={"markdown": rendered}, reply_markup=kb))
+        # #279: keep the tracked keypad message current (this msg, edited in place) so a later
+        # /shell toggle strips/restores the RIGHT message; clear it once input is no longer awaited.
+        if awaiting:
+            sessions.set_shell_kb(key, msg.chat.id, msg.message_id, rendered)
+        else:
+            sessions.set_shell_kb(key, None, None)
         await cb.answer()
 
     def _command_arg(message: Message) -> str:
@@ -470,6 +478,13 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
     def _is_owner(message: Message) -> bool:
         """True iff the message comes from the configured owner."""
         return bool(message.from_user) and message.from_user.id == settings.owner_id
+
+    def _has_code_access(uid: int | None, uname: str | None) -> bool:
+        """#283: True iff this USER may use code-only features — the owner, or a user whose
+        allowlist LEVEL is "code". Gates the code-only commands by the caller's level (not
+        just the session's mode), so a user demoted code→chat — who still owns their existing
+        code-mode sessions — can't keep using /shell, /secret, /permissions, Tools on them."""
+        return uid == settings.owner_id or allowlist.level_of(uid, uname) == "code"
 
     def _may_max_effort(uid: int | None, uname: str | None) -> bool:
         """Whether this user may select the (expensive) `max` reasoning effort — the
@@ -733,16 +748,19 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 cb = f"sx:opt:{setting.key}"
             elif not editable:
                 cb = f"sx:ro:{setting.key}"           # read-only → a "locked" toast
-            elif setting.type is bool:
-                cb = f"sx:tog:{sc_code}:{setting.key}"
             else:
+                # #275: EVERY editable setting — including booleans — opens a value picker
+                # with a Back button, so a tap never silently flips a value in place (the
+                # user sees the choices first). (was: bool → an immediate `sx:tog` flip.)
                 cb = f"sx:nav:{sc_code}:{setting.key}"
             rows.append([B(text=text, callback_data=cb)])
         # Bespoke pages (Tools grid / Usage picker / Users admin) are sx: sub-pages
         # linked from the SESSION tab only. Tools is code-only (menu.md §1.7); the
         # owner-only Usage + Users rows go LAST, above Close (menu.md §1.8).
         if scope == ss.Scope.SESSION:
-            if getattr(ctx.state, "mode", None) == "code":
+            # #283: code-only rows require BOTH a code session AND a code-level user (so a
+            # demoted user who still owns a code session doesn't see Tools/Secret).
+            if getattr(ctx.state, "mode", None) == "code" and role >= ss.Role.CODE:
                 rows.append([B(text=i18n.t("settings.row_tools", lang), callback_data="sx:tools")])
                 rows.append([B(text=i18n.t("settings.row_secret", lang),  # #222: discoverable
                                callback_data="sx:secret")])
@@ -769,6 +787,47 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         (30, "admin.ret_1mo"), (90, "admin.ret_3mo"), (180, "admin.ret_6mo"),
         (365, "admin.ret_12mo"), (0, "admin.ret_never"),
     )
+    # #261: idle→fresh-session picker choices (minutes; 0 = off).
+    _IDLE_RESET_CHOICES = (0, 15, 30, 60, 120, 240)
+
+    def _idle_reset_min() -> int:
+        """Effective global idle→fresh-session window in MINUTES — the live value held by
+        the SessionManager (loaded from kv ``idle_reset_sec`` at startup, owner-set in
+        Admin), falling back to the config default. 0 = off."""
+        sec = float(getattr(sessions, "_idle_reset", 0) or 0)
+        return int(sec // 60)
+
+    def _idle_reset_label(minutes: int, lang: str) -> str:
+        if minutes <= 0:
+            return i18n.t("admin.idle_off", lang)
+        if minutes % 60 == 0:
+            return i18n.t("admin.idle_hours", lang, n=minutes // 60)
+        return i18n.t("admin.idle_mins", lang, n=minutes)
+
+    def _ss_idle_keyboard(cur_min: int, lang: str) -> InlineKeyboardMarkup:
+        B = InlineKeyboardButton
+        rows = [
+            [B(text=("✓ " if m == cur_min else "") + _idle_reset_label(m, lang),
+               callback_data=f"sx:admin:idleset:{m}")]
+            for m in _IDLE_RESET_CHOICES
+        ]
+        rows.append([B(text=i18n.t("settings.back_to", lang), callback_data="sx:admin"),
+                     B(text=i18n.t("btn.close", lang), callback_data="sx:close")])
+        return InlineKeyboardMarkup(inline_keyboard=rows)
+
+    def _ss_admin_bool_keyboard(which: str, cur: bool, lang: str) -> InlineKeyboardMarkup:
+        """#275: On/Off picker (with Back) for an Admin boolean, so it no longer flips in
+        place. `which` is the toggle key (cs/wp)."""
+        B = InlineKeyboardButton
+        rows = [[
+            B(text=("✓ " if cur else "") + i18n.onoff(True, lang),
+              callback_data=f"sx:admin:boolset:{which}:on"),
+            B(text=("✓ " if not cur else "") + i18n.onoff(False, lang),
+              callback_data=f"sx:admin:boolset:{which}:off"),
+        ]]
+        rows.append([B(text=i18n.t("settings.back_to", lang), callback_data="sx:admin"),
+                     B(text=i18n.t("btn.close", lang), callback_data="sx:close")])
+        return InlineKeyboardMarkup(inline_keyboard=rows)
 
     async def _archive_retention_days() -> int:
         """Effective archive retention in days: the owner's runtime value (kv
@@ -800,17 +859,20 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         return InlineKeyboardMarkup(inline_keyboard=rows)
 
     def _ss_admin_keyboard(lang: str, ret_days: int, cs_on: bool, wp_on: bool,
-                           gsl: int = 10) -> InlineKeyboardMarkup:
+                           gsl: int = 10, idle_min: int = 30) -> InlineKeyboardMarkup:
         B = InlineKeyboardButton
         gsl_lbl = "∞" if gsl <= 0 else str(gsl)
         rows = [
             [B(text=i18n.t("admin.retention", lang, val=_retention_label(ret_days, lang)),
                callback_data="sx:admin:ret"),
              B(text=i18n.t("admin.gsl_btn", lang, val=gsl_lbl), callback_data="sx:admin:gsl")],
+            [B(text=i18n.t("admin.idle_btn", lang, val=_idle_reset_label(idle_min, lang)),
+               callback_data="sx:admin:idle")],
+            # #275: open an On/Off picker (with Back) instead of flipping in place.
             [B(text=i18n.t("admin.tog_codesplit", lang, val=i18n.onoff(cs_on, lang)),
-               callback_data="sx:admin:tog:cs"),
+               callback_data="sx:admin:bool:cs"),
              B(text=i18n.t("admin.tog_workingplate", lang, val=i18n.onoff(wp_on, lang)),
-               callback_data="sx:admin:tog:wp")],
+               callback_data="sx:admin:bool:wp")],
             [B(text=i18n.t("admin.btn_allow", lang), callback_data="sx:admin:cmd:allow"),
              B(text=i18n.t("admin.btn_deny", lang), callback_data="sx:admin:cmd:deny")],
             [B(text=i18n.t("admin.btn_level", lang), callback_data="sx:admin:cmd:level"),
@@ -828,9 +890,10 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         cs = bool(getattr(sessions, "split_code_messages", True))
         wp = bool(getattr(sessions, "working_plate", True))
         gsl = await _global_session_limit()
+        idle_min = _idle_reset_min()
         with contextlib.suppress(Exception):
             await _edit_menu(msg, i18n.t("admin.title", lang),  # #173: native rich nav-edit
-                             _ss_admin_keyboard(lang, days, cs, wp, gsl))
+                             _ss_admin_keyboard(lang, days, cs, wp, gsl, idle_min))
 
     def _ss_picker_keyboard(setting, scope, ctx: ss.Ctx, lang: str,
                             may_max: bool = True) -> InlineKeyboardMarkup:
@@ -1001,8 +1064,8 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 # #222: open the /secret arg-capture prompt from the hub (Session tab,
                 # code only) so the feature is discoverable without the "/" command menu.
                 ctx = await _build_ss_ctx(key, uid, role)
-                if getattr(ctx.state, "mode", None) != "code":
-                    await cb.answer(i18n.t("common.error", lang))
+                if getattr(ctx.state, "mode", None) != "code" or not _has_code_access(uid, uname):
+                    await cb.answer(i18n.t("common.error", lang))  # #283: level gate too
                     return
                 secrets = _read_secrets(key)
                 names = (", ".join(f"<code>{markup.escape_html(n)}</code>" for n in secrets)
@@ -1063,8 +1126,8 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 state = None
                 with contextlib.suppress(Exception):
                     state = await db.get_thread(key)
-                if getattr(state, "mode", None) != "code":
-                    await cb.answer(i18n.t("settings.denied", lang), show_alert=True)
+                if getattr(state, "mode", None) != "code" or not _has_code_access(uid, uname):
+                    await cb.answer(i18n.t("settings.denied", lang), show_alert=True)  # #283
                     return
                 with contextlib.suppress(Exception):
                     await _edit_menu(msg, i18n.t("settings.tools_title", lang),  # #173: rich nav-edit
@@ -1079,7 +1142,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                     state = await db.get_thread(key)
                 mode = getattr(state, "mode", "chat")
                 universe = engine.CODE_TOOLS if mode == "code" else engine.CHAT_TOOLS
-                if mode == "code" and tool in universe:
+                if mode == "code" and tool in universe and _has_code_access(uid, uname):  # #283
                     base = (state.tools_enabled if state and state.tools_enabled is not None
                             else list(universe))
                     enabled = {t for t in base if t in universe}
@@ -1157,6 +1220,24 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                     await _send_ss_admin(msg, lang)
                     await cb.answer(i18n.t("admin.ret_saved", lang, val=_retention_label(days, lang)))
                     return
+                if sub == "idle":
+                    # #261: open the idle→fresh-session picker.
+                    with contextlib.suppress(Exception):
+                        await _edit_menu(
+                            msg, i18n.t("admin.idle_title", lang),
+                            _ss_idle_keyboard(_idle_reset_min(), lang))
+                    await cb.answer()
+                    return
+                if sub == "idleset":
+                    try:
+                        mins = max(0, int(arg))
+                    except (TypeError, ValueError):
+                        mins = 30
+                    await sessions.set_idle_reset_sec(mins * 60)
+                    await _send_ss_admin(msg, lang)
+                    await cb.answer(
+                        i18n.t("admin.idle_saved", lang, val=_idle_reset_label(mins, lang)))
+                    return
                 if sub == "gsl":
                     # Global default per-user session limit → arg-capture the owner's
                     # next message (a number, or off/unlimited). Handled by _run_pending.
@@ -1176,14 +1257,24 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                                                parse_mode="HTML")
                     await cb.answer()
                     return
-                if sub == "tog" and arg in ("cs", "wp"):
-                    # Global owner toggles (code-block split / working plate).
+                if sub == "bool" and arg in ("cs", "wp"):
+                    # #275: open the On/Off picker (with Back) for a global owner toggle
+                    # (code-block split / working plate) instead of flipping in place.
+                    cur = (bool(getattr(sessions, "split_code_messages", True)) if arg == "cs"
+                           else bool(getattr(sessions, "working_plate", True)))
+                    name = i18n.t("admin.name_codesplit" if arg == "cs"
+                                  else "admin.name_workingplate", lang)
+                    with contextlib.suppress(Exception):
+                        await _edit_menu(msg, i18n.t("settings.v2_pick", lang, name=name),
+                                         _ss_admin_bool_keyboard(arg, cur, lang))
+                    await cb.answer()
+                    return
+                if sub == "boolset" and arg in ("cs", "wp"):
+                    val = (parts[4] if len(parts) > 4 else "") == "on"
                     if arg == "cs":
-                        await sessions.set_split_code_messages(
-                            not bool(getattr(sessions, "split_code_messages", True)))
+                        await sessions.set_split_code_messages(val)
                     else:
-                        await sessions.set_working_plate(
-                            not bool(getattr(sessions, "working_plate", True)))
+                        await sessions.set_working_plate(val)
                     await _send_ss_admin(msg, lang)
                     await cb.answer(i18n.t("settings.saved", lang))
                     return
@@ -1351,6 +1442,11 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
     # consumed by the next plain message or cleared by /cancel.
     pending: dict[tuple, str] = {}
 
+    # #288: per-uid lock serializing idle-rotation so two near-simultaneous DM
+    # messages can't both pass the idle check and each mint a fresh session
+    # (TOCTOU between get_thread and _new_dm_session). One lock per chat uid.
+    rotate_locks: dict[int, asyncio.Lock] = {}
+
     # #235: media-group (album) coalescing buffer, keyed by (chat_id, thread_key,
     # media_group_id). Each value is a dict: {"parts": [(message_id, part)], "caption":
     # str, "msg": Message (representative reply target), "lang": str, "timer": Task,
@@ -1381,7 +1477,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         """The global default per-user session limit: kv `max_sessions_default` (owner-set
         in Admin) else `settings.max_sessions_default`. 0 = unlimited."""
         raw = await db.get_kv("max_sessions_default")
-        default = getattr(settings, "max_sessions_default", 10)
+        default = getattr(settings, "max_sessions_default", 500)  # #268: 10→500
         try:
             return max(0, int(raw)) if raw is not None else default
         except (TypeError, ValueError):
@@ -1433,6 +1529,91 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             name=markup.escape_html(name),
             tagline=mode_tagline(mode, lang=lang),
         )
+
+    async def _evict_oldest_empty(uid: int, exclude: int) -> bool:
+        """#266: free one session slot by archiving the user's OLDEST disposable session —
+        non-current, non-favorite, with ZERO usage (never really used). Returns True if one
+        was archived. Never touches a session that has any usage, so nothing with content is
+        ever auto-deleted (the idle-rotation falls back to an in-place reset instead)."""
+        page, _ = await db.browse_threads(uid, None, limit=100, offset=0)
+        cands = []
+        for r in page:
+            tid = r["thread_id"]
+            if tid == exclude or r.get("favorite"):
+                continue
+            try:
+                tot = await db.get_usage_totals(tid)
+            except Exception:
+                continue
+            if int(tot.get("requests", 0) or 0) == 0:
+                cands.append(r)
+        if not cands:
+            return False
+        victim = min(cands, key=lambda r: r.get("created_at") or 0)
+        vk = victim["thread_id"]
+        vname = victim.get("name")
+        with contextlib.suppress(Exception):
+            await sessions.reset(vk)
+        ok = False
+        with contextlib.suppress(Exception):
+            ok = await db.delete_dm_session(uid, vk)
+        if ok:
+            with contextlib.suppress(Exception):
+                archive.archive_session(settings.base_workdir, db.session_sid(vk),
+                                        owner_id=uid, key=vk, name=vname)
+        return ok
+
+    async def _rotate_if_idle(message: Message) -> tuple[int, bool]:
+        """#266/#271: resolve the current DM session key, starting a NEW session first when
+        the current one has been idle past the configured window. Returns (key, rotated).
+        DM only — supergroup topics are a shared resource and never auto-rotate. The old
+        session stays in /sessions with its history; the fresh one becomes current and (via
+        #260) auto-names itself, inheriting the old session's mode. At the session cap, the
+        oldest disposable empty session is archived to make room; if there's nothing
+        disposable, falls back to an in-place context reset so no session with content is
+        lost. #271: callable from a command entry too (not just a chat turn), so the fresh
+        session shows up the moment the user interacts (e.g. opens /sessions), not only on
+        the next typed message. Rotates AT MOST once per idle gap: the new session has
+        last_active=0, so a follow-up interaction won't rotate again."""
+        key = await _session_key(message)
+        if message.chat.type != "private":
+            return key, False
+        uid = message.chat.id
+        window = await sessions.idle_reset_seconds(uid)
+        if window <= 0:
+            return key, False
+        # #288: serialize the decide-then-rotate on a per-uid lock and re-read the
+        # CURRENT key + its last_active INSIDE the lock — a concurrent message may
+        # have already rotated (so `key` is stale) or refreshed last_active.
+        lock = rotate_locks.setdefault(uid, asyncio.Lock())
+        async with lock:
+            key = await _session_key(message)
+            st = await db.get_thread(key)
+            if st is None or not st.last_active:
+                return key, False  # never finished a turn here → nothing to rotate
+            if (time.time() - float(st.last_active)) < window:
+                return key, False  # still inside the active window → continue this session
+            lang = _lang(message)
+            uname = message.from_user.username if message.from_user else None
+            if await _session_limit_block(uid, uname, lang) is not None:
+                # At the cap: free a slot by archiving an empty session, else reset in place.
+                if not await _evict_oldest_empty(uid, exclude=key):
+                    with contextlib.suppress(Exception):
+                        await sessions.rotate_in_place(key)
+                    return key, False
+            # #274: an auto-started (idle) session is ALWAYS a chat — never code. Code is a
+            # privileged, resource-heavier mode entered only on an explicit user action
+            # (/code or /new code), so an automatic rotation must not silently mint one.
+            # was: _new_dm_session(uid, st.mode, _default_session_name(st.mode, lang))
+            newk = await _new_dm_session(uid, "chat", _default_session_name("chat", lang))
+            return newk, True
+
+    async def _session_key_for_turn(message: Message) -> int:
+        """The session key for a CONVERSATIONAL turn (on_text / attachments). Thin wrapper
+        over _rotate_if_idle that drops the rotated flag (the turn stays silent on idle —
+        the new session is surfaced passively in /sessions, never as a push notice)."""
+        key, _ = await _rotate_if_idle(message)
+        return key
 
     async def _do_new(message: Message, arg: str) -> None:
         # #133: every session is BORN a chat; the type is no longer fixed (/code and
@@ -1609,9 +1790,10 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         lang = _lang(message)
         arg = _command_arg(message)
         if not arg:
-            await reply(message, i18n.t("schedule.usage", lang))
+            # #258: one bubble, not two (usage + prompt were separate reply()s).
             pending[_pkey(message)] = "schedule"
-            await reply(message, i18n.t("schedule.prompt", lang))
+            await reply(message, i18n.t("schedule.usage", lang) + "\n\n"
+                        + i18n.t("schedule.prompt", lang))
             return
         await _do_schedule(message, arg)
 
@@ -1676,21 +1858,27 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         elif verb == "tog":
             now_on = not bool(row["enabled"])
             if now_on:
-                # Resuming: recompute the next run from now so it doesn't fire for every
-                # missed slot while paused.
-                with contextlib.suppress(Exception):
+                # Resuming: recompute the next run from now so it doesn't fire for every missed
+                # slot while paused. #257: only enable if the recompute SUCCEEDS — otherwise the
+                # row would re-enable with a stale (past) next_run and fire immediately on the
+                # next sweep (exactly the missed-slot storm this avoids). A bad spec stays paused.
+                try:
                     spec = json.loads(row["spec"])
                     await db.update_schedule_run(
                         sid, schedules.next_run_after(spec, time.time()),
                         row["last_run"] or 0, row["last_status"] or "")
+                except Exception:
+                    await cb.answer(i18n.t("common.error", lang))
+                    return
             await db.set_schedule_enabled(sid, now_on)
             await cb.answer(i18n.t("schedule.resumed" if now_on else "schedule.paused", lang))
         else:
             await cb.answer()
             return
         text, kb = await _render_schedules(uid, lang)
-        with contextlib.suppress(Exception):
-            await cb.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
+        if cb.message is not None:  # #258: None for an old/inaccessible message
+            with contextlib.suppress(Exception):
+                await cb.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
 
     # --------------------------------------------------------- session browser
     # /sessions: browse + search + (DM) switch to a session. Paginated to respect
@@ -1714,7 +1902,8 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
 
     async def _render_sessions(
         chat_id: int, is_dm: bool, current_key: int, keyword: str | None,
-        offset: int, lang: str = "en",
+        offset: int, lang: str = "en", idle_note: str | None = None,
+        uname: str | None = None,
     ) -> tuple[str, InlineKeyboardMarkup]:
         rows, total = await db.browse_threads(
             chat_id, keyword or None, limit=_SESSIONS_PAGE, offset=offset
@@ -1724,11 +1913,23 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             head += i18n.t("sessions.head_search", lang, kw=markup.escape_html(keyword))
         head += i18n.t("sessions.head_total", lang, total=total)
         lines = [head, ""]
+        # #271: passive notice that this very open auto-started a fresh session after idle
+        # (the new session is `current`). Never a push — only shown here when /sessions is
+        # opened, so it respects the "no spammy auto-notices" rule.
+        if idle_note:
+            lines.append(idle_note)
+            lines.append("")
         kb_rows: list[list[InlineKeyboardButton]] = []
+        # #285: one GROUP BY for the whole page's usage instead of an N+1 per-row query.
+        stats = {}
+        with contextlib.suppress(Exception):
+            stats = await db.get_usage_totals_bulk([r["thread_id"] for r in rows])
         for r in rows:
             name = _session_name(r)
             # #136: no sid shown in the list (was `sid = db.session_sid(...)`).
-            reqs, toks = await _session_stats(r["thread_id"])
+            tot = stats.get(r["thread_id"], {})
+            reqs = int(tot.get("requests", 0) or 0)
+            toks = _fmt_tokens((tot.get("input", 0) or 0) + (tot.get("output", 0) or 0))
             mark = i18n.t("sessions.current_mark", lang) if r["thread_id"] == current_key else ""
             icon = mode_glyph(r["mode"])
             lines.append(i18n.t(
@@ -1771,12 +1972,20 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         if is_dm:
             # New chat / New code right in the browser (next to Search/Close) so a
             # new session is one tap away while reviewing the list (#95).
-            kb_rows.append(
-                [
-                    InlineKeyboardButton(text=i18n.t("btn.new_chat", lang), callback_data="ses:new:chat"),
-                    InlineKeyboardButton(text=i18n.t("btn.new_code", lang), callback_data="ses:new:code"),
-                ]
-            )
+            # #281: only offer "New code" to a user with CODE access (owner or a code
+            # grant) — a chat-only user must not even SEE the option (numeric ids are
+            # authoritative for the level check; chat_id == the DM user's id).
+            # #290: route through _has_code_access with the tapper's username so the hide
+            # check matches the ses:new:code callback gate — a username-only code grant
+            # (id not yet pinned) now sees the button instead of it being hidden.
+            # was: can_code = chat_id == settings.owner_id or allowlist.level_of(chat_id, None) == "code"
+            new_row = [InlineKeyboardButton(text=i18n.t("btn.new_chat", lang),
+                                            callback_data="ses:new:chat")]
+            can_code = _has_code_access(chat_id, uname)
+            if can_code:
+                new_row.append(InlineKeyboardButton(text=i18n.t("btn.new_code", lang),
+                                                    callback_data="ses:new:code"))
+            kb_rows.append(new_row)
         kb_rows.append(
             [
                 InlineKeyboardButton(text=i18n.t("btn.search", lang), callback_data="ses:find"),
@@ -1785,12 +1994,14 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         )
         return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=kb_rows)
 
-    async def _open_sessions(message: Message, keyword: str | None = None) -> None:
+    async def _open_sessions(message: Message, keyword: str | None = None,
+                             idle_note: str | None = None) -> None:
         is_dm = message.chat.type == "private"
         chat_id = message.chat.id
         current = await _session_key(message)
         text, kb = await _render_sessions(
-            chat_id, is_dm, current, keyword, 0, _lang(message)
+            chat_id, is_dm, current, keyword, 0, _lang(message), idle_note=idle_note,
+            uname=(message.from_user.username if message.from_user else None),
         )
         send_kwargs: dict = {}
         if message.message_thread_id:
@@ -1799,6 +2010,18 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         sent = await _send_menu(chat_id, text, kb, **send_kwargs)
         if sent is not None:
             browsers[(chat_id, sent.message_id)] = keyword
+
+    async def _session_switch_line(key: int, lang: str = "en") -> str:
+        """#280: the SINGLE confirmation line shown on switching into a session — just
+        "switched to <glyph> <name>". The mode tagline + sid/model/date/usage meta (the
+        old card's other lines) are dropped here; they live in /status & /settings."""
+        st = await db.get_thread(key)
+        if st is None:
+            return i18n.t("common.switched", lang)
+        name = st.name or ("General" if key == 0 else f"#{abs(key)}")
+        return i18n.t("session.switched_to", lang, glyph=mode_glyph(st.mode),
+                      name=markup.escape_html(name)
+                      + (" [shell]" if getattr(st, "shell_mode", False) else ""))
 
     async def _session_card(key: int, lang: str = "en") -> str:
         st = await db.get_thread(key)
@@ -1933,7 +2156,11 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
     async def cmd_sessions(message: Message) -> None:
         """Browse / search / switch sessions (DM) or topics (supergroup)."""
         await _ensure_state(message)
-        await _open_sessions(message, _command_arg(message) or None)
+        # #271: opening /sessions after the idle window auto-starts a fresh session and
+        # shows it as current (creation happens on interaction, not only on a chat turn).
+        _, rotated = await _rotate_if_idle(message)
+        note = i18n.t("sessions.idle_rotated", _lang(message)) if rotated else None
+        await _open_sessions(message, _command_arg(message) or None, idle_note=note)
 
     @router.callback_query(F.data.startswith("ses:"))
     async def on_sessions_cb(cb: CallbackQuery) -> None:
@@ -2072,7 +2299,8 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                     return
                 await _new_dm_session(uid, mode, _default_session_name(mode, lang))
                 current = await db.get_dm_current(uid)
-                text, kb = await _render_sessions(chat_id, is_dm, current or 0, keyword, 0, lang)
+                text, kb = await _render_sessions(chat_id, is_dm, current or 0, keyword, 0, lang,
+                                                  uname=cb.from_user.username)
                 with contextlib.suppress(Exception):
                     await _edit_menu(msg, text, kb)  # #173: native rich nav-edit
                 await cb.answer(i18n.t("common.created", lang))
@@ -2092,17 +2320,11 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                         await cb.answer(i18n.t("access.code_denied", lang), show_alert=True)
                         return
                     await db.set_dm_current(cb.from_user.id, key)
-                    # Quick actions on the switch card: Recap + Transcript (#95).
-                    # #136: was btn.export — it's the same ses:hist transcript as the
-                    # options menu, so use the same label to avoid two names for one
-                    # thing.
-                    quick = InlineKeyboardMarkup(inline_keyboard=[[
-                        InlineKeyboardButton(text=i18n.t("btn.recap", lang), callback_data=f"ses:recap:{key}"),
-                        InlineKeyboardButton(text=i18n.t("btn.transcript", lang), callback_data=f"ses:hist:{key}"),
-                    ]])
+                    # #280: switching shows ONLY the one-line confirmation — no Recap/
+                    # Transcript quick buttons (they live in the session options menu /
+                    # /settings) and no sid/model/usage meta lines (debug noise).
                     with contextlib.suppress(Exception):
-                        await _send_menu(chat_id, await _session_card(key, lang),  # #173: rich menu open
-                                         quick)
+                        await _send_menu(chat_id, await _session_switch_line(key, lang))
                     # #136: close the now-stale options menu the Switch button came
                     # from so it doesn't linger above the switch card.
                     with contextlib.suppress(Exception):
@@ -2188,7 +2410,8 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                             )
                             await db.set_dm_current(uid, nk)
                 current = await db.get_dm_current(uid)
-                text, kb = await _render_sessions(chat_id, is_dm, current or 0, keyword, 0, lang)
+                text, kb = await _render_sessions(chat_id, is_dm, current or 0, keyword, 0, lang,
+                                                  uname=cb.from_user.username)
                 with contextlib.suppress(Exception):
                     await _edit_menu(msg, text, kb)  # #173: native rich nav-edit
                 await cb.answer(
@@ -2200,7 +2423,8 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 current = (
                     await db.get_dm_current(cb.from_user.id) if is_dm else thread_key(msg)
                 )
-                text, kb = await _render_sessions(chat_id, is_dm, current or 0, keyword, offset, lang)
+                text, kb = await _render_sessions(chat_id, is_dm, current or 0, keyword, offset, lang,
+                                                  uname=cb.from_user.username)
                 with contextlib.suppress(Exception):
                     await _edit_menu(msg, text, kb)  # #173: native rich nav-edit
                 await cb.answer()
@@ -2727,6 +2951,12 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         if state.mode != "code":
             await reply(message, i18n.t("common.code_only", lang))
             return
+        # #283: gate on the USER's level too, not just the session mode (a demoted user may
+        # still own a code session).
+        if not _has_code_access(message.from_user.id if message.from_user else 0,
+                                message.from_user.username if message.from_user else None):
+            await reply(message, i18n.t("access.code_denied", lang))
+            return
         await _do_secret(message, _command_arg(message))
 
     @router.callback_query(F.data == "secret:guide")
@@ -2782,6 +3012,11 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         # instead of storing a silent no-op (owner UX request).
         if state.mode != "code":
             await reply(message, i18n.t("perm.chat_na", lang))
+            return
+        # #283: gate on the caller's level too (demotion gap — see _has_code_access).
+        if not _has_code_access(message.from_user.id if message.from_user else 0,
+                                message.from_user.username if message.from_user else None):
+            await reply(message, i18n.t("access.code_denied", lang))
             return
         arg = _command_arg(message).lower()
 
@@ -2877,10 +3112,42 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         if state.mode != "code":
             await reply(message, i18n.t("shell.code_only", lang))
             return
+        # #283: gate on the caller's level too (demotion gap — see _has_code_access).
+        if not _has_code_access(message.from_user.id if message.from_user else 0,
+                                message.from_user.username if message.from_user else None):
+            await reply(message, i18n.t("access.code_denied", lang))
+            return
         key = await _session_key(message)
         new_on = not bool(state.shell_mode)
+        # #279: capture the live keypad message + paused-input render BEFORE toggling.
+        kb_ref = sessions.shell_kb_ref(key)
+        resume_render = sessions.shell_resume_render(key)
         await sessions.set_shell_mode(key, new_on)
+        if not new_on and kb_ref is not None:
+            # Detach → strip the now-stale keypad from its message (we're back in agent mode).
+            cid, mid = kb_ref
+            with contextlib.suppress(Exception):
+                await bot(EditRichMessage(
+                    chat_id=cid, message_id=mid,
+                    rich_message={"markdown": resume_render or "```\n(shell)\n```"},
+                    reply_markup=None))
+            sessions.set_shell_kb(key, None, None)
         await reply(message, i18n.t("shell.on" if new_on else "shell.off", lang))
+        if new_on and resume_render is not None:
+            # Re-attach with a command still waiting → re-offer the keypad where input paused,
+            # so the user continues instead of restarting the interactive flow (#279). Refresh
+            # first in case the program advanced (printed a new prompt) while detached.
+            live = await sessions.shell_refresh(key, lang)
+            render = live or resume_render
+            send_kwargs = ({"message_thread_id": message.message_thread_id}
+                           if message.message_thread_id else {})
+            with contextlib.suppress(Exception):
+                sent = await bot(SendRichMessage(
+                    chat_id=message.chat.id,
+                    rich_message={"markdown": render},
+                    reply_markup=_sessions.shell_keypad(), **send_kwargs))
+                sessions.set_shell_kb(key, message.chat.id,
+                                      getattr(sent, "message_id", None), render)
 
     @router.message(Command("usage"))
     async def cmd_usage(message: Message) -> None:
@@ -3062,7 +3329,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         # Per-user rolling usage + any caps (#120), so a user can see their own spend.
         if uid is not None:
             try:
-                bd = await db.get_user_usage_breakdown(uid)
+                bd = await db.get_user_breakdown(uid)
                 lines.append(i18n.t("whoami.usage", lang, day=_fmt_tokens(bd["day"]),
                                     week=_fmt_tokens(bd["week"]), total=_fmt_tokens(bd["total"])))
                 rate = allowlist.rate_of(uid, uname)
@@ -3338,24 +3605,58 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             return
         await _do_limit(message, arg)
 
+    def _who_label(fname, uname, fallback: str) -> str:
+        """#272: a user's display label — owner-assigned friendly name (bold) then
+        @username. `fallback` (already HTML-safe) is used only when BOTH are missing
+        (e.g. a pinned entry with no username → its numeric id)."""
+        bits = []
+        if fname:
+            bits.append(f"<b>{markup.escape_html(str(fname))}</b>")
+        if uname:
+            bits.append(f"@{markup.escape_html(str(uname))}")
+        return " ".join(bits) if bits else fallback
+
     async def _users_text(snap: dict, lang: str) -> list[str]:
         """The /users summary lines (owner + each entry/pending), each WITH per-user
         usage (day/week/total) — shown for everyone regardless of whether limits are
         set (owner request). The token column shows the #120 ROLLING caps (day/week)."""
-        async def _usage_line(uid):
-            try:
-                ub = await db.get_user_units_breakdown(uid)  # #165: weighted units
-                return i18n.t("users.entry_usage", lang, day=_fmt_tokens(ub["day"]),
-                              week=_fmt_tokens(ub["week"]), total=_fmt_tokens(ub["total"]))
-            except Exception:
+        # #285: fetch every user's weighted units in ONE GROUP BY (was an N+1 per-user query).
+        # #293: get_all_users_breakdown returns a list; key it by uid for the per-user lookup.
+        units = {}
+        with contextlib.suppress(Exception):
+            units = {r["uid"]: r for r in await db.get_all_users_breakdown("units")}
+
+        def _usage_line(uid):
+            ub = units.get(uid)
+            if not ub:
                 return None
+            return i18n.t("users.entry_usage", lang, day=_fmt_tokens(ub["day"]),
+                          week=_fmt_tokens(ub["week"]), total=_fmt_tokens(ub["total"]))
+
+        def _user_meta(rec) -> str:
+            """#286: build the trailing meta — only show 'exp' when the user is actually
+            time-limited and 'caps' when actually capped (a never-expiring, uncapped user
+            shows neither, instead of noisy 'exp: never · caps: ∞')."""
+            parts = []
+            exp = rec.get("expires_at")
+            if exp:
+                parts.append(i18n.t("users.meta_exp", lang, expiry=markup.escape_html(str(exp))))
+            rate = rec.get("rate") or {}
+            if rate.get("day") is not None or rate.get("week") is not None:
+                parts.append(i18n.t("users.meta_caps", lang, quota=_fmt_caps(rate, lang)))
+            return "".join(parts)
 
         owner_id = snap.get("owner_id")
+        # #272: label = friendly name + @username (id moved to the per-user card). The
+        # owner's name/username live in owner_prefs (the owner has no access entry).
+        oprefs = snap.get("owner_prefs", {})
+        owner_who = _who_label(oprefs.get("friendly_name"), oprefs.get("username"),
+                               i18n.t("users.btn_owner_bare", lang))
         lines = [
             i18n.t("users.header", lang),
-            i18n.t("users.owner_id", lang, id=owner_id),
+            i18n.t("users.owner_id", lang, who=owner_who),
         ]
-        ou = await _usage_line(owner_id)   # owner is uncapped but still worth seeing
+        ou = _usage_line(owner_id)   # owner is uncapped but still worth seeing
         if ou:
             lines.append(ou)
         entries = snap.get("entries", {})
@@ -3363,32 +3664,20 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         if not entries and not pending_u:
             lines.append(i18n.t("users.none_entries", lang))
         for uid, rec in entries.items():
-            uname = rec.get("username")
-            fname = rec.get("friendly_name")  # #171: friendly name BEFORE the @username
-            _bits = []
-            if fname:
-                _bits.append(f"<b>{markup.escape_html(fname)}</b>")
-            if uname:
-                _bits.append(f"@{markup.escape_html(uname)}")
-            uname_s = (" " + " ".join(_bits)) if _bits else ""
-            exp = rec.get("expires_at") or i18n.t("users.never", lang)
-            # was (#105 lifetime grant — replaced by #120 rolling caps):
-            #   grant = rec.get("token_grant")
-            #   if grant is None: quota = i18n.t("users.unlimited", lang)
-            #   else: used = await db.get_user_usage_tokens(uid); quota = f"{used}/{grant}"
-            quota = _fmt_caps(rec.get("rate"), lang)
-            lines.append(i18n.t("users.entry", lang, id=uid, uname=uname_s,
-                                level=rec.get("level", "chat"),
-                                expiry=markup.escape_html(str(exp)), quota=quota))
-            ul = await _usage_line(uid)
+            # #272: name then @username; the id only as a last-resort identifier when a
+            # pinned entry has neither (was: "<code>{id}</code> <b>fname</b> @username").
+            who = _who_label(rec.get("friendly_name"), rec.get("username"),
+                             f"<code>{uid}</code>")
+            # #286: exp/caps shown only when actually set (see _user_meta).
+            lines.append(i18n.t("users.entry", lang, who=who,
+                                level=rec.get("level", "chat"), meta=_user_meta(rec)))
+            ul = _usage_line(uid)
             if ul:
                 lines.append(ul)
         for name, rec in pending_u.items():
-            exp = rec.get("expires_at") or i18n.t("users.never", lang)
-            quota = _fmt_caps(rec.get("rate"), lang)  # was: token_grant (#105 → #120)
-            lines.append(i18n.t("users.pending", lang, name=markup.escape_html(name),
-                                level=rec.get("level", "chat"),
-                                expiry=markup.escape_html(str(exp)), quota=quota))
+            who = _who_label(rec.get("friendly_name"), name, f"@{markup.escape_html(name)}")
+            lines.append(i18n.t("users.pending", lang, who=who,
+                                level=rec.get("level", "chat"), meta=_user_meta(rec)))
             # pending (un-pinned) users have no id yet → no usage to show.
         lines.append("")
         lines.append(i18n.t("users.footnote", lang))
@@ -3404,14 +3693,17 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         owner_id = snap.get("owner_id")
         rows.append([B(text=i18n.t("users.btn_owner", lang), callback_data=f"usr:card:{owner_id}")])
         for uid, rec in snap.get("entries", {}).items():
+            # #284: prefer the owner-assigned friendly name on the button too; fall back to
+            # @username, then the id (plain text — inline button labels aren't HTML).
             uname = rec.get("username")
-            who = f"@{uname}" if uname else str(uid)
+            who = rec.get("friendly_name") or (f"@{uname}" if uname else str(uid))
             rows.append([B(
                 text=i18n.t("users.btn_entry", lang, who=who, level=rec.get("level", "chat")),
                 callback_data=f"usr:card:{uid}")])
         for name, rec in snap.get("pending", {}).items():
+            who = rec.get("friendly_name") or f"@{name}"  # #284
             rows.append([B(
-                text=i18n.t("users.btn_pending", lang, name=name, level=rec.get("level", "chat")),
+                text=i18n.t("users.btn_pending", lang, who=who, level=rec.get("level", "chat")),
                 callback_data=f"usr:card:{name}")])
         rows.append([B(text=i18n.t("users.btn_add", lang), callback_data="usr:add"),
                      B(text=i18n.t("users.btn_stats", lang), callback_data="usr:stats")])
@@ -3421,6 +3713,33 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             B(text=i18n.t("settings.back_to", lang), callback_data="sx:tab:s"),
             B(text=i18n.t("btn.close", lang), callback_data="usr:close"),
         ])
+        return InlineKeyboardMarkup(inline_keyboard=rows)
+
+    # #275: per-user card On/Off + level pickers (with Back) — same "never flip in place"
+    # rule as the /settings hub. `which` ∈ {mem, eff}.
+    _USER_BOOL_OPTS = {
+        "mem": ("usercard.pick_memory", "global_memory"),
+        "eff": ("usercard.pick_maxeffort", "allow_max_effort"),
+    }
+
+    def _user_bool_picker_kb(target: str, which: str, cur: bool, lang: str) -> InlineKeyboardMarkup:
+        B = InlineKeyboardButton
+        rows = [[
+            B(text=("✓ " if cur else "") + i18n.onoff(True, lang),
+              callback_data=f"usr:boptset:{target}:{which}:on"),
+            B(text=("✓ " if not cur else "") + i18n.onoff(False, lang),
+              callback_data=f"usr:boptset:{target}:{which}:off"),
+        ]]
+        rows.append([B(text=i18n.t("usercard.btn_back", lang), callback_data=f"usr:card:{target}")])
+        return InlineKeyboardMarkup(inline_keyboard=rows)
+
+    def _user_level_picker_kb(target: str, cur: str, lang: str) -> InlineKeyboardMarkup:
+        B = InlineKeyboardButton
+        rows = [[
+            B(text=("✓ " if cur == lvl else "") + lvl, callback_data=f"usr:loptset:{target}:{lvl}")
+            for lvl in ("chat", "code")
+        ]]
+        rows.append([B(text=i18n.t("usercard.btn_back", lang), callback_data=f"usr:card:{target}")])
         return InlineKeyboardMarkup(inline_keyboard=rows)
 
     async def _render_user_card(target: str, lang: str):
@@ -3438,11 +3757,11 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         fname = d.get("friendly_name")  # #171: owner-assigned alias
         who = f"{fname} ({base_who})" if fname else base_who
         tid = d.get("id")
-        bd = await db.get_user_usage_breakdown(tid) if tid is not None else \
+        bd = await db.get_user_breakdown(tid) if tid is not None else \
             {"day": 0, "week": 0, "total": 0, "requests": 0}
         # #165: the day/week/total figures on the card are WEIGHTED USAGE UNITS (the
         # same metric the caps enforce); the request count stays from the raw breakdown.
-        ub = await db.get_user_units_breakdown(tid) if tid is not None else \
+        ub = await db.get_user_breakdown(tid, "units") if tid is not None else \
             {"day": 0, "week": 0, "total": 0}
         rate = d.get("rate") or {"day": None, "week": None}
 
@@ -3483,7 +3802,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
 
         rows: list[list[InlineKeyboardButton]] = []
         mem_btn = B(text=i18n.t("usercard.btn_memory", lang, state=i18n.onoff(d.get("global_memory"), lang)),
-                    callback_data=f"usr:mem:{target}")
+                    callback_data=f"usr:bopt:{target}:mem")  # #275: opens On/Off picker
         # #182: per-user idle-TTL — shown on EVERY card, including the owner's own
         # (the owner can set it on themselves to tune/test reaper behaviour).
         idle_btn = B(text=i18n.t("usercard.btn_idle", lang, val=_idle_lbl(idle_raw)),
@@ -3497,23 +3816,26 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             # was: rows.append([mem_btn, idle_btn])
             rows.append([mem_btn,
                          B(text=i18n.t("usercard.btn_maxeffort", lang, state=i18n.onoff(d.get("allow_max_effort"), lang)),
-                           callback_data=f"usr:eff:{target}")])
+                           callback_data=f"usr:bopt:{target}:eff")])  # #275
             rows.append([B(text=i18n.t("usercard.btn_tools", lang, val=_fmt_cap(d.get("tool_cap"), lang)),
                            callback_data=f"usr:tools:{target}"),
                          idle_btn])
             rows.append([B(text=i18n.t("usercard.btn_day", lang), callback_data=f"usr:rday:{target}"),
                          B(text=i18n.t("usercard.btn_week", lang), callback_data=f"usr:rweek:{target}"),
                          ses_btn])
+            # #272: the owner can set their OWN friendly name (stored in owner_prefs) so
+            # the /users list + stats label them by name, not a bare id.
+            rows.append([B(text=i18n.t("usercard.btn_name", lang), callback_data=f"usr:name:{target}")])
             if rate.get("day") is not None or rate.get("week") is not None:
                 rows.append([B(text=i18n.t("usercard.btn_clear_limits", lang), callback_data=f"usr:rclr:{target}")])
         else:
             nxt = "code" if d.get("level") == "chat" else "chat"
             rows.append([B(text=i18n.t("usercard.btn_level", lang, level=d.get("level", "chat"), next=nxt),
-                           callback_data=f"usr:lvl:{target}"),
+                           callback_data=f"usr:lopt:{target}"),  # #275
                          ses_btn])
             rows.append([mem_btn,
                          B(text=i18n.t("usercard.btn_maxeffort", lang, state=i18n.onoff(d.get("allow_max_effort"), lang)),
-                           callback_data=f"usr:eff:{target}")])
+                           callback_data=f"usr:bopt:{target}:eff")])  # #275
             rows.append([B(text=i18n.t("usercard.btn_tools", lang, val=_fmt_cap(d.get("tool_cap"), lang)),
                            callback_data=f"usr:tools:{target}"),
                          B(text=i18n.t("usercard.btn_access", lang), callback_data=f"usr:acc:{target}")])
@@ -3592,12 +3914,56 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         rows.append([B(text=i18n.t("btn.back", lang), callback_data=f"usr:acc:{target}")])
         return InlineKeyboardMarkup(inline_keyboard=rows)
 
+    @router.callback_query(F.data.startswith("req:"))
+    async def on_access_request_cb(cb: CallbackQuery) -> None:
+        """#277: owner taps Allow on an unknown-user access-request notice → grant chat/code
+        access by the user's numeric id (the way to add someone whose id you didn't have)."""
+        lang = _lang(cb)
+        if not (cb.from_user and cb.from_user.id == settings.owner_id):
+            await cb.answer(i18n.t("common.owner_only_access", lang))
+            return
+        parts = (cb.data or "").split(":")
+        verb = parts[1] if len(parts) > 1 else ""
+        if verb in ("al", "ac") and len(parts) > 2:
+            try:
+                tuid = int(parts[2])
+            except (TypeError, ValueError):
+                await cb.answer()
+                return
+            level = "code" if verb == "ac" else "chat"
+            # #290: the notice fires only for currently-unknown users, but the user may have
+            # been granted between the notice and this tap. Don't let a stale Allow silently
+            # re-set an existing user's level (e.g. demote code→chat) — skip and point the
+            # owner to /users for an intentional change.
+            existing = allowlist.level_of(tuid, None)
+            if existing is not None:
+                if cb.message is not None:
+                    with contextlib.suppress(Exception):
+                        await cb.message.edit_text(
+                            i18n.t("access.req_already", lang, id=tuid, level=existing),
+                            parse_mode="HTML")
+                await cb.answer(i18n.t("access.req_already_toast", lang, level=existing))
+                return
+            with contextlib.suppress(Exception):
+                allowlist.add(str(tuid), level)
+            if cb.message is not None:
+                with contextlib.suppress(Exception):
+                    await cb.message.edit_text(
+                        i18n.t("access.req_granted", lang, id=tuid, level=level),
+                        parse_mode="HTML")
+            await cb.answer(i18n.t("access.req_granted_toast", lang, level=level))
+            return
+        await cb.answer()
+
     @router.message(Command("users"))
     async def cmd_users(message: Message) -> None:
         lang = _lang(message)
         if not _is_owner(message):
             await reply(message, i18n.t("common.owner_only_access", lang))
             return
+        if message.from_user:  # #272: learn the owner's @username for their label
+            with contextlib.suppress(Exception):
+                allowlist.note_owner_identity(message.from_user.id, message.from_user.username)
         snap = allowlist.snapshot()
         await _send_menu(  # #173: native rich menu open
             message.chat.id, "\n".join(await _users_text(snap, lang)),
@@ -3613,6 +3979,8 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         if not (cb.from_user and cb.from_user.id == settings.owner_id):
             await cb.answer(i18n.t("common.owner_only_access", lang))
             return
+        with contextlib.suppress(Exception):  # #272: learn the owner's @username
+            allowlist.note_owner_identity(cb.from_user.id, cb.from_user.username)
         try:
             parts = (cb.data or "").split(":", 2)
             verb = parts[1] if len(parts) > 1 else ""
@@ -3743,20 +4111,54 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                         _users_keyboard(snap, lang))
                 await cb.answer(i18n.t("common.deleted", lang))
                 return
-            # In-place toggles (re-render the card afterwards).
-            if verb == "lvl":
-                d = allowlist.describe(target)
-                if d:
-                    allowlist.set_level(target, "code" if d.get("level") == "chat" else "chat")
-            elif verb == "mem":
-                d = allowlist.describe(target)
-                if d:
-                    allowlist.set_global_memory(target, not d.get("global_memory"))
-            elif verb == "eff":
-                d = allowlist.describe(target)
-                if d:
-                    allowlist.set_allow_max_effort(target, not d.get("allow_max_effort"))
-            elif verb == "rclr":
+            # #275: bool/level settings open a PICKER (with Back) instead of flipping in
+            # place — same rule as the /settings hub.
+            if verb == "bopt":
+                tgt, _, which = target.partition(":")
+                if which not in _USER_BOOL_OPTS:
+                    await cb.answer()
+                    return
+                title_key, field = _USER_BOOL_OPTS[which]
+                d = allowlist.describe(tgt) or {}
+                cur = bool(d.get(field))
+                with contextlib.suppress(Exception):
+                    await _edit_menu(msg, i18n.t("settings.v2_pick", lang,
+                                                 name=i18n.t(title_key, lang)),
+                                     _user_bool_picker_kb(tgt, which, cur, lang))
+                await cb.answer()
+                return
+            if verb == "boptset":
+                bits = target.split(":")
+                if len(bits) >= 3 and bits[1] in _USER_BOOL_OPTS:
+                    tgt, which, val = bits[0], bits[1], bits[2] == "on"
+                    if which == "mem":
+                        allowlist.set_global_memory(tgt, val)
+                    else:
+                        allowlist.set_allow_max_effort(tgt, val)
+                    text, kb = await _render_user_card(tgt, lang)
+                    with contextlib.suppress(Exception):
+                        await _edit_menu(msg, text, kb)
+                await cb.answer(i18n.t("settings.saved", lang))
+                return
+            if verb == "lopt":
+                d = allowlist.describe(target) or {}
+                with contextlib.suppress(Exception):
+                    await _edit_menu(msg, i18n.t("settings.v2_pick", lang,
+                                                 name=i18n.t("usercard.pick_level", lang)),
+                                     _user_level_picker_kb(target, d.get("level", "chat"), lang))
+                await cb.answer()
+                return
+            if verb == "loptset":
+                tgt, _, level = target.partition(":")
+                if level in ("chat", "code"):
+                    allowlist.set_level(tgt, level)
+                text, kb = await _render_user_card(tgt, lang)
+                with contextlib.suppress(Exception):
+                    await _edit_menu(msg, text, kb)
+                await cb.answer(i18n.t("settings.saved", lang))
+                return
+            # In-place actions (re-render the card afterwards).
+            if verb == "rclr":
                 allowlist.set_rate(target, day=None, week=None)
             text, kb = await _render_user_card(target, lang)
             with contextlib.suppress(Exception):
@@ -4063,11 +4465,11 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 await reply(message, i18n.t("limits.account_empty", lang))
             return
 
-        # Delegated user → their own trailing-24h / trailing-7d use vs cap. #165: the
+        # Delegated user → their own trailing-5h / trailing-7d use vs cap. #165: the
         # day/week figures and the caps are WEIGHTED USAGE UNITS (cost-aware), while the
         # request count still comes from the raw breakdown.
-        bd = await db.get_user_usage_breakdown(uid)      # for the request count
-        ub = await db.get_user_units_breakdown(uid)      # weighted units (#165)
+        bd = await db.get_user_breakdown(uid)      # for the request count
+        ub = await db.get_user_breakdown(uid, "units")   # weighted units (#165)
         caps = allowlist.rate_of(uid, uname)
 
         def _row(label: str, used: int, cap) -> str:
@@ -4095,26 +4497,38 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
 
     async def _send_userstats(chat_id: int, send_kwargs: dict, lang: str) -> None:
         """#164: build + send the per-user usage dashboard as a NATIVE table (one row
-        per user: trailing-day / week / lifetime tokens, requests, last-seen). Falls
+        per user: trailing-5h / week / lifetime tokens, requests, last-seen). Falls
         back to a monospace grid if sendRichMessage fails. Shared by /userstats and the
         📊 button on the /users page (#172)."""
-        rows = await db.get_all_users_usage()
+        rows = await db.get_all_users_breakdown()   # raw tokens, one row per DM user
         if not rows:
             with contextlib.suppress(Exception):
                 await bot.send_message(chat_id, i18n.t("userstats.empty", lang),
                                        parse_mode="HTML", **send_kwargs)
             return
-        # uid → friendly-name / @username label from the allowlist snapshot.
+        # uid → PLAIN-text label (the table escapes, so no HTML here). #272: show the
+        # friendly name AND @username together (was: fname OR @username), and resolve
+        # the OWNER from owner_prefs (the owner has no access entry → showed only an id).
+        def _plain_who(fname, uname, fallback: str) -> str:
+            bits = []
+            if fname:
+                bits.append(str(fname))
+            if uname:
+                bits.append(f"@{uname}")
+            return " ".join(bits) if bits else fallback
+
         labels: dict[int, str] = {}
         with contextlib.suppress(Exception):
-            for sid, rec in (allowlist.snapshot().get("entries") or {}).items():
+            snap = allowlist.snapshot()
+            for sid, rec in (snap.get("entries") or {}).items():
                 try:
                     luid = int(sid)
                 except (TypeError, ValueError):
                     continue
-                uname = rec.get("username")
-                fname = rec.get("friendly_name")  # #171: prefer the owner's alias
-                labels[luid] = fname or (f"@{uname}" if uname else str(luid))
+                labels[luid] = _plain_who(rec.get("friendly_name"), rec.get("username"), str(luid))
+            oprefs = snap.get("owner_prefs", {})
+            labels[settings.owner_id] = _plain_who(
+                oprefs.get("friendly_name"), oprefs.get("username"), str(settings.owner_id))
         now = time.time()
 
         def _ago(ts: float) -> str:
@@ -4161,6 +4575,9 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         if not _is_owner(message):
             await reply(message, i18n.t("common.owner_only_access", lang))
             return
+        if message.from_user:  # #272: learn the owner's @username for their label
+            with contextlib.suppress(Exception):
+                allowlist.note_owner_identity(message.from_user.id, message.from_user.username)
         send_kwargs: dict = {}
         if message.chat.type != "private" and message.message_thread_id:
             send_kwargs["message_thread_id"] = message.message_thread_id
@@ -4236,7 +4653,18 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         goes through the normal access/quota gate + streaming via _submit."""
         await _ensure_state(message)
         lang = _lang(message)
-        await _submit(message, i18n.t("recap.prompt", lang))
+        # #270: recap the CURRENT session (no idle rotation). If it has no logged turns,
+        # answer helpfully (point at /sessions) instead of running a model turn that would
+        # produce a confused "we've never talked" recap.
+        key = await _session_key(message)
+        try:
+            msgs = await db.get_recent_messages(key, limit=1)
+        except Exception:
+            msgs = []
+        if not msgs:
+            await reply(message, i18n.t("recap.empty_session", lang))
+            return
+        await _submit(message, i18n.t("recap.prompt", lang), key=key)
 
     async def _history_doc(key: int, lang: str):
         """Build a session's transcript as a Markdown document. Returns
@@ -4523,24 +4951,26 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         # session) — mirrors the run-time code-level gate above. Owner is exempt.
         if st is not None and st.effort == "max" and not _may_max_effort(uid, uname):
             await db.set_effort(key, "xhigh")
-        # Rolling-window rate limits (#120 → #165): deny when the user's trailing-24h or
-        # trailing-7d WEIGHTED USAGE UNITS reach their cap. Windows are computed from
-        # usage timestamps, so they free up on their own (no reset job). #165: the cap
-        # now counts cost-weighted units (model weight + cache + output) instead of raw
+        # Rolling-window rate limits (#120 → #165 → #264): deny when the user's trailing
+        # 5h or trailing-7d WEIGHTED USAGE UNITS reach their cap. Windows are computed
+        # from usage timestamps, so they free up on their own (no reset job). #165: the
+        # cap counts cost-weighted units (model weight + cache + output) instead of raw
         # input+output, so a big warm context no longer reads as near-zero spend; caps
-        # are therefore interpreted in units (≈ Sonnet-input-token-equivalents). The
-        # legacy lifetime token_grant (#105) is not enforced — superseded by these.
+        # are therefore interpreted in units (≈ Sonnet-input-token-equivalents). #264: the
+        # short window is 5h (Anthropic's real reset cadence), not 24h, so the owner can
+        # carve the shared subscription fairly. Legacy lifetime token_grant (#105) is not
+        # enforced — superseded by these.
         rate = allowlist.rate_of(uid, uname)
         now = time.time()
         day_cap = rate.get("day")
         if day_cap is not None:
-            used = await db.get_user_usage_units(uid, since=now - 86400)
+            used = await db.get_user_usage_window(uid, since=now - db.SHORT_WINDOW_SEC)  # #264: was 24h
             if used >= day_cap:
                 return i18n.t("access.rate_day_exceeded", lang,
                               used=_fmt_tokens(used), cap=_fmt_tokens(day_cap))
         week_cap = rate.get("week")
         if week_cap is not None:
-            used = await db.get_user_usage_units(uid, since=now - 7 * 86400)
+            used = await db.get_user_usage_window(uid, since=now - db.WEEK_WINDOW_SEC)
             if used >= week_cap:
                 return i18n.t("access.rate_week_exceeded", lang,
                               used=_fmt_tokens(used), cap=_fmt_tokens(week_cap))
@@ -4561,7 +4991,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         if action:
             await _run_pending(action, message, text)
             return
-        key = await _session_key(message)
+        key = await _session_key_for_turn(message)  # #266: may start a fresh session on idle
         uid = message.from_user.id if message.from_user else 0
         uname = message.from_user.username if message.from_user else None
         block = await _access_block(uid, uname, _lang(message), key)
@@ -4593,9 +5023,14 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         except Exception:
             pass
 
-    async def _submit(message: Message, text: str, attachments=None) -> None:
-        """Route a turn (text + optional content blocks) into the thread session."""
-        key = await _session_key(message)
+    async def _submit(message: Message, text: str, attachments=None, key: int | None = None) -> None:
+        """Route a turn (text + optional content blocks) into the thread session.
+
+        #266: a conversational turn resolves the key via _session_key_for_turn (may start a
+        fresh session on idle). A caller that must target the CURRENT session without rotating
+        (e.g. /recap summarizing this session) passes an explicit `key`."""
+        if key is None:
+            key = await _session_key_for_turn(message)
         uid = message.from_user.id if message.from_user else 0
         uname = message.from_user.username if message.from_user else None
         block = await _access_block(uid, uname, _lang(message), key)
@@ -4890,6 +5325,11 @@ def _setting_value_label(setting, value, lang: str) -> str:
 
 def _setting_choice_labels(setting, lang: str) -> list[tuple[str, str]]:
     """[(callback_value, button_label)] for a fixed-choice setting's picker."""
+    if setting.type is bool:
+        # #275: booleans get a 2-option picker (On / Off) like any other setting, so they
+        # open a sub-menu with Back instead of flipping in place. Labels match
+        # _setting_value_label's bool rendering so the picker's ✓ lands on the current value.
+        return [("on", i18n.onoff(True, lang)), ("off", i18n.onoff(False, lang))]
     if setting.key == "model":
         return [(a, a) for a in ("opus", "sonnet", "haiku")]
     if setting.key == "effort":

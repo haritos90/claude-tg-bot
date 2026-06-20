@@ -38,7 +38,9 @@ Anthropic API key, no per-token billing.**
 - **Allowlist access** — only the owner and explicitly allowed users can talk to
   the bot; each allowed user has a **level** (chat or code), an optional
   **expiry**, and optional rolling **token limits** (day/week). The list lives in a
-  gitignored `allowlist.json`.
+  gitignored `allowlist.json`. Don't know someone's numeric id (only their phone or
+  name)? Have them open the bot and send a message — the owner gets a one-tap
+  **access request** with the person's id and an Allow button.
 - **Full owner control from Telegram** — `/settings` is one **scope-tabbed hub**
   (📍 This session · 👤 My defaults · 🌍 Global) for everything, no server access
   needed. Open **👥 Users** and tap a person to set their **access** (chat vs
@@ -54,9 +56,11 @@ Anthropic API key, no per-token billing.**
   **per-user exceptions** on the user card. Effective values are **derived per
   prompt** (session → personal default → global), so a change applies on the next
   message with nothing to migrate.
-- **Approvals & auto mode** — in code mode Bash/Write/Edit pause for an inline
-  **Allow / Deny** tap; `/auto on` (owner) runs everything without asking.
-  `/permissions` switches ask / auto-edits / plan / full-access.
+- **Approvals & auto mode** — code mode defaults to **auto-edits**: file
+  creation/edits and ordinary in-jail commands run without asking, and only risky
+  actions (push/publish, destructive deletes, web fetches) pause for an inline
+  **Allow / Deny** tap (the sandbox is the containment layer). `/auto on` (owner)
+  runs everything; `/permissions` switches auto-edits / plan / full-access.
 - **Ambient usage** — `/usage` and `/status` show your subscription's **5h** and
   **7d** windows as "% left", as a footer or a pinned live message.
 - **Task chaining** — send a follow-up during or right after a run; it queues into
@@ -263,6 +267,7 @@ Tunables (`.env`, all optional — sane defaults derived from the box):
 | `MAX_LIVE_CLIENTS` | from RAM | Max simultaneously-live `claude` subprocesses (idle+busy). |
 | `MAX_CONCURRENT_TURNS` | from RAM/CPU | Max turns generating at once; overflow turns queue with a "server busy" notice. |
 | `IDLE_TTL_SEC` | `900` | Reap a session's subprocess after this many seconds idle. |
+| `SHELL_TTL_SEC` | `86400` | A persistent shell (`/shell`) outlives the subprocess reap and is kept this long (≈24h); it's ~3 MB vs ~500 MB for the client, so it survives a reap and is only torn down on session delete. `0` = until delete. |
 | `MIN_FREE_MB` | `400` | Below this much free RAM, evict idle sessions before starting a turn. |
 | `CRED_BROKER` | `0` | Keep the subscription token OUT of every jail — a host broker injects it (#119b). |
 | `SANDBOX_EGRESS` | `0` | Hard-block jail egress to loopback only; dev hosts via the CONNECT proxy (#119c). |
