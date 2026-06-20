@@ -56,11 +56,16 @@ def test_add_reasoning_accumulates_caps_and_clears_phase():
 
 
 def test_thinking_label_rotates():
-    """#240a: the placeholder gerund advances with elapsed time and wraps."""
-    first = streamer._thinking_label(0.0)
-    second = streamer._thinking_label(streamer._THINKING_ROTATE_SECS + 0.1)
-    assert first == streamer._THINKING_WORDS[0]
-    assert second == streamer._THINKING_WORDS[1]
+    """#240a/#294: the placeholder gerund advances with elapsed time and wraps, and is
+    localized — the rotation list now comes from i18n (stream.thinking_words)."""
+    import i18n
+    words = [w for w in i18n.t("stream.thinking_words", "en").split(",") if w]
+    first = streamer._thinking_label(0.0, "en")
+    second = streamer._thinking_label(streamer._THINKING_ROTATE_SECS + 0.1, "en")
+    assert first == words[0]
+    assert second == words[1]
     # wraps around the list
-    wrap = streamer._thinking_label(streamer._THINKING_ROTATE_SECS * len(streamer._THINKING_WORDS))
-    assert wrap == streamer._THINKING_WORDS[0]
+    wrap = streamer._thinking_label(streamer._THINKING_ROTATE_SECS * len(words), "en")
+    assert wrap == words[0]
+    # localized: the Russian rotation differs from the English one
+    assert streamer._thinking_label(0.0, "ru") != first
