@@ -54,6 +54,11 @@ class _FakeStreamer:
     def set_phase(self, label):
         self.phases.append(label)
 
+    def set_tool_phase(self, tool_name, tool_input):
+        # #294: mirror the real streamer — build the localized label (en in tests).
+        import streamer as _st
+        self.phases.append(_st.tool_phase_label(tool_name, tool_input, "en"))
+
 
 class _FakeSession:
     def __init__(self, events):

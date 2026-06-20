@@ -33,7 +33,7 @@ import token_refresh
 import usage
 import settings_schema
 from engine import ClaudeSession
-from streamer import Streamer, resolve_speed, tool_phase_label
+from streamer import Streamer, resolve_speed  # #294: tool_phase_label now used via streamer.set_tool_phase
 from permissions import PermissionGate
 
 # The Anthropic prompt cache stays warm for ~5 minutes after the last request.
@@ -1203,7 +1203,8 @@ class SessionManager:
                     # DM draft path (a no-op elsewhere).
                     if stream:
                         with contextlib.suppress(Exception):
-                            streamer.set_phase(tool_phase_label(ev.tool_name, ev.tool_input))
+                            # #294: localized to the user's language (streamer owns the lang).
+                            streamer.set_tool_phase(ev.tool_name, ev.tool_input)
                     # #229: live task-list card from the agent's TodoWrite events — a SEPARATE
                     # rich message edited in place (off the draft path). Code-only, opt-in.
                     if rec.mode == "code" and rec.todo_card and ev.tool_name == "TodoWrite":

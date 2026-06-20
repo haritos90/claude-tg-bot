@@ -4497,15 +4497,20 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
 
     async def _send_userstats(chat_id: int, send_kwargs: dict, lang: str) -> None:
         """#164: build + send the per-user usage dashboard as a NATIVE table (one row
-        per user: trailing-5h / week / lifetime tokens, requests, last-seen). Falls
-        back to a monospace grid if sendRichMessage fails. Shared by /userstats and the
-        📊 button on the /users page (#172)."""
-        rows = await db.get_all_users_breakdown()   # raw tokens, one row per DM user
+        per user). #293: shows BOTH metrics in separate columns — raw input+output
+        tokens AND cost-weighted units (the cap basis) — for the trailing 5h / week /
+        lifetime, plus requests and last-seen. Falls back to a monospace grid if
+        sendRichMessage fails. Shared by /userstats and the 📊 button on /users (#172)."""
+        rows = await db.get_all_users_breakdown("raw")   # raw tokens, one row per DM user
         if not rows:
             with contextlib.suppress(Exception):
                 await bot.send_message(chat_id, i18n.t("userstats.empty", lang),
                                        parse_mode="HTML", **send_kwargs)
             return
+        # #293: weighted units for the same users, keyed by uid (units = the cap basis).
+        units_by_uid: dict[int, dict] = {}
+        with contextlib.suppress(Exception):
+            units_by_uid = {u["uid"]: u for u in await db.get_all_users_breakdown("units")}
         # uid → PLAIN-text label (the table escapes, so no HTML here). #272: show the
         # friendly name AND @username together (was: fname OR @username), and resolve
         # the OWNER from owner_prefs (the owner has no access entry → showed only an id).
@@ -4541,9 +4546,12 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 return f"{int(d // 3600)}h"
             return f"{int(d // 86400)}d"
 
+        # #293: tokens and units side by side per window (User | 5h tok | 5h un | …).
         header = [
-            i18n.t("userstats.col_user", lang), i18n.t("userstats.col_day", lang),
-            i18n.t("userstats.col_week", lang), i18n.t("userstats.col_total", lang),
+            i18n.t("userstats.col_user", lang),
+            i18n.t("userstats.col_5h_tok", lang), i18n.t("userstats.col_5h_un", lang),
+            i18n.t("userstats.col_wk_tok", lang), i18n.t("userstats.col_wk_un", lang),
+            i18n.t("userstats.col_tot_tok", lang), i18n.t("userstats.col_tot_un", lang),
             i18n.t("userstats.col_req", lang), i18n.t("userstats.col_last", lang),
         ]
         trows = [header]
@@ -4552,21 +4560,27 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             label = labels.get(uid, str(uid))
             if uid == settings.owner_id:
                 label = f"👑 {label}"
+            un = units_by_uid.get(uid, {})
             trows.append([
-                label, _fmt_tokens(r["day"]), _fmt_tokens(r["week"]),
-                _fmt_tokens(r["total"]), str(r["requests"]), _ago(r["last_ts"]),
+                label,
+                _fmt_tokens(r["day"]), _fmt_tokens(un.get("day", 0)),
+                _fmt_tokens(r["week"]), _fmt_tokens(un.get("week", 0)),
+                _fmt_tokens(r["total"]), _fmt_tokens(un.get("total", 0)),
+                str(r["requests"]), _ago(r["last_ts"]),
             ])
-        aligns = ["left", "right", "right", "right", "right", "right"]
+        aligns = ["left", "right", "right", "right", "right", "right", "right", "right", "right"]
         title = f"<b>👥 {markup.escape_html(i18n.t('userstats.title', lang))}</b>"
-        html = title + markup.table_to_rich_html(trows, aligns)
+        legend = f"<i>{markup.escape_html(i18n.t('userstats.legend', lang))}</i>"
+        html = title + "\n" + legend + markup.table_to_rich_html(trows, aligns)
         try:
             await bot(SendRichMessage(
                 chat_id=chat_id, rich_message={"html": html}, **send_kwargs))
         except Exception:
             esc = [[markup.escape_html(c) for c in row] for row in trows]
             with contextlib.suppress(Exception):
-                await bot.send_message(chat_id, markup._render_table_pre(esc),
-                                       parse_mode="HTML", **send_kwargs)
+                await bot.send_message(
+                    chat_id, legend + "\n" + markup._render_table_pre(esc),
+                    parse_mode="HTML", **send_kwargs)
 
     @router.message(Command("userstats"))
     async def cmd_userstats(message: Message) -> None:

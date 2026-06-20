@@ -1023,6 +1023,17 @@ CATALOG: dict[str, dict[str, str]] = {
     "userstats.col_total": {"en": "Total", "ru": "Всего"},
     "userstats.col_req": {"en": "Req", "ru": "Запр"},
     "userstats.col_last": {"en": "Last", "ru": "Актив."},
+    # #293: the table shows BOTH metrics in separate columns — raw tokens and weighted units.
+    "userstats.col_5h_tok": {"en": "5h tok", "ru": "5ч ток"},
+    "userstats.col_5h_un": {"en": "5h un", "ru": "5ч ед"},
+    "userstats.col_wk_tok": {"en": "Wk tok", "ru": "Нед ток"},
+    "userstats.col_wk_un": {"en": "Wk un", "ru": "Нед ед"},
+    "userstats.col_tot_tok": {"en": "Tot tok", "ru": "Σ ток"},
+    "userstats.col_tot_un": {"en": "Tot un", "ru": "Σ ед"},
+    "userstats.legend": {
+        "en": "tok = tokens · un = cost-weighted units (the cap basis)",
+        "ru": "ток = токены · ед = взвешенные единицы (основа лимитов)",
+    },
     "stream.usage_line": {"en": "📊 {pct}% {kind}", "ru": "📊 {pct}% {kind}"},
     "stream.kind_day": {"en": "of 5h limit", "ru": "5-часового лимита"},
     "stream.kind_week": {"en": "of weekly limit", "ru": "недельного лимита"},
@@ -1321,8 +1332,8 @@ CATALOG: dict[str, dict[str, str]] = {
         "ru": "<i>Нажмите на пользователя: память, лимиты, effort, инструменты, срок доступа и статистика.</i>",
     },
     "users.entry_usage": {
-        "en": "   ↳ used: 5h {day} · week {week} · total {total}",
-        "ru": "   ↳ расход: 5ч {day} · неделя {week} · всего {total}",
+        "en": "   ↳ units: 5h {day} · week {week} · total {total}",
+        "ru": "   ↳ единицы: 5ч {day} · неделя {week} · всего {total}",
     },
     "users.btn_owner": {"en": "👑 You (owner)", "ru": "👑 Вы (владелец)"},
     "users.btn_owner_bare": {"en": "Owner", "ru": "Владелец"},  # #272: owner label fallback
@@ -1347,8 +1358,8 @@ CATALOG: dict[str, dict[str, str]] = {
     "usercard.tools": {"en": "Tools allowed: <b>{tools}</b>", "ru": "Разрешено инструментов: <b>{tools}</b>"},
     "usercard.cap_all": {"en": "all", "ru": "все"},
     "usercard.usage": {
-        "en": "Used: 5h <b>{day}</b> · week <b>{week}</b> · total <b>{total}</b> ({reqs} req)",
-        "ru": "Израсходовано: 5ч <b>{day}</b> · неделя <b>{week}</b> · всего <b>{total}</b> ({reqs} зап.)",
+        "en": "Units: 5h <b>{day}</b> · week <b>{week}</b> · total <b>{total}</b> ({reqs} req)",
+        "ru": "Единицы: 5ч <b>{day}</b> · неделя <b>{week}</b> · всего <b>{total}</b> ({reqs} зап.)",
     },
     "usercard.memory_warn": {
         "en": "<i>⚠️ Global memory loads your ~/.claude for this user — not just CLAUDE.md/memory but your <b>settings</b> (permission allow-rules + env). Grant only to fully-trusted users, and keep secrets / allow-rules out of ~/.claude/settings.json.</i>",
@@ -1433,8 +1444,8 @@ CATALOG: dict[str, dict[str, str]] = {
               "безлимита, или <code>default</code> чтобы наследовать глобальный. /cancel — отмена.",
     },
     "whoami.usage": {
-        "en": "Usage — 5h <b>{day}</b> · week <b>{week}</b> · total <b>{total}</b>",
-        "ru": "Расход — 5ч <b>{day}</b> · неделя <b>{week}</b> · всего <b>{total}</b>",
+        "en": "Tokens — 5h <b>{day}</b> · week <b>{week}</b> · total <b>{total}</b>",
+        "ru": "Токены — 5ч <b>{day}</b> · неделя <b>{week}</b> · всего <b>{total}</b>",
     },
     "whoami.caps": {"en": "Limits: <b>{caps}</b>", "ru": "Лимиты: <b>{caps}</b>"},
 
@@ -1666,6 +1677,28 @@ CATALOG: dict[str, dict[str, str]] = {
     "stopbtn.stopping": {"en": "Stopping…", "ru": "Останавливаю…"},
     "stopbtn.nothing": {"en": "Nothing is running.", "ru": "Ничего не выполняется."},
     "stream.working": {"en": "⏳ <i>Working…</i>", "ru": "⏳ <i>Работаю…</i>"},
+    # #294: localize the animated <tg-thinking> placeholder + tool-phase labels to the
+    # user's language (was English-only). `thinking_words` is a comma-separated rotation
+    # list; the verbs feed tool_phase_label (emoji stays in code, verb is localized).
+    "stream.thinking": {"en": "Thinking", "ru": "Думаю"},
+    "stream.thinking_words": {
+        "en": "Thinking,Pondering,Ruminating,Cogitating,Mulling,Noodling,Percolating,"
+              "Marinating,Deliberating,Contemplating,Brewing,Churning,Synthesizing,"
+              "Reasoning,Considering,Puzzling,Untangling",
+        "ru": "Думаю,Размышляю,Соображаю,Обдумываю,Прикидываю,Анализирую,Рассуждаю,"
+              "Взвешиваю,Кумекаю,Вникаю,Обмозговываю,Осмысляю",
+    },
+    "stream.verb_reading": {"en": "Reading", "ru": "Читаю"},
+    "stream.verb_writing": {"en": "Writing", "ru": "Пишу"},
+    "stream.verb_editing": {"en": "Editing", "ru": "Редактирую"},
+    "stream.verb_searching_code": {"en": "Searching code", "ru": "Ищу в коде"},
+    "stream.verb_finding_files": {"en": "Finding files", "ru": "Ищу файлы"},
+    "stream.verb_listing": {"en": "Listing files", "ru": "Смотрю файлы"},
+    "stream.verb_web_search": {"en": "Searching the web", "ru": "Ищу в вебе"},
+    "stream.verb_web_fetch": {"en": "Reading a page", "ru": "Читаю страницу"},
+    "stream.verb_planning": {"en": "Planning", "ru": "Планирую"},
+    "stream.verb_running": {"en": "Running", "ru": "Выполняю"},
+    "stream.phase_running_any": {"en": "Running a command", "ru": "Выполняю команду"},
     "stream.too_long": {
         "en": "📄 Response too long — sent as a file.",
         "ru": "📄 Ответ слишком длинный — отправлен файлом.",

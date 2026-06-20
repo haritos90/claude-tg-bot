@@ -106,17 +106,19 @@ _DRAFT_CURSOR = ""
 # sendRichMessage — finish() uses {"markdown": full_text}, so it can't leak. Custom emoji
 # from t.me/addemoji/AIActions are optional. (Was: an empty plain draft showing Telegram's
 # own native "Thinking…" — replaced for #239 to follow the documented rich block.)
-_THINKING_HTML = "<tg-thinking>Thinking…</tg-thinking>"
+# #294: localized — `_thinking_placeholder_html(lang)` builds the static placeholder and
+# the rotating gerunds come from i18n (stream.thinking_words). Was an English-only literal:
+#   _THINKING_HTML = "<tg-thinking>Thinking…</tg-thinking>"
 # #240: Claude-Code-style "thinking" gerunds, rotated in the <tg-thinking> block before the
 # first content arrives so the placeholder ANIMATES (instead of a static "Thinking…"). Each
 # is shown for _THINKING_ROTATE_SECS; dedup on the rendered html means ~1 draft update per
 # rotation (flood-safe). Whimsical on purpose — these are the Claude Code spinner words.
-_THINKING_WORDS = (
-    "Thinking", "Pondering", "Ruminating", "Cogitating", "Mulling", "Noodling",
-    "Percolating", "Marinating", "Deliberating", "Contemplating", "Brewing",
-    "Churning", "Synthesizing", "Reasoning", "Considering", "Puzzling", "Untangling",
-)
 _THINKING_ROTATE_SECS = 4.0
+
+
+def _thinking_placeholder_html(lang: str = "en") -> str:
+    """#294: the static <tg-thinking> placeholder in the user's language."""
+    return f"<tg-thinking>{i18n.t('stream.thinking', lang)}…</tg-thinking>"
 # #240c: extended-thinking (reasoning) shown in the <tg-thinking> block. Keep only the
 # tail (the block is a compact live indicator, not a transcript) and retain a little more
 # than is shown so the frontier animates smoothly as deltas arrive.
@@ -124,42 +126,54 @@ _REASONING_MAX = 4000        # cap retained reasoning text
 _REASONING_DRAFT_TAIL = 600  # how much of the tail to show in the block
 
 
-def _thinking_label(elapsed: float) -> str:
-    """#240: pick the gerund for the animated <tg-thinking> placeholder by elapsed time."""
-    return _THINKING_WORDS[int(elapsed // _THINKING_ROTATE_SECS) % len(_THINKING_WORDS)]
+def _thinking_label(elapsed: float, lang: str = "en") -> str:
+    """#240/#294: pick the localized gerund for the animated <tg-thinking> placeholder by
+    elapsed time. The rotation list is the comma-separated `stream.thinking_words` string."""
+    words = [w for w in i18n.t("stream.thinking_words", lang).split(",") if w]
+    if not words:
+        words = ["Thinking"]
+    return words[int(elapsed // _THINKING_ROTATE_SECS) % len(words)]
 
 
 # #240b: map an agent TOOL call to a short live phase shown in the <tg-thinking> block while
 # the tool runs ("what the agent is doing now"). Plain text + a leading unicode emoji (free,
 # renders everywhere — bots can't use premium custom emoji); the caller HTML-escapes it.
+# #294: tool → (emoji, i18n verb key). Emoji stays in code (renders everywhere); the verb
+# is localized so the phase label follows the user's language.
 _TOOL_PHASES = {
-    "Read": ("📖", "Reading"), "Write": ("✏️", "Writing"), "Edit": ("✏️", "Editing"),
-    "MultiEdit": ("✏️", "Editing"), "NotebookEdit": ("✏️", "Editing"),
-    "Grep": ("🔍", "Searching code"), "Glob": ("🔍", "Finding files"),
-    "LS": ("📂", "Listing files"), "WebSearch": ("🌐", "Searching the web"),
-    "WebFetch": ("🌐", "Reading a page"), "TodoWrite": ("🧠", "Planning"),
+    "Read": ("📖", "stream.verb_reading"), "Write": ("✏️", "stream.verb_writing"),
+    "Edit": ("✏️", "stream.verb_editing"), "MultiEdit": ("✏️", "stream.verb_editing"),
+    "NotebookEdit": ("✏️", "stream.verb_editing"),
+    "Grep": ("🔍", "stream.verb_searching_code"), "Glob": ("🔍", "stream.verb_finding_files"),
+    "LS": ("📂", "stream.verb_listing"), "WebSearch": ("🌐", "stream.verb_web_search"),
+    "WebFetch": ("🌐", "stream.verb_web_fetch"), "TodoWrite": ("🧠", "stream.verb_planning"),
 }
 
 
-def tool_phase_label(tool_name: str, tool_input: dict | None) -> str:
-    """#240b: a short 'doing X' phase for a tool call, e.g. '⚙️ Running pytest -q…' /
-    '📖 Reading sessions.py…'. Plain text (HTML-escaped by the streamer before send)."""
+def tool_phase_label(tool_name: str, tool_input: dict | None, lang: str = "en") -> str:
+    """#240b/#294: a short, localized 'doing X' phase for a tool call, e.g.
+    '⚙️ Running pytest -q…' / '📖 Reading sessions.py…'. Plain text (HTML-escaped by the
+    streamer before send); emoji is fixed, the verb comes from i18n in the user's language."""
     inp = tool_input or {}
     if tool_name == "Bash":
         cmd = (inp.get("command") or "").strip().splitlines()[0:1]
         cmd = cmd[0] if cmd else ""
         if len(cmd) > 40:
             cmd = cmd[:39] + "…"
-        return f"⚙️ Running {cmd}…" if cmd else "⚙️ Running a command…"
+        run = i18n.t("stream.verb_running", lang)
+        return f"⚙️ {run} {cmd}…" if cmd else f"⚙️ {i18n.t('stream.phase_running_any', lang)}…"
     if tool_name in ("Read", "Write", "Edit", "MultiEdit", "NotebookEdit"):
         fp = inp.get("file_path") or inp.get("notebook_path") or ""
         base = fp.rsplit("/", 1)[-1]
-        emoji, verb = _TOOL_PHASES[tool_name]
+        emoji, vkey = _TOOL_PHASES[tool_name]
+        verb = i18n.t(vkey, lang)
         return f"{emoji} {verb} {base}…" if base else f"{emoji} {verb}…"
     if tool_name in _TOOL_PHASES:
-        emoji, verb = _TOOL_PHASES[tool_name]
-        return f"{emoji} {verb}…"
-    return f"⚙️ Running {tool_name}…" if tool_name else "💭 Thinking…"
+        emoji, vkey = _TOOL_PHASES[tool_name]
+        return f"{emoji} {i18n.t(vkey, lang)}…"
+    if tool_name:
+        return f"⚙️ {i18n.t('stream.verb_running', lang)} {tool_name}…"
+    return f"💭 {i18n.t('stream.thinking', lang)}…"
 
 # A DM draft can't carry an inline button (send_message_draft has no reply_markup),
 # so the ⏹ Stop affordance lives on a SEPARATE control message. To avoid flicker on
@@ -413,6 +427,12 @@ class Streamer:
         Cleared automatically once real content streams."""
         self._phase = label or None
 
+    def set_tool_phase(self, tool_name: str, tool_input: dict | None) -> None:
+        """#294: set the live tool phase, localized to this chat's language (the streamer
+        owns the language so the caller needn't resolve it). Builds the label via
+        tool_phase_label and stores it like set_phase."""
+        self._phase = tool_phase_label(tool_name, tool_input, i18n.cached_lang(self.chat_id))
+
     def add_reasoning(self, delta: str) -> None:
         """#240c: append a chunk of the model's extended-thinking (reasoning) text. Its tail
         is shown in the <tg-thinking> draft block until real answer content starts (then it
@@ -488,7 +508,8 @@ class Streamer:
             elif self._phase:
                 inner = markup.escape_html(self._phase)
             else:
-                inner = f"💭 {_thinking_label(time.monotonic() - self._start_time)}…"
+                lang = i18n.cached_lang(self.chat_id)   # #294: localized gerund
+                inner = f"💭 {_thinking_label(time.monotonic() - self._start_time, lang)}…"
             html = f"<tg-thinking>{inner}</tg-thinking>"
             # #242: skip only if unchanged AND sent recently; otherwise re-send to keep the
             # ephemeral ~30s draft alive (a static phase during a long tool would else expire).
@@ -704,7 +725,8 @@ class Streamer:
                     await self.bot(
                         SendRichMessageDraft(
                             chat_id=self.chat_id, draft_id=self._draft_id,
-                            rich_message={"html": _THINKING_HTML},
+                            rich_message={"html": _thinking_placeholder_html(
+                                i18n.cached_lang(self.chat_id))},
                         )
                     )
                 except TelegramBadRequest:
@@ -822,7 +844,8 @@ class Streamer:
                 await self.bot(
                     SendRichMessageDraft(
                         chat_id=self.chat_id, draft_id=self._draft_id,
-                        rich_message={"html": _THINKING_HTML},
+                        rich_message={"html": _thinking_placeholder_html(
+                            i18n.cached_lang(self.chat_id))},
                     )
                 )
         else:
