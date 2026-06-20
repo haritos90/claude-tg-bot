@@ -52,6 +52,56 @@ def test_owner_never_stored_and_always_code(tmp_path):
     assert a.token_grant_of(OWNER, None) is None       # uncapped
 
 
+def test_owner_identity_captured_and_friendly_name(tmp_path):
+    """#272: the owner has no access entry, so their @username (auto-captured) and
+    owner-assigned friendly name live in owner_prefs and surface via describe()."""
+    p = tmp_path / "a.json"
+    a = al.Allowlist(p, OWNER)
+    # Initially unknown → describe shows no username/friendly name.
+    d0 = a.describe(str(OWNER))
+    assert d0["kind"] == "owner" and d0["username"] is None and d0["friendly_name"] is None
+    # Capture username (idempotent: a second identical call is a no-op).
+    assert a.note_owner_identity(OWNER, "@AlexK") is True
+    assert a.note_owner_identity(OWNER, "alexk") is False        # unchanged after norm
+    assert a.note_owner_identity(123, "someone") is False        # non-owner ignored
+    # The owner can set their OWN friendly name (no entry needed).
+    assert a.set_friendly_name(str(OWNER), "Alex") is True
+    d = a.describe(str(OWNER))
+    assert d["username"] == "alexk" and d["friendly_name"] == "Alex"
+    # Persisted: a fresh instance reading the same file keeps both.
+    b = al.Allowlist(p, OWNER)
+    db = b.describe(str(OWNER))
+    assert db["username"] == "alexk" and db["friendly_name"] == "Alex"
+    # Clearing the friendly name leaves the username intact.
+    assert b.set_friendly_name(str(OWNER), "off") is True
+    assert b.describe(str(OWNER))["friendly_name"] is None
+    assert b.describe(str(OWNER))["username"] == "alexk"
+
+
+def test_friendly_name_survives_reload_and_other_assignments(tmp_path):
+    """#284 regression: a friendly name set on one user must NOT vanish when another is
+    set or when the allowlist reloads from disk (it was dropped by _norm_record/_pending)."""
+    p = tmp_path / "a.json"
+    a = al.Allowlist(p, OWNER)
+    a.add("111", "chat")
+    a.add("222", "chat")
+    a.add("ghost", "chat")          # pending (username, not yet pinned to an id)
+    assert a.set_friendly_name("111", "Alice") is True
+    assert a.set_friendly_name("222", "Bob") is True          # setting Bob must not wipe Alice
+    assert a.set_friendly_name("ghost", "Ghosty") is True
+    assert a.describe("111")["friendly_name"] == "Alice"
+    assert a.describe("222")["friendly_name"] == "Bob"
+    # A FRESH instance (simulates a reload / restart) must keep all three.
+    b = al.Allowlist(p, OWNER)
+    assert b.describe("111")["friendly_name"] == "Alice"
+    assert b.describe("222")["friendly_name"] == "Bob"
+    assert b.describe("ghost")["friendly_name"] == "Ghosty"
+    # And the snapshot the /users list reads from carries them too.
+    snap = b.snapshot()
+    assert snap["entries"][111]["friendly_name"] == "Alice"
+    assert snap["entries"][222]["friendly_name"] == "Bob"
+
+
 def test_add_level_default_chat(tmp_path):
     a = al.Allowlist(tmp_path / "a.json", OWNER)
     kind, _ = a.add("111")

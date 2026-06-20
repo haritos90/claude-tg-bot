@@ -15,7 +15,7 @@ controls #120/global-memory/max-effort):
   (#120 replaced the lifetime cap with rolling windows).
 - ``rate``          — rolling-window token caps ``{"day": <int|null>, "week":
   <int|null>}`` (``None`` = no cap for that window). Enforced from the trailing
-  24h / 7d of ``db.usage`` (no reset job — computed from timestamps).
+  5h / 7d of ``db.usage`` (no reset job — computed from timestamps).
 - ``global_memory`` — when ``True``, that user's sessions load ``setting_sources=
   ["user"]`` (the owner's ``~/.claude`` settings + ``CLAUDE.md`` / memory) instead
   of ``[]``. This DELIBERATELY relaxes the per-session isolation invariant for the
@@ -178,6 +178,12 @@ class Allowlist:
                 out[str(k)] = s
         return out
 
+    @staticmethod
+    def _norm_friendly(rec: dict) -> Optional[str]:
+        """#284: the owner-assigned friendly name, trimmed/capped (None if unset)."""
+        fname = rec.get("friendly_name")
+        return (str(fname).strip()[:64] or None) if fname else None
+
     def _norm_record(self, rec: Optional[dict]) -> dict:
         rec = rec or {}
         uname = rec.get("username")
@@ -193,6 +199,9 @@ class Allowlist:
             "allow_max_effort": self._norm_bool(rec.get("allow_max_effort")),
             "tool_cap": self._norm_tool_cap(rec.get("tool_cap")),
             "access": self._norm_access(rec.get("access")),
+            # #284: was DROPPED here — so any reload from disk wiped friendly names set
+            # via /users; now preserved through the load/normalize path.
+            "friendly_name": self._norm_friendly(rec),
         }
 
     def _norm_pending(self, rec: Optional[dict]) -> dict:
@@ -207,6 +216,7 @@ class Allowlist:
             "allow_max_effort": self._norm_bool(rec.get("allow_max_effort")),
             "tool_cap": self._norm_tool_cap(rec.get("tool_cap")),
             "access": self._norm_access(rec.get("access")),
+            "friendly_name": self._norm_friendly(rec),  # #284: was dropped on reload
         }
 
     def _norm_owner_prefs(self, rec: Optional[dict]) -> dict:
@@ -216,12 +226,21 @@ class Allowlist:
         # uncapped: no rate caps, max-effort allowed, no tool cap. A missing/legacy
         # owner_prefs (only global_memory) upgrades transparently on load.
         ame = rec.get("allow_max_effort")
+        # #272: the owner has no access ENTRY, so their @username / owner-assigned
+        # friendly name (used to label the owner on /users, the stats table, and the
+        # owner card) live here. username is auto-captured on owner-only screens.
+        uname = rec.get("username")
+        uname = _norm_username(str(uname)) if uname else None
+        fname = rec.get("friendly_name")
+        fname = str(fname).strip()[:64] if fname else None
         return {
             "global_memory": self._norm_bool(rec.get("global_memory")),
             "rate": self._norm_rate(rec.get("rate")),
             "allow_max_effort": True if ame is None else self._norm_bool(ame),
             "tool_cap": self._norm_tool_cap(rec.get("tool_cap")),
             "max_sessions": self._norm_grant(rec.get("max_sessions")),
+            "username": uname or None,
+            "friendly_name": fname or None,
         }
 
     # -- loading / saving ---------------------------------------------------
@@ -533,14 +552,37 @@ class Allowlist:
         """Set/clear an entry's owner-assigned friendly name (#171). A blank/`off`
         name clears it. Returns True if the target exists."""
         self._reload_if_changed()
+        n = (name or "").strip()
+        keep = bool(n) and n.lower() not in ("off", "none", "clear", "-")
+        # #272: the owner has no entry — their friendly name lives in owner_prefs.
+        if self._is_owner_target(target):
+            if keep:
+                self._owner_prefs["friendly_name"] = n[:64]
+            else:
+                self._owner_prefs["friendly_name"] = None
+            self._save()
+            return True
         rec = self._record_for_target(target)
         if rec is None:
             return False
-        n = (name or "").strip()
-        if n and n.lower() not in ("off", "none", "clear", "-"):
+        if keep:
             rec["friendly_name"] = n[:64]
         else:
             rec.pop("friendly_name", None)
+        self._save()
+        return True
+
+    def note_owner_identity(self, uid: int, username: Optional[str]) -> bool:
+        """#272: remember the owner's current @username (the owner is synthesised, never
+        an access entry, so there's nowhere else to learn it). Cheap no-op when unchanged;
+        only persists on an actual change. Returns True if something was saved."""
+        if uid != self.owner_id or not username:
+            return False
+        self._reload_if_changed()
+        norm = _norm_username(str(username))
+        if not norm or self._owner_prefs.get("username") == norm:
+            return False
+        self._owner_prefs["username"] = norm
         self._save()
         return True
 
@@ -725,7 +767,10 @@ class Allowlist:
         is_id = candidate.isascii() and candidate.isdigit()
         if is_id and int(raw) == self.owner_id:
             return {
-                "kind": "owner", "id": self.owner_id, "username": None,
+                # #272: surface the owner's captured username + owner-set friendly name
+                # (were both hardcoded None, so the owner showed only as a bare id).
+                "kind": "owner", "id": self.owner_id,
+                "username": self._owner_prefs.get("username"),
                 "level": "code", "expires_at": None, "token_grant": None,
                 # #185: reflect the owner's self-imposed limits on the card (were
                 # hardcoded uncapped: rate {None,None} / allow_max_effort True / tool_cap None).
@@ -735,7 +780,7 @@ class Allowlist:
                 "tool_cap": self._norm_tool_cap(self._owner_prefs.get("tool_cap")),
                 "max_sessions": self._norm_grant(self._owner_prefs.get("max_sessions")),
                 "access": {},
-                "friendly_name": None,
+                "friendly_name": self._owner_prefs.get("friendly_name"),  # #272
             }
         rec = self._record_for_target(target)
         if rec is None:

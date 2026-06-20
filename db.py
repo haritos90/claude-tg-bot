@@ -47,7 +47,7 @@ class ThreadState:
     cwd: str
     code_session_id: str | None
     name: str | None
-    permission_mode: str = "default"
+    permission_mode: str = "acceptEdits"
     # Resumable chat-mode session id (persisted every chat turn). Resumed on
     # rebuild only when big_memory is on, so important topics survive restarts.
     chat_session_id: str | None = None
@@ -82,6 +82,12 @@ class ThreadState:
     # #229: live task-list card from the agent's TodoWrite events (delegated, code-only,
     # default OFF). See settings_schema + streamer.update_todo_card.
     todo_card: bool = False
+    # #260: True (default) = auto-adopt Claude Code's transcript ai-title as the session
+    # label; a manual /rename pins the name and clears this. See set_session_name.
+    name_auto: bool = True
+    # #261: epoch seconds of the last finished turn (durable last-activity); 0 = never ran.
+    # Drives the idle-rotation-to-fresh-session check on the next message.
+    last_active: float = 0.0
 
 
 def _require_conn() -> aiosqlite.Connection:
@@ -164,6 +170,17 @@ async def init_db(db_path: str) -> None:
         await _conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(thread_id, id)"
         )
+        # #285: the append-only `usage` table had NO index — every usage aggregate
+        # (session stats, /users units, rate-limit window checks) full-scanned it, and it
+        # grows forever. Index by (thread_id, ts) so per-thread + time-window scans are
+        # range scans. Also index threads.chat_id (the per-user filter/join column used by
+        # browse_threads and every per-user usage join).
+        await _conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_usage_thread_ts ON usage(thread_id, ts)"
+        )
+        await _conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_threads_chat ON threads(chat_id)"
+        )
         # #188: recurring scheduled prompts. spec = JSON (schedules.parse_schedule); the
         # runner loop (sessions._schedule_loop) fires due+enabled rows into their session.
         await _conn.execute(
@@ -217,7 +234,7 @@ async def init_db(db_path: str) -> None:
         existing = {col["name"] for col in columns}
         if "permission_mode" not in existing:
             await _conn.execute(
-                "ALTER TABLE threads ADD COLUMN permission_mode TEXT DEFAULT 'default'"
+                "ALTER TABLE threads ADD COLUMN permission_mode TEXT DEFAULT 'acceptEdits'"
             )
         if "chat_session_id" not in existing:
             await _conn.execute("ALTER TABLE threads ADD COLUMN chat_session_id TEXT")
@@ -274,9 +291,23 @@ async def init_db(db_path: str) -> None:
             await _conn.execute(
                 "ALTER TABLE threads ADD COLUMN todo_card INTEGER DEFAULT 0"
             )
+        # #260: auto-naming flag. 1 (default) = adopt Claude Code's own ai-title from
+        # the transcript as the session label; a manual /rename pins the name and
+        # flips this to 0 so the auto-namer stops touching it.
+        if "name_auto" not in existing:
+            await _conn.execute(
+                "ALTER TABLE threads ADD COLUMN name_auto INTEGER DEFAULT 1"
+            )
+        # #261: wall-clock (epoch seconds) of the last finished turn. Read on the next
+        # message to decide an idle-rotation to a fresh session; durable across restart
+        # (unlike the in-memory monotonic last_activity the reaper uses). 0 = never ran.
+        if "last_active" not in existing:
+            await _conn.execute(
+                "ALTER TABLE threads ADD COLUMN last_active REAL DEFAULT 0"
+            )
         # #165: the per-turn MODEL and the live CONTEXT size are needed to compute the
         # weighted "usage units" metric (a cost-aware proxy for the official windows;
-        # see get_user_usage_units). Older rows have NULL model / 0 context — they
+        # see get_user_usage_window). Older rows have NULL model / 0 context — they
         # simply weight as the default-model baseline with no context term.
         cur = await _conn.execute("PRAGMA table_info(usage)")
         ucols = {col["name"] for col in await cur.fetchall()}
@@ -287,6 +318,14 @@ async def init_db(db_path: str) -> None:
             await _conn.execute(
                 "ALTER TABLE usage ADD COLUMN context_tokens INTEGER DEFAULT 0"
             )
+        # #278: the legacy permission_mode 'default' (pre-#212 = prompt for EVERY tool,
+        # incl. file edits) is no longer a selectable mode — the #212 baseline is
+        # 'acceptEdits' (the #119 jail is the containment layer). Migrate stale rows so a
+        # code session auto-accepts file creation/edits instead of prompting.
+        await _conn.execute(
+            "UPDATE threads SET permission_mode = 'acceptEdits' "
+            "WHERE permission_mode = 'default' OR permission_mode IS NULL"
+        )
         await _conn.commit()
 
 
@@ -320,7 +359,7 @@ async def get_thread(thread_id: int) -> ThreadState | None:
     async with _lock:
         cur = await conn.execute(
             "SELECT thread_id, chat_id, mode, model, cwd, code_session_id, name, "
-            "COALESCE(permission_mode, 'default') AS permission_mode, "
+            "COALESCE(permission_mode, 'acceptEdits') AS permission_mode, "
             "chat_session_id, "
             "COALESCE(big_memory, 0) AS big_memory, "
             "COALESCE(created_at, 0) AS created_at, created_by, "
@@ -332,7 +371,9 @@ async def get_thread(thread_id: int) -> ThreadState | None:
             "tools_enabled, "
             "COALESCE(hot_cache_timer, 0) AS hot_cache_timer, "
             "COALESCE(auto_compact, 0) AS auto_compact, "
-            "COALESCE(todo_card, 0) AS todo_card "
+            "COALESCE(todo_card, 0) AS todo_card, "
+            "COALESCE(name_auto, 1) AS name_auto, "
+            "COALESCE(last_active, 0) AS last_active "
             "FROM threads WHERE thread_id = ?",
             (thread_id,),
         )
@@ -365,6 +406,8 @@ async def get_thread(thread_id: int) -> ThreadState | None:
         hot_cache_timer=bool(row["hot_cache_timer"]),
         auto_compact=bool(row["auto_compact"]),
         todo_card=bool(row["todo_card"]),
+        name_auto=bool(row["name_auto"]),
+        last_active=float(row["last_active"] or 0),
     )
 
 
@@ -383,7 +426,7 @@ async def ensure_thread(
             """
             INSERT OR IGNORE INTO threads
                 (thread_id, chat_id, mode, model, cwd, code_session_id, name, permission_mode, chat_session_id, big_memory, created_at)
-            VALUES (?, ?, 'chat', ?, ?, NULL, NULL, 'default', NULL, 0, ?)
+            VALUES (?, ?, 'chat', ?, ?, NULL, NULL, 'acceptEdits', NULL, 0, ?)
             """,
             (thread_id, chat_id, default_model, default_cwd, time.time()),
         )
@@ -437,13 +480,25 @@ async def set_model(thread_id: int, model: str) -> None:
         await conn.commit()
 
 
-async def set_session_name(thread_id: int, name: str) -> None:
-    """Rename a session (the human label shown in /sessions)."""
+async def set_session_name(thread_id: int, name: str, *, manual: bool = True) -> None:
+    """Rename a session (the human label shown in /sessions).
+
+    #260: ``manual=True`` (the /rename path) PINS the name and turns auto-naming OFF
+    (``name_auto = 0``). ``manual=False`` is the auto-namer (Claude Code's transcript
+    ai-title) and only writes WHILE still in auto mode — a no-op once the user has
+    pinned a name, so a manual label is never clobbered."""
     conn = _require_conn()
     async with _lock:
-        await conn.execute(
-            "UPDATE threads SET name = ? WHERE thread_id = ?", (name, thread_id)
-        )
+        if manual:
+            await conn.execute(
+                "UPDATE threads SET name = ?, name_auto = 0 WHERE thread_id = ?",
+                (name, thread_id),
+            )
+        else:
+            await conn.execute(
+                "UPDATE threads SET name = ? WHERE thread_id = ? AND name_auto = 1",
+                (name, thread_id),
+            )
         await conn.commit()
 
 
@@ -452,6 +507,34 @@ async def set_cwd(thread_id: int, cwd: str) -> None:
     async with _lock:
         await conn.execute(
             "UPDATE threads SET cwd = ? WHERE thread_id = ?", (cwd, thread_id)
+        )
+        await conn.commit()
+
+
+async def set_last_active(thread_id: int, ts: float) -> None:
+    """#261: stamp the wall-clock (epoch) time of the last finished turn — read on the
+    next message to decide an idle-rotation. Durable across restart."""
+    conn = _require_conn()
+    async with _lock:
+        await conn.execute(
+            "UPDATE threads SET last_active = ? WHERE thread_id = ?", (ts, thread_id)
+        )
+        await conn.commit()
+
+
+async def rotate_session_for_idle(thread_id: int) -> None:
+    """#261: start a FRESH conversation on the same session after a long idle gap —
+    NULL the code + chat session ids so the next turn runs with no resumed context.
+
+    Unlike reset_thread, this KEEPS the message log (recap/history) and never touches
+    mode/model/cwd or usage; the old transcript stays on disk (resumable). The point is
+    only to stop stale context from being re-ingested, not to wipe the session."""
+    conn = _require_conn()
+    async with _lock:
+        await conn.execute(
+            "UPDATE threads SET code_session_id = NULL, chat_session_id = NULL "
+            "WHERE thread_id = ?",
+            (thread_id,),
         )
         await conn.commit()
 
@@ -577,8 +660,7 @@ async def delete_schedule(schedule_id: int) -> None:
     conn = _require_conn()
     async with _lock:
         await conn.execute("DELETE FROM schedules WHERE id = ?", (schedule_id,))
-        await conn.commit()
-        await conn.commit()
+        await conn.commit()  # #257: dropped a duplicate second commit() here
 
 
 async def set_auto_compact(thread_id: int, on: bool) -> None:
@@ -847,56 +929,47 @@ async def get_usage_totals(thread_id: int) -> dict:
     }
 
 
-async def get_user_usage_tokens(user_id: int, since: float | None = None) -> int:
-    """Total input+output tokens a user has spent across ALL their sessions. With
-    ``since`` (epoch seconds), counts only usage at-or-after that time — the basis
-    for the rolling-window rate limits (#120). A user owns the DM rows whose
-    chat_id == their id, so we sum usage joined on that."""
+async def get_usage_totals_bulk(thread_ids: list[int]) -> dict[int, dict]:
+    """#285: per-thread {input, output, requests} for MANY threads in ONE query — replaces
+    the N+1 `get_usage_totals` loop in the /sessions render (one GROUP BY instead of N
+    full scans). Threads with no usage are absent from the result (caller defaults to 0)."""
+    ids = [int(t) for t in thread_ids]
+    if not ids:
+        return {}
     conn = _require_conn()
-    query = (
-        "SELECT COALESCE(SUM(u.input_tokens + u.output_tokens), 0) AS t "
-        "FROM usage u JOIN threads th ON u.thread_id = th.thread_id "
-        "WHERE th.chat_id = ?"
-    )
-    params: list = [user_id]
-    if since is not None:
-        query += " AND u.ts >= ?"
-        params.append(since)
-    async with _lock:
-        cur = await conn.execute(query, params)
-        row = await cur.fetchone()
-        await cur.close()
-    return int(row["t"] or 0)
-
-
-async def get_user_usage_breakdown(user_id: int) -> dict:
-    """Per-user input+output token usage over the trailing day / week plus the
-    lifetime total and request count (feeds the per-user stats card, #120). Windows
-    are computed from usage.ts, so no reset job is needed."""
-    now = time.time()
-    day_since = now - 86400
-    week_since = now - 7 * 86400
-    conn = _require_conn()
+    placeholders = ",".join("?" * len(ids))
     async with _lock:
         cur = await conn.execute(
-            "SELECT "
-            "COALESCE(SUM(CASE WHEN u.ts >= ? THEN u.input_tokens + u.output_tokens ELSE 0 END), 0) AS day, "
-            "COALESCE(SUM(CASE WHEN u.ts >= ? THEN u.input_tokens + u.output_tokens ELSE 0 END), 0) AS week, "
-            "COALESCE(SUM(u.input_tokens + u.output_tokens), 0) AS total, "
-            "COUNT(*) AS requests "
-            "FROM usage u JOIN threads th ON u.thread_id = th.thread_id "
-            "WHERE th.chat_id = ?",
-            (day_since, week_since, user_id),
+            f"""
+            SELECT thread_id,
+                   COALESCE(SUM(input_tokens), 0)  AS input,
+                   COALESCE(SUM(output_tokens), 0) AS output,
+                   COUNT(*)                        AS requests
+            FROM usage
+            WHERE thread_id IN ({placeholders})
+            GROUP BY thread_id
+            """,
+            ids,
         )
-        row = await cur.fetchone()
+        rows = await cur.fetchall()
         await cur.close()
-    return {
-        "day": int(row["day"] or 0),
-        "week": int(row["week"] or 0),
-        "total": int(row["total"] or 0),
-        "requests": int(row["requests"] or 0),
-    }
+    return {int(r["thread_id"]): {"input": int(r["input"]), "output": int(r["output"]),
+                                  "requests": int(r["requests"])} for r in rows}
 
+
+# #293: get_user_usage_tokens removed — dead since #165 (the raw-token scalar limit
+# basis was superseded by weighted units; see get_user_usage_window(measure="units")).
+
+# #264: per-user rolling-cap windows. The SHORT window now tracks Anthropic's real
+# ~5-hour subscription reset (was a 24h "daily" window — too coarse to distribute the
+# shared budget fairly across users); the long window stays 7 days. The breakdown dict
+# keys are still "day"/"week" for back-compat, but "day" now means the trailing 5 HOURS.
+SHORT_WINDOW_SEC = 5 * 3600    # 5h — Anthropic's short reset window (was 86400 = 24h)
+WEEK_WINDOW_SEC = 7 * 86400    # 7 days — the long window
+
+
+# #293: get_user_usage_breakdown / get_user_units_breakdown consolidated into
+# get_user_breakdown(user_id, measure=...) — see the centralized family below.
 
 # #165: weighted "usage units" — a cost-aware per-turn metric that mirrors how the
 # shared subscription windows actually fill, so a user with a big WARM context (cheap
@@ -932,15 +1005,34 @@ def _units_sql_expr() -> str:
     )
 
 
-async def get_user_usage_units(user_id: int, since: float | None = None) -> int:
-    """Total weighted usage UNITS a user has spent across all their sessions (#165) —
-    the cost-aware basis for the rolling-window caps, replacing the raw input+output
-    sum (which ignored cache tokens and model weight, so a user looked cheap while the
-    owner's window drained). With ``since`` (epoch seconds), counts only at-or-after
-    that time."""
+# #293: centralized usage-aggregation family. The raw-token and weighted-unit reads
+# used to be parallel twin functions doing the same query with a different summed
+# expression; now ONE measure parameter selects the expression and the rest (windows,
+# scope, grouping) is shared. `measure="raw"` = input+output tokens; `measure="units"`
+# = cost-weighted units (#165). Consolidates the former get_user_usage_units,
+# get_user_usage_breakdown, get_user_units_breakdown, get_all_users_units,
+# get_all_users_usage (and the dead get_user_usage_tokens).
+def _usage_measure_expr(measure: str) -> str:
+    """The per-``usage u`` row SQL sum sub-expression for a measure. Numeric weights
+    are trusted module constants (never user input); `measure` is a fixed literal from
+    the call sites, validated here so a typo fails loudly instead of mis-summing."""
+    if measure == "units":
+        return _units_sql_expr()
+    if measure == "raw":
+        return "(COALESCE(u.input_tokens,0) + COALESCE(u.output_tokens,0))"
+    raise ValueError(f"unknown usage measure: {measure!r}")
+
+
+async def get_user_usage_window(user_id: int, since: float | None = None,
+                                measure: str = "units") -> int:
+    """Total usage one user has spent across ALL their sessions, in `measure`
+    (default weighted "units" #165 — the cost-aware basis for the rolling-window caps).
+    With ``since`` (epoch seconds), counts only usage at-or-after that time. A user owns
+    the DM rows whose chat_id == their id, so usage is summed over that join."""
+    expr = _usage_measure_expr(measure)
     conn = _require_conn()
     query = (
-        f"SELECT COALESCE(SUM({_units_sql_expr()}), 0) AS u "
+        f"SELECT COALESCE(SUM({expr}), 0) AS v "
         "FROM usage u JOIN threads th ON u.thread_id = th.thread_id "
         "WHERE th.chat_id = ?"
     )
@@ -952,24 +1044,25 @@ async def get_user_usage_units(user_id: int, since: float | None = None) -> int:
         cur = await conn.execute(query, params)
         row = await cur.fetchone()
         await cur.close()
-    return int(row["u"] or 0)
+    return int(row["v"] or 0)
 
 
-async def get_user_units_breakdown(user_id: int) -> dict:
-    """Weighted usage UNITS over the trailing day / week plus the lifetime total (#165),
-    mirroring get_user_usage_breakdown but in cost-weighted units (feeds the per-user
-    card + /limits)."""
+async def get_user_breakdown(user_id: int, measure: str = "raw") -> dict:
+    """Per-user usage over the trailing 5h / week plus the lifetime total and request
+    count, in `measure` ("raw" tokens or weighted "units" #165). Windows are computed
+    from usage.ts, so no reset job is needed. Feeds the per-user stats card + /limits."""
     now = time.time()
-    day_since = now - 86400
-    week_since = now - 7 * 86400
-    expr = _units_sql_expr()
+    day_since = now - SHORT_WINDOW_SEC   # #264: "day" key = trailing 5h
+    week_since = now - WEEK_WINDOW_SEC
+    expr = _usage_measure_expr(measure)
     conn = _require_conn()
     async with _lock:
         cur = await conn.execute(
             f"SELECT "
             f"COALESCE(SUM(CASE WHEN u.ts >= ? THEN {expr} ELSE 0 END), 0) AS day, "
             f"COALESCE(SUM(CASE WHEN u.ts >= ? THEN {expr} ELSE 0 END), 0) AS week, "
-            f"COALESCE(SUM({expr}), 0) AS total "
+            f"COALESCE(SUM({expr}), 0) AS total, "
+            f"COUNT(*) AS requests "
             "FROM usage u JOIN threads th ON u.thread_id = th.thread_id "
             "WHERE th.chat_id = ?",
             (day_since, week_since, user_id),
@@ -980,29 +1073,29 @@ async def get_user_units_breakdown(user_id: int) -> dict:
         "day": int(row["day"] or 0),
         "week": int(row["week"] or 0),
         "total": int(row["total"] or 0),
+        "requests": int(row["requests"] or 0),
     }
 
 
-async def get_all_users_usage() -> list[dict]:
-    """Per-user token-usage aggregate for the owner stats dashboard (#164):
-    trailing-day / trailing-week / lifetime input+output tokens, request count and
-    last-activity ts — one row per DM user, busiest week first. The handler maps
-    chat_id → username via the allowlist.
-
-    Only DM users (``chat_id > 0`` == the user's Telegram id) count: a group /
-    supergroup chat has a negative ``-100…`` chat_id and is NOT a person, so it is
+async def get_all_users_breakdown(measure: str = "raw") -> list[dict]:
+    """#285: per-user usage aggregate for ALL DM users in ONE GROUP BY — trailing-5h /
+    week / lifetime total in `measure` ("raw" tokens or weighted "units" #165), plus the
+    request count and last-activity ts, busiest week first. Keyed-by-uid dicts are built
+    by the caller when needed. Only DM users (``chat_id > 0`` == the Telegram id) count: a
+    group/supergroup has a negative ``-100…`` chat_id and is NOT a person, so it is
     excluded (it would otherwise show up as a phantom 'user' — #164 follow-up)."""
     now = time.time()
-    day_since = now - 86400
-    week_since = now - 7 * 86400
+    day_since = now - SHORT_WINDOW_SEC
+    week_since = now - WEEK_WINDOW_SEC
+    expr = _usage_measure_expr(measure)
     conn = _require_conn()
     async with _lock:
         cur = await conn.execute(
-            "SELECT th.chat_id AS uid, "
-            "COALESCE(SUM(CASE WHEN u.ts >= ? THEN u.input_tokens + u.output_tokens ELSE 0 END), 0) AS day, "
-            "COALESCE(SUM(CASE WHEN u.ts >= ? THEN u.input_tokens + u.output_tokens ELSE 0 END), 0) AS week, "
-            "COALESCE(SUM(u.input_tokens + u.output_tokens), 0) AS total, "
-            "COUNT(*) AS requests, COALESCE(MAX(u.ts), 0) AS last_ts "
+            f"SELECT th.chat_id AS uid, "
+            f"COALESCE(SUM(CASE WHEN u.ts >= ? THEN {expr} ELSE 0 END), 0) AS day, "
+            f"COALESCE(SUM(CASE WHEN u.ts >= ? THEN {expr} ELSE 0 END), 0) AS week, "
+            f"COALESCE(SUM({expr}), 0) AS total, "
+            f"COUNT(*) AS requests, COALESCE(MAX(u.ts), 0) AS last_ts "
             "FROM usage u JOIN threads th ON u.thread_id = th.thread_id "
             "WHERE th.chat_id > 0 "          # DM users only; groups (chat_id<0) are not people
             "GROUP BY th.chat_id ORDER BY week DESC, total DESC",
@@ -1186,7 +1279,7 @@ async def allocate_dm_session(
             "INSERT INTO threads (thread_id, chat_id, mode, model, cwd, "
             "code_session_id, name, permission_mode, chat_session_id, big_memory, "
             "created_by, created_at) "
-            "VALUES (?, ?, ?, ?, ?, NULL, ?, 'default', NULL, 0, ?, ?)",
+            "VALUES (?, ?, ?, ?, ?, NULL, ?, 'acceptEdits', NULL, 0, ?, ?)",
             (key, user_id, session_mode, default_model, cwd, name, user_id, time.time()),
         )
         await conn.commit()
@@ -1317,6 +1410,9 @@ async def delete_dm_session(user_id: int, key: int) -> bool:
         await conn.execute("DELETE FROM usage WHERE thread_id = ?", (key,))
         await conn.execute("DELETE FROM messages WHERE thread_id = ?", (key,))
         await conn.execute("DELETE FROM session_uid WHERE sid = ?", (session_sid(key),))  # #221
+        # #254: cascade to schedules too — otherwise an orphaned schedule keeps firing and
+        # _fire_schedule → handle_text → ensure_thread silently resurrects the deleted thread.
+        await conn.execute("DELETE FROM schedules WHERE thread_id = ?", (key,))
         await conn.commit()
     return removed > 0
 

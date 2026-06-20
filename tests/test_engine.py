@@ -54,6 +54,37 @@ def test_global_memory_injected_without_widening_setting_sources(monkeypatch, tm
     assert memo in sp.get("append", "")
 
 
+def test_bot_context_note_injected_in_both_modes():
+    """#265: the agent is told it's a Telegram bot (modes, /code, /shell) in chat AND code."""
+    chat = _sess("chat")._build_options()
+    assert engine.BOT_CONTEXT_NOTE in (chat.system_prompt or "")
+    assert "/shell" in chat.system_prompt and "Telegram bot" in chat.system_prompt
+    code = _sess("code")._build_options()
+    append = code.system_prompt.get("append", "")
+    assert engine.BOT_CONTEXT_NOTE in append
+    # #269: outbox + isolation + table notes are consolidated into the one doc.
+    assert "outbox/" in append and "private" in append.lower() and "20 columns" in append
+
+
+def test_session_state_note_mode_and_level_aware():
+    """#276: the dynamic note tells the model the current mode + what the user can do.
+    chat + chat-only level → 'cannot upgrade' (no /code); chat + code level → offer /code;
+    code session → mention /shell + /chat."""
+    chat_only = engine.ClaudeSession(mode="chat", model="claude-opus-4-8", cwd="/tmp",
+                                     user_level="chat")._session_state_note()
+    assert "chat-only" in chat_only.lower() and "owner" in chat_only.lower()
+    assert "/code" in chat_only  # mentioned (as the thing they CAN'T self-do)
+
+    chat_code = engine.ClaudeSession(mode="chat", model="claude-opus-4-8", cwd="/tmp",
+                                     user_level="code")._session_state_note()
+    assert "/code" in chat_code and "/chat" in chat_code
+    assert "chat-only" not in chat_code.lower()
+
+    code = engine.ClaudeSession(mode="code", model="claude-opus-4-8", cwd="/tmp",
+                                user_level="code")._session_state_note()
+    assert "/shell" in code and "/chat" in code
+
+
 def test_no_memory_file_means_no_injection(monkeypatch, tmp_path):
     """On but no ~/.claude/CLAUDE.md → nothing to inject; chat prompt is the plain one."""
     (tmp_path / ".claude").mkdir(parents=True, exist_ok=True)  # dir exists, no CLAUDE.md
@@ -63,8 +94,10 @@ def test_no_memory_file_means_no_injection(monkeypatch, tmp_path):
     assert s._global_memory_block() == ""
     opts = s._build_options()
     assert opts.setting_sources == []
-    # #243: the table-format note is always appended; with no memory file nothing else is.
-    assert opts.system_prompt == engine.CHAT_SYSTEM_PROMPT + engine.TABLE_FORMAT_NOTE
+    # #265/#269: the bot-context doc is always appended; with no memory file nothing else is.
+    # #276: a dynamic "this session right now" note is also appended (mode + level aware).
+    assert opts.system_prompt == (engine.CHAT_SYSTEM_PROMPT + engine.BOT_CONTEXT_NOTE
+                                  + s._session_state_note())
 
 
 # ----------------------------------------------------------- big_memory 1M (#134)

@@ -31,8 +31,14 @@ aligned over time.
 - **One leading emoji, then a space, then the word(s).** Never more than one
   emoji per label. The emoji is the scannable anchor (see §1.3).
 - **Value rows** use the pattern `«<emoji> <Name>: <value> ▸»` — the trailing
-  `▸` signals "opens a sub-menu/picker". A bare toggle shows the current state
-  instead (e.g. `«Big memory: on»`).
+  `▸` signals "opens a sub-menu/picker".
+- **A settings row NEVER changes its value in place — it always opens a picker.**
+  This holds even for a boolean (a 2-option On/Off picker) or a single-option
+  setting: tapping a row shows the choices first, with a **Back** button to leave
+  without changing anything, so the user is never surprised by a silent flip and
+  always sees how many values exist (#275). (A direct typed command like `/shell`
+  or `/auto` still toggles immediately — that is explicit user intent, not a menu
+  tap.)
 - **Localized.** The visible text comes from the locale catalog; the same button
   is `«✏️ Rename»` / `«✏️ Переименовать»`. Slugs and callback tokens stay ASCII.
 
@@ -119,9 +125,10 @@ arguments, and ~90% of use is on a phone. Therefore:
   **prompt and capture the user's *next* message** as the argument, with
   **`/cancel`** to abort. They never fail with a "usage:" error on an empty
   argument.
-- **Fixed-choice input is always a picker, never typed.** Free-text input is
-  always next-message capture. (Typing `«/model opus»` still works as a power-user
-  shortcut, but the menu path never requires it.)
+- **Fixed-choice input is always a picker, never typed** — including booleans,
+  which open a 2-option On/Off picker with Back rather than flipping in place
+  (#275). Free-text input is always next-message capture. (Typing `«/model opus»`
+  still works as a power-user shortcut, but the menu path never requires it.)
 
 ### 1.6 The Telegram command list (the "/" menu)
 

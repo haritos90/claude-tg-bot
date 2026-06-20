@@ -247,7 +247,7 @@ async def main() -> None:
 
     # Allowlist access enforced as an OUTER middleware so unauthorized
     # updates never reach filters or handlers.
-    allowlist_mw = AllowlistMiddleware(allowlist)
+    allowlist_mw = AllowlistMiddleware(allowlist, owner_id=settings.owner_id)  # #277
     dp.message.outer_middleware(allowlist_mw)
     dp.callback_query.outer_middleware(allowlist_mw)
 

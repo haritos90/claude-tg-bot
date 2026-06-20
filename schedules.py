@@ -104,7 +104,13 @@ def parse_schedule(text: str) -> tuple[dict, str]:
 
 
 def next_run_after(spec: dict, after_ts: float) -> float:
-    """The next fire time (epoch seconds, server-local) strictly AFTER ``after_ts``."""
+    """The next fire time (epoch seconds, server-local) strictly AFTER ``after_ts``.
+
+    Daily/weekly preserve the wall-clock time across days (naive ``replace`` + ``timestamp``),
+    so they track the server's local timezone including DST. Caveat (#258): a target time that
+    falls inside a DST transition hour (a non-existent or repeated wall-clock time) resolves to
+    whatever the platform's ``timestamp()`` picks for that hour — acceptable for a best-effort
+    scheduler; the runner's 30s sweep tolerates the at-most-1h skew on those two days a year."""
     kind = spec.get("kind")
     if kind == "interval":
         return after_ts + int(spec["seconds"])

@@ -55,6 +55,42 @@ _OUTBOX_IMG_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
 # (small contexts aren't interesting and the early turns sit well below it).
 _CTX_STATUS_MIN = 50_000
 
+# #260: longest auto-name we adopt (Telegram session-label readability; manual
+# /rename is uncapped — the user owns that).
+_AI_TITLE_MAX = 64
+
+
+def _read_ai_title(cwd: str | None, session_id: str | None) -> str | None:
+    """#260: the auto-title Claude Code writes into the session transcript as
+    ``{"type":"ai-title","aiTitle":…}`` — the same name shown in the browser. Returns
+    the LAST one (it is rewritten as the topic evolves) or None.
+
+    The transcript lives at ``<sid>/state/<encoded-cwd>/<session_id>.jsonl`` where the
+    jail HOME is the sibling ``state`` dir (~/.claude/projects) and encoded-cwd is the
+    cwd with every '/' turned into '-'. Cheap: a line at a time, JSON-parsing only the
+    rare ai-title lines, keeping the last match."""
+    if not cwd or not session_id:
+        return None
+    try:
+        path = Path(cwd).parent / "state" / cwd.replace("/", "-") / f"{session_id}.jsonl"
+        if not path.is_file():
+            return None
+        title = None
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                # Prefilter — skip the JSON parse unless this is an ai-title line.
+                if '"ai-title"' not in line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except ValueError:
+                    continue
+                if obj.get("type") == "ai-title" and obj.get("aiTitle"):
+                    title = str(obj["aiTitle"]).strip()
+        return title[:_AI_TITLE_MAX] if title else None
+    except OSError:
+        return None
+
 
 def _ctx_total(info) -> int:
     """Extract the total-tokens-in-context number from a get_context_usage() result
@@ -130,7 +166,7 @@ _SCHEDULE_INTERVAL = 30.0
 
 # #236: cap on prompts WAITING behind a running turn (per session). A burst of
 # follow-ups past this is rejected so a session can't accumulate an unbounded
-# backlog; the running turn itself does not count. Mirrors cc-connect's default.
+# backlog; the running turn itself does not count. A small, fixed default.
 # handle_text() return codes for the caller's queued/full UX (see #236):
 MAX_QUEUED_MESSAGES = 5
 SUBMIT_STARTED = 0      # ran immediately — the worker was idle
@@ -200,6 +236,22 @@ def shell_keypad(more: bool = False):
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def _normalize_shell_cmd(cmd: str) -> str | None:
+    """#267: phone keyboards auto-capitalize the first word, so a user typing `ls` / `cat x`
+    sends `Ls` / `Cat x` and bash returns "command not found". Return the command with ONLY
+    its first TOKEN (the command name) lowercased, or None if nothing would change. Arguments,
+    paths and filenames are left untouched (they stay case-sensitive). Used as a retry ONLY
+    after the original command returns 127 (not-found), so a real command is never altered and
+    a case-sensitive name can't be confused — nothing ran on a 127."""
+    if not cmd or not cmd[0].isascii() or not cmd[0].isupper():
+        return None
+    parts = cmd.split(None, 1)
+    head = parts[0].lower()
+    if head == parts[0]:
+        return None
+    return head + (" " + parts[1] if len(parts) > 1 else "")
+
+
 def _shell_input_keys(text: str) -> bytes | None:
     """#227b: parse a key-token message into raw bytes, or None if it isn't all key tokens."""
     toks = text.split()
@@ -265,9 +317,19 @@ class _ThreadRecord:
     # #229: live task-list card toggle (code-only). Re-synced from the effective settings
     # on every _ensure (no rebuild needed — it's a display option). Default OFF.
     todo_card: bool = False
+    # #260: current session label + whether auto-naming is still on. Mirror the persisted
+    # ThreadState (re-synced every _ensure); the turn-end auto-namer compares against name
+    # to write only on change and skips entirely once name_auto is cleared by /rename.
+    name: str | None = None
+    name_auto: bool = True
     # #227b: True when the persistent shell paused for interactive input — the NEXT message
     # is forwarded to the running program instead of being run as a new command.
     shell_awaiting: bool = False
+    # #279: the message currently bearing the inline keypad + its rendered body, so /shell
+    # OFF can strip the now-stale keypad and /shell ON can restore it where input paused.
+    shell_kb_chat: int | None = None
+    shell_kb_msg: int | None = None
+    shell_last_render: str | None = None
     # Most recent (text, attachments) submitted for this thread (used by /retry).
     last_prompt: tuple | None = None
     # #167/#168: effective forced-on toggles the live session was built for, plus the
@@ -279,6 +341,14 @@ class _ThreadRecord:
     # the next turn resets the window).
     hot_cache_msg_id: int | None = None
     hot_cache_task: asyncio.Task | None = None
+
+
+def _coerce_perm(mode: str | None) -> str:
+    """#278: resolve a session's permission mode to a current value. The legacy/unset
+    "default" (pre-#212 = prompt for EVERY tool, incl. file edits) is no longer a
+    selectable mode, so it maps to the #212 "acceptEdits" baseline (file edits + ordinary
+    in-jail Bash auto-run; the #119 jail is the containment). Other modes pass through."""
+    return "acceptEdits" if (not mode or mode == "default") else mode
 
 
 def _send_thread_id(thread_id: int) -> int | None:
@@ -344,7 +414,14 @@ class SessionManager:
         # was `..., 900) or 900` — aligned to the 6-min config default so 6 min is the
         # single default everywhere (this fallback only bites a settings stub lacking the attr).
         self._idle_ttl: float = float(getattr(settings, "idle_ttl_sec", 360) or 360)
+        # #261: idle → fresh-session window (seconds); 0 = off. Per-user override → idle_reset_min.
+        self._idle_reset: float = float(getattr(settings, "idle_reset_sec", 1800) or 0)
         self._min_free_mb: int = int(getattr(settings, "min_free_mb", 400) or 400)
+        # #274: persistent shells preserved across a client reap, keyed by thread_id →
+        # (shell, monotonic_stash_ts). Reaped on their own (much longer) shell TTL, on
+        # session reset/delete, or at shutdown. 0 = keep until delete.
+        self._detached_shells: dict[int, tuple] = {}
+        self._shell_ttl: float = float(getattr(settings, "shell_ttl_sec", 86400) or 0)
         self._turn_sem: asyncio.Semaphore = asyncio.Semaphore(
             int(getattr(settings, "max_concurrent_turns", 4) or 4)
         )
@@ -438,12 +515,54 @@ class SessionManager:
             return float(self._idle_ttl)
         return 0.0 if minutes <= 0 else float(minutes * 60)
 
+    async def idle_reset_seconds(self, owner_uid: int | None) -> float:
+        """#261/#266: the idle→new-session window (seconds) for a session OWNER. Reads the
+        per-uid KV ``idle_reset_min`` (minutes): None → the global default (admin-set, kv
+        ``idle_reset_sec``, mirrored on ``self._idle_reset``); ≤0 → never rotate; N → N*60.
+        The handler reads this to decide whether the next message starts a new session."""
+        raw = None
+        if owner_uid is not None:
+            with contextlib.suppress(Exception):
+                raw = await db.get_user_default(owner_uid, "idle_reset_min")
+        if raw is None:
+            return float(self._idle_reset)
+        try:
+            minutes = int(raw)
+        except (TypeError, ValueError):
+            return float(self._idle_reset)
+        return 0.0 if minutes <= 0 else float(minutes * 60)
+
+    async def rotate_in_place(self, thread_id: int) -> None:
+        """#266 fallback: clear a session's conversation context WITHOUT creating a new
+        entry — NULL the resume ids (keeping the workdir, transcript, and message log) and
+        drop the live client so the next message rebuilds fresh. Used only when an idle
+        rotation can't mint a new session (the user is at their session cap with nothing
+        disposable to evict), so we never silently delete a session that has content."""
+        with contextlib.suppress(Exception):
+            await db.rotate_session_for_idle(thread_id)
+        rec = self._records.get(thread_id)
+        if rec is not None and rec.session is not None:
+            async with rec.lock:
+                if rec.session is not None:
+                    old = rec.session
+                    rec.session = None
+                    # #289: preserve a live jailed shell across the in-place rotation too
+                    # (same as the reaper path) — a running command + cd/env survive the
+                    # context reset and re-attach on the next rebuild. was: aclose() only,
+                    # which killed the shell on rotate-in-place.
+                    if getattr(old, "has_live_shell", None) and old.has_live_shell():
+                        sh = old.detach_shell()
+                        if sh is not None:
+                            self._detached_shells[thread_id] = (sh, time.monotonic())
+                    with contextlib.suppress(Exception):
+                        await old.aclose()
+
     def _raw_settings(self, state: db.ThreadState) -> dict:
         """The stored per-session values, used as the fallback when no allowlist is
         wired (e.g. unit tests) — keeps behaviour identical to reading ``state``."""
         return {
             "model": state.model, "effort": state.effort,
-            "permission_mode": state.permission_mode,
+            "permission_mode": _coerce_perm(state.permission_mode),  # #278
             "max_turns": state.max_turns, "big_memory": state.big_memory,
         }
 
@@ -490,7 +609,10 @@ class SessionManager:
             "model": eff("model") or self.settings.default_model,
             "effort": eff("effort"),
             # was `or "default"` — #212 new baseline (jail-backed); see settings_schema.
-            "permission_mode": eff("permission_mode") or "acceptEdits",
+            # #278: a stored legacy "default" (pre-#212 ask-for-EVERY-tool) is no longer a
+            # selectable mode → coerce it to the acceptEdits baseline so file edits/creation
+            # auto-run without a prompt (belt-and-suspenders alongside the db.py migration).
+            "permission_mode": _coerce_perm(eff("permission_mode")),
             "max_turns": eff("max_turns"),
             "big_memory": bool(eff("memory")),
             # #167/#168: forced-on (default True) unless the owner delegated a disable.
@@ -510,6 +632,18 @@ class SessionManager:
             # which is acceptEdits since #212 (was "default") — same as a fresh user.
             out["permission_mode"] = "acceptEdits"
         return out
+
+    def _owner_level(self, state: db.ThreadState) -> str:
+        """#276: the session owner's access level — "code" (owner, or a code-grant user)
+        or "chat". Used to tell the model whether the user can self-upgrade via /code."""
+        owner_uid = state.created_by if state.created_by else state.chat_id
+        if owner_uid is not None and owner_uid == getattr(self.settings, "owner_id", None):
+            return "code"
+        if self.allowlist is not None:
+            with contextlib.suppress(Exception):
+                if self.allowlist.level_of(owner_uid, None) == "code":
+                    return "code"
+        return "chat"
 
     def _build_session(self, state: db.ThreadState, eff: dict | None = None) -> ClaudeSession:
         """Construct a fresh ClaudeSession for a thread from its stored state, using
@@ -585,6 +719,7 @@ class SessionManager:
             uid_range=getattr(self.settings, "sandbox_uid_range", 60000),
             extra_blocked_keywords=getattr(self.settings, "extra_blocked_keywords", None),
             auto_compact=eff.get("auto_compact", True),  # #168
+            user_level=self._owner_level(state),  # #276: drives the "this session" prompt note
         )
 
     async def _get_session(
@@ -605,6 +740,8 @@ class SessionManager:
         eff = await self._effective_settings(state)
         rec.idle_ttl = await self._resolve_idle_ttl(state)  # #182: per-user idle-TTL
         rec.todo_card = bool(eff.get("todo_card", False))   # #229: display toggle, no rebuild
+        rec.name = state.name                                # #260: for the auto-namer
+        rec.name_auto = state.name_auto                      # #260: stop once /rename pins
         needs_rebuild = (
             rec.session is None
             or rec.mode != state.mode
@@ -633,12 +770,23 @@ class SessionManager:
             busy = worker is not None and not worker.done()
             if busy and rec.session is not None:
                 return rec.session
+            # #274: keep a live persistent shell alive across this rebuild too (config
+            # drift, e.g. a model change, otherwise killed it via aclose).
+            pending_shell = None
             if rec.session is not None:
                 old = rec.session
                 rec.session = None
+                if getattr(old, "has_live_shell", None) and old.has_live_shell():
+                    pending_shell = old.detach_shell()
                 with contextlib.suppress(Exception):
                     await old.aclose()
             rec.session = self._build_session(state, eff)
+            # Re-attach a shell preserved from this rebuild OR stashed earlier by the reaper.
+            # #289: this carries the live shell even across a code→chat mode switch. That is
+            # DELIBERATE — a chat session never drives or closes the shell, but keeping it
+            # preserves the user's cd/env + any running command for a switch back to code,
+            # and it is still reaped on aclose / shell TTL / session delete (no leak).
+            self._reattach_shell(rec.session, state.thread_id, pending_shell)
             rec.mode = state.mode
             rec.model = eff["model"]
             rec.cwd = state.cwd
@@ -710,6 +858,9 @@ class SessionManager:
                 busy = rec.worker is not None and not rec.worker.done()
                 if busy and rec.queue.qsize() >= MAX_QUEUED_MESSAGES:
                     return SUBMIT_QUEUE_FULL
+                # #266: idle handling moved UP to the handler (_session_key_for_turn),
+                # which starts a brand-new session on a long idle gap instead of resetting
+                # this one in place — so the old conversation is preserved in /sessions.
                 # Build/refresh the session up front so config changes apply before
                 # the prompt is enqueued and consumed by the worker.
                 await self._get_session(rec, state)
@@ -875,6 +1026,11 @@ class SessionManager:
             else:
                 # #227a: persistent shell (cd/env persist across messages).
                 rc, out, status = await session.shell_run(cmd)
+                # #267: auto-capitalized command (phone keyboard) → 127. Retry lowercased.
+                if rc == 127:
+                    alt = _normalize_shell_cmd(cmd)
+                    if alt:
+                        rc, out, status = await session.shell_run(alt)
         except Exception:
             # Persistent shell unavailable (spawn/PTY error) → fall back to the #224 one-shot.
             rec.shell_awaiting = False
@@ -888,6 +1044,11 @@ class SessionManager:
                 return
             try:
                 rc, out = await session.run_shell(cmd)
+                # #267: auto-capitalized command (phone keyboard) → 127. Retry lowercased.
+                if rc == 127:
+                    alt = _normalize_shell_cmd(cmd)
+                    if alt:
+                        rc, out = await session.run_shell(alt)
             except Exception as exc:  # never let a shell failure kill the worker
                 rc, out = (-1, f"shell error: {exc}")
         rec.shell_awaiting = (status == "awaiting")  # #227b: next message → forwarded as input
@@ -895,6 +1056,13 @@ class SessionManager:
         kb = shell_keypad() if rec.shell_awaiting else None  # #227b: inline key keypad
         with contextlib.suppress(Exception):
             await streamer.finish(rendered, notify=True, reply_markup=kb)
+        # #279: remember the live keypad message (to strip on detach / restore on re-attach).
+        if rec.shell_awaiting:
+            rec.shell_kb_chat = streamer.chat_id
+            rec.shell_kb_msg = streamer.message_id
+            rec.shell_last_render = rendered
+        else:
+            rec.shell_kb_chat = rec.shell_kb_msg = rec.shell_last_render = None
 
     @staticmethod
     def _render_shell(out: str, rc, status: str, lang: str) -> str:
@@ -1005,19 +1173,35 @@ class SessionManager:
                     # starts. Only meaningful on the DM draft path (the streamer no-ops it
                     # otherwise). Cheap/sync — the draft loop renders it on its next tick.
                     if stream:
-                        streamer.add_reasoning(ev.text)
-                elif kind == "tool":
-                    # Code mode: commit the text produced before this tool as its
-                    # own message so each burst is visible, then stream the next
-                    # burst fresh. (Chat mode has no tools, so this never fires.)
-                    if stream and rec.mode == "code":
+                        # #259: think-AFTER-write. If the model already produced answer text and
+                        # now reasons again (interleaved thinking, no tool in between), finalize
+                        # that text as its own bubble and open a fresh one — _begin_next_segment
+                        # re-shows the <tg-thinking> placeholder, so the new reasoning is visible
+                        # (a non-empty body would otherwise keep _reasoning cleared every frame).
+                        # The empty-running_text guard fires only on the FIRST delta after text.
                         if running_text.strip():
                             with contextlib.suppress(Exception):
                                 await streamer.segment_break()
                             running_text = ""
                             segmented = True
-                        # #240b: show the live tool phase in the <tg-thinking> block while
-                        # the tool runs ("⚙️ Running pytest…", "📖 Reading sessions.py…").
+                        streamer.add_reasoning(ev.text)
+                elif kind == "tool":
+                    # Code mode: commit the text produced before this tool as its
+                    # own message so each burst is visible, then stream the next
+                    # burst fresh. (Chat is web-only — no bubble split there.)
+                    # was: the whole phase block was code-only (#240b) — chat showed a
+                    # generic "thinking" with no hint a web search was running (#262).
+                    if stream and rec.mode == "code" and running_text.strip():
+                        with contextlib.suppress(Exception):
+                            await streamer.segment_break()
+                        running_text = ""
+                        segmented = True
+                    # #240b/#262: show the live tool phase in the <tg-thinking> block for
+                    # ALL modes — "🌐 Searching the web…" / "📖 Reading a page…" in chat,
+                    # "⚙️ Running pytest…" / "📖 Reading sessions.py…" in code — so the user
+                    # sees WHICH tool is working, not a bare "thinking". Renders only on the
+                    # DM draft path (a no-op elsewhere).
+                    if stream:
                         with contextlib.suppress(Exception):
                             streamer.set_phase(tool_phase_label(ev.tool_name, ev.tool_input))
                     # #229: live task-list card from the agent's TodoWrite events — a SEPARATE
@@ -1108,6 +1292,10 @@ class SessionManager:
                             model=getattr(rec, "model", None),
                             context_tokens=int(getattr(rec, "last_context_tokens", 0) or 0),
                         )
+                    # #261: stamp durable last-activity (wall clock) so the next message
+                    # can detect a long idle gap and rotate to a fresh session.
+                    with contextlib.suppress(Exception):
+                        await db.set_last_active(thread_id, time.time())
                     if ev.session_id:
                         if rec.mode == "code":
                             with contextlib.suppress(Exception):
@@ -1118,6 +1306,22 @@ class SessionManager:
                             # / stop). big_memory only toggles the 1M window now.
                             with contextlib.suppress(Exception):
                                 await db.set_chat_session(thread_id, ev.session_id)
+                        # #260: adopt Claude Code's own auto-title (the name shown in
+                        # the browser) as our session label — until the user pins one
+                        # with /rename (manual=False is a no-op once name_auto is 0).
+                        # Only when it actually changed, to avoid a write every turn.
+                        if getattr(rec, "name_auto", True):
+                            with contextlib.suppress(Exception):
+                                # #285: the transcript JSONL grows unbounded; scan it off the
+                                # event loop so a long session's turn-end doesn't stall others.
+                                title = await asyncio.to_thread(
+                                    _read_ai_title, getattr(rec, "cwd", None), ev.session_id
+                                )
+                                if title and title != getattr(rec, "name", None):
+                                    await db.set_session_name(
+                                        thread_id, title, manual=False
+                                    )
+                                    rec.name = title
                         # One-shot fork done: the branched id is now persisted, so
                         # clear the flag — subsequent turns continue this branch (#23).
                         if rec.fork:
@@ -1257,6 +1461,9 @@ class SessionManager:
                         await old.aclose()
                 self._records.pop(thread_id, None)
 
+        # #274: a hard reset/delete tears the shell down for good (unlike the idle reaper,
+        # which preserves it) — close any reaper-stashed shell for this thread too.
+        await self._drop_detached_shell(thread_id)
         with contextlib.suppress(Exception):
             await db.reset_thread(thread_id)
 
@@ -1446,6 +1653,59 @@ class SessionManager:
         with contextlib.suppress(Exception):
             await db.set_shell_mode(thread_id, on)
 
+    def shell_kb_ref(self, thread_id: int) -> tuple[int, int] | None:
+        """#279: (chat_id, message_id) of the message currently bearing the shell keypad,
+        or None. Used by /shell OFF to strip the now-stale keypad from it."""
+        rec = self._records.get(thread_id)
+        if rec is None or not rec.shell_kb_chat or not rec.shell_kb_msg:
+            return None
+        return (rec.shell_kb_chat, rec.shell_kb_msg)
+
+    def shell_resume_render(self, thread_id: int) -> str | None:
+        """#279: the last awaiting-input render (the prompt screen) IF the shell is still
+        paused for input, else None — so /shell ON can restore the keypad where it paused."""
+        rec = self._records.get(thread_id)
+        if rec is None or not rec.shell_awaiting:
+            return None
+        return rec.shell_last_render
+
+    async def shell_refresh(self, thread_id: int, lang: str = "en") -> str | None:
+        """#279: on /shell re-attach, surface any output the program printed WHILE DETACHED
+        (it may have advanced past the prompt we stored). Drains the shell's pending output
+        without sending input; if there's something new, re-renders + stores it. Returns the
+        live render, or None to fall back to the stored resume render."""
+        rec = self._records.get(thread_id)
+        if rec is None:
+            return None
+        # #289: hold rec.lock across the snapshot read + peek so a concurrent rebuild can't
+        # swap rec.session under us between the guard and the await (was an unlocked read).
+        async with rec.lock:
+            if rec.session is None or not rec.shell_awaiting:
+                return None
+            try:
+                rc, out, status = await rec.session.shell_peek()
+            except Exception:
+                return None
+            if out and out.strip():
+                rendered = self._render_shell(out, rc, "awaiting", lang)
+                rec.shell_last_render = rendered
+                return rendered
+        return None
+
+    def set_shell_kb(self, thread_id: int, chat: int | None, msg: int | None,
+                     render: str | None = None) -> None:
+        """#279: point the keypad tracker at a message (chat, msg) — pass None,None to forget
+        the message REF (e.g. on detach, after stripping its keypad) while KEEPING the paused
+        render + awaiting flag so /shell ON can restore. `render` updates the stored body only
+        when given (never cleared here — the restore gate is `shell_awaiting`)."""
+        rec = self._records.get(thread_id)
+        if rec is None:
+            return
+        rec.shell_kb_chat = chat
+        rec.shell_kb_msg = msg
+        if render is not None:
+            rec.shell_last_render = render
+
     # ------------------------------------------------------------------ usage
 
     async def load_persisted(self) -> None:
@@ -1474,6 +1734,14 @@ class SessionManager:
             raw = await db.get_kv("working_plate")
             if raw is not None:
                 self.working_plate = str(raw).lower() not in ("0", "off", "false", "")
+
+        # #261: global idle→fresh-session window (seconds). Owner-set in Admin (runtime),
+        # falling back to the .env/config default. 0 = off. Per-user idle_reset_min still
+        # overrides this for a given owner (see idle_reset_seconds).
+        with contextlib.suppress(Exception):
+            raw = await db.get_kv("idle_reset_sec")
+            if raw is not None:
+                self._idle_reset = max(0.0, float(int(raw)))
 
         # Main chat id.
         with contextlib.suppress(Exception):
@@ -1527,6 +1795,13 @@ class SessionManager:
         self.working_plate = bool(on)
         await db.set_kv("working_plate", "1" if on else "0")
 
+    async def set_idle_reset_sec(self, sec: int) -> None:
+        """#261: set + persist the GLOBAL idle→fresh-session window (seconds; 0 = off).
+        Owner-set in Admin; takes effect on the next message (no restart). A per-user
+        idle_reset_min still overrides it for that owner."""
+        self._idle_reset = max(0.0, float(sec))
+        await db.set_kv("idle_reset_sec", str(int(self._idle_reset)))
+
     def usage_footer(self, lang: str = "en", chat_id: int | None = None) -> str:
         """Footer line appended to a finished reply when footer display is on.
 
@@ -1579,7 +1854,7 @@ class SessionManager:
                 caps = self.allowlist.rate_of(chat_id, None)
                 day_cap, week_cap = caps.get("day"), caps.get("week")
                 if day_cap or week_cap:
-                    bd = await db.get_user_usage_breakdown(chat_id)
+                    bd = await db.get_user_breakdown(chat_id)
                     best = None  # (fraction, kind_key)
                     if day_cap:
                         frac = bd["day"] / day_cap
@@ -1827,6 +2102,13 @@ class SessionManager:
                 return False
             old = rec.session
             rec.session = None
+            # #274: preserve a live jailed shell across the reap (it's ~3 MB vs the ~500 MB
+            # client we're freeing, and holds the user's cd/env + any running command). It
+            # gets its own much longer TTL and is re-attached on the next rebuild.
+            if getattr(old, "has_live_shell", None) and old.has_live_shell():
+                sh = old.detach_shell()
+                if sh is not None:
+                    self._detached_shells[thread_id] = (sh, time.monotonic())
             with contextlib.suppress(Exception):
                 await old.aclose()
             # Clear the snapshot → _get_session rebuilds fresh on the next message.
@@ -1836,6 +2118,49 @@ class SessionManager:
             rec.permission_mode = None
             rec.big_memory = None
         return True
+
+    def _reattach_shell(self, session, thread_id: int, pending_shell=None) -> None:
+        """#274: give a freshly-built session a persistent shell preserved from a rebuild
+        (`pending_shell`) or one stashed by the reaper for this thread. A dead shell is
+        dropped, not adopted."""
+        sh = pending_shell
+        entry = self._detached_shells.pop(thread_id, None)
+        if sh is None and entry is not None:
+            sh = entry[0]
+        elif entry is not None:
+            # Drift-path shell wins; the stashed one is stale → discard it.
+            with contextlib.suppress(Exception):
+                self._loop_close_shell(entry[0])
+        if sh is None:
+            return
+        if getattr(sh, "alive", lambda: False)():
+            session.adopt_shell(sh)
+        else:
+            with contextlib.suppress(Exception):
+                self._loop_close_shell(sh)
+
+    def _loop_close_shell(self, sh) -> None:
+        """Best-effort fire-and-forget close of a shell from a sync context."""
+        with contextlib.suppress(Exception):
+            asyncio.create_task(sh.close())
+
+    async def _drop_detached_shell(self, thread_id: int) -> None:
+        """#274: close + forget a reaper-stashed shell (on hard reset / session delete)."""
+        entry = self._detached_shells.pop(thread_id, None)
+        if entry is not None:
+            with contextlib.suppress(Exception):
+                await entry[0].close()
+
+    async def _reap_detached_shells(self, now: float) -> None:
+        """#274: close persistent shells stashed by the reaper that have outlived the shell
+        TTL (or already died). 0 = never (kept until session delete)."""
+        for tid, (sh, ts) in list(self._detached_shells.items()):
+            dead = not getattr(sh, "alive", lambda: False)()
+            expired = self._shell_ttl > 0 and (now - ts) >= self._shell_ttl
+            if dead or expired:
+                self._detached_shells.pop(tid, None)
+                with contextlib.suppress(Exception):
+                    await sh.close()
 
     async def _relieve_memory(self, *, exclude: int | None = None, max_evict: int = 8) -> int:
         """Free RAM by evicting IDLE live clients, least-recently-active first, until
@@ -1896,6 +2221,8 @@ class SessionManager:
             idle.sort()
             for _, tid in idle[: live_total - cap]:
                 await self._evict_session(tid)
+        # #274: independently age out persistent shells preserved past the client reap.
+        await self._reap_detached_shells(now)
 
     async def _reaper_loop(self) -> None:
         """Periodic idle-client reaper (#179). Sleeps _REAPER_INTERVAL between sweeps;
@@ -1922,6 +2249,9 @@ class SessionManager:
         import schedules  # local import: pure module, avoids a top-level cycle risk
         sid = int(row["id"])
         now = time.time()
+        # NOTE: last_status reflects DISPATCH, not turn outcome — "running" once submitted,
+        # "ok" once handle_text returns (it only ENQUEUES the turn; a later turn error is not
+        # captured here). "ok" therefore means "dispatched", not "succeeded" (#258).
         status = "ok"
         try:
             spec = json.loads(row["spec"])
@@ -1931,6 +2261,27 @@ class SessionManager:
             await db.set_schedule_enabled(sid, False)
             await db.update_schedule_run(sid, now, now, "bad-spec")
             return
+        # #254: orphan guard. If the session was deleted, do NOT let handle_text/ensure_thread
+        # resurrect it (the db cascade should prevent this, but disable any legacy orphan).
+        if await db.get_thread(int(row["thread_id"])) is None:
+            await db.set_schedule_enabled(sid, False)
+            await db.update_schedule_run(sid, now, now, "orphaned")
+            return
+        # #255: re-check the owner is still allowlisted — a schedule created while allowed must
+        # not keep firing (and consuming the subscription) after the owner is removed/expires.
+        owner_uid = int(row["owner_uid"]) if row.get("owner_uid") is not None else 0
+        if self.allowlist and not self.allowlist.is_allowed(owner_uid, None):
+            await db.set_schedule_enabled(sid, False)
+            await db.update_schedule_run(sid, now, now, "revoked")
+            return
+        # Memory gate (this host has NO swap): a fire spawns a claude jail. If MemAvailable is
+        # below the floor, evict idle clients; if still tight, DEFER — leave next_run UNTOUCHED
+        # so the next ~30s sweep retries, rather than advancing past the slot or risking an OOM
+        # kill. Best-effort and silent (no run notice on a deferral).
+        if self._mem_available_mb() < self._min_free_mb:
+            await self._relieve_memory()
+            if self._mem_available_mb() < self._min_free_mb:
+                return
         await db.update_schedule_run(sid, nxt, now, "running")
         try:
             lang = i18n.cached_lang(int(row["chat_id"]))
@@ -2098,7 +2449,10 @@ class SessionManager:
                     path.unlink()          # a staging copy we can never deliver
                 continue
             try:
-                data = path.read_bytes()
+                # #285: a staged file can be multi-MB — read it off the event loop so a turn
+                # that emits files doesn't block other users (the empty-outbox common case
+                # stays cheap: just the is_dir + empty iterdir above).
+                data = await asyncio.to_thread(path.read_bytes)
             except OSError:
                 continue
             if not is_img:
@@ -2189,6 +2543,12 @@ class SessionManager:
                         rec.session = None
                         with contextlib.suppress(Exception):
                             await old.aclose()
+        # #274: close any persistent shells preserved across a reap.
+        for tid in list(self._detached_shells.keys()):
+            entry = self._detached_shells.pop(tid, None)
+            if entry is not None:
+                with contextlib.suppress(Exception):
+                    await entry[0].close()
         self._records.clear()
 
 
