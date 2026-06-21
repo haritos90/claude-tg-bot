@@ -126,10 +126,22 @@ def _html_table() -> str:
     return f"{INTRO}\n<table bordered striped>{rows}</table>\nDone — finalized."
 
 
+def _math_markdown() -> str:
+    """#297: a reply mixing INLINE ($…$) and BLOCK ($$…$$) LaTeX math."""
+    return (
+        "Euler's identity: $e^{i\\pi}+1=0$.\n\n"
+        "A definite integral as a block formula:\n"
+        "$$\\int_0^1 x^2\\,dx = \\frac{1}{3}$$\n"
+        "Done — finalized."
+    )
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--chat", type=int, default=0, help="target chat id (default: OWNER_ID)")
     ap.add_argument("--step", type=float, default=0.7, help="seconds between draft frames")
+    ap.add_argument("--math", action="store_true",
+                    help="#297: verify $…$ inline + $$…$$ block math (draft snap + parsed blocks)")
     ap.add_argument("--thinking", action="store_true",
                     help="open with a <tg-thinking> draft (draft-only block)")
     ap.add_argument("--html", action="store_true",
@@ -149,6 +161,24 @@ def main() -> None:
         print("thinking draft:")
         _draft(token, chat, markdown="<tg-thinking>Generating…</tg-thinking>")
         time.sleep(args.step)
+
+    if args.math:
+        # #297: $…$ → inline mathematical_expression, $$…$$ → block. Stream a partial frame
+        # (unclosed $$ at the frontier — should render as literal text, then snap to the formula
+        # on the complete frame), then dump the server-parsed blocks to confirm the mapping.
+        full = _math_markdown()
+        partial = full.split("$$")[0] + "$$\\int_0^1 x^2"   # unclosed block at the frontier
+        print("math: partial (unclosed $$) draft, then the complete message:")
+        _draft(token, chat, markdown=partial)
+        time.sleep(args.step)
+        _draft(token, chat, markdown=full)
+        time.sleep(args.step)
+        out = _call(token, "sendRichMessage",
+                    {"chat_id": chat, "rich_message": {"markdown": full}})
+        blocks = out.get("result", {}).get("rich_message", {}).get("blocks") if out.get("ok") else out
+        print("parsed blocks:", json.dumps(blocks, ensure_ascii=False)[:700])
+        print("expect: an inline 'mathematical_expression' in the first paragraph + a block one.")
+        return
 
     if args.wide:
         # #243: send an over-limit (>20-col) table draft + final and report what the client does.

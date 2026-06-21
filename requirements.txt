@@ -16,3 +16,8 @@ python-dotenv==1.2.2
 # wide monospace grid wraps; narrow tables stay text grids). Uses the system
 # DejaVuSansMono font (Cyrillic-safe). See table_image.py.
 Pillow==12.2.0
+# cairosvg: rasterize a chat reply's inline <svg> diagram to PNG so it can be sent as an
+# image (#295 — Claude has no image generator but produces clean vector SVG; Telegram can't
+# render SVG inline). Needs the system library libcairo2 (apt install libcairo2). See
+# svg_image.py. If rendering fails the bot falls back to sending the raw .svg document.
+cairosvg==2.9.0

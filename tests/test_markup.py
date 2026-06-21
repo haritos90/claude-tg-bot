@@ -484,3 +484,39 @@ def test_clip_partial_table_keeps_only_complete_rows():
     # prose before a streaming table: prose kept, in-progress row dropped
     mixed = "Intro\n\n| A | B |\n|---|---|\n| 9"
     assert markup.clip_partial_table(mixed) == "Intro\n\n| A | B |\n|---|---|"
+
+
+def test_extract_svgs_fenced_and_raw():
+    """#295: complete <svg> blocks (fenced ```svg or raw) are pulled out and replaced by a
+    token; surrounding prose is kept; no <svg> leaves the text untouched."""
+    import markup
+    # fenced ```svg block
+    fenced = "Here is the schematic:\n\n```svg\n<svg width='10'><rect/></svg>\n```\n\nDone."
+    out, svgs = markup.extract_svgs(fenced)
+    assert len(svgs) == 1 and svgs[0].startswith("<svg") and svgs[0].endswith("</svg>")
+    assert markup.SVG_TOKEN in out and "<svg" not in out and "```" not in out
+    assert "Here is the schematic" in out and "Done." in out
+    # raw unfenced <svg>
+    raw = "before <svg viewBox='0 0 2 2'><line/></svg> after"
+    out2, svgs2 = markup.extract_svgs(raw)
+    assert len(svgs2) == 1 and markup.SVG_TOKEN in out2 and "<svg" not in out2
+    # two diagrams → two tokens, document order
+    two = "<svg id='a'></svg>\nmid\n<svg id='b'></svg>"
+    out3, svgs3 = markup.extract_svgs(two)
+    assert len(svgs3) == 2 and "id='a'" in svgs3[0] and "id='b'" in svgs3[1]
+    assert out3.count(markup.SVG_TOKEN) == 2
+    # no svg → unchanged, empty list
+    assert markup.extract_svgs("plain text") == ("plain text", [])
+
+
+def test_render_svg_png_smoke():
+    """#295: a minimal SVG rasterizes to a valid PNG; junk raises so the caller can fall back."""
+    import svg_image
+    png = svg_image.render_svg_png(
+        "<svg xmlns='http://www.w3.org/2000/svg' width='20' height='20'>"
+        "<rect width='20' height='20' fill='#888'/></svg>"
+    )
+    assert png[:8] == b"\x89PNG\r\n\x1a\n" and len(png) > 50
+    import pytest
+    with pytest.raises(Exception):
+        svg_image.render_svg_png("not an svg")

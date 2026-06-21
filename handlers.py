@@ -4599,9 +4599,10 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
 
     @router.message(Command("test"))
     async def cmd_test(message: Message) -> None:
-        """#172: owner-only self-test — SIMULATE a streamed generation (3 paragraphs +
-        a 5×5 table + an asm snippet) so the live rich-draft formatting can be eyeballed
-        (it should format as it streams, not snap to rich at the end)."""
+        """#172: owner-only self-test — SIMULATE a streamed generation (paragraphs, a wide
+        table, an asm snippet, and an SVG diagram, #295) so the live rich-draft formatting
+        can be eyeballed (it should format as it streams, not snap to rich at the end; the
+        SVG is rasterized to a PNG photo at finish)."""
         if not _is_owner(message):
             return
         await sessions.stream_demo(message.chat.id)

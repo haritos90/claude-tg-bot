@@ -33,6 +33,7 @@ from aiogram.types import (
 import i18n
 import markup
 import table_image  # #243: wide (>20-col) tables → PNG; also the #162 PNG-table revert path
+import svg_image  # #295: chat <svg> diagrams → PNG (rasterized via cairosvg)
 from rich_message import EditRichMessage, SendRichMessage, SendRichMessageDraft
 
 logger = logging.getLogger("streamer")
@@ -497,6 +498,12 @@ class Streamer:
                 body, _wide = markup.extract_wide_tables(body)
                 body = self._wide_table_notes(body, _wide)
                 self._wide_cache = (_in, body)
+        # #295: while an <svg> diagram streams, hide it from the draft (raw XML would otherwise
+        # animate). Complete ones become the note; an unclosed one at the frontier is cut.
+        if "<svg" in body.lower():
+            body, _svgs = markup.extract_svgs(body)
+            body = self._svg_notes(body, _svgs)
+            body = self._hide_unclosed_svg(body)
         if not body:
             # Animate the <tg-thinking> placeholder. Priority (most → least specific):
             #   #240c: live REASONING (extended-thinking) text — show its tail, "unfurling";
@@ -941,6 +948,57 @@ class Streamer:
                           cols=markup.table_col_count(tbl.rows)) + parts[idx + 1]
         return out
 
+    def _svg_notes(self, rich_text: str, svgs: list) -> str:
+        """#295: replace each ``markup.SVG_TOKEN`` (left by ``markup.extract_svgs``) with the
+        localized ``stream.svg_image`` note; the diagram itself is sent separately as a PNG.
+        Shared by the final commit and the draft path so the streamed body matches the final
+        bubble instead of dumping raw <svg> XML. No-op when there are no SVGs."""
+        if not svgs:
+            return rich_text
+        lang = i18n.cached_lang(self.chat_id)
+        parts = rich_text.split(markup.SVG_TOKEN)
+        out = parts[0]
+        note = i18n.t("stream.svg_image", lang)
+        for idx in range(len(svgs)):
+            out += note + (parts[idx + 1] if idx + 1 < len(parts) else "")
+        return out
+
+    def _hide_unclosed_svg(self, body: str) -> str:
+        """#295: in a streaming draft, an <svg> that hasn't closed yet would show as raw XML.
+        Cut from the still-open ``<svg`` (or its opening ```fence) to the end and leave the
+        transient 'rendering…' note, so the draft never animates a wall of markup."""
+        low = body.lower()
+        cut = low.rfind("<svg")
+        if cut == -1 or "</svg>" in low[cut:]:
+            return body
+        fence = body.rfind("```", 0, cut)
+        pos = fence if fence != -1 else cut
+        note = i18n.t("stream.svg_rendering", i18n.cached_lang(self.chat_id))
+        return (body[:pos].rstrip() + "\n" + note).strip()
+
+    async def _send_svg_image(self, svg: str) -> None:
+        """#295: rasterize one <svg> diagram to PNG and send it as a photo. On any render
+        failure, fall back to sending the raw .svg as a document so nothing is lost. Always a
+        silent intermediate (it follows the already-sent reply bubble)."""
+        try:
+            png = await asyncio.to_thread(svg_image.render_svg_png, svg)
+        except Exception:
+            logger.warning("#295 svg render failed; sending raw .svg document", exc_info=True)
+            with contextlib.suppress(Exception):
+                await self.bot.send_document(
+                    chat_id=self.chat_id,
+                    document=BufferedInputFile(svg.encode("utf-8"), filename="diagram.svg"),
+                    disable_notification=True, **self._kwargs(),
+                )
+            return
+        await self._safe(
+            lambda: self.bot.send_photo(
+                chat_id=self.chat_id,
+                photo=BufferedInputFile(png, filename="diagram.png"),
+                disable_notification=True, **self._kwargs(),
+            )
+        )
+
     async def _send_wide_table_image(self, table) -> None:
         """#243: send one wide (>20-column) table as its own PNG photo — a native rich table
         caps at 20 columns. If PNG rendering is unavailable (e.g. the table-image font is not
@@ -1134,13 +1192,18 @@ class Streamer:
         # #243: a native rich table caps at 20 columns. Pull each WIDER table out of the body,
         # leave a note where it was, send the rich markdown, then send each wide table as a PNG
         # image (rich tables ≤20 cols stream/render natively as before).
-        rich_text, wide_tables = markup.extract_wide_tables(full_text)
+        # #295: pull out <svg> diagrams first (they're sent as images), then wide tables.
+        svg_text, svgs = markup.extract_svgs(full_text)
+        rich_text, wide_tables = markup.extract_wide_tables(svg_text)
         # was (#243): inline token→note expansion here — factored to _wide_table_notes so the
         # draft path (#256) reuses the SAME substitution and draft↔final stay consistent.
         rich_text = self._wide_table_notes(rich_text, wide_tables)
+        rich_text = self._svg_notes(rich_text, svgs)
         if await self._commit_rich_markdown(rich_text, footer, silent_first, reply_markup=reply_markup):
             for tbl in wide_tables:  # empty unless a >20-col table was extracted (#243)
                 await self._send_wide_table_image(tbl)
+            for svg in svgs:         # empty unless the reply contained an <svg> diagram (#295)
+                await self._send_svg_image(svg)
             return
         # # was (#176): split a code reply → rich prose/tables + classic code block:
         # if markup.has_code_block(full_text):

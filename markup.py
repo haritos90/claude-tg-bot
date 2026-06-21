@@ -594,6 +594,35 @@ def extract_wide_tables(text: str, max_cols: int = RICH_TABLE_MAX_COLS):
     return "\n".join(out), wide
 
 
+# #295: chat replies can include an <svg> diagram (a schematic, chart, floor plan…). Telegram
+# can't render SVG inline, so each complete <svg>…</svg> is pulled out, rasterized to PNG, and
+# sent as a photo; a localized note is left where it was. Mirrors the wide-table token scheme.
+SVG_TOKEN = "\x00SVG\x00"
+_SVG_FENCE_RE = re.compile(
+    r"```[ \t]*(?:svg|xml|html)?[ \t]*\r?\n\s*(<svg\b.*?</svg>)\s*\r?\n?```",
+    re.DOTALL | re.IGNORECASE,
+)
+_SVG_RAW_RE = re.compile(r"<svg\b[^>]*>.*?</svg>", re.DOTALL | re.IGNORECASE)
+
+
+def extract_svgs(text: str):
+    """#295: pull complete ``<svg>…</svg>`` diagrams (fenced ```svg or raw) out of ``text`` so
+    they can be rasterized and sent as images instead of dumping raw XML in the bubble. Each is
+    replaced IN PLACE by ``SVG_TOKEN``; returns ``(new_text, [svg_str, …])`` in document order.
+    No ``<svg`` → ``(text, [])`` so the common case is untouched."""
+    if "<svg" not in (text or "").lower():
+        return text, []
+    svgs: list[str] = []
+
+    def _take(svg: str) -> str:
+        svgs.append(svg.strip())
+        return SVG_TOKEN
+
+    out = _SVG_FENCE_RE.sub(lambda m: _take(m.group(1)), text)   # fenced (drops the fence)
+    out = _SVG_RAW_RE.sub(lambda m: _take(m.group(0)), out)      # any remaining unfenced <svg>
+    return out, svgs
+
+
 def has_code_block(text: str) -> bool:
     """True if ``text`` contains a real (multi-line) fenced code block (#176)."""
     return bool(_CODE_FENCE_BLOCK_RE.search(text or ""))
