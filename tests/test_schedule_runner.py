@@ -9,8 +9,8 @@ import json
 import time
 from types import SimpleNamespace
 
-import db
-import sessions
+from app.storage import db
+from app.core import sessions
 
 
 class _AL:

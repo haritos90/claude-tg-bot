@@ -11,9 +11,9 @@ import asyncio
 import time
 from types import SimpleNamespace
 
-import db
-import i18n
-import sessions
+from app.storage import db
+from app import i18n
+from app.core import sessions
 
 
 class _FakeStreamer:
@@ -56,7 +56,7 @@ class _FakeStreamer:
 
     def set_tool_phase(self, tool_name, tool_input):
         # #294: mirror the real streamer — build the localized label (en in tests).
-        import streamer as _st
+        from app.telegram import streamer as _st
         self.phases.append(_st.tool_phase_label(tool_name, tool_input, "en"))
 
 

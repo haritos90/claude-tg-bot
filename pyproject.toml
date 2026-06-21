@@ -14,3 +14,7 @@ select = ["E4", "E7", "E9", "F", "W", "B"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# #302: the bot's modules now live under the `app` package; put the repo root on
+# sys.path so tests import them as `app.<subpkg>.<module>` (was: bare top-level
+# imports, enabled only by conftest.py's presence at the root).
+pythonpath = ["."]

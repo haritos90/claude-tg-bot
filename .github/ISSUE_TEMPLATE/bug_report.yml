@@ -80,7 +80,7 @@ body:
       placeholder: |
         Python: 3.11.x
         OS: Debian 12
-        Run via: python bot.py   (or: systemd unit)
+        Run via: python -m app   (or: systemd unit)
     validations:
       required: true
 

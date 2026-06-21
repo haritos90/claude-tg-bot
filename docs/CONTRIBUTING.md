@@ -2,7 +2,7 @@
 
 Thanks for helping out. Keep changes **small** and consistent with the file you're
 editing — match the surrounding style, comment the *why* not the *what*, and don't
-add abstractions beyond what the task needs. [`AGENTS.md`](AGENTS.md) is the single
+add abstractions beyond what the task needs. [`AGENTS.md`](../AGENTS.md) is the single
 source of truth for how this project works; this file is the short contributor
 version of its rules.
 
@@ -45,7 +45,7 @@ session`. Types: `feat` · `fix` · `docs` · `refactor` · `test` · `build` ·
 
 ## Tasks
 
-Work is tracked in [`TODO.md`](TODO.md), which flows **Backlog → Open → Closed**
+Work is tracked in [`TODO.md`](../TODO.md), which flows **Backlog → Open → Closed**
 (with a **Deferred** parking area). Read its "How this file works" section first.
 A new idea goes to **Backlog**; when you pick it up move it to **Open**; when it's
 done move it to **Closed** and fill the **Resolution** column (deleting its Details
@@ -73,5 +73,5 @@ And keep these **hard invariants** intact:
   `allowed_tools`) without a deliberate reason — that silently bypasses the
   Allow/Deny approval gate.
 
-For the deeper SDK / Telegram / async invariants, read **[`AGENTS.md`](AGENTS.md)
+For the deeper SDK / Telegram / async invariants, read **[`AGENTS.md`](../AGENTS.md)
 §5** rather than re-deriving them here.

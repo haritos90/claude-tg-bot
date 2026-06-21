@@ -8,7 +8,7 @@ async, no I/O.
 
 import re
 
-import i18n
+from app import i18n
 
 _PLACEHOLDER = re.compile(r"{(\w+)}")
 _TAG = re.compile(r"</?[a-zA-Z][a-zA-Z0-9]*")

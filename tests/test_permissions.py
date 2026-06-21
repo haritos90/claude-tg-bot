@@ -1,7 +1,7 @@
 """Unit tests for permissions: the tool-approval input preview, focused on the
 #204 workdir-relative path rendering."""
 
-import permissions
+from app.access import permissions
 
 
 CWD = "/var/lib/claude-tg-bot/workdirs/fca29e/work"

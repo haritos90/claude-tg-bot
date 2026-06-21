@@ -8,8 +8,8 @@ for EVERY combination of global flag and per-session override.
 
 from types import SimpleNamespace
 
-import settings_schema
-from settings_schema import Role, Scope
+from app.access import settings_schema
+from app.access.settings_schema import Role, Scope
 
 
 def _state(**kw):
@@ -119,7 +119,7 @@ def test_memory_bool_user_coercion():
 # --------------------------------------------------------------------------- #
 # Access model (#151, menu.md §4)
 # --------------------------------------------------------------------------- #
-from settings_schema import Access  # noqa: E402
+from app.access.settings_schema import Access  # noqa: E402
 
 
 def test_base_access_defaults_match_table_23():

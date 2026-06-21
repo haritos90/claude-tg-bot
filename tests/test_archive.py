@@ -11,7 +11,7 @@ import tarfile
 import time
 from pathlib import Path
 
-import archive
+from app.storage import archive
 
 
 def _seed(base: Path, sid: str, home: Path):

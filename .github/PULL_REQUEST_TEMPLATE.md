@@ -11,7 +11,7 @@
 ## Checklist
 
 - [ ] PR title follows Conventional Commits (`type(scope): summary`).
-- [ ] `python -m py_compile *.py`, the import smoke (AGENTS.md §3), and `pytest -q` are green.
+- [ ] `python -m compileall -q app conftest.py`, the import smoke (AGENTS.md §3), and `pytest -q` are green.
 - [ ] User-facing strings go through `i18n` (`en` **and** `ru`), not hardcoded.
 - [ ] No `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` introduced (subscription-only).
 - [ ] `setting_sources=[]` preserved on every `ClaudeAgentOptions`.

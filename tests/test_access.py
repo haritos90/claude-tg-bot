@@ -4,7 +4,7 @@ notice (so the owner can grant someone whose numeric id they don't have)."""
 import asyncio
 from types import SimpleNamespace
 
-from access import AllowlistMiddleware
+from app.access.access import AllowlistMiddleware
 
 OWNER = 1
 

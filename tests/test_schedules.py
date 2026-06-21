@@ -4,7 +4,7 @@ from datetime import datetime
 
 import pytest
 
-import schedules
+from app.core import schedules
 
 
 def test_parse_daily_forms():

@@ -44,18 +44,18 @@ from aiogram.types import (
     Message,
 )
 
-import archive
-import commands
-import db
-import engine
-import i18n
-import markup
-import schedules
-import sessions as _sessions  # module (build_router's `sessions` param is the instance)
-import settings_schema as ss
-import usage
-from allowlist import normalize_date
-from rich_message import EditRichMessage, SendRichMessage  # #164/#173: native rich
+from app.storage import archive
+from app.telegram import commands
+from app.storage import db
+from app.core import engine
+from app import i18n
+from app.telegram import markup
+from app.core import schedules
+from app.core import sessions as _sessions  # module (build_router's `sessions` param is the instance)
+from app.access import settings_schema as ss
+from app.storage import usage
+from app.access.allowlist import normalize_date
+from app.telegram.rich_message import EditRichMessage, SendRichMessage  # #164/#173: native rich
 
 
 # Friendly aliases mapped to concrete model ids for the /model command.
@@ -3622,16 +3622,26 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         set (owner request). The token column shows the #120 ROLLING caps (day/week)."""
         # #285: fetch every user's weighted units in ONE GROUP BY (was an N+1 per-user query).
         # #293: get_all_users_breakdown returns a list; key it by uid for the per-user lookup.
+        # #303: also fetch RAW tokens so each user shows a units line AND a tokens line.
         units = {}
+        tokens = {}
         with contextlib.suppress(Exception):
             units = {r["uid"]: r for r in await db.get_all_users_breakdown("units")}
+            tokens = {r["uid"]: r for r in await db.get_all_users_breakdown("raw")}
 
-        def _usage_line(uid):
+        def _usage_lines(uid):
+            # #303: the weighted-units line and, below it, a same-format raw-tokens line;
+            # either is omitted if that user has no usage rows for the metric.
+            out = []
             ub = units.get(uid)
-            if not ub:
-                return None
-            return i18n.t("users.entry_usage", lang, day=_fmt_tokens(ub["day"]),
-                          week=_fmt_tokens(ub["week"]), total=_fmt_tokens(ub["total"]))
+            if ub:
+                out.append(i18n.t("users.entry_usage", lang, day=_fmt_tokens(ub["day"]),
+                                  week=_fmt_tokens(ub["week"]), total=_fmt_tokens(ub["total"])))
+            tb = tokens.get(uid)
+            if tb:
+                out.append(i18n.t("users.entry_usage_tok", lang, day=_fmt_tokens(tb["day"]),
+                                  week=_fmt_tokens(tb["week"]), total=_fmt_tokens(tb["total"])))
+            return out
 
         def _user_meta(rec) -> str:
             """#286: build the trailing meta — only show 'exp' when the user is actually
@@ -3656,9 +3666,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             i18n.t("users.header", lang),
             i18n.t("users.owner_id", lang, who=owner_who),
         ]
-        ou = _usage_line(owner_id)   # owner is uncapped but still worth seeing
-        if ou:
-            lines.append(ou)
+        lines.extend(_usage_lines(owner_id))   # owner is uncapped but still worth seeing (#303)
         entries = snap.get("entries", {})
         pending_u = snap.get("pending", {})
         if not entries and not pending_u:
@@ -3671,17 +3679,19 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             # #286: exp/caps shown only when actually set (see _user_meta).
             lines.append(i18n.t("users.entry", lang, who=who,
                                 level=rec.get("level", "chat"), meta=_user_meta(rec)))
-            ul = _usage_line(uid)
-            if ul:
-                lines.append(ul)
+            lines.extend(_usage_lines(uid))   # #303: units + tokens lines
         for name, rec in pending_u.items():
             who = _who_label(rec.get("friendly_name"), name, f"@{markup.escape_html(name)}")
             lines.append(i18n.t("users.pending", lang, who=who,
                                 level=rec.get("level", "chat"), meta=_user_meta(rec)))
             # pending (un-pinned) users have no id yet → no usage to show.
-        lines.append("")
-        lines.append(i18n.t("users.footnote", lang))
-        lines.append(i18n.t("users.tap_hint", lang))
+        # #303: dropped the trailing description footer — the card is self-explanatory and
+        # each user now carries an extra tokens line, so the prose only added clutter. The
+        # `users.footnote` / `users.tap_hint` keys are kept (unused) for an easy revert.
+        # was:
+        # lines.append("")
+        # lines.append(i18n.t("users.footnote", lang))
+        # lines.append(i18n.t("users.tap_hint", lang))
         return lines
 
     def _users_keyboard(snap: dict, lang: str) -> InlineKeyboardMarkup:

@@ -1,8 +1,8 @@
 """Unit tests for markup: escaping, splitting, fence repair, code isolation,
 and the render-time LaTeX→Unicode conversion (#12)."""
 
-import markup
-import table_image
+from app.telegram import markup
+from app.telegram import table_image
 
 
 def test_escape_html():
@@ -489,7 +489,7 @@ def test_clip_partial_table_keeps_only_complete_rows():
 def test_extract_svgs_fenced_and_raw():
     """#295: complete <svg> blocks (fenced ```svg or raw) are pulled out and replaced by a
     token; surrounding prose is kept; no <svg> leaves the text untouched."""
-    import markup
+    from app.telegram import markup
     # fenced ```svg block
     fenced = "Here is the schematic:\n\n```svg\n<svg width='10'><rect/></svg>\n```\n\nDone."
     out, svgs = markup.extract_svgs(fenced)
@@ -505,18 +505,23 @@ def test_extract_svgs_fenced_and_raw():
     out3, svgs3 = markup.extract_svgs(two)
     assert len(svgs3) == 2 and "id='a'" in svgs3[0] and "id='b'" in svgs3[1]
     assert out3.count(markup.SVG_TOKEN) == 2
+    # #301: mixed raw-THEN-fenced keeps document order (raw 'a' before fenced 'b')
+    mixed = "<svg id='a'></svg>\n\n```svg\n<svg id='b'></svg>\n```\n"
+    out4, svgs4 = markup.extract_svgs(mixed)
+    assert len(svgs4) == 2 and "id='a'" in svgs4[0] and "id='b'" in svgs4[1]
+    assert "```" not in out4 and out4.count(markup.SVG_TOKEN) == 2
     # no svg → unchanged, empty list
     assert markup.extract_svgs("plain text") == ("plain text", [])
 
 
 def test_render_svg_png_smoke():
     """#295: a minimal SVG rasterizes to a valid PNG; junk raises so the caller can fall back."""
-    import svg_image
+    from app.telegram import svg_image
     png = svg_image.render_svg_png(
         "<svg xmlns='http://www.w3.org/2000/svg' width='20' height='20'>"
         "<rect width='20' height='20' fill='#888'/></svg>"
     )
     assert png[:8] == b"\x89PNG\r\n\x1a\n" and len(png) > 50
     import pytest
-    with pytest.raises(Exception):
+    with pytest.raises(ValueError):
         svg_image.render_svg_png("not an svg")

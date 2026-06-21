@@ -25,16 +25,16 @@ from types import SimpleNamespace
 
 from aiogram.types import BufferedInputFile
 
-import archive
-import db
-import i18n
-import markup
-import token_refresh
-import usage
-import settings_schema
-from engine import ClaudeSession
-from streamer import Streamer, resolve_speed  # #294: tool_phase_label now used via streamer.set_tool_phase
-from permissions import PermissionGate
+from app.storage import archive
+from app.storage import db
+from app import i18n
+from app.telegram import markup
+from app.core import token_refresh
+from app.storage import usage
+from app.access import settings_schema
+from app.core.engine import ClaudeSession
+from app.telegram.streamer import Streamer, resolve_speed  # #294: tool_phase_label now used via streamer.set_tool_phase
+from app.access.permissions import PermissionGate
 
 # The Anthropic prompt cache stays warm for ~5 minutes after the last request.
 _CACHE_WINDOW_SECONDS = 300.0
@@ -2281,7 +2281,7 @@ class SessionManager:
         """Run one due schedule: advance next_run FIRST (so a slow/failing run can't
         re-fire in a tight loop), post a small notice, then submit the prompt into its
         session via the normal queue. All best-effort — errors are stamped, not raised."""
-        import schedules  # local import: pure module, avoids a top-level cycle risk
+        from app.core import schedules  # local import: pure module, avoids a top-level cycle risk
         sid = int(row["id"])
         now = time.time()
         # NOTE: last_status reflects DISPATCH, not turn outcome — "running" once submitted,

@@ -152,7 +152,7 @@ exact INPUT→block mapping in the **Rich Markdown** form the bot uses:
 - The bot streams + persists as `{"markdown"}` (#176), so `$…$` / `$$…$$` pass straight through
   on BOTH the draft and final send — no special handling needed. The classic-HTML fallback
   (`markup._latex_to_unicode`, #51) still degrades math to Unicode only when a rich send fails.
-- The chat prompt (`engine.CHAT_SYSTEM_PROMPT`) and `agent_context.md` instruct the model to
+- The chat prompt (`engine.CHAT_SYSTEM_PROMPT`) and `app/core/agent_context.md` instruct the model to
   emit `$…$` / `$$…$$` and to escape a literal dollar as `\$`.
 - **Streaming note:** an unclosed `$`/`$$` at the draft frontier renders as literal text until
   it closes, then snaps to the formula — the SAME behavior as a half-typed `**bold**`, and

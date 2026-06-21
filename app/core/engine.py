@@ -29,6 +29,8 @@ from claude_agent_sdk import (
     ToolUseBlock,
 )
 
+from app import DEPLOY_DIR  # repo-root deploy/ scripts (#302: modules live in the package now)
+
 logger = logging.getLogger(__name__)
 
 # #137: signatures used to classify a failed-startup / failed-turn from the CLI's
@@ -733,7 +735,9 @@ class ClaudeSession:
 
     def _sandbox_launcher(self) -> str:
         """Absolute path to the committed bubblewrap launcher (deploy/)."""
-        return str(Path(__file__).resolve().parent / "deploy" / "sandbox-claude.sh")
+        # was: Path(__file__).resolve().parent / "deploy" / "sandbox-claude.sh" — #302:
+        # engine moved to app/core/, so deploy/ is at the repo root, not a sibling dir.
+        return str(DEPLOY_DIR / "sandbox-claude.sh")
 
     def _hash_uid(self) -> int:
         """The deterministic per-session host uid from the sid — the PREFERRED value the
@@ -753,7 +757,7 @@ class ClaudeSession:
         preferred = self._hash_uid()
         sid = Path(self.cwd).parent.name
         try:
-            import db
+            from app.storage import db
             return await db.claim_session_uid(
                 sid, preferred, self.uid_base, self.uid_base + self.uid_range
             )
