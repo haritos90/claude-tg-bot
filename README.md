@@ -25,6 +25,9 @@ API key, no per-token billing.
 - Streaming: native Telegram draft streaming (`sendRichMessageDraft`), DM only.
 - Web-capable chat: chat sessions use `WebSearch`/`WebFetch`; code sessions add the
   full agent toolset (Bash, file edits, notebooks).
+- Diagrams in chat: when a chat reply contains an inline SVG (a schematic, chart, or
+  floor plan), the bot rasterizes it to PNG and sends it as an image. Claude has no
+  image generator, so this is vector diagrams, not photos.
 - Isolated sessions: each is its own Claude session (context, working dir, resume id),
   born chat and upgradeable to code (`/code` ⇄ `/chat`). Nothing leaks between them.
   Browse, switch, rename, star, and delete via `/sessions`.
@@ -198,9 +201,12 @@ directory; with the broker (#119b) on, it never enters a jail.
   | `aiosqlite==0.22.1` | Async SQLite for per-session state and usage. |
   | `python-dotenv==1.2.2` | Loads `.env`. |
   | `Pillow==12.2.0` | Renders the PNG-table fallback (`table_image.py`); needs the DejaVu Sans Mono font. |
+  | `cairosvg==2.9.0` | Rasterizes a chat reply's inline `<svg>` diagram to PNG (`svg_image.py`); needs the system library `libcairo2` (`apt install libcairo2`). |
 
 - Optional: `bubblewrap` for the code sandbox; `pytest` + `ruff`
-  (`requirements-dev.txt`) for development.
+  (`requirements-dev.txt`) for development. `cairosvg` needs the system `libcairo2`
+  library (`apt install libcairo2`); without it the SVG-diagram feature falls back to
+  sending the raw `.svg` file.
 - Optional (for the #119 egress allowlist, `SANDBOX_EGRESS`): `iptables` (the
   `iptables-nft` backend works) + the `xt_cgroup` kernel module + cgroup v2. No
   `nftables` and no extra Python packages. See [`isolation.md`](isolation.md).

@@ -100,10 +100,61 @@ CHAT_SYSTEM_PROMPT = (
     "execution. If the user wants to run commands, execute code, or read/write files, "
     "tell them this session can be upgraded to a code session with the /code command — "
     "do NOT attempt those actions yourself. "
-    "Your replies are shown in a Telegram chat, which CANNOT render LaTeX or math "
-    "markup — never use $...$, $$...$$, \\(...\\), \\[...\\], or backslash commands "
-    "like \\frac or \\text. Write math in plain Unicode instead "
-    "(e.g. ×, ÷, ≈, ≤, ≥, ², ₂, √, π, ½, →, ∞)."
+    # #299: chat is tool-free, so it CANNOT build a document file — a PDF/Word/Excel/PowerPoint
+    # is a binary that needs code execution (openpyxl/reportlab/python-docx), which only a code
+    # session has (it also has the outbox that delivers generated files). Keep THIS part
+    # level-AGNOSTIC: HOW the user reaches a code session depends on their access level, and the
+    # per-session note (_session_state_note) branches on it — own /code vs ask the owner to grant
+    # code access. So here we only state the limitation + the no-fake-attachment rule.
+    "If the user asks you to PRODUCE a downloadable document — a PDF, Word (.docx), Excel "
+    "(.xlsx), PowerPoint (.pptx), CSV, or any other generated file — you cannot build it in a "
+    "chat session; only a code session can. Briefly say what you would generate and that it "
+    "needs a code session (the conversation carries over, and you would send the file back as an "
+    "attachment), then follow the per-session instructions below for HOW this particular user "
+    "reaches a code session. Never paste the file's raw bytes or claim to attach a file here — "
+    "chat cannot create files. "
+    # was (#43/#51) — Telegram couldn't render math, so the prompt forced plain Unicode and
+    # banned $…$. #297: Bot API 10.1 renders math NATIVELY — verified live against the API
+    # (and on-device): $…$ → an inline `mathematical_expression`, $$…$$ → a block one; \(…\),
+    # \[…\] and an HTML <math> are NOT parsed (they arrive as literal text). Replies stream +
+    # persist as {"markdown"} (#176), so LaTeX passes straight through to a real rendered
+    # formula; the classic-HTML FALLBACK still degrades it to Unicode via markup._latex_to_unicode.
+    # Replaced:
+    # "Your replies are shown in a Telegram chat, which CANNOT render LaTeX or math "
+    # "markup — never use $...$, $$...$$, \\(...\\), \\[...\\], or backslash commands "
+    # "like \\frac or \\text. Write math in plain Unicode instead "
+    # "(e.g. ×, ÷, ≈, ≤, ≥, ², ₂, √, π, ½, →, ∞). "
+    "Telegram renders LaTeX math natively. Write a real formula in LaTeX: wrap an INLINE "
+    "formula in single dollar signs ($E=mc^2$) and a DISPLAY/block formula in double dollar "
+    "signs ($$\\int_0^1 x^2\\,dx = \\tfrac13$$), with standard LaTeX inside (\\frac, \\sqrt, "
+    "\\sum, \\int, ^, _, Greek letters, etc.). Only these two forms render — do NOT use \\(…\\) "
+    "or \\[…\\] (Telegram shows those as raw text). Write a literal dollar sign as \\$ so it is "
+    "not read as math. Simple inline symbols in prose can still be plain Unicode (×, ≈, ≤, π, "
+    "→); reach for $…$ when it is an actual formula. "
+    # #295: chat has no code execution, but the bot rasterizes inline SVG to an image, so the
+    # model CAN produce a real picture for diagram-shaped requests. #296: this SVG path is ALSO
+    # how we cover graph/flow diagrams (the Mermaid use-case) without a JS/headless renderer —
+    # the model both writes AND lays out the SVG, so steer it toward clean, non-overlapping
+    # layouts and enumerate the graph diagram types so it reaches for a drawing, not prose.
+    # was (#295) — replaced by the strengthened prompt below for #296:
+    # "When the user asks for a diagram, schematic, chart, floor plan, cutting/assembly plan, "
+    # "or any simple drawing, output it as a single self-contained SVG in a fenced ```svg code "
+    # "block — the bot renders that SVG to an image and sends it as a picture. Keep the SVG "
+    # "self-contained (inline attributes/styles, no external references or scripts), give it a "
+    # "width/height or viewBox, and label key parts and dimensions. Prefer drawing it over "
+    # "describing it in words. You cannot generate photographic images — use SVG for diagrams."
+    "When the user asks for a diagram, schematic, chart, flowchart, sequence / state / ER / "
+    "class diagram, org chart, mind map, tree, network graph, Gantt chart, floor plan, "
+    "cutting/assembly plan, or any drawing, output it as a single self-contained SVG in a "
+    "fenced ```svg code block — the bot renders that SVG to an image and sends it as a picture. "
+    "Keep the SVG self-contained (inline attributes/styles, no external references, fonts, or "
+    "scripts) and set a viewBox sized to the content. For node-and-arrow diagrams, lay it out "
+    "cleanly: pick ONE flow direction (top-to-bottom or left-to-right), give boxes consistent "
+    "sizes with inner padding, space the nodes so nothing overlaps or is clipped, connect them "
+    "with straight or right-angled arrows that end in a <marker> arrowhead, and label both the "
+    "nodes and the edges. Use a simple, readable palette and legible font sizes. Prefer drawing "
+    "it over describing it in words. You cannot generate photographic images — use SVG for any "
+    "diagram."
 )
 
 # #269: the table-format note (#243), the outbox file-delivery instructions (#187), and the
@@ -1010,7 +1061,11 @@ class ClaudeSession:
                 "files, or code execution. The user HAS code access: if they want to run commands or "
                 "edit files, tell them to send **/code** to turn THIS session into a full Claude Code "
                 "session (then **/shell** for a terminal), and **/chat** to switch back. Don't pretend "
-                "to run anything here — point them to /code."
+                "to run anything here — point them to /code. "
+                # #299: generating a document file is a code task too; this user CAN self-upgrade.
+                "This includes GENERATING a document (PDF, Excel/.xlsx, Word/.docx, PowerPoint/.pptx, "
+                "CSV, …): tell them to send /code and you will build the file there and send it back "
+                "as an attachment."
             )
         return (
             "\n\n## This session right now\n"
@@ -1018,7 +1073,13 @@ class ClaudeSession:
             "or code execution. The user's access level is **chat-only**, so they CANNOT upgrade to code "
             "themselves — do NOT tell them to use /code. Only the bot's owner can grant code access. If "
             "they need to run commands or edit files, explain that the owner must grant them code access "
-            "first."
+            "first. "
+            # #299: same gate for document generation — a chat-only user can't /code, so route them
+            # to the OWNER for a status upgrade rather than suggesting /code (which would be denied).
+            "This also covers GENERATING a document file (PDF, Excel/.xlsx, Word/.docx, PowerPoint/.pptx, "
+            "CSV, …): it needs a code session, which this user cannot start themselves — so tell them to "
+            "ask the bot's owner to grant them code access, after which a code session can build the "
+            "file. Do NOT tell them to use /code."
         )
 
     def _build_options(self) -> ClaudeAgentOptions:

@@ -132,3 +132,29 @@ and no custom emoji is added and it is not localized (the `Streamer` has no `lan
 so the block shows the live action (and AIActions emoji), instead of (or alongside) the separate
 "Working…" control plate — a native, self-cleaning "what the agent is doing" line. Keep it
 DRAFT-ONLY; finish() must stay `{"markdown": full_text}` with no thinking block.
+
+## Math / formulas — `mathematical_expression` (#297)
+
+Telegram renders LaTeX math natively (Bot API 10.1: `RichTextMathematicalExpression` inline,
+`RichBlockMathematicalExpression` block). **Verified live** against the API on 2026-06-21 (a
+`sendRichMessage` probe + the returned parsed `rich_message` JSON, confirmed on-device) — the
+exact INPUT→block mapping in the **Rich Markdown** form the bot uses:
+
+| Input (in `{"markdown"}`) | Parses to | Render |
+|---|---|---|
+| `$e^{i\pi}+1=0$` | inline `{"type":"mathematical_expression","expression":"e^{i\\pi}+1=0"}` | ✅ inline formula |
+| `$$\int_0^1 x^2\,dx$$` | block `mathematical_expression` | ✅ centered block formula |
+| ```` ```math … ``` ```` (fenced) | block `mathematical_expression` | ✅ (equivalent to `$$…$$`) |
+| `\(…\)` / `\[…\]` | plain paragraph text | ❌ NOT parsed — shown literally |
+| HTML `<math>…</math>` | plain text (tag stripped) | ❌ — in the HTML form use `<tg-math>…</tg-math>` |
+
+- The `expression` is **standard LaTeX** (`\frac`, `\sqrt`, `\sum`, `\int`, `^`, `_`, Greek, …).
+- The bot streams + persists as `{"markdown"}` (#176), so `$…$` / `$$…$$` pass straight through
+  on BOTH the draft and final send — no special handling needed. The classic-HTML fallback
+  (`markup._latex_to_unicode`, #51) still degrades math to Unicode only when a rich send fails.
+- The chat prompt (`engine.CHAT_SYSTEM_PROMPT`) and `agent_context.md` instruct the model to
+  emit `$…$` / `$$…$$` and to escape a literal dollar as `\$`.
+- **Streaming note:** an unclosed `$`/`$$` at the draft frontier renders as literal text until
+  it closes, then snaps to the formula — the SAME behavior as a half-typed `**bold**`, and
+  harmless (it does NOT break sibling blocks the way a partial table did, #237), so no
+  clip-partial-math step is needed. Re-verify with `deploy/verify-rich-draft.py --math`.

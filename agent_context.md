@@ -109,7 +109,9 @@ per-session isolation accurately rather than guessing.
   per-session credential (e.g. a token) injected only into this session's sandbox.
 
 ### Rendering
-Replies render as Telegram messages with Markdown. The client cannot render LaTeX/math
-markup — never use `$...$`, `\(...\)`, `\frac`, etc.; write math in plain Unicode. A Markdown
+Replies render as Telegram messages with Markdown. Math renders natively as LaTeX: wrap an
+inline formula in single dollar signs (`$E=mc^2$`) and a block formula in double dollar signs
+(`$$\int_0^1 x^2\,dx$$`); only those two forms render — `\(...\)`, `\[...\]` and `<math>` arrive
+as raw text — and a literal dollar sign is written `\$`. A Markdown
 table renders only up to 20 columns (wider tables are sent as an image automatically); prefer
 ≤20 columns, keep cells short, or transpose/split a wide table.

@@ -1710,6 +1710,13 @@ CATALOG: dict[str, dict[str, str]] = {
         "en": "📊 Table {n} ({cols} columns) — too wide to display inline; sent as an image below.",
         "ru": "📊 Таблица {n} ({cols} столбцов) — слишком широкая для встроенного показа; отправлена изображением ниже.",
     },
+    # #295: a chat reply's <svg> diagram is rasterized and sent as a photo; this note marks
+    # where it was, and svg_rendering is the transient draft placeholder while it streams.
+    "stream.svg_image": {
+        "en": "🖼 Diagram — sent as an image below.",
+        "ru": "🖼 Схема — отправлена изображением ниже.",
+    },
+    "stream.svg_rendering": {"en": "🖼 Rendering a diagram…", "ru": "🖼 Рисую схему…"},
     # #229: header of the live task-list card ({n} total, {done} completed, {open} not done).
     "todo.card_header": {
         "en": "📋 {n} tasks ({done} done, {open} open)",

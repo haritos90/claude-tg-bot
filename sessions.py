@@ -151,6 +151,39 @@ jz      short loc_load_fail
 mov     esp, ebp
 pop     ebp
 retn    8
+```
+
+Finally an inline **SVG diagram** (#295): in a chat session the bot rasterizes this to a PNG and sends it as a photo. Example — a nightstand built from a washing-machine body, using the round porthole as the cabinet door:
+
+```svg
+<svg xmlns="http://www.w3.org/2000/svg" width="600" height="660" viewBox="0 0 600 660" font-family="sans-serif">
+  <rect width="600" height="660" fill="#ffffff"/>
+  <text x="300" y="34" font-size="20" font-weight="bold" text-anchor="middle" fill="#222">Nightstand from a washing-machine body</text>
+  <text x="300" y="55" font-size="13" text-anchor="middle" fill="#666">sketch — front view</text>
+  <rect x="110" y="86" width="320" height="24" rx="4" fill="#c9a36a" stroke="#8a6a3a" stroke-width="2"/>
+  <rect x="130" y="110" width="280" height="420" rx="16" fill="#e9edf0" stroke="#49555f" stroke-width="3"/>
+  <circle cx="270" cy="320" r="112" fill="#9aa7b0" stroke="#49555f" stroke-width="3"/>
+  <circle cx="270" cy="320" r="84" fill="#cfe0ea" stroke="#7f8b94" stroke-width="2"/>
+  <circle cx="368" cy="320" r="8" fill="#49555f"/>
+  <rect x="160" y="530" width="30" height="42" fill="#3a4048"/>
+  <rect x="380" y="530" width="30" height="42" fill="#3a4048"/>
+  <g stroke="#9aa3ab" stroke-width="1">
+    <line x1="430" y1="98" x2="448" y2="98"/><line x1="410" y1="180" x2="448" y2="180"/>
+    <line x1="382" y1="300" x2="448" y2="272"/><line x1="410" y1="551" x2="448" y2="551"/>
+  </g>
+  <g font-size="13" fill="#3a4048">
+    <text x="452" y="102">countertop</text><text x="452" y="184">washer shell</text>
+    <text x="452" y="268">porthole &#8594; door</text>
+    <text x="452" y="286" font-size="11" fill="#6a747c">&#216; &#8776; 300 mm</text>
+    <text x="452" y="555">legs</text>
+  </g>
+  <g stroke="#c0392b" stroke-width="1.5">
+    <line x1="84" y1="86" x2="84" y2="572"/><line x1="78" y1="86" x2="90" y2="86"/><line x1="78" y1="572" x2="90" y2="572"/>
+    <line x1="130" y1="598" x2="410" y2="598"/><line x1="130" y1="592" x2="130" y2="604"/><line x1="410" y1="592" x2="410" y2="604"/>
+  </g>
+  <text x="66" y="330" font-size="13" fill="#c0392b" text-anchor="middle" transform="rotate(-90 66 330)">&#8776; 720 mm</text>
+  <text x="270" y="618" font-size="13" fill="#c0392b" text-anchor="middle">&#8776; 600 mm</text>
+</svg>
 ```"""
 # #135: how often to poll the account /api/oauth/usage endpoint for the real % used.
 # The 5h/7d windows move slowly, so 5 min keeps the footer/pinned fresh cheaply.
@@ -1819,10 +1852,11 @@ class SessionManager:
         return usage.footer_line(self.rate_by_type, lang, sep="\n")
 
     async def stream_demo(self, chat_id: int, thread_id: int | None = None) -> None:
-        """#172 (/test): simulate a STREAMED generation of a sample reply (3 paragraphs
-        + a 5×5 table + an asm snippet) so the owner can watch the live rich-draft
-        formatting build up — instead of plain text snapping to rich at the end. Drives
-        a standalone Streamer; not a real session. Best-effort."""
+        """#172 (/test): simulate a STREAMED generation of a sample reply (paragraphs,
+        a wide table, an asm snippet, and an SVG diagram, #295) so the owner can watch the
+        live rich-draft formatting build up — instead of plain text snapping to rich at the
+        end. The SVG renders to a PNG photo at finish. Drives a standalone Streamer; not a
+        real session. Best-effort."""
         # controllable=False → no mid-stream Stop message (kept the draft from
         # "regenerating"); finish(notify=False) → the persisted message is SILENT.
         streamer = Streamer(self.bot, chat_id, thread_id,
