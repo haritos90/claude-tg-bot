@@ -9,7 +9,7 @@ this avoids needing pytest-asyncio (and the cross-loop lock reuse it would risk)
 import asyncio
 import tempfile
 
-import db
+from app.storage import db
 
 
 def _run(coro_factory):

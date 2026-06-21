@@ -16,7 +16,7 @@ import re
 from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-import i18n
+from app import i18n
 
 
 # Read-only / non-destructive tools: never need owner approval.

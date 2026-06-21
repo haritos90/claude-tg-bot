@@ -2,7 +2,7 @@
 
 How a session is contained: what an untrusted `code`-level user (driving the
 agent) **cannot** do, and the mechanism behind each guarantee. This is the deep
-reference; [`AGENTS.md`](AGENTS.md) §5 *Sandbox* is the summary and
+reference; [`AGENTS.md`](../AGENTS.md) §5 *Sandbox* is the summary and
 [§12](#12-threat-model--design-rationale) holds the threat model + design rationale.
 
 **The jail is MANDATORY for every session — chat AND code, no exceptions (#231).** There
@@ -297,7 +297,7 @@ The launcher reads its config from `SBX_*` env vars that `engine._enable_sandbox
 
 ## 11. Build gotchas
 
-See the memory note `sandbox-119-build-gotchas` and [`AGENTS.md`](AGENTS.md) §5 for the
+See the memory note `sandbox-119-build-gotchas` and [`AGENTS.md`](../AGENTS.md) §5 for the
 traps (manual cgroup vs `systemd-run`; the seccomp fall-through-must-be-ALLOW bug; the
 `iptables -m cgroup --path` "dir must exist + module loaded" requirement; the
 egress-proxy ASCII-decode trap).

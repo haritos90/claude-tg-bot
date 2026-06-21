@@ -5,7 +5,7 @@ unit-tested here; the testable combining math is extracted to module-level pure
 functions (the #235 album coalescer), which these tests exercise directly.
 """
 
-import handlers
+from app.telegram import handlers
 
 
 def _part(mid, blocks=None, inline=""):

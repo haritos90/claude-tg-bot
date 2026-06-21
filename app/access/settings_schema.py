@@ -347,7 +347,7 @@ def _session_attr_setter(db_func_name: str) -> Setter:
     """SESSION setter calling the matching ``db.set_<x>(thread_id, value)`` async
     helper for the bound session (no-op when no session is bound)."""
     async def setter(ctx: Ctx, value):
-        import db  # lazy: avoid an import cycle
+        from app.storage import db  # lazy: avoid an import cycle
         st = ctx.state
         if st is None:
             return
@@ -363,7 +363,7 @@ def _session_attr_setter(db_func_name: str) -> Setter:
 def _user_setter(key: str) -> Setter:
     """USER setter persisting the per-user default (value None CLEARS it)."""
     async def setter(ctx: Ctx, value):
-        import db  # lazy
+        from app.storage import db  # lazy
         if ctx.user_id is None:
             return
         await db.set_user_default(ctx.user_id, key, value)
@@ -387,7 +387,7 @@ def _sandbox_session_setter() -> Setter:
     (raw) → no_sandbox True, value None → re-isolate (clear the opt-out). Mirrors
     the inversion in ``_sandbox_session_get`` so resolve() stays generic."""
     async def setter(ctx: Ctx, value):
-        import db  # lazy
+        from app.storage import db  # lazy
         st = ctx.state
         thread_id = getattr(st, "thread_id", None) if st is not None else None
         if thread_id is None:
@@ -411,7 +411,7 @@ def _language_user_setter() -> Setter:
     """USER language setter — persists the locale to its OWN kv store
     (db.set_user_lang, key lang:<uid>), not the generic user_default kv."""
     async def setter(ctx: Ctx, value):
-        import db  # lazy
+        from app.storage import db  # lazy
         if ctx.user_id is None or value is None:
             return
         await db.set_user_lang(ctx.user_id, value)

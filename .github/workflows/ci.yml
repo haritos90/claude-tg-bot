@@ -36,13 +36,13 @@ jobs:
         run: ruff check .
 
       - name: Byte-compile
-        run: python -m py_compile *.py
+        run: python -m compileall -q app conftest.py
 
       - name: Import smoke test
         # No .env is present in CI; importing must not load settings or start
         # polling (guarded by __main__), so this verifies the module graph only.
         run: |
-          python -c "import config, db, access, allowlist, markup, streamer, permissions, engine, sessions, usage, handlers, bot"
+          python -c "import app.config, app.storage.db, app.access.access, app.access.allowlist, app.telegram.markup, app.telegram.streamer, app.access.permissions, app.core.engine, app.core.sessions, app.storage.usage, app.telegram.handlers, app.bot"
 
       - name: Unit tests
         run: pytest -q

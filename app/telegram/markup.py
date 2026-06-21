@@ -598,11 +598,15 @@ def extract_wide_tables(text: str, max_cols: int = RICH_TABLE_MAX_COLS):
 # can't render SVG inline, so each complete <svg>…</svg> is pulled out, rasterized to PNG, and
 # sent as a photo; a localized note is left where it was. Mirrors the wide-table token scheme.
 SVG_TOKEN = "\x00SVG\x00"
-_SVG_FENCE_RE = re.compile(
-    r"```[ \t]*(?:svg|xml|html)?[ \t]*\r?\n\s*(<svg\b.*?</svg>)\s*\r?\n?```",
+# #301: ONE combined pass, fenced-alternative first so a fenced ```svg block is consumed as a
+# whole (and the fence dropped) before its inner <svg> can match the raw alternative. A single
+# left-to-right sub keeps the captured SVGs in true document order — a separate fenced-then-raw
+# pass put all fenced ones ahead of all raw ones regardless of position.
+_SVG_BLOCK_RE = re.compile(
+    r"```[ \t]*(?:svg|xml|html)?[ \t]*\r?\n\s*(<svg\b.*?</svg>)\s*\r?\n?```"  # group 1: fenced
+    r"|(<svg\b[^>]*>.*?</svg>)",                                              # group 2: raw
     re.DOTALL | re.IGNORECASE,
 )
-_SVG_RAW_RE = re.compile(r"<svg\b[^>]*>.*?</svg>", re.DOTALL | re.IGNORECASE)
 
 
 def extract_svgs(text: str):
@@ -614,12 +618,11 @@ def extract_svgs(text: str):
         return text, []
     svgs: list[str] = []
 
-    def _take(svg: str) -> str:
-        svgs.append(svg.strip())
+    def _take(m) -> str:
+        svgs.append((m.group(1) or m.group(2)).strip())  # fenced -> inner svg; else the raw svg
         return SVG_TOKEN
 
-    out = _SVG_FENCE_RE.sub(lambda m: _take(m.group(1)), text)   # fenced (drops the fence)
-    out = _SVG_RAW_RE.sub(lambda m: _take(m.group(0)), out)      # any remaining unfenced <svg>
+    out = _SVG_BLOCK_RE.sub(_take, text)
     return out, svgs
 
 

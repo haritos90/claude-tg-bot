@@ -8,7 +8,7 @@ allowed, always ``code``, always uncapped, and never written to the file.
 import json
 from datetime import date, timedelta
 
-import allowlist as al
+from app.access import allowlist as al
 
 OWNER = 999
 

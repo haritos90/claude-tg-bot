@@ -11,7 +11,7 @@ import os
 import tempfile
 import time
 
-import token_refresh
+from app.core import token_refresh
 
 
 def _write(path, oauth):

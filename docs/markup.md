@@ -190,4 +190,4 @@ Tags `sendRichMessage` (Path B) can render. Status legend:
 | PNG fallback (retained, commented) | `table_image.py`, `markup.split_image_tables` |
 | Commands & settings structure | **[menu.md](menu.md)** |
 
-See also the **Message formatting** section of the [README](README.md).
+See also the **Message formatting** section of the [README](../README.md).

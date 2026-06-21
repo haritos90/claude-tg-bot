@@ -16,7 +16,7 @@ import urllib.request
 from datetime import datetime
 from types import SimpleNamespace
 
-import i18n
+from app import i18n
 
 # Account usage endpoint (the source Claude Code's /usage reads). Authenticated with
 # the subscription OAuth bearer from ~/.claude/.credentials.json + the OAuth beta

@@ -1,6 +1,6 @@
 """Unit tests for streamer pure helpers (#240)."""
 
-import streamer
+from app.telegram import streamer
 
 
 def test_tool_phase_label_maps_tools_to_phrases():
@@ -23,7 +23,7 @@ def test_tool_phase_label_maps_tools_to_phrases():
 def test_wide_table_notes_replaces_token_and_is_noop_when_narrow():
     """#256: the draft + final paths share _wide_table_notes — a >20-col table's token is
     swapped for the localized note (so the draft matches the final bubble); no-op when none."""
-    import markup
+    from app.telegram import markup
     s = streamer.Streamer(None, 123, None)
     header = "| " + " | ".join(f"c{i}" for i in range(21)) + " |"
     sep = "|" + "---|" * 21
@@ -58,7 +58,7 @@ def test_add_reasoning_accumulates_caps_and_clears_phase():
 def test_thinking_label_rotates():
     """#240a/#294: the placeholder gerund advances with elapsed time and wraps, and is
     localized — the rotation list now comes from i18n (stream.thinking_words)."""
-    import i18n
+    from app import i18n
     words = [w for w in i18n.t("stream.thinking_words", "en").split(",") if w]
     first = streamer._thinking_label(0.0, "en")
     second = streamer._thinking_label(streamer._THINKING_ROTATE_SECS + 0.1, "en")

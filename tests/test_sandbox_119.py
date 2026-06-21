@@ -9,7 +9,7 @@ position and EVERY non-denied syscall returned EPERM (the process then SIGSEGV'd
 import importlib.util
 from pathlib import Path
 
-import engine
+from app.core import engine
 
 _DEPLOY = Path(__file__).resolve().parent.parent / "deploy"
 

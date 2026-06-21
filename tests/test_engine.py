@@ -9,7 +9,7 @@ the model only when global memory is on.
 
 import os
 
-import engine
+from app.core import engine
 
 
 def _redirect_home(monkeypatch, tmp_path, memo="REMEMBER: always be terse"):

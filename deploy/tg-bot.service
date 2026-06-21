@@ -4,7 +4,7 @@
 # the reference deployment at /opt/claude-tg-bot running as root):
 #   sudo cp deploy/tg-bot.service /etc/systemd/system/claude-tg-bot.service
 #   sudo systemctl daemon-reload
-#   pkill -f 'python bot\.py$'              # stop any manual copy (avoid a 409)
+#   pkill -f 'python -m app$'               # stop any manual copy (avoid a 409)
 #   sudo systemctl enable --now claude-tg-bot
 #   journalctl -u claude-tg-bot -f
 #
@@ -46,7 +46,9 @@ TimeoutStopSec=60
 
 User=root
 WorkingDirectory=/opt/claude-tg-bot
-ExecStart=/opt/claude-tg-bot/.venv/bin/python /opt/claude-tg-bot/bot.py
+# was: ExecStart=… /opt/claude-tg-bot/bot.py — #302: run the app package (python -m app);
+# WorkingDirectory (above) puts the repo root on sys.path so `app` is importable.
+ExecStart=/opt/claude-tg-bot/.venv/bin/python -m app
 
 # .env is read from WorkingDirectory by python-dotenv. systemd does NOT inherit a
 # login PATH/HOME — set them so the (bundled) claude CLI + its ~/.claude creds are

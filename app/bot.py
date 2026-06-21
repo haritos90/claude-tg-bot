@@ -15,21 +15,22 @@ import os
 import shutil
 import subprocess
 import sys
-from pathlib import Path
+# from pathlib import Path  # #302: unused after deploy/ paths moved to app.DEPLOY_DIR
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.exceptions import TelegramNetworkError
 
-from config import load_settings
-from db import init_db, close_db, migrate_workdirs_to_sid, sandbox_uid_collisions
-from allowlist import Allowlist
-from access import AllowlistMiddleware, LanguageMiddleware
-from permissions import PermissionGate
-from sessions import SessionManager
-from handlers import build_router, setup_commands
-import watchdog
-import i18n
+from app.config import load_settings
+from app.storage.db import init_db, close_db, migrate_workdirs_to_sid, sandbox_uid_collisions
+from app.access.allowlist import Allowlist
+from app.access.access import AllowlistMiddleware, LanguageMiddleware
+from app.access.permissions import PermissionGate
+from app.core.sessions import SessionManager
+from app.telegram.handlers import build_router, setup_commands
+from app import watchdog
+from app import i18n
+from app import DEPLOY_DIR  # repo-root deploy/ scripts (#302: bot.py moved into the package)
 
 logger = logging.getLogger("bot")
 
@@ -161,14 +162,16 @@ async def main() -> None:
                           if k not in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")}
             broker_proc = subprocess.Popen(
                 [sys.executable,
-                 str(Path(__file__).resolve().parent / "deploy" / "cred-broker.py"),
+                 # was: Path(__file__).resolve().parent / "deploy" / "cred-broker.py" (#302)
+                 str(DEPLOY_DIR / "cred-broker.py"),
                  "--port", str(settings.cred_broker_port)],
                 env=broker_env,
             )
             logger.info("Credential broker (#119b) started on 127.0.0.1:%s",
                         settings.cred_broker_port)
 
-    _deploy = Path(__file__).resolve().parent / "deploy"
+    # was: _deploy = Path(__file__).resolve().parent / "deploy" (#302: bot.py moved into app/)
+    _deploy = DEPLOY_DIR
 
     # #119e: compile the seccomp denylist BPF once at startup (x86_64 only — make-seccomp.py
     # no-ops on other arches). The engine points bwrap's --seccomp fd at this file per jail.

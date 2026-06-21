@@ -30,11 +30,11 @@ from aiogram.types import (
     LinkPreviewOptions,
 )
 
-import i18n
-import markup
-import table_image  # #243: wide (>20-col) tables → PNG; also the #162 PNG-table revert path
-import svg_image  # #295: chat <svg> diagrams → PNG (rasterized via cairosvg)
-from rich_message import EditRichMessage, SendRichMessage, SendRichMessageDraft
+from app import i18n
+from app.telegram import markup
+from app.telegram import table_image  # #243: wide (>20-col) tables → PNG; also the #162 PNG-table revert path
+from app.telegram import svg_image  # #295: chat <svg> diagrams → PNG (rasterized via cairosvg)
+from app.telegram.rich_message import EditRichMessage, SendRichMessage, SendRichMessageDraft
 
 logger = logging.getLogger("streamer")
 

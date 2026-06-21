@@ -8,7 +8,7 @@ drop windows with no number, and map the used fraction to the status vocabulary.
 
 import asyncio
 
-import usage
+from app.storage import usage
 
 
 def test_normalize_percent_to_fraction_and_iso_to_epoch():

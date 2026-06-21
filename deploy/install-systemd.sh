@@ -42,7 +42,7 @@ echo "Installing $UNIT  (dir=$PROJECT_DIR  user=$RUN_USER  home=$HOME_DIR)"
 sed -E \
   -e "s|^User=.*|User=$RUN_USER|" \
   -e "s|^WorkingDirectory=.*|WorkingDirectory=$PROJECT_DIR|" \
-  -e "s|^ExecStart=.*|ExecStart=$PY $PROJECT_DIR/bot.py|" \
+  -e "s|^ExecStart=.*|ExecStart=$PY -m app|" \
   -e "s|^Environment=HOME=.*|Environment=HOME=$HOME_DIR|" \
   -e "s|^Environment=PATH=.*|Environment=PATH=$HOME_DIR/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin|" \
   "$PROJECT_DIR/deploy/tg-bot.service" > "$DEST/$UNIT"
@@ -51,9 +51,11 @@ sed -E \
 cp "$PROJECT_DIR/deploy/claude-tg-bot-restart.service" "$DEST/" 2>/dev/null || true
 cp "$PROJECT_DIR/deploy/claude-tg-bot-restart.timer"   "$DEST/" 2>/dev/null || true
 
-# Stop any MANUAL copy first (a 2nd poller per token → 409). This pattern does NOT
-# match the systemd process (its cmdline is absolute-path), so it won't fight the service.
-pkill -f 'python bot\.py$' 2>/dev/null && echo "stopped a manual bot copy" || true
+# Stop any MANUAL copy first (a 2nd poller per token → 409). #302: with `-m app` the
+# manual and service cmdlines look alike, so exclude the unit's own MainPID before killing.
+SVC_PID=$(systemctl show -p MainPID --value "$UNIT" 2>/dev/null || true)
+pgrep -f 'python -m app' 2>/dev/null | grep -vx "${SVC_PID:-x}" | xargs -r kill 2>/dev/null \
+  && echo "stopped a manual bot copy" || true
 
 systemctl daemon-reload
 systemctl enable --now "$UNIT"

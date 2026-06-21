@@ -1335,6 +1335,10 @@ CATALOG: dict[str, dict[str, str]] = {
         "en": "   ↳ units: 5h {day} · week {week} · total {total}",
         "ru": "   ↳ единицы: 5ч {day} · неделя {week} · всего {total}",
     },
+    "users.entry_usage_tok": {  # #303: a same-format raw-tokens line below the units line
+        "en": "   ↳ tokens: 5h {day} · week {week} · total {total}",
+        "ru": "   ↳ токены: 5ч {day} · неделя {week} · всего {total}",
+    },
     "users.btn_owner": {"en": "👑 You (owner)", "ru": "👑 Вы (владелец)"},
     "users.btn_owner_bare": {"en": "Owner", "ru": "Владелец"},  # #272: owner label fallback
     "users.btn_add": {"en": "➕ Add user", "ru": "➕ Добавить"},

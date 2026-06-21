@@ -100,7 +100,7 @@ language label or copy button) because the Telegram client does not yet style
 `RichBlockPreformatted` (#174).
 
 The rendering paths, the Markdown→HTML contract, the rich tag catalog, and the size
-rules are specified in [markup.md](markup.md). Telegram reference:
+rules are specified in [markup.md](docs/markup.md). Telegram reference:
 [Rich message formatting][tg-fmt] · [HTML style][tg-html].
 
 [tg-fmt]: https://core.telegram.org/bots/api#rich-message-formatting-options
@@ -110,31 +110,39 @@ rules are specified in [markup.md](markup.md). Telegram reference:
 
 ## Project structure
 
-| File | Responsibility |
+The code is grouped into the `app` package (run with `python -m app`):
+
+| Path | Responsibility |
 |---|---|
-| `bot.py` | Entry point: wiring, middleware, long polling, graceful shutdown. |
-| `watchdog.py` | systemd liveness watchdog — `READY=1` at startup, `WATCHDOG=1` after a successful Telegram probe, so a wedged connection triggers an auto-restart. |
-| `config.py` | `.env` → `Settings` (warns if `ANTHROPIC_API_KEY` is set). |
-| `handlers.py` | aiogram router: commands, text/photo/document routing, callbacks, the `/` menu. |
-| `commands.py` | Source of truth for the command set + localized menu labels; `/help` and `setMyCommands` derive from it. |
-| `settings_schema.py` | Settings registry + resolver: each setting's type/default, storage tier, and access model. |
-| `engine.py` | `ClaudeSession` over the Agent SDK — all SDK code lives here, including the sandbox launcher. |
-| `sessions.py` | `SessionManager`: per-session worker, the chaining queue, `/stop`, usage accounting. |
-| `archive.py` | Cold storage (#177): on delete, bundle a session's workdir + transcript into one gzip archive. |
-| `streamer.py` | Live reply: draft streaming in DM, code/table rendering, usage footer. |
-| `permissions.py` | `PermissionGate`: the code-mode Allow/Deny approval gate. |
-| `access.py` | Middleware: allowlist (drops non-allowed updates) + per-user language. |
-| `allowlist.py` | JSON-backed access store: levels, expiry, usage caps; owner always allowed; fail-closed. |
-| `db.py` | `aiosqlite` state: sessions, usage, conversation log, key-value store. |
-| `i18n.py` | Localization table + `t(key, lang, …)`; `en` canonical, `ru` translation. |
-| `markup.py` | Telegram formatting: Markdown→HTML, 4096-safe splitting, long-output-as-file. |
-| `rich_message.py` | Binding for Bot API 10.1 `sendRichMessage` — native tables. |
-| `table_image.py` | Dormant PNG-table fallback (#162), kept for wide tables. |
-| `usage.py` | Formatters for the 5h / 7d subscription windows. |
-| `deploy/` | `tg-bot.service` (systemd unit) and `sandbox-claude.sh` (bubblewrap launcher). |
+| `app/__main__.py` | Entry point — `python -m app` runs `app.bot.main()`. |
+| `app/bot.py` | Wiring, middleware, long polling, graceful shutdown. |
+| `app/watchdog.py` | systemd liveness watchdog — `READY=1` at startup, `WATCHDOG=1` after a successful Telegram probe, so a wedged connection triggers an auto-restart. |
+| `app/config.py` | `.env` → `Settings` (warns if `ANTHROPIC_API_KEY` is set). |
+| `app/i18n.py` | Localization table + `t(key, lang, …)`; `en` canonical, `ru` translation. |
+| `app/core/engine.py` | `ClaudeSession` over the Agent SDK — all SDK code lives here, including the sandbox launcher. |
+| `app/core/sessions.py` | `SessionManager`: per-session worker, the chaining queue, `/stop`, usage accounting. |
+| `app/core/token_refresh.py` | Background refresh of the subscription OAuth credential (#191). |
+| `app/core/schedules.py` | Recurring / one-shot schedule runner. |
+| `app/core/agent_context.md` | Agent self-description loaded into the system prompt (runtime asset, co-located with `engine`). |
+| `app/storage/db.py` | `aiosqlite` state: sessions, usage, conversation log, key-value store. |
+| `app/storage/archive.py` | Cold storage (#177): on delete, bundle a session's workdir + transcript into one gzip archive. |
+| `app/storage/usage.py` | Formatters for the 5h / 7d subscription windows. |
+| `app/access/access.py` | Middleware: allowlist (drops non-allowed updates) + per-user language. |
+| `app/access/allowlist.py` | JSON-backed access store: levels, expiry, usage caps; owner always allowed; fail-closed. |
+| `app/access/permissions.py` | `PermissionGate`: the code-mode Allow/Deny approval gate. |
+| `app/access/settings_schema.py` | Settings registry + resolver: each setting's type/default, storage tier, and access model. |
+| `app/telegram/handlers.py` | aiogram router: commands, text/photo/document routing, callbacks, the `/` menu. |
+| `app/telegram/commands.py` | Source of truth for the command set + localized menu labels; `/help` and `setMyCommands` derive from it. |
+| `app/telegram/streamer.py` | Live reply: draft streaming in DM, code/table rendering, usage footer. |
+| `app/telegram/markup.py` | Telegram formatting: Markdown→HTML, 4096-safe splitting, long-output-as-file. |
+| `app/telegram/rich_message.py` | Binding for Bot API 10.1 `sendRichMessage` — native tables. |
+| `app/telegram/svg_image.py` | Rasterizes a chat reply's inline `<svg>` diagram to PNG (#295). |
+| `app/telegram/table_image.py` | Dormant PNG-table fallback (#162), kept for wide tables. |
+| `deploy/` | Out-of-process helpers: `tg-bot.service` (systemd unit), `sandbox-claude.sh` (bubblewrap launcher), the egress / broker / seccomp scripts. |
+| `docs/` | Design docs: `data-model.md`, `isolation.md`, `menu.md`, `markup.md`, `rich-message-spec.md`, `CONTRIBUTING.md`, `SECURITY.md`. |
 
 Tasks are tracked in [`TODO.md`](TODO.md); contributor rules in [`AGENTS.md`](AGENTS.md)
-and [`CONTRIBUTING.md`](CONTRIBUTING.md).
+and [`CONTRIBUTING.md`](docs/CONTRIBUTING.md).
 
 ---
 
@@ -145,7 +153,10 @@ file is the service user (whoever ran `claude setup-token` and the systemd unit)
 
 ```
 <repo>/                          ← the checkout (service user owns it)
-├── *.py                         ← application code (see Project structure)
+├── app/                         ← application package (run via `python -m app`; see Project structure)
+├── deploy/                      ← systemd unit + sandbox / egress / broker helpers
+├── docs/                        ← design docs (data-model, isolation, menu, markup, rich-message-spec)
+├── tests/   conftest.py         ← pytest suite (+ the root sys.path shim)
 ├── .env                         ← config + secrets: TELEGRAM_BOT_TOKEN, OWNER_ID,
 │                                  DEFAULT_MODEL, BASE_WORKDIR, DB_PATH, ALLOWLIST_PATH,
 │                                  optional SANDBOX_*/concurrency caps        [gitignored]
@@ -167,10 +178,10 @@ Isolation is structural: each session sees only its own `work/`, and with
 jail escape cannot read another session's files. The subscription credential is injected
 read-only in the bare jail, or — with the broker (#119b) — kept out of the jail entirely
 (a `BROKER-PLACEHOLDER` dummy is injected and a host broker supplies the real token). See
-[Security & isolation](#security--isolation) and [`isolation.md`](isolation.md).
+[Security & isolation](#security--isolation) and [`isolation.md`](docs/isolation.md).
 
 SQLite tables in `bot.db` (additive-migration only; full schema in
-[`data-model.md`](data-model.md)):
+[`data-model.md`](docs/data-model.md)):
 
 | Table | One row per | Holds |
 |---|---|---|
@@ -209,7 +220,7 @@ directory; with the broker (#119b) on, it never enters a jail.
   sending the raw `.svg` file.
 - Optional (for the #119 egress allowlist, `SANDBOX_EGRESS`): `iptables` (the
   `iptables-nft` backend works) + the `xt_cgroup` kernel module + cgroup v2. No
-  `nftables` and no extra Python packages. See [`isolation.md`](isolation.md).
+  `nftables` and no extra Python packages. See [`isolation.md`](docs/isolation.md).
 
 ### Resource requirements & concurrency limits
 
@@ -298,7 +309,7 @@ Run:
 
 ```bash
 . .venv/bin/activate
-python bot.py
+python -m app
 ```
 
 Open a DM, `/start`, create a session with `/new`, and say hello; upgrade it with
@@ -338,7 +349,7 @@ text goes to the current session's Claude.
 Commands are registered most-used first; `/new`, `/sessions`, `/settings` sit at the
 top. Fixed-choice commands open an inline picker; commands needing free text prompt for
 your next message (with `/cancel`). `/help` is generated from the same registry. The
-full menu structure is in [menu.md](menu.md).
+full menu structure is in [menu.md](docs/menu.md).
 
 | Group | Commands |
 |---|---|
@@ -397,7 +408,7 @@ archive and removes the live copies (#177); archives older than the retention pe
 auto-purged (#178; default 6 months, owner-configurable under Settings → Admin → Archive
 retention or `ARCHIVE_RETENTION_DAYS`).
 
-Report vulnerabilities privately — see [`SECURITY.md`](SECURITY.md).
+Report vulnerabilities privately — see [`SECURITY.md`](docs/SECURITY.md).
 
 ---
 
@@ -452,7 +463,7 @@ Resilience:
   `sudo systemctl enable --now claude-tg-bot-restart.timer`.
 
 Restart after a code change with `sudo systemctl restart claude-tg-bot` (never a second
-manual `python bot.py` — two pollers per token gives a 409). Run the service as the same
+manual `python -m app` — two pollers per token gives a 409). Run the service as the same
 user that ran `claude setup-token`.
 
 ---

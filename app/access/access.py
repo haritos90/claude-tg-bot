@@ -16,9 +16,9 @@ from aiogram import BaseMiddleware
 from aiogram.types import (InlineKeyboardButton, InlineKeyboardMarkup,
                            TelegramObject)
 
-import db
-import i18n
-import markup
+from app.storage import db
+from app import i18n
+from app.telegram import markup
 
 
 class AllowlistMiddleware(BaseMiddleware):
