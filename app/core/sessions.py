@@ -17,8 +17,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import os
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -36,8 +38,80 @@ from app.core.engine import ClaudeSession
 from app.telegram.streamer import Streamer, resolve_speed  # #294: tool_phase_label now used via streamer.set_tool_phase
 from app.access.permissions import PermissionGate
 
+logger = logging.getLogger(__name__)  # #325: drain progress → the journal
+
 # The Anthropic prompt cache stays warm for ~5 minutes after the last request.
 _CACHE_WINDOW_SECONDS = 300.0
+
+
+class FairAdmission:
+    """#326: a FAIR concurrency gate for turn admission. At most ``slots`` turns run at once;
+    when full, waiting turns are admitted ROUND-ROBIN by key (the user / chat_id), so one user's
+    burst across many sessions can't occupy every slot and starve another user — which a plain
+    ``asyncio.Semaphore`` allows (it wakes blocked acquirers FIFO by arrival). Pure single-threaded
+    asyncio; cancellation-safe (a cancelled waiter is removed; a slot handed to a since-cancelled
+    waiter is passed on, never leaked). Drop-in for the Semaphore's ``locked()`` + acquire/release."""
+
+    def __init__(self, slots: int) -> None:
+        self._slots = max(1, int(slots))
+        self._in_use = 0
+        self._waiters: dict = {}        # key -> deque[asyncio.Future] (FIFO within one user)
+        self._order: deque = deque()    # keys that HAVE waiters, in round-robin order (each once)
+
+    def locked(self) -> bool:
+        """True when every slot is taken (a new acquire would have to wait)."""
+        return self._in_use >= self._slots
+
+    @property
+    def active(self) -> int:
+        return self._in_use
+
+    async def acquire(self, key) -> None:
+        """Take a slot, waiting (round-robin by key) if all are busy."""
+        if self._in_use < self._slots:
+            self._in_use += 1
+            return
+        fut = asyncio.get_running_loop().create_future()
+        q = self._waiters.get(key)
+        if q is None:
+            q = deque()
+            self._waiters[key] = q
+        q.append(fut)
+        if len(q) == 1:                 # this key's FIRST waiter → join the rotation
+            self._order.append(key)
+        try:
+            await fut
+        except asyncio.CancelledError:
+            # Cancelled while WAITING → drop our future. Cancelled just AFTER being handed the
+            # slot → pass it on so the slot isn't leaked.
+            if not fut.done():
+                with contextlib.suppress(ValueError):
+                    q.remove(fut)
+            elif not fut.cancelled():
+                self.release()
+            raise
+
+    def release(self) -> None:
+        """Release a held slot — hand it to the next waiter ROUND-ROBIN by key, else free it."""
+        while self._order:
+            key = self._order.popleft()
+            q = self._waiters.get(key)
+            if not q:
+                self._waiters.pop(key, None)
+                continue
+            fut = q.popleft()
+            if q:                       # key still has waiters → back of the rotation
+                self._order.append(key)
+            else:
+                self._waiters.pop(key, None)
+            if not fut.done():          # hand the slot over (in_use stays the same)
+                fut.set_result(None)
+                return
+            # waiter was cancelled in flight → keep looking for a live one
+        self._in_use -= 1               # nobody waiting → the slot is now free
+        if self._in_use < 0:
+            self._in_use = 0
+
 
 # #187: outbox file send-back. The agent drops files in <cwd>/outbox/; after each turn
 # the host delivers them to the chat (images as photos, the rest as documents) and
@@ -437,7 +511,7 @@ class SessionManager:
         # #135: background task polling the account /api/oauth/usage endpoint for the
         # REAL per-window % (the SDK rate-events only send it near a limit).
         self._usage_task: asyncio.Task | None = None
-        # #179: concurrency / RAM management. _turn_sem caps SIMULTANEOUS active turns
+        # #179/#326: concurrency / RAM management. the fair _turn_gate caps SIMULTANEOUS active turns
         # (the generation spike); _reaper_task periodically aclose()s idle live clients
         # (each ~400–600 MB) so N idle sessions don't pin N processes until restart.
         # History lives on disk (transcript) → `resume` rebuilds it; nothing is lost.
@@ -455,9 +529,20 @@ class SessionManager:
         # session reset/delete, or at shutdown. 0 = keep until delete.
         self._detached_shells: dict[int, tuple] = {}
         self._shell_ttl: float = float(getattr(settings, "shell_ttl_sec", 86400) or 0)
-        self._turn_sem: asyncio.Semaphore = asyncio.Semaphore(
+        # #326: FAIR admission (round-robin by user) instead of a plain Semaphore, so one user's
+        # burst of sessions can't occupy every slot and starve others.
+        # was: self._turn_sem = asyncio.Semaphore(max_concurrent_turns)
+        self._turn_gate: FairAdmission = FairAdmission(
             int(getattr(settings, "max_concurrent_turns", 4) or 4)
         )
+        # #325: graceful drain — on shutdown we stop STARTING new turns and wait for the
+        # in-flight ones to finish (so a restart doesn't kill a turn mid-generation / tear its
+        # transcript). `_active_turns` counts running _run_one()s; `_idle_event` is set when
+        # none are; `_draining` makes each per-thread worker stop pulling new queued turns.
+        self._draining: bool = False
+        self._active_turns: int = 0
+        self._idle_event: asyncio.Event = asyncio.Event()
+        self._idle_event.set()
         self._reaper_task: asyncio.Task | None = None
         # #178: background task purging expired archive bundles (retention).
         self._archive_purge_task: asyncio.Task | None = None
@@ -488,7 +573,8 @@ class SessionManager:
         #      — replaced for #140 (sid-named workdirs)
         # #181: nested layout — cwd is <sid>/work (agent's writable dir); the jail
         # state/transcript live in the SIBLING <sid>/state (not bound into the jail).
-        return str(Path(self.settings.base_workdir) / db.session_sid(thread_id) / "work")
+        # #332: dir named by the PUBLIC ULID (was db.session_sid — the legacy 6-hex).
+        return str(Path(self.settings.base_workdir) / db.session_pubid(thread_id) / "work")
 
     # --------------------------------------------------------------- session mgmt
 
@@ -922,6 +1008,10 @@ class SessionManager:
         send_tid = _send_thread_id(thread_id)
         try:
             while True:
+                # #325: graceful drain — let the in-flight turn (the loop body below) run to
+                # completion, but start NO new queued turns once draining (shutdown).
+                if self._draining:
+                    break
                 try:
                     _qid, prompt, attachments = rec.queue.get_nowait()
                 except asyncio.QueueEmpty:
@@ -967,10 +1057,23 @@ class SessionManager:
                     # box; a contended slot tells the user the turn is queued. The
                     # per-thread queue still serializes THIS thread's own turns.
                     await self._admit_turn(thread_id, chat_id, send_tid)
-                    async with self._turn_sem:
+                    # #326: FAIR admission — round-robin by user (chat_id) so a multi-session
+                    # burst can't starve another user; the per-thread queue still serializes THIS
+                    # thread's turns. Paired with the release() in the finally below.
+                    await self._turn_gate.acquire(chat_id)
+                    # #325: track in-flight turns so a graceful drain can wait them out.
+                    self._active_turns += 1
+                    self._idle_event.clear()
+                    try:
                         await self._run_one(
                             rec, thread_id, prompt, attachments, streamer
                         )
+                    finally:
+                        self._active_turns -= 1
+                        if self._active_turns <= 0:
+                            self._active_turns = 0
+                            self._idle_event.set()
+                        self._turn_gate.release()  # #326
                     # #187: deliver any files the agent staged in outbox/ this turn.
                     # OUTSIDE the turn-sem (uploads shouldn't hold a concurrency slot) but
                     # INSIDE the per-thread loop, so it's serialized before the next queued
@@ -1218,13 +1321,26 @@ class SessionManager:
                             running_text = ""
                             segmented = True
                         streamer.add_reasoning(ev.text)
+                elif kind == "tool_start":
+                    # #319: a tool is STARTING (esp. a server-side WebSearch, which can run for
+                    # many seconds before its result lands). Surface its phase in the
+                    # <tg-thinking> block NOW so the user sees "🌐 Searching the web…" DURING the
+                    # call — the assembled `tool` event below only fires AFTER it completes.
+                    # Phase only: no source / no segment-break (those wait for the real `tool`).
+                    if stream:
+                        with contextlib.suppress(Exception):
+                            streamer.set_tool_phase(ev.tool_name, ev.tool_input)
                 elif kind == "tool":
-                    # Code mode: commit the text produced before this tool as its
-                    # own message so each burst is visible, then stream the next
-                    # burst fresh. (Chat is web-only — no bubble split there.)
-                    # was: the whole phase block was code-only (#240b) — chat showed a
-                    # generic "thinking" with no hint a web search was running (#262).
-                    if stream and rec.mode == "code" and running_text.strip():
+                    # #320: commit any text the model produced BEFORE this tool as its OWN
+                    # message — in BOTH modes now (was code-only). A model that comments before
+                    # searching ("…let me look it up. Meanwhile I'll search …") then answers
+                    # produces text → tool → text; the FINAL result excludes that pre-tool text,
+                    # so in chat it used to be shown and then CLOBBERED by the final answer (and
+                    # it sat in the draft buffer, so the search animation never showed). Now it
+                    # is kept as its own bubble and the draft frees up for the search anim.
+                    # No-op when there's no pre-tool text (the common "just search then answer").
+                    # was (#240b/#262): `stream and rec.mode == "code" and running_text.strip()`.
+                    if stream and running_text.strip():
                         with contextlib.suppress(Exception):
                             await streamer.segment_break()
                         running_text = ""
@@ -1246,6 +1362,33 @@ class SessionManager:
                             await streamer.update_todo_card(
                                 todos, i18n.cached_lang(streamer.chat_id)
                             )
+                    # #321: web-search "Sources" card DISABLED — the search feedback is the
+                    # animated 🔎 thinking tag ALONE (owner: more native, less message-clutter;
+                    # this card listed the QUERIES, mislabelled as "sources", while the model
+                    # cites real sources itself in the answer). The card machinery
+                    # (streamer.add_web_source / finalize_sources / sources_card_markdown) is kept
+                    # intact for revert — re-enable by uncommenting this block. was (#318):
+                    #   if stream and ev.tool_name in ("WebFetch", "WebSearch"):
+                    #       _ti = ev.tool_input or {}
+                    #       _src = _ti.get("url") if ev.tool_name == "WebFetch" else _ti.get("query")
+                    #       if _src:
+                    #           with contextlib.suppress(Exception):
+                    #               await streamer.add_web_source(
+                    #                   "fetch" if ev.tool_name == "WebFetch" else "search",
+                    #                   _src, i18n.cached_lang(streamer.chat_id),
+                    #               )
+                elif kind == "session":
+                    # #324: persist the session id the MOMENT the engine first reports it (the
+                    # init message), not only at the terminal result — so a turn killed mid-flight
+                    # (restart/crash/reap before the result) still leaves a RESUMABLE id and the
+                    # session keeps its context, instead of starting a fresh one with no memory.
+                    if ev.session_id:
+                        if rec.mode == "code":
+                            with contextlib.suppress(Exception):
+                                await db.set_code_session(thread_id, ev.session_id)
+                        elif rec.mode == "chat":
+                            with contextlib.suppress(Exception):
+                                await db.set_chat_session(thread_id, ev.session_id)
                 elif kind == "rate_limit":
                     rec.rate = ev.rate
                     # Accumulate per-window account-wide rate state. Persisting to
@@ -2221,10 +2364,10 @@ class SessionManager:
     async def _admit_turn(self, thread_id: int, chat_id: int, send_tid: int | None) -> None:
         """Gate a turn before it runs: (1) if MemAvailable is below the floor, evict
         idle clients to make room (defer-on-pressure); (2) if every concurrency slot
-        is taken the turn will block on _turn_sem — tell the user it is queued."""
+        is taken the turn will block on the fair turn-gate — tell the user it is queued."""
         if self._mem_available_mb() < self._min_free_mb:
             await self._relieve_memory(exclude=thread_id)
-        if self._turn_sem.locked():
+        if self._turn_gate.locked():
             with contextlib.suppress(Exception):
                 await self._notify(
                     chat_id, send_tid, i18n.t("busy.queued", i18n.cached_lang(chat_id))
@@ -2527,6 +2670,30 @@ class SessionManager:
             kwargs["message_thread_id"] = thread_id
         with contextlib.suppress(Exception):
             await self.bot.send_message(chat_id, text, **kwargs)
+
+    async def drain(self, timeout: float = 40.0) -> bool:
+        """#325: graceful-shutdown step — stop STARTING new turns and wait for the in-flight
+        ones to FINISH, so a restart doesn't kill a turn mid-generation (the #324 incident) or
+        tear its transcript. Per-thread workers stop pulling new queued turns; the running ones
+        complete. Bounded by ``timeout``; returns True if fully drained, False on timeout (the
+        caller then tears down — #324 makes any still-running turn resumable). Idempotent.
+
+        Requires ``KillMode=mixed`` in the systemd unit so SIGTERM reaches ONLY the bot (not the
+        jailed ``claude`` children) — else systemd kills the subprocesses and there is nothing
+        to drain. Pending (not-yet-started) queued turns are dropped; the user re-sends (the
+        session keeps its context via the persisted resume id)."""
+        self._draining = True
+        if self._active_turns <= 0:
+            return True
+        logger.info("draining %d active turn(s), up to %.0fs…", self._active_turns, timeout)
+        try:
+            await asyncio.wait_for(self._idle_event.wait(), timeout)
+            logger.info("drain complete — all in-flight turns finished")
+            return True
+        except asyncio.TimeoutError:
+            logger.warning("drain timed out — %d turn(s) still active, tearing down",
+                           self._active_turns)
+            return False
 
     async def aclose(self) -> None:
         """Best-effort shutdown: forcefully cancel workers and disconnect clients.

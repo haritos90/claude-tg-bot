@@ -126,13 +126,17 @@ CHAT_SYSTEM_PROMPT = (
     # "markup — never use $...$, $$...$$, \\(...\\), \\[...\\], or backslash commands "
     # "like \\frac or \\text. Write math in plain Unicode instead "
     # "(e.g. ×, ÷, ≈, ≤, ≥, ², ₂, √, π, ½, →, ∞). "
-    "Telegram renders LaTeX math natively. Write a real formula in LaTeX: wrap an INLINE "
-    "formula in single dollar signs ($E=mc^2$) and a DISPLAY/block formula in double dollar "
-    "signs ($$\\int_0^1 x^2\\,dx = \\tfrac13$$), with standard LaTeX inside (\\frac, \\sqrt, "
-    "\\sum, \\int, ^, _, Greek letters, etc.). Only these two forms render — do NOT use \\(…\\) "
-    "or \\[…\\] (Telegram shows those as raw text). Write a literal dollar sign as \\$ so it is "
-    "not read as math. Simple inline symbols in prose can still be plain Unicode (×, ≈, ≤, π, "
-    "→); reach for $…$ when it is an actual formula. "
+    # #306: math guidance DEDUPED — it was here AND in agent_context.md's Rendering section
+    # (which both modes already carry), so chat received it twice. The shared doc's math note
+    # was enriched (LaTeX commands + "Unicode for simple symbols") and this copy removed. Kept
+    # commented for revert. was (#297):
+    # "Telegram renders LaTeX math natively. Write a real formula in LaTeX: wrap an INLINE "
+    # "formula in single dollar signs ($E=mc^2$) and a DISPLAY/block formula in double dollar "
+    # "signs ($$\\int_0^1 x^2\\,dx = \\tfrac13$$), with standard LaTeX inside (\\frac, \\sqrt, "
+    # "\\sum, \\int, ^, _, Greek letters, etc.). Only these two forms render — do NOT use \\(…\\) "
+    # "or \\[…\\] (Telegram shows those as raw text). Write a literal dollar sign as \\$ so it is "
+    # "not read as math. Simple inline symbols in prose can still be plain Unicode (×, ≈, ≤, π, "
+    # "→); reach for $…$ when it is an actual formula. "
     # #295: chat has no code execution, but the bot rasterizes inline SVG to an image, so the
     # model CAN produce a real picture for diagram-shaped requests. #296: this SVG path is ALSO
     # how we cover graph/flow diagrams (the Mermaid use-case) without a JS/headless renderer —
@@ -145,32 +149,42 @@ CHAT_SYSTEM_PROMPT = (
     # "self-contained (inline attributes/styles, no external references or scripts), give it a "
     # "width/height or viewBox, and label key parts and dimensions. Prefer drawing it over "
     # "describing it in words. You cannot generate photographic images — use SVG for diagrams."
-    "When the user asks for a diagram, schematic, chart, flowchart, sequence / state / ER / "
-    "class diagram, org chart, mind map, tree, network graph, Gantt chart, floor plan, "
-    "cutting/assembly plan, or any drawing, output it as a single self-contained SVG in a "
-    "fenced ```svg code block — the bot renders that SVG to an image and sends it as a picture. "
-    "Keep the SVG self-contained (inline attributes/styles, no external references, fonts, or "
-    "scripts) and set a viewBox sized to the content. For node-and-arrow diagrams, lay it out "
-    "cleanly: pick ONE flow direction (top-to-bottom or left-to-right), give boxes consistent "
-    "sizes with inner padding, space the nodes so nothing overlaps or is clipped, connect them "
-    "with straight or right-angled arrows that end in a <marker> arrowhead, and label both the "
-    "nodes and the edges. Use a simple, readable palette and legible font sizes. Prefer drawing "
-    "it over describing it in words. You cannot generate photographic images — use SVG for any "
-    "diagram."
+    # #305: the SVG/diagram capability + diagram-type list + node-and-arrow layout guidance
+    # MOVED to agent_context.md's Rendering section so CODE mode gets it too — the streamer
+    # rasterizes a ```svg block to a PNG identically in BOTH modes, but only chat was ever told
+    # (code gets the claude_code preset + agent_context.md, not this chat prompt). Chat still
+    # receives this via BOT_CONTEXT_NOTE (the shared doc appended to both modes), so nothing is
+    # lost here. Kept commented for revert. was (#295/#296):
+    # "When the user asks for a diagram, schematic, chart, flowchart, sequence / state / ER / "
+    # "class diagram, org chart, mind map, tree, network graph, Gantt chart, floor plan, "
+    # "cutting/assembly plan, or any drawing, output it as a single self-contained SVG in a "
+    # "fenced ```svg code block — the bot renders that SVG to an image and sends it as a picture. "
+    # "Keep the SVG self-contained (inline attributes/styles, no external references, fonts, or "
+    # "scripts) and set a viewBox sized to the content. For node-and-arrow diagrams, lay it out "
+    # "cleanly: pick ONE flow direction (top-to-bottom or left-to-right), give boxes consistent "
+    # "sizes with inner padding, space the nodes so nothing overlaps or is clipped, connect them "
+    # "with straight or right-angled arrows that end in a <marker> arrowhead, and label both the "
+    # "nodes and the edges. Use a simple, readable palette and legible font sizes. Prefer drawing "
+    # "it over describing it in words. You cannot generate photographic images — use SVG for any "
+    # "diagram."
 )
 
 # #269: the table-format note (#243), the outbox file-delivery instructions (#187), and the
 # per-session isolation/privacy note (#205/#208) were all FOLDED INTO the agent_context.md
-# project document (loaded below) — so the agent's ENTIRE self-description lives in one
-# editable place instead of several hardcoded prompt strings. Their content now appears in
-# that doc's Files / "Your environment & privacy" / Rendering sections.
+# project document (loaded below) — so the agent's self-description lives in editable docs
+# instead of hardcoded prompt strings. #306: that doc was SPLIT into a SHARED CORE
+# (agent_context.md — what the bot is, modes, sessions, history, commands, rendering; appended
+# to BOTH modes) and a CODE-ONLY ADDENDUM (code_addendum.md — shell mode, file delivery,
+# sandbox/privacy, /secret; appended to CODE mode only), so chat no longer carries ~1k tokens
+# of code-only content it can't use on every turn.
 #
 # #265/#269: tell the agent WHAT it is — a Telegram-bot frontend — and what it (and the
 # user) can do, so it guides the user to the right mode/command instead of refusing or
-# hallucinating. The text is maintained as a PROJECT DOCUMENT (agent_context.md) and loaded
-# from there, so the bot's self-description can be edited without touching code. Appended to
-# BOTH the chat and code system prompts (a restart picks up doc edits). A short built-in
-# fallback keeps the bot working if the file is ever missing.
+# hallucinating. The text is maintained as PROJECT DOCUMENTS (agent_context.md +
+# code_addendum.md) and loaded from there, so the bot's self-description can be edited without
+# touching code (a restart picks up doc edits). The shared core is appended to BOTH prompts;
+# the code addendum to the code prompt only. Short built-in fallbacks keep the bot working if a
+# file is ever missing.
 _AGENT_CONTEXT_FILE = Path(__file__).resolve().parent / "agent_context.md"
 _BOT_CONTEXT_FALLBACK = (
     "\n\n## About you (this bot)\n"
@@ -195,6 +209,32 @@ def _load_bot_context() -> str:
 
 
 BOT_CONTEXT_NOTE = _load_bot_context()
+
+# #306: the CODE-ONLY half of the self-description (shell mode, file delivery, sandbox/privacy,
+# /secret). Appended to the CODE system prompt ONLY — a chat session can't use any of it, so
+# keeping it out of the chat prompt saves ~1k tokens per chat turn. Same load-from-doc +
+# fallback pattern as the shared core above.
+_AGENT_CODE_ADDENDUM_FILE = Path(__file__).resolve().parent / "code_addendum.md"
+_CODE_ADDENDUM_FALLBACK = (
+    "\n\n## Code session capabilities\n"
+    "In a CODE session you also have: /shell (a persistent jailed interactive terminal); "
+    "delivery of files to the user by copying them into the outbox/ directory (/export zips the "
+    "workdir, /files browses it); a private per-session sandbox workdir with possibly-restricted "
+    "filesystem/network; and /secret NAME=VALUE to inject a per-session credential."
+)
+
+
+def _load_code_addendum() -> str:
+    """#306: load the code-only addendum (code_addendum.md), appended to the CODE prompt only.
+    Falls back to a short built-in string if the file is missing/unreadable."""
+    try:
+        text = _AGENT_CODE_ADDENDUM_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        return _CODE_ADDENDUM_FALLBACK
+    return ("\n\n" + text) if text else _CODE_ADDENDUM_FALLBACK
+
+
+CODE_ADDENDUM_NOTE = _load_code_addendum()
 
 # The full universe of tools the model may CALL in code mode (the `tools`
 # option). Availability != auto-permission: dangerous tools here are NOT in
@@ -744,9 +784,12 @@ class ClaudeSession:
         #221 registry hands out (and remaps only on collision). uid_base + sid % range."""
         sid = Path(self.cwd).parent.name
         try:
-            n = int(sid, 16)            # the sid is a 6-hex-char digest (db.session_sid)
+            n = int(sid, 16)            # legacy 6-hex sid → int directly
         except ValueError:
-            n = sum(sid.encode()) or 1  # fallback for non-sid cwds (e.g. tests)
+            # #327: a ULID (Crockford base32) or other non-hex sid → byte-sum. This is only the
+            # PREFERRED uid; the stored session_uid row (re-keyed by the migration) is
+            # authoritative at launch, so a migrated session keeps its existing uid regardless.
+            n = sum(sid.encode()) or 1
         return self.uid_base + (n % self.uid_range)
 
     async def _claim_host_uid(self) -> int:
@@ -895,6 +938,36 @@ class ClaudeSession:
             "\n\n# Owner global memory (from ~/.claude/CLAUDE.md)\n"
             "The deployer has shared these personal instructions and notes with this "
             "session — treat them as standing guidance:\n\n" + mem
+        )
+
+    def _workdir_claude_block(self) -> str:
+        """CODE sessions: inject a ``CLAUDE.md`` from the agent's WORKING DIRECTORY into
+        the system prompt (#314), so a code user (or the agent itself) can keep durable
+        project instructions like a real Claude Code project memory. We run with
+        ``setting_sources=[]`` (the #130 isolation invariant — never load settings.json),
+        so the SDK does NOT auto-load a project CLAUDE.md; we read + inject the CONTENT
+        ourselves, exactly like _global_memory_block. Re-read on each build, so an edit to
+        ./CLAUDE.md takes effect on the next session build. Returns "" for chat / no cwd /
+        missing-or-empty file / read error."""
+        if self.mode != "code" or not self.cwd:
+            return ""
+        try:
+            with open(os.path.join(self.cwd, "CLAUDE.md"), encoding="utf-8") as fh:
+                text = fh.read().strip()
+        except OSError:
+            return ""
+        if not text:
+            return ""
+        # Cap the injected size so a huge (or hostile) CLAUDE.md can't blow the context
+        # window or burn the shared subscription on every turn. ~16 KB is ample for
+        # project instructions.
+        cap = 16384
+        if len(text) > cap:
+            text = text[:cap].rstrip() + "\n\n…[CLAUDE.md truncated at 16 KB]"
+        return (
+            "\n\n# Project instructions (from ./CLAUDE.md in your working directory)\n"
+            "The user keeps these in CLAUDE.md at the root of your working directory — "
+            "treat them as standing project guidance for this session:\n\n" + text
         )
 
     async def run_shell(self, command: str, timeout: float = 60.0) -> tuple[int, str]:
@@ -1144,8 +1217,15 @@ class ClaudeSession:
             # #205: also state the per-session isolation so the agent can answer the
             # user accurately if asked about privacy / where their files live.
             # #269: outbox/isolation/table notes are now part of BOT_CONTEXT_NOTE (the doc).
-            append = (BOT_CONTEXT_NOTE + self._session_state_note()
-                      + (("\n\n" + mem_block) if mem_block else ""))
+            # #314: also inject a CLAUDE.md from the agent's working directory (project
+            # instructions), mirroring the owner global-memory injection — kept out of
+            # setting_sources for the #130 reasons above.
+            # was (pre-#314, no workdir CLAUDE.md):
+            #   append = (BOT_CONTEXT_NOTE + CODE_ADDENDUM_NOTE + self._session_state_note()
+            #             + (("\n\n" + mem_block) if mem_block else ""))
+            append = (BOT_CONTEXT_NOTE + CODE_ADDENDUM_NOTE + self._session_state_note()
+                      + (("\n\n" + mem_block) if mem_block else "")
+                      + self._workdir_claude_block())
             code_extra["system_prompt"] = {
                 "type": "preset", "preset": "claude_code", "append": append,
             }
@@ -1365,6 +1445,16 @@ class ClaudeSession:
             await self._send_query(prompt, attachments)
 
             async for msg in self.client.receive_response():
+                # #324: persist the session id as SOON as any message carries it (the init
+                # SystemMessage does), not only the terminal ResultMessage — so a turn KILLED
+                # mid-flight (a restart/crash/reap before the result) still leaves a RESUMABLE id.
+                # Without this the next message can't resume → the session loses ALL its context
+                # (the incident: a service restart killed an SVG turn before its result, the id
+                # was never saved, and the next message started a fresh "новая сессия").
+                _sid = getattr(msg, "session_id", None)
+                if _sid and _sid != self.session_id:
+                    self.session_id = _sid
+                    yield EngineEvent(kind="session", session_id=_sid)
                 # --- Incremental text deltas (preferred for live streaming) ---
                 if isinstance(msg, StreamEvent):
                     event = msg.event or {}
@@ -1382,6 +1472,21 @@ class ClaudeSession:
                             think = delta.get("thinking")
                             if think:
                                 yield EngineEvent(kind="thinking_delta", text=think)
+                    elif event.get("type") == "content_block_start":
+                        # #319: a tool block is STARTING — surface it so the consumer shows a
+                        # live phase ("🌐 Searching the web…") DURING a slow call (esp. a
+                        # server-side WebSearch, whose assembled ToolUseBlock — and thus the
+                        # post-hoc `tool` event — only lands AFTER the search returns). Phase
+                        # only; the real `tool` event still adds sources. Defensive: a differing
+                        # SDK shape simply no-ops.
+                        cb = event.get("content_block") or {}
+                        if cb.get("type") in ("tool_use", "server_tool_use"):
+                            _raw = cb.get("name") or ""
+                            _name = {"web_search": "WebSearch",
+                                     "web_fetch": "WebFetch"}.get(_raw, _raw)
+                            if _name:
+                                yield EngineEvent(
+                                    kind="tool_start", tool_name=_name, tool_input={})
                     continue
 
                 # --- Assistant message: text blocks + tool-use blocks ---

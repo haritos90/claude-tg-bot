@@ -76,6 +76,11 @@ CATALOG: dict[str, dict[str, str]] = {
     "common.error": {"en": "Error.", "ru": "Ошибка."},
     "common.switched": {"en": "Switched.", "ru": "Переключено."},
     "common.created": {"en": "Created.", "ru": "Создано."},
+    # #328: shown to users while the maintenance sentinel is up (data frozen for a migration).
+    "maintenance.notice": {
+        "en": "🛠 The service is updating and will be back in ~15 minutes. Your sessions and history are saved — please try again shortly.",
+        "ru": "🛠 Сервис обновляется и вернётся примерно через 15 минут. Ваши сессии и история сохранены — попробуйте чуть позже.",
+    },
     "common.deleted": {"en": "Deleted.", "ru": "Удалено."},
     "common.cancelled": {"en": "Cancelled.", "ru": "Отменено."},
     "common.nothing_cancel": {"en": "Nothing to cancel.", "ru": "Нечего отменять."},
@@ -405,9 +410,9 @@ CATALOG: dict[str, dict[str, str]] = {
     # #282: a fresh, never-used session reads as a placeholder ("Untitled") — the mode
     # glyph (💬/🟩) already conveys chat vs code, and #260 auto-names it once it has a
     # conversation. Avoids colliding with the "➕ New chat/code" create buttons.
-    "session.default_name_chat": {"en": "Untitled", "ru": "Без названия"},
-    "session.default_name_code": {"en": "Untitled", "ru": "Без названия"},
-    "session.first_default": {"en": "Untitled", "ru": "Без названия"},
+    "session.default_name_chat": {"en": "Not named yet", "ru": "Пока без названия"},
+    "session.default_name_code": {"en": "Not named yet", "ru": "Пока без названия"},
+    "session.first_default": {"en": "Not named yet", "ru": "Пока без названия"},
     "session.fork_name": {"en": "{base} (fork)", "ru": "{base} (форк)"},
     "session.limit_reached": {
         "en": "🔢 You've reached your session limit (<b>{total}/{cap}</b>). Delete a session "
@@ -428,9 +433,17 @@ CATALOG: dict[str, dict[str, str]] = {
         "en": "✅ Switched to {glyph} <b>{name}</b>",
         "ru": "✅ Переключено на {glyph} <b>{name}</b>",
     },
+    # #311: dropped the "· {reqs} msgs · {toks} tok" usage stats — the Sessions UI no
+    # longer shows per-session stats.
+    # #330: dropped {sid} + {date} too — the public id and creation date are card
+    # noise; the mode glyph already conveys the type. was:
+    #   "en": "<code>{sid}</code> · Model: <code>{model}</code> · {date}",
+    #   "ru": "<code>{sid}</code> · Модель: <code>{model}</code> · {date}",
+    # #331: show the reasoning-effort tier next to the model — a bare value (e.g.
+    # high / xhigh), no extra words.
     "session.card_meta": {
-        "en": "<code>{sid}</code> · Model: <code>{model}</code> · {date} · {reqs} msgs · {toks} tok",
-        "ru": "<code>{sid}</code> · Модель: <code>{model}</code> · {date} · {reqs} сообщ. · {toks} ток.",
+        "en": "Model: <code>{model}</code> · Effort: <code>{effort}</code>",
+        "ru": "Модель: <code>{model}</code> · Усилие: <code>{effort}</code>",
     },
     "session.delete_confirm": {
         "en": "Delete session <b>{name}</b>?\nThis permanently removes its "
@@ -460,10 +473,11 @@ CATALOG: dict[str, dict[str, str]] = {
         "en": "{icon} <b>{name}</b>{mark}",
         "ru": "{icon} <b>{name}</b>{mark}",
     },
-    "sessions.row_stats": {
-        "en": "    {reqs} msgs · {toks} tok",
-        "ru": "    {reqs} сообщ. · {toks} ток.",
-    },
+    # #311: per-session usage stats removed from the Sessions list — key retired. was:
+    #   "sessions.row_stats": {
+    #       "en": "<code>{reqs} msg · {toks} tok · {units} u</code>",
+    #       "ru": "<code>{reqs} сооб · {toks} ток · {units} ед</code>",
+    #   },
     "sessions.options_header": {
         "en": "{glyph} <b>{name}</b> — choose an action:",
         "ru": "{glyph} <b>{name}</b> — выберите действие:",
@@ -478,6 +492,11 @@ CATALOG: dict[str, dict[str, str]] = {
         "ru": "🔍 Отправьте слово для поиска по вашим сессиям (или /cancel).",
     },
     "sessions.search_toast": {"en": "Type a keyword.", "ru": "Введите слово."},
+    # #322: a New-chat tap dismisses the browser; this toast confirms + nudges to just type.
+    "sessions.new_chat_toast": {
+        "en": "✨ New chat — just type your question.",
+        "ru": "✨ Новый чат — просто напишите вопрос.",
+    },
 
     # -- /mode -------------------------------------------------------------- #
     # #220: mode.show / mode.hint_upgrade / mode.hint_downgrade removed — they were the
@@ -1133,6 +1152,34 @@ CATALOG: dict[str, dict[str, str]] = {
         "en": "Send the numeric id or @username to revoke (or /cancel).",
         "ru": "Отправьте числовой id или @username для отзыва (или /cancel).",
     },
+    # -- /whois (owner: user -> sessions -> workdir -> transcript, #333) ------ #
+    "whois.prompt": {
+        "en": "🔎 Send a numeric user id to look up (or /cancel).",
+        "ru": "🔎 Отправьте числовой id пользователя для поиска (или /cancel).",
+    },
+    "whois.bad_id": {
+        "en": "Not a valid user id — send a number (e.g. <code>2859339</code>).",
+        "ru": "Неверный id — отправьте число (например <code>2859339</code>).",
+    },
+    "whois.none": {
+        "en": "No sessions found for user <code>{uid}</code>.",
+        "ru": "Сессии для пользователя <code>{uid}</code> не найдены.",
+    },
+    "whois.head": {
+        "en": "🔎 <b>User <code>{uid}</code></b>{label} — {n} session(s):",
+        "ru": "🔎 <b>Пользователь <code>{uid}</code></b>{label} — сессий: {n}:",
+    },
+    "whois.label": {
+        "en": " · level <b>{level}</b>",
+        "ru": " · уровень <b>{level}</b>",
+    },
+    "whois.row": {
+        "en": "\n{glyph} <b>{name}</b> · <code>{pubid}</code> · {status}\n   <code>{cwd}</code>",
+        "ru": "\n{glyph} <b>{name}</b> · <code>{pubid}</code> · {status}\n   <code>{cwd}</code>",
+    },
+    "whois.tx_live": {"en": "📝 transcript", "ru": "📝 транскрипт"},
+    "whois.tx_archived": {"en": "📦 archived", "ru": "📦 в архиве"},
+    "whois.tx_none": {"en": "— no transcript", "ru": "— нет транскрипта"},
     "allow.granted": {
         "en": "✅ Granted <code>{val}</code> — level <b>{level}</b>{until}.",
         "ru": "✅ Доступ выдан <code>{val}</code> — уровень <b>{level}</b>{until}.",
@@ -1332,12 +1379,17 @@ CATALOG: dict[str, dict[str, str]] = {
         "ru": "<i>Нажмите на пользователя: память, лимиты, effort, инструменты, срок доступа и статистика.</i>",
     },
     "users.entry_usage": {
-        "en": "   ↳ units: 5h {day} · week {week} · total {total}",
-        "ru": "   ↳ единицы: 5ч {day} · неделя {week} · всего {total}",
+        # #308: monospace + compact; values are NBSP-padded in handlers so the day/week/total
+        # columns line up across users. The <code> wraps the WHOLE line so the row renders as
+        # one monospace span (like the /sessions stat row). The shorter label ("units"/"ед.")
+        # gets a trailing NBSP ( ) right after its colon so the "5h …" columns also line
+        # up vertically against the longer-label tokens line below it (else tokens shifts +1).
+        "en": "<code>↳ units:  5h {day} · wk {week} · tot {total}</code>",
+        "ru": "<code>↳ ед.:  5ч {day} · нед {week} · всего {total}</code>",
     },
     "users.entry_usage_tok": {  # #303: a same-format raw-tokens line below the units line
-        "en": "   ↳ tokens: 5h {day} · week {week} · total {total}",
-        "ru": "   ↳ токены: 5ч {day} · неделя {week} · всего {total}",
+        "en": "<code>↳ tokens: 5h {day} · wk {week} · tot {total}</code>",
+        "ru": "<code>↳ ток.: 5ч {day} · нед {week} · всего {total}</code>",
     },
     "users.btn_owner": {"en": "👑 You (owner)", "ru": "👑 Вы (владелец)"},
     "users.btn_owner_bare": {"en": "Owner", "ru": "Владелец"},  # #272: owner label fallback
@@ -1346,8 +1398,11 @@ CATALOG: dict[str, dict[str, str]] = {
     "users.btn_entry": {"en": "{who} · {level}", "ru": "{who} · {level}"},
     "users.btn_pending": {"en": "{who} · {level} (unpinned)", "ru": "{who} · {level} (не привязан)"},
     "usercard.title": {
-        "en": "<b>User</b> <code>{who}</code> {kind}",
-        "ru": "<b>Пользователь</b> <code>{who}</code> {kind}",
+        # #308: {who} is now an interactive HTML link (friendly name + clickable @user/id),
+        # built and escaped in handlers — so NO <code> wrapper (it would kill the link) and
+        # the title is sent without re-escaping.
+        "en": "<b>User</b> {who} {kind}",
+        "ru": "<b>Пользователь</b> {who} {kind}",
     },
     "usercard.kind_owner": {"en": "(owner)", "ru": "(владелец)"},
     "usercard.kind_pending": {"en": "(unpinned)", "ru": "(не привязан)"},
@@ -1686,11 +1741,29 @@ CATALOG: dict[str, dict[str, str]] = {
     # list; the verbs feed tool_phase_label (emoji stays in code, verb is localized).
     "stream.thinking": {"en": "Thinking", "ru": "Думаю"},
     "stream.thinking_words": {
+        # #316: en/ru kept at the SAME count (30) — test_i18n enforces parity so a length
+        # mismatch (this shipped once as 17 vs 12) can't silently slip back in.
         "en": "Thinking,Pondering,Ruminating,Cogitating,Mulling,Noodling,Percolating,"
               "Marinating,Deliberating,Contemplating,Brewing,Churning,Synthesizing,"
-              "Reasoning,Considering,Puzzling,Untangling",
+              "Reasoning,Considering,Puzzling,Untangling,Reflecting,Weighing,Analyzing,"
+              "Reckoning,Musing,Processing,Unpacking,Calculating,Figuring,Wrangling,"
+              "Scheming,Computing,Deducing",
         "ru": "Думаю,Размышляю,Соображаю,Обдумываю,Прикидываю,Анализирую,Рассуждаю,"
-              "Взвешиваю,Кумекаю,Вникаю,Обмозговываю,Осмысляю",
+              "Взвешиваю,Кумекаю,Вникаю,Обмозговываю,Осмысляю,Прорабатываю,Мозгую,"
+              "Систематизирую,Синтезирую,Распутываю,Вычисляю,Продумываю,Соотношу,"
+              "Перевариваю,Усваиваю,Распаковываю,Углубляюсь,Разбираюсь,Прокручиваю,"
+              "Концентрируюсь,Изучаю,Рефлексирую,Структурирую",
+    },
+    # #319: a SEARCH-themed gerund subset for the <tg-thinking> tag while a web search/fetch is
+    # in flight (rotated by _thinking_label(searching=True)) — so the animation reads as
+    # info-gathering, not generic "thinking". Same count en/ru (test_i18n enforces parity).
+    "stream.searching_words": {
+        "en": "Searching,Looking it up,Digging,Researching,Gathering sources,Scanning,"
+              "Browsing,Cross-checking,Fact-finding,Combing the web,Tracking it down,"
+              "Sourcing,Surveying,Checking sources,Hunting,Sifting",
+        "ru": "Ищу,Гуглю,Копаю,Изучаю,Собираю источники,Сканирую,Просматриваю,Сверяю,"
+              "Уточняю,Прочёсываю сеть,Выясняю,Разыскиваю,Проверяю источники,Сопоставляю,"
+              "Отыскиваю,Перебираю",
     },
     "stream.verb_reading": {"en": "Reading", "ru": "Читаю"},
     "stream.verb_writing": {"en": "Writing", "ru": "Пишу"},
@@ -1703,6 +1776,11 @@ CATALOG: dict[str, dict[str, str]] = {
     "stream.verb_planning": {"en": "Planning", "ru": "Планирую"},
     "stream.verb_running": {"en": "Running", "ru": "Выполняю"},
     "stream.phase_running_any": {"en": "Running a command", "ru": "Выполняю команду"},
+    # #318/#319: the live web-research card. While the agent is still searching/reading it
+    # shows the in-progress header (stream.searching); once the turn finishes it flips to the
+    # done header (stream.sources_title). One resource per line (see sources_card_markdown).
+    "stream.searching": {"en": "🔎 Searching the web…", "ru": "🔎 Ищу в вебе…"},
+    "stream.sources_title": {"en": "📚 Sources", "ru": "📚 Источники"},
     "stream.too_long": {
         "en": "📄 Response too long — sent as a file.",
         "ru": "📄 Ответ слишком длинный — отправлен файлом.",

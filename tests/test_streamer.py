@@ -69,3 +69,54 @@ def test_thinking_label_rotates():
     assert wrap == words[0]
     # localized: the Russian rotation differs from the English one
     assert streamer._thinking_label(0.0, "ru") != first
+
+
+def test_sources_card_markdown_renders_list():
+    """#318/#319: the research card lists WebSearch queries (🔍) and WebFetch URLs (🔗) as
+    inline-code markdown LIST items (own line each, '- ' bullets, header as its own block),
+    scheme + trailing slash trimmed; the header flips from in-progress to done."""
+    from app import i18n
+    src = [("search", "weather kyiv"), ("fetch", "https://example.com/page/")]
+    live = streamer.sources_card_markdown(src, "en")
+    assert live.startswith(i18n.t("stream.searching", "en"))       # in-progress header
+    assert "- 🔍 `weather kyiv`" in live
+    assert "- 🔗 `example.com/page`" in live                        # scheme + slash trimmed
+    assert live.count("\n- ") == 2                                  # each on its own list line
+    done = streamer.sources_card_markdown(src, "en", done=True)
+    assert done.startswith(i18n.t("stream.sources_title", "en"))   # done header
+
+
+def test_custom_emoji_gated_on_owner_premium():
+    """#323: a custom (animated) emoji replaces the unicode in the thinking tag ONLY when the
+    bot owner has Premium AND an id is configured; otherwise plain unicode (viewers need no
+    premium). A draft failure self-heals back to unicode for the turn."""
+    streamer.configure_custom_emoji("think:555,search:777")
+    try:
+        s = streamer.Streamer(None, 123, None)
+        streamer.set_owner_premium(False)
+        assert s._emoji("💭", "think") == "💭"                       # no owner premium → unicode
+        streamer.set_owner_premium(True)
+        assert s._emoji("💭", "think") == '<tg-emoji emoji-id="555">💭</tg-emoji>'
+        assert s._emoji("🔎", "search") == '<tg-emoji emoji-id="777">🔎</tg-emoji>'
+        assert s._emoji("📁", "files") == "📁"                       # no id for role → unicode
+        s._custom_emoji_failed = True
+        assert s._emoji("💭", "think") == "💭"                       # self-heal → unicode
+    finally:
+        streamer.configure_custom_emoji("")     # reset module globals for the rest of the suite
+        streamer.set_owner_premium(False)
+
+
+def test_set_tool_phase_routes_web_to_searching_mode():
+    """#319: a web search/fetch flips "searching" MODE (the placeholder then rotates the
+    search-themed gerund subset — animated), not a static phase; other tools keep a fixed
+    phase label that names the file/command."""
+    from app import i18n
+    s = streamer.Streamer(None, 123, None)
+    s.set_tool_phase("WebSearch", {"query": "q"})
+    assert s._searching is True and s._phase is None
+    s.set_tool_phase("Bash", {"command": "pytest -q"})
+    assert s._searching is False and s._phase and "pytest" in s._phase
+    # the searching gerunds are their own subset, distinct from the generic ones
+    sg = streamer._thinking_label(0.0, "en", searching=True)
+    assert sg in i18n.t("stream.searching_words", "en")
+    assert sg != streamer._thinking_label(0.0, "en", searching=False)

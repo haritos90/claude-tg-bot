@@ -208,10 +208,20 @@ def load_settings() -> Settings:
     except ValueError:
         sandbox_uid = 65534
     sandbox_allow_exec = _flag("SANDBOX_EXEC", True)
-    cred_broker = _flag("CRED_BROKER", False)  # #119b: off by default
-    sandbox_egress = _flag("SANDBOX_EGRESS", False)    # #119c: off by default
-    sandbox_seccomp = _flag("SANDBOX_SECCOMP", False)  # #119e: off by default
-    sandbox_per_session_uid = _flag("SANDBOX_PER_SESSION_UID", False)  # escape hardening
+    # #312: full isolation is the DEFAULT posture now (was opt-in / off by default).
+    # The broker, the loopback-only egress block, the seccomp denylist and the per-session
+    # non-root uid all default ON; a host that can't support a layer opts OUT via its env
+    # flag (=0). On this deployment `.env` already sets all four to 1, so the default flip
+    # is a runtime no-op here — it only hardens a fresh deploy that ships no overrides.
+    # was (opt-in, off by default — pre-#312):
+    #   cred_broker = _flag("CRED_BROKER", False)                        # #119b
+    #   sandbox_egress = _flag("SANDBOX_EGRESS", False)                  # #119c
+    #   sandbox_seccomp = _flag("SANDBOX_SECCOMP", False)                # #119e
+    #   sandbox_per_session_uid = _flag("SANDBOX_PER_SESSION_UID", False)
+    cred_broker = _flag("CRED_BROKER", True)             # #312: default-on (needs the host broker sidecar)
+    sandbox_egress = _flag("SANDBOX_EGRESS", True)       # #312: default-on (needs egress-setup.sh + iptables/cgroup)
+    sandbox_seccomp = _flag("SANDBOX_SECCOMP", True)     # #312: default-on (needs the generated seccomp profile)
+    sandbox_per_session_uid = _flag("SANDBOX_PER_SESSION_UID", True)  # #312: default-on (needs userns + BASE_WORKDIR outside /root)
     egress_allow_hosts = (os.environ.get("EGRESS_ALLOW_HOSTS", "") or "").strip()
 
     # Concurrency / RAM caps (#179). Derive sane defaults from the box: reserve

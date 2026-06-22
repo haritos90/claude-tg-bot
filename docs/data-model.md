@@ -26,8 +26,13 @@ are `0700` and owned by that session's uid.
 
 ## Per-session directory layout
 
-Each session owns one directory named by its **public session id** (`<sid>` =
-`sha1("sess:"+thread_id)[:6]`). Nothing for a session is stored outside it.
+Each session owns one directory named by its **public session id** (`<sid>` = the
+session's **ULID** — the 26-char value in `threads.sid`, the same id shown in the UI).
+Nothing for a session is stored outside it. (Pre-#332 the dir was named by a 6-hex
+`sha1("sess:"+thread_id)[:6]`; #332 renames it to the ULID — collision-safe at 80 random
+bits vs the old 24 — so the on-disk name matches the id users see. A one-time, idempotent
+startup migration renames legacy dirs, re-encodes their transcripts so `resume` survives,
+and re-keys the per-session uid registry.)
 
 ```
 /var/lib/claude-tg-bot/workdirs/
@@ -55,7 +60,7 @@ Created on `db.init` and migrated **forward in place** — only additive, guarde
 
 | Table | Key | Holds |
 |---|---|---|
-| `threads` | `thread_id` (PK) | One row per session: `chat_id`, `mode` (`chat`/`code`), `model`, `cwd`, the resumable `code_session_id` / `chat_session_id`, `name`, `created_by`, `created_at`, and per-session toggles added by migration (`permission_mode` — default `acceptEdits` since #278, `effort`, `max_turns`, `big_memory`, `favorite`, `no_sandbox`, `tools_enabled`, `add_dirs`, `fork_pending`, `auto_compact`, `hot_cache_timer`, `stream_enabled`). Indexed `(chat_id)` (#285 — the per-user join/filter column). `stream_enabled` is still read live (it gates whether replies stream) but its user-facing toggle was retired in #144 — streaming is always-on. |
+| `threads` | `thread_id` (PK) | One row per session: `chat_id`, `mode` (`chat`/`code`), `model`, `cwd`, the public `sid` (ULID — names the on-disk session dir, #327/#332; `UNIQUE`-indexed), the resumable `code_session_id` / `chat_session_id`, `name`, `created_by`, `created_at`, and per-session toggles added by migration (`permission_mode` — default `acceptEdits` since #278, `effort`, `max_turns`, `big_memory`, `favorite`, `no_sandbox`, `tools_enabled`, `add_dirs`, `fork_pending`, `auto_compact`, `hot_cache_timer`, `stream_enabled`). Indexed `(chat_id)` (#285 — the per-user join/filter column). `stream_enabled` is still read live (it gates whether replies stream) but its user-facing toggle was retired in #144 — streaming is always-on. |
 | `usage` | `id` (PK) | One row per turn: `thread_id`, `ts`, `input_tokens`, `output_tokens`, `cache_read`, `cache_creation`, `cost_usd`, `model`, `context_tokens`. Append-only (never pruned). Indexed `(thread_id, ts)` (#285) so per-thread + time-window aggregates are index range scans, not full scans. Per-user totals roll up via `JOIN threads ON chat_id`; the `/sessions` and `/users` lists use single batch GROUP BY queries (`get_usage_totals_bulk` / `get_all_users_units`) rather than one aggregate per row. |
 | `messages` | `id` (PK) | Conversation log (`thread_id`, `ts`, `role`, `text`) feeding `/last` / `/recap` / `/history`; indexed `(thread_id, id)`. |
 | `kv` | `key` (PK) | Small key-value state: per-user current session (`dm_current:<uid>`), `dm_seq`, usage-display mode, pinned-message id, per-user `lang:<uid>`, access overrides, user defaults, `archive_retention_days`, `max_sessions_default`. |
@@ -63,7 +68,8 @@ Created on `db.init` and migrated **forward in place** — only additive, guarde
 
 A DM session's `thread_id` is a synthetic **negative** id minted from `kv.dm_seq` with
 `chat_id == user_id == created_by`; supergroup topics are `>= 0` (0 = General, frozen).
-`thread_id` is the only stable id; `<sid>` is its public render.
+`thread_id` is the only stable **internal** key; `<sid>` (the ULID in `threads.sid`) is its
+public render and, since #332, also names the on-disk session directory.
 
 ### Per-user access records (`allowlist.json`)
 

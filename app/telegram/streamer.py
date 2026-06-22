@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
 import time
 from typing import Any
 
@@ -116,6 +117,41 @@ _DRAFT_CURSOR = ""
 # rotation (flood-safe). Whimsical on purpose — these are the Claude Code spinner words.
 _THINKING_ROTATE_SECS = 4.0
 
+# #323: custom (premium/animated) emoji for the <tg-thinking> indicator. A bot may send custom
+# emoji only if its OWNER has Telegram Premium (detected live from the owner's messages via
+# set_owner_premium) OR the bot bought a Fragment username; ALL viewers see them animated, no
+# premium needed on their side. So _emoji() substitutes a custom emoji for the plain unicode
+# ONLY when the owner is premium AND an id is configured for that icon — else the unicode (the
+# <tg-emoji> fallback, shown everywhere). Ids come from THINKING_EMOJI_IDS ("think:<id>,
+# search:<id>"); empty by default → unicode, no behaviour change. Spec: docs/rich-message-spec.md.
+_OWNER_PREMIUM: bool = False
+_CUSTOM_EMOJI_IDS: dict[str, str] = {}
+
+
+def set_owner_premium(value: bool) -> None:
+    """#323: record whether the bot OWNER has Telegram Premium (read from the owner's
+    `from_user.is_premium` on their messages) — gates custom-emoji substitution (see _emoji)."""
+    global _OWNER_PREMIUM
+    _OWNER_PREMIUM = bool(value)
+
+
+def configure_custom_emoji(raw: str | None) -> None:
+    """#323: set the icon→custom_emoji_id map from a "role:id,role:id" string (roles: think,
+    search). Empty / unparseable → custom emoji disabled (plain unicode)."""
+    global _CUSTOM_EMOJI_IDS
+    out: dict[str, str] = {}
+    for part in (raw or "").split(","):
+        if ":" in part:
+            role, cid = part.split(":", 1)
+            role, cid = role.strip(), cid.strip()
+            if role and cid:
+                out[role] = cid
+    _CUSTOM_EMOJI_IDS = out
+
+
+# Read the configured ids at import (startup); owner premium is set live per-message.
+configure_custom_emoji(os.environ.get("THINKING_EMOJI_IDS", ""))
+
 
 def _thinking_placeholder_html(lang: str = "en") -> str:
     """#294: the static <tg-thinking> placeholder in the user's language."""
@@ -127,12 +163,16 @@ _REASONING_MAX = 4000        # cap retained reasoning text
 _REASONING_DRAFT_TAIL = 600  # how much of the tail to show in the block
 
 
-def _thinking_label(elapsed: float, lang: str = "en") -> str:
-    """#240/#294: pick the localized gerund for the animated <tg-thinking> placeholder by
-    elapsed time. The rotation list is the comma-separated `stream.thinking_words` string."""
-    words = [w for w in i18n.t("stream.thinking_words", lang).split(",") if w]
+def _thinking_label(elapsed: float, lang: str = "en", searching: bool = False) -> str:
+    """#240/#294/#319: pick the localized gerund for the animated <tg-thinking> placeholder by
+    elapsed time. Two rotation subsets: the generic `stream.thinking_words`, or — while a web
+    search/fetch is in flight (`searching`) — the search-themed `stream.searching_words`, so the
+    thinking tag keeps ANIMATING (a fixed phase string is static — only a CHANGING draft
+    animates) and the words read as info-gathering."""
+    key = "stream.searching_words" if searching else "stream.thinking_words"
+    words = [w for w in i18n.t(key, lang).split(",") if w]
     if not words:
-        words = ["Thinking"]
+        words = ["Searching"] if searching else ["Thinking"]
     return words[int(elapsed // _THINKING_ROTATE_SECS) % len(words)]
 
 
@@ -175,6 +215,33 @@ def tool_phase_label(tool_name: str, tool_input: dict | None, lang: str = "en") 
     if tool_name:
         return f"⚙️ {i18n.t('stream.verb_running', lang)} {tool_name}…"
     return f"💭 {i18n.t('stream.thinking', lang)}…"
+
+
+def sources_card_markdown(sources: list, lang: str = "en", done: bool = False) -> str:
+    """#318/#319: render the live web-research card body. `sources` is a list of (kind, value):
+    kind 'search' (a WebSearch query) or 'fetch' (a WebFetch URL). While the turn runs `done`
+    is False → the in-progress "Searching…" header; at finish it flips to the "Sources" header.
+    Each resource is a markdown LIST item on its OWN line — a single '\\n' collapses to a space
+    in Telegram's rich markdown (the #318 bug: everything ran together), so the header is a
+    separate block ('\\n\\n') and each item is a '- ' list row. Values are inline code (a fetch
+    URL has its scheme + trailing slash trimmed) so markdown in a URL/query can't mangle it.
+    Pure — the streamer sends/edits the rendered body."""
+    header = i18n.t("stream.sources_title" if done else "stream.searching", lang)
+    items = []
+    for kind, value in sources:
+        v = (value or "").replace("`", "").strip()
+        if kind == "fetch":
+            for pre in ("https://", "http://"):
+                if v.startswith(pre):
+                    v = v[len(pre):]
+                    break
+            v = v.rstrip("/")
+        if len(v) > 70:
+            v = v[:69] + "…"
+        glyph = "🔍" if kind == "search" else "🔗"
+        items.append(f"- {glyph} `{v}`")
+    return header + "\n\n" + "\n".join(items) if items else header
+
 
 # A DM draft can't carry an inline button (send_message_draft has no reply_markup),
 # so the ⏹ Stop affordance lives on a SEPARATE control message. To avoid flicker on
@@ -234,6 +301,13 @@ class Streamer:
         # #229: message id of the live task-list card (a SEPARATE bubble from the answer,
         # edited in place across the turn). None until the first TodoWrite event.
         self._todo_msg_id: int | None = None
+        # #318 (experimental): live "Sources" card — a SEPARATE bubble listing the web
+        # resources (WebFetch URLs + WebSearch queries) the agent pulled this turn, edited
+        # in place as they accumulate. Persists across segment breaks (like _todo_msg_id;
+        # _begin_next_segment does not touch it). None until the first web tool of the turn.
+        self._sources_msg_id: int | None = None
+        self._web_sources: list[tuple[str, str]] = []
+        self._web_sources_seen: set[tuple[str, str]] = set()
         # #240c: accumulated extended-thinking (reasoning) text, shown (tail) in the
         # <tg-thinking> draft block until real answer content starts. Capped to the tail.
         self._reasoning: str = ""
@@ -252,6 +326,12 @@ class Streamer:
         # #240b: the current live "phase" shown in the <tg-thinking> block while the agent
         # works (set from tool events). None → the placeholder rotates a gerund instead.
         self._phase: str | None = None
+        # #319: True while a web search/fetch is in flight — the placeholder then rotates the
+        # search-themed gerund subset (animated) instead of a static "Searching the web" phase.
+        self._searching: bool = False
+        # #323: set if a custom-emoji draft send fails this turn → fall back to plain unicode for
+        # the rest of the turn, so a rejected custom emoji can never blank the thinking tag.
+        self._custom_emoji_failed: bool = False
 
         self.message_id: int | None = None
         self._start_time: float = 0.0
@@ -422,6 +502,16 @@ class Streamer:
         # else: caught up — the caret spins in place (no new characters revealed).
         await self._render_frame()
 
+    def _emoji(self, uni: str, role: str) -> str:
+        """#323: a custom (animated) emoji for `role` (think/search) when the bot OWNER has
+        Telegram Premium AND an id is configured AND custom emoji haven't failed this turn;
+        otherwise the plain unicode (works for everyone — viewers never need premium). The
+        unicode is the <tg-emoji> fallback, shown where a custom emoji can't render."""
+        if self._custom_emoji_failed or not _OWNER_PREMIUM:
+            return uni
+        cid = _CUSTOM_EMOJI_IDS.get(role)
+        return f'<tg-emoji emoji-id="{cid}">{uni}</tg-emoji>' if cid else uni
+
     def set_phase(self, label: str | None) -> None:
         """#240b: set the live phase shown in the <tg-thinking> placeholder (e.g. from a
         tool event). Synchronous + cheap; the animation loop picks it up on the next tick.
@@ -429,10 +519,17 @@ class Streamer:
         self._phase = label or None
 
     def set_tool_phase(self, tool_name: str, tool_input: dict | None) -> None:
-        """#294: set the live tool phase, localized to this chat's language (the streamer
-        owns the language so the caller needn't resolve it). Builds the label via
-        tool_phase_label and stores it like set_phase."""
-        self._phase = tool_phase_label(tool_name, tool_input, i18n.cached_lang(self.chat_id))
+        """#294/#319: set the live tool phase, localized to this chat's language. A web
+        search/fetch flips on "searching" MODE — the placeholder then rotates the search-themed
+        gerund subset so the <tg-thinking> tag keeps ANIMATING (a fixed phase string is static);
+        every other tool stores a fixed label (e.g. "📖 Reading sessions.py") naming the
+        file/command. The Sources card (a separate message) carries WHAT is being looked at."""
+        if tool_name in ("WebSearch", "WebFetch"):
+            self._searching = True
+            self._phase = None
+        else:
+            self._searching = False
+            self._phase = tool_phase_label(tool_name, tool_input, i18n.cached_lang(self.chat_id))
 
     def add_reasoning(self, delta: str) -> None:
         """#240c: append a chunk of the model's extended-thinking (reasoning) text. Its tail
@@ -443,6 +540,7 @@ class Streamer:
             return
         self._reasoning = (self._reasoning + delta)[-_REASONING_MAX:]
         self._phase = None
+        self._searching = False  # #319: reasoning resumed — leave search-mode rotation
 
     async def _render_draft(self) -> None:
         """Push the current text as a native message draft (DM streaming).
@@ -511,12 +609,22 @@ class Streamer:
             #   #240a: otherwise a rotating Claude-Code-style gerund (Thinking… → Pondering…).
             # Dedup on the rendered html → ~1 draft update per change.
             if self._reasoning:
-                inner = "💭 " + markup.escape_html(self._reasoning[-_REASONING_DRAFT_TAIL:])
+                inner = self._emoji("💭", "think") + " " + markup.escape_html(
+                    self._reasoning[-_REASONING_DRAFT_TAIL:])
+            elif self._searching:
+                # #319: a web search/fetch is running — rotate the search-themed gerund subset
+                # (🔎) so the tag ANIMATES while reading as info-gathering, instead of a static
+                # "Searching the web" phase (a fixed string doesn't animate).
+                # #323: the 🔎 is a custom animated emoji when the owner has Premium, else unicode.
+                lang = i18n.cached_lang(self.chat_id)
+                inner = (self._emoji("🔎", "search")
+                         + f" {_thinking_label(time.monotonic() - self._start_time, lang, searching=True)}…")
             elif self._phase:
                 inner = markup.escape_html(self._phase)
             else:
                 lang = i18n.cached_lang(self.chat_id)   # #294: localized gerund
-                inner = f"💭 {_thinking_label(time.monotonic() - self._start_time, lang)}…"
+                inner = (self._emoji("💭", "think")
+                         + f" {_thinking_label(time.monotonic() - self._start_time, lang)}…")
             html = f"<tg-thinking>{inner}</tg-thinking>"
             # #242: skip only if unchanged AND sent recently; otherwise re-send to keep the
             # ephemeral ~30s draft alive (a static phase during a long tool would else expire).
@@ -534,9 +642,14 @@ class Streamer:
             except TelegramRetryAfter as exc:
                 self._draft_retry_after = time.monotonic() + float(getattr(exc, "retry_after", 1) or 1)
             except Exception:
-                pass
+                # #323: a draft can fail if a custom emoji is rejected (owner lost premium, a bad
+                # id, or drafts don't accept custom emoji) — fall back to plain unicode for the
+                # rest of the turn so the indicator keeps showing (unicode always works).
+                if _OWNER_PREMIUM and _CUSTOM_EMOJI_IDS:
+                    self._custom_emoji_failed = True
             return
         self._phase = None  # #240b: real content is streaming — drop any live tool phase
+        self._searching = False  # #319: and any search-mode rotation
         self._reasoning = ""  # #240c: answer started — clear reasoning (a later segment refills)
         # #172: stream the RAW markdown via sendRichMessageDraft, so the draft is
         # ALREADY FORMATTED as it generates (Durov's GIF) instead of plain text that
@@ -802,6 +915,8 @@ class Streamer:
             self._last_edit = time.monotonic()
         # Outside the lock: tear down the Stop control message for this turn.
         await self._remove_control()
+        # #321: web-search Sources card disabled (see add_web_source) — finalize call commented.
+        # was (#319): await self.finalize_sources()
 
     async def segment_break(self) -> None:
         """Commit the current segment as its own message and reset for the next.
@@ -1067,6 +1182,62 @@ class Streamer:
             # Edits fail if the content is unchanged ("message is not modified") or the
             # card was deleted — neither should disturb the turn.
             logger.debug("#229 todo card update failed", exc_info=True)
+
+    # #321: CURRENTLY DISABLED — the web-search Sources card is off (its call sites in
+    # sessions.py + finish() are commented; search feedback is the animated 🔎 thinking tag
+    # alone). add_web_source / finalize_sources / sources_card_markdown are kept intact for revert.
+    async def add_web_source(self, kind: str, value: str, lang: str = "en") -> None:
+        """#318 (experimental): collect a web source (kind 'search'=query | 'fetch'=url) and
+        (re)render the live Sources card — a SEPARATE rich message sent on the first web tool
+        of the turn and EDITED IN PLACE as more arrive (mirrors update_todo_card). Dedups,
+        caps at 15, best-effort (a send/edit failure never disturbs the answer)."""
+        value = (value or "").strip()
+        if not value:
+            return
+        key = (kind, value)
+        if key in self._web_sources_seen or len(self._web_sources) >= 15:
+            return
+        self._web_sources_seen.add(key)
+        self._web_sources.append(key)
+        rich = {"markdown": sources_card_markdown(self._web_sources, lang)}
+        try:
+            if self._sources_msg_id is None:
+                msg = await self.bot(
+                    SendRichMessage(
+                        chat_id=self.chat_id,
+                        rich_message=rich,
+                        disable_notification=True,
+                        **self._kwargs(),
+                    )
+                )
+                self._sources_msg_id = getattr(msg, "message_id", None)
+            else:
+                await self.bot(
+                    EditRichMessage(
+                        chat_id=self.chat_id,
+                        message_id=self._sources_msg_id,
+                        rich_message=rich,
+                    )
+                )
+        except Exception:
+            logger.debug("#318 sources card update failed", exc_info=True)
+
+    async def finalize_sources(self) -> None:
+        """#319: at turn end, flip the live research card from the in-progress "Searching…"
+        header to the final "Sources" header (the resource list itself is unchanged). No-op if
+        no web tool ran this turn. Best-effort — never disturbs the finished answer."""
+        if self._sources_msg_id is None or not self._web_sources:
+            return
+        lang = i18n.cached_lang(self.chat_id)
+        rich = {"markdown": sources_card_markdown(self._web_sources, lang, done=True)}
+        with contextlib.suppress(Exception):
+            await self.bot(
+                EditRichMessage(
+                    chat_id=self.chat_id,
+                    message_id=self._sources_msg_id,
+                    rich_message=rich,
+                )
+            )
 
     async def _commit_rich_markdown(self, full_text: str, footer: str, silent: bool,
                                     reply_markup=None) -> bool:

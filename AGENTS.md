@@ -155,7 +155,8 @@ stays cheap.
 | `app/core/sessions.py` | `SessionManager` — per-thread session + serial worker + chaining queue + `/stop` + usage accumulation. |
 | `app/core/token_refresh.py` | Background sweep that refreshes the subscription OAuth credential before it expires (#191). |
 | `app/core/schedules.py` | Recurring / one-shot schedule runner (natural-language schedules). |
-| `app/core/agent_context.md` | The agent self-description appended to both system prompts; loaded at import by `engine` (runtime asset, co-located). |
+| `app/core/agent_context.md` | Shared agent self-description (what the bot is, modes, sessions, history, commands, rendering); loaded at import by `engine`, appended to BOTH system prompts (runtime asset, co-located). |
+| `app/core/code_addendum.md` | Code-only addendum to the self-description (shell mode, file delivery, sandbox/privacy, `/secret`); appended to the CODE system prompt only (#306). |
 | `app/storage/db.py` | `aiosqlite` durable state (`threads` / `usage` / `messages` / `kv` / `rate_history`) — see **Data model** below. Survives restart. |
 | `app/storage/archive.py` | Cold storage (#177): `archive_session` gzip-bundles a deleted session's workdir + transcript under `BASE_WORKDIR/_archive/` instead of `rmtree` — fail-safe (live copies kept on a half-write). |
 | `app/storage/usage.py` | Formatters for the 5h/7d subscription windows (footer / pinned) + `fetch_account_usage` — the `/api/oauth/usage` GET for the real % (#135). |

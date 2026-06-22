@@ -57,8 +57,8 @@ Run the smoke checks — both are cheap and catch most breakage (you don't need 
 start the bot to verify syntax):
 
 ```bash
-python -m py_compile *.py
-python -c "import config, db, access, allowlist, markup, streamer, permissions, engine, sessions, usage, handlers, bot"
+python -m compileall -q app conftest.py
+python -c "import app.config, app.storage.db, app.i18n, app.access.access, app.access.allowlist, app.telegram.markup, app.telegram.rich_message, app.telegram.table_image, app.telegram.streamer, app.access.permissions, app.telegram.commands, app.access.settings_schema, app.core.engine, app.core.sessions, app.storage.archive, app.storage.usage, app.telegram.handlers, app.watchdog, app.bot"
 pytest -q
 ```
 

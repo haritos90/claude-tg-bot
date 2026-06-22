@@ -13,6 +13,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import sqlite3
 import time
 from dataclasses import dataclass, field
@@ -27,15 +28,47 @@ _conn: aiosqlite.Connection | None = None
 _lock = None  # type: ignore[assignment]  # lazily created asyncio.Lock in init_db
 
 
-def session_sid(thread_id: int) -> str:
-    """A stable, git-short-hash-style PUBLIC id for a session (#97).
+# #327 (decoupled): two ids per session. session_sid() is the INTERNAL stable workdir id (6-hex
+# sha1) naming the on-disk workdir / transcript / jail-uid / secrets — it must NEVER move (resume
+# is cwd-keyed). session_pubid() is the PUBLIC id shown in the UI: a stored ULID read from this
+# cache (backfilled by migrate_sessions_to_ulid, set on create). The filesystem stays on the 6-hex
+# id, so adding the ULID is a pure DB/display change that can't break resume.
+_SID_BY_THREAD: dict[int, str] = {}  # thread_id -> public ULID
 
-    Derived purely from the immutable thread_id, so it needs no migration / new
-    column and every existing session gets one immediately. Shown in /sessions,
-    the session card, and /status so a session has a FIXED identifier instead of a
-    list position that shifts as sessions are added/removed.
-    """
+# Crockford base32 (no I, L, O, U) — the ULID alphabet.
+_CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+
+
+def new_ulid() -> str:
+    """#327: a ULID — 26-char Crockford base32, lexicographically time-sortable (48-bit ms
+    timestamp in the high bits + 80-bit randomness). Fixed length, opaque, collision-resistant;
+    no external dependency."""
+    val = ((int(time.time() * 1000) & ((1 << 48) - 1)) << 80) | int.from_bytes(os.urandom(10), "big")
+    out = bytearray(26)
+    for i in range(25, -1, -1):
+        out[i] = ord(_CROCKFORD[val & 0x1F])
+        val >>= 5
+    return out.decode("ascii")
+
+
+def _derive_sid(thread_id: int) -> str:
+    """The LEGACY derived sid (`sha1[:6]`) — used to locate a session's OLD on-disk name during the
+    #327 migration, and as a transitional fallback for a thread not yet in the ULID cache."""
     return hashlib.sha1(f"sess:{thread_id}".encode()).hexdigest()[:6]
+
+
+def session_sid(thread_id: int) -> str:
+    """INTERNAL stable workdir id — the 6-hex `sha1[:6]`. Names the on-disk workdir / transcript /
+    jail-uid / secrets, which must NEVER move (resume is cwd-keyed), so it is purely derived and
+    never changes. NOT user-facing — the PUBLIC id is session_pubid() (#327)."""
+    return _derive_sid(thread_id)
+
+
+def session_pubid(thread_id: int) -> str:
+    """#327: the PUBLIC session id shown in the UI — a stored ULID (opaque, fixed-length, time-
+    sortable) from the cache (backfilled by migrate_sessions_to_ulid / set on create). Falls back to
+    the 6-hex workdir id for a thread not yet backfilled."""
+    return _SID_BY_THREAD.get(thread_id) or session_sid(thread_id)
 
 
 @dataclass
@@ -114,6 +147,10 @@ async def init_db(db_path: str) -> None:
         try:
             await _conn.execute("PRAGMA journal_mode=WAL")
             await _conn.execute("PRAGMA synchronous=NORMAL")
+            # #332: wait up to 5s for a lock instead of erroring instantly, so a second
+            # writer touching the file (backup tool, stray poller, watchdog) gets a brief
+            # queue rather than an immediate "database is locked".
+            await _conn.execute("PRAGMA busy_timeout=5000")
         except aiosqlite.Error:
             pass
 
@@ -137,6 +174,7 @@ async def init_db(db_path: str) -> None:
             CREATE TABLE IF NOT EXISTS usage (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 thread_id INTEGER,
+                chat_id INTEGER,
                 ts REAL,
                 input_tokens INTEGER,
                 output_tokens INTEGER,
@@ -178,6 +216,9 @@ async def init_db(db_path: str) -> None:
         await _conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_usage_thread_ts ON usage(thread_id, ts)"
         )
+        # #309: idx_usage_chat_ts is created LATER, in the migration block, AFTER the
+        # chat_id column is guaranteed to exist — on an existing db the column is added by
+        # an ALTER there, so an index here would hit "no such column: chat_id".
         await _conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_threads_chat ON threads(chat_id)"
         )
@@ -235,6 +276,12 @@ async def init_db(db_path: str) -> None:
         if "permission_mode" not in existing:
             await _conn.execute(
                 "ALTER TABLE threads ADD COLUMN permission_mode TEXT DEFAULT 'acceptEdits'"
+            )
+        # #327: stored PUBLIC session id (a ULID); backfilled by migrate_sessions_to_ulid.
+        if "sid" not in existing:
+            await _conn.execute("ALTER TABLE threads ADD COLUMN sid TEXT")
+            await _conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_threads_sid ON threads(sid)"
             )
         if "chat_session_id" not in existing:
             await _conn.execute("ALTER TABLE threads ADD COLUMN chat_session_id TEXT")
@@ -318,6 +365,22 @@ async def init_db(db_path: str) -> None:
             await _conn.execute(
                 "ALTER TABLE usage ADD COLUMN context_tokens INTEGER DEFAULT 0"
             )
+        # #309: usage is now owned by chat_id (the DM user / group), not just the thread, so
+        # per-user totals + rolling-limit windows survive a session delete. Backfill existing
+        # rows from their thread; a row whose thread is already gone stays NULL (unrecoverable
+        # — it was already excluded from per-user totals by the old threads join).
+        if "chat_id" not in ucols:
+            await _conn.execute("ALTER TABLE usage ADD COLUMN chat_id INTEGER")
+            await _conn.execute(
+                "UPDATE usage SET chat_id = "
+                "(SELECT th.chat_id FROM threads th WHERE th.thread_id = usage.thread_id) "
+                "WHERE chat_id IS NULL"
+            )
+        # #309: index AFTER the column is guaranteed present (the ALTER above runs only on an
+        # old db; on a fresh db chat_id comes from CREATE TABLE usage). Idempotent either way.
+        await _conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_usage_chat_ts ON usage(chat_id, ts)"
+        )
         # #278: the legacy permission_mode 'default' (pre-#212 = prompt for EVERY tool,
         # incl. file edits) is no longer a selectable mode — the #212 baseline is
         # 'acceptEdits' (the #119 jail is the containment layer). Migrate stale rows so a
@@ -518,6 +581,34 @@ async def set_last_active(thread_id: int, ts: float) -> None:
     async with _lock:
         await conn.execute(
             "UPDATE threads SET last_active = ? WHERE thread_id = ?", (ts, thread_id)
+        )
+        await conn.commit()
+
+
+async def get_user_last_active(user_id: int) -> float:
+    """#329: the USER's overall last-active epoch time (across ALL their sessions). Idle rotation
+    keys off the user's inactivity gap, NOT any single session's age — so a month-old session is
+    fine to continue, and only a >window gap since the user's last activity starts a fresh one."""
+    conn = _require_conn()
+    async with _lock:
+        cur = await conn.execute("SELECT value FROM kv WHERE key = ?", (f"ula:{user_id}",))
+        row = await cur.fetchone()
+        await cur.close()
+    try:
+        return float(row["value"]) if row else 0.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+async def set_user_last_active(user_id: int, ts: float) -> None:
+    """#329: record the user's overall last-active time — any message OR an explicit session
+    switch counts (a switch must KEEP the chosen session, never idle-rotate it away)."""
+    conn = _require_conn()
+    async with _lock:
+        await conn.execute(
+            "INSERT INTO kv (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (f"ula:{user_id}", str(ts)),
         )
         await conn.commit()
 
@@ -879,12 +970,13 @@ async def add_usage(
         await conn.execute(
             """
             INSERT INTO usage
-                (thread_id, ts, input_tokens, output_tokens, cache_read, cache_creation,
-                 cost_usd, model, context_tokens)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                (thread_id, chat_id, ts, input_tokens, output_tokens, cache_read,
+                 cache_creation, cost_usd, model, context_tokens)
+            VALUES (?, (SELECT chat_id FROM threads WHERE thread_id = ?), ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 thread_id,
+                thread_id,   # #309: resolve + store the owning chat_id so the row outlives the thread
                 time.time(),
                 input_tokens,
                 output_tokens,
@@ -941,19 +1033,22 @@ async def get_usage_totals_bulk(thread_ids: list[int]) -> dict[int, dict]:
     async with _lock:
         cur = await conn.execute(
             f"""
-            SELECT thread_id,
-                   COALESCE(SUM(input_tokens), 0)  AS input,
-                   COALESCE(SUM(output_tokens), 0) AS output,
-                   COUNT(*)                        AS requests
-            FROM usage
-            WHERE thread_id IN ({placeholders})
-            GROUP BY thread_id
+            SELECT u.thread_id                       AS thread_id,
+                   COALESCE(SUM(u.input_tokens), 0)  AS input,
+                   COALESCE(SUM(u.output_tokens), 0) AS output,
+                   COALESCE(SUM({_units_sql_expr()}), 0) AS units,
+                   COUNT(*)                          AS requests
+            FROM usage u
+            WHERE u.thread_id IN ({placeholders})
+            GROUP BY u.thread_id
             """,
             ids,
         )
         rows = await cur.fetchall()
         await cur.close()
+    # #307: also return weighted "units" per thread (for the /sessions list stats line).
     return {int(r["thread_id"]): {"input": int(r["input"]), "output": int(r["output"]),
+                                  "units": int(r["units"]),
                                   "requests": int(r["requests"])} for r in rows}
 
 
@@ -1027,14 +1122,15 @@ async def get_user_usage_window(user_id: int, since: float | None = None,
                                 measure: str = "units") -> int:
     """Total usage one user has spent across ALL their sessions, in `measure`
     (default weighted "units" #165 — the cost-aware basis for the rolling-window caps).
-    With ``since`` (epoch seconds), counts only usage at-or-after that time. A user owns
-    the DM rows whose chat_id == their id, so usage is summed over that join."""
+    With ``since`` (epoch seconds), counts only usage at-or-after that time. Usage rows
+    carry their owner's chat_id (#309), so the sum is over ``usage.chat_id`` directly and
+    survives a session delete (a deleted session's spend still counts toward the cap)."""
     expr = _usage_measure_expr(measure)
     conn = _require_conn()
     query = (
         f"SELECT COALESCE(SUM({expr}), 0) AS v "
-        "FROM usage u JOIN threads th ON u.thread_id = th.thread_id "
-        "WHERE th.chat_id = ?"
+        "FROM usage u "                 # #309: by usage.chat_id, not a threads join
+        "WHERE u.chat_id = ?"
     )
     params: list = [user_id]
     if since is not None:
@@ -1063,8 +1159,8 @@ async def get_user_breakdown(user_id: int, measure: str = "raw") -> dict:
             f"COALESCE(SUM(CASE WHEN u.ts >= ? THEN {expr} ELSE 0 END), 0) AS week, "
             f"COALESCE(SUM({expr}), 0) AS total, "
             f"COUNT(*) AS requests "
-            "FROM usage u JOIN threads th ON u.thread_id = th.thread_id "
-            "WHERE th.chat_id = ?",
+            "FROM usage u "                       # #309: by usage.chat_id, not a threads join
+            "WHERE u.chat_id = ?",
             (day_since, week_since, user_id),
         )
         row = await cur.fetchone()
@@ -1091,14 +1187,16 @@ async def get_all_users_breakdown(measure: str = "raw") -> list[dict]:
     conn = _require_conn()
     async with _lock:
         cur = await conn.execute(
-            f"SELECT th.chat_id AS uid, "
+            f"SELECT u.chat_id AS uid, "
             f"COALESCE(SUM(CASE WHEN u.ts >= ? THEN {expr} ELSE 0 END), 0) AS day, "
             f"COALESCE(SUM(CASE WHEN u.ts >= ? THEN {expr} ELSE 0 END), 0) AS week, "
             f"COALESCE(SUM({expr}), 0) AS total, "
             f"COUNT(*) AS requests, COALESCE(MAX(u.ts), 0) AS last_ts "
-            "FROM usage u JOIN threads th ON u.thread_id = th.thread_id "
-            "WHERE th.chat_id > 0 "          # DM users only; groups (chat_id<0) are not people
-            "GROUP BY th.chat_id ORDER BY week DESC, total DESC",
+            # #309: group by usage.chat_id (no threads join) so a deleted session's owner
+            # still appears with their full lifetime totals.
+            "FROM usage u "
+            "WHERE u.chat_id > 0 "          # DM users only; groups (chat_id<0) are not people
+            "GROUP BY u.chat_id ORDER BY week DESC, total DESC",
             (day_since, week_since),
         )
         rows = await cur.fetchall()
@@ -1224,7 +1322,7 @@ async def browse_threads(
         await cur.close()
         cur = await conn.execute(
             "SELECT thread_id, name, mode, created_at, created_by, "
-            "COALESCE(favorite, 0) AS favorite "
+            "COALESCE(favorite, 0) AS favorite, COALESCE(name_auto, 1) AS name_auto "
             f"FROM threads WHERE {where} "
             "ORDER BY favorite DESC, created_at DESC LIMIT ? OFFSET ?",
             (*params, limit, offset),
@@ -1268,21 +1366,23 @@ async def allocate_dm_session(
             (str(seq),),
         )
         key = -seq
-        # #140: name the workdir by the stable PUBLIC sid, not the raw numeric
-        # key, so the directory matches the id shown in /sessions and the export
-        # filename and never leaks the internal numbering on disk.
-        # was: cwd = str(Path(base_workdir) / str(key))  — replaced for #140
-        # #181: nested layout — the session cwd is <sid>/work (state is the sibling).
-        cwd = str(Path(base_workdir) / session_sid(key) / "work")
+        # #332: name the workdir by the PUBLIC ULID — same id shown in the UI, collision-safe
+        # (80-bit), and the on-disk dir == sid == session_pubid. The legacy 6-hex session_sid
+        # is migration-only now. was: cwd = base / session_sid(key) / "work".
+        # #181: nested layout — the session cwd is <ulid>/work (state is the sibling).
+        pubid = new_ulid()
+        _SID_BY_THREAD[key] = pubid  # so session_pubid(key) resolves while building the path
+        cwd = str(Path(base_workdir) / pubid / "work")
         session_mode = "code" if mode == "code" else "chat"
         await conn.execute(
             "INSERT INTO threads (thread_id, chat_id, mode, model, cwd, "
             "code_session_id, name, permission_mode, chat_session_id, big_memory, "
-            "created_by, created_at) "
-            "VALUES (?, ?, ?, ?, ?, NULL, ?, 'acceptEdits', NULL, 0, ?, ?)",
-            (key, user_id, session_mode, default_model, cwd, name, user_id, time.time()),
+            "created_by, created_at, sid) "
+            "VALUES (?, ?, ?, ?, ?, NULL, ?, 'acceptEdits', NULL, 0, ?, ?, ?)",
+            (key, user_id, session_mode, default_model, cwd, name, user_id, time.time(), pubid),
         )
         await conn.commit()
+        _SID_BY_THREAD[key] = pubid
     return key
 
 
@@ -1386,8 +1486,10 @@ async def set_user_lang(user_id: int, lang: str) -> None:
 
 
 async def delete_dm_session(user_id: int, key: int) -> bool:
-    """Delete a DM session (and its usage + message rows). Returns True if a row
-    was removed.
+    """Delete a DM session (and its message + schedule rows). Returns True if a row
+    was removed. NOTE (#309): the session's ``usage`` rows are deliberately KEPT — a
+    user's recorded token spend must outlive deleting the session (it still feeds their
+    lifetime totals + rolling-limit windows, keyed by chat_id).
 
     Scoped to (thread_id == key AND chat_id == user_id) so a user can only ever
     delete their OWN row. DM rows are owned by a real, positive user id, whereas a
@@ -1407,9 +1509,17 @@ async def delete_dm_session(user_id: int, key: int) -> bool:
         )
         removed = cur.rowcount or 0
         await cur.close()
-        await conn.execute("DELETE FROM usage WHERE thread_id = ?", (key,))
+        # #309: usage rows are NO LONGER deleted with the session — a user's per-session
+        # token spend must survive deleting that session, so it still counts toward their
+        # lifetime totals + rolling-limit windows (else deleting sessions silently shrinks
+        # recorded spend and dodges the caps). Usage is keyed by chat_id and aggregated
+        # without the threads join, so the orphaned rows still attribute to the right user.
+        # was (removed for #309):
+        # await conn.execute("DELETE FROM usage WHERE thread_id = ?", (key,))
         await conn.execute("DELETE FROM messages WHERE thread_id = ?", (key,))
-        await conn.execute("DELETE FROM session_uid WHERE sid = ?", (session_sid(key),))  # #221
+        # #332: the session_uid registry is keyed by the on-disk dir name = the ULID (re-keyed
+        # by migrate_workdirs_to_ulid). was: session_sid(key) — the legacy 6-hex.
+        await conn.execute("DELETE FROM session_uid WHERE sid = ?", (session_pubid(key),))  # #221/#332
         # #254: cascade to schedules too — otherwise an orphaned schedule keeps firing and
         # _fire_schedule → handle_text → ensure_thread silently resurrects the deleted thread.
         await conn.execute("DELETE FROM schedules WHERE thread_id = ?", (key,))
@@ -1500,6 +1610,114 @@ def sandbox_uid_collisions(base_workdir: str) -> dict[int, list[str]]:
     except OSError:
         return {}
     return _uid_collisions(uid_by_sid)
+
+
+async def load_sid_cache() -> None:
+    """#327: populate the thread_id -> ULID cache from the DB at startup (after the migration has
+    backfilled `sid`). session_sid() reads this cache on the hot path."""
+    conn = _require_conn()
+    async with _lock:
+        cur = await conn.execute("SELECT thread_id, sid FROM threads WHERE sid IS NOT NULL")
+        rows = await cur.fetchall()
+        await cur.close()
+    _SID_BY_THREAD.clear()
+    for r in rows:
+        _SID_BY_THREAD[int(r["thread_id"])] = r["sid"]
+
+
+async def migrate_sessions_to_ulid(base_workdir: str) -> int:
+    """#327 (decoupled): backfill a stored PUBLIC ULID for every session that lacks one. DB-ONLY —
+    the workdir / transcript / jail-uid stay on the stable 6-hex session_sid(), so the filesystem is
+    NEVER touched and `resume` can't break. Idempotent (rows that already have a sid are skipped),
+    safe to run every startup. ``base_workdir`` is unused now (kept for the call signature — no dirs
+    are moved). Returns the count backfilled."""
+    _ = base_workdir  # decoupled migration is DB-only; no directories are moved
+    conn = _require_conn()
+    backfilled = 0
+    async with _lock:
+        cur = await conn.execute("SELECT thread_id FROM threads WHERE sid IS NULL")
+        rows = await cur.fetchall()
+        await cur.close()
+        for row in rows:
+            tid = int(row["thread_id"])
+            pubid = new_ulid()
+            await conn.execute(
+                "UPDATE threads SET sid = ? WHERE thread_id = ?", (pubid, tid)
+            )
+            _SID_BY_THREAD[tid] = pubid
+            backfilled += 1
+        if backfilled:
+            await conn.commit()
+    return backfilled
+
+
+async def migrate_workdirs_to_ulid(base_workdir: str) -> int:
+    """#332: rename each per-session workdir from the legacy 6-hex ``session_sid`` to the
+    PUBLIC ULID, so the on-disk name matches the id shown in the UI and is collision-safe
+    (80-bit) instead of the old 24-bit hash. For every session whose dir is still the 6-hex:
+
+      * rename ``base/<6hex>`` -> ``base/<ulid>``;
+      * re-encode the nested transcript dir ``<ulid>/state/<old-encoded-cwd>`` ->
+        ``<ulid>/state/<new-encoded-cwd>`` — claude keys ``resume`` by the cwd-encoded path,
+        so this MUST follow the rename or resume breaks (the #327/#140 trap);
+      * re-key the ``session_uid`` registry row (keyed by the on-disk dir name) 6hex -> ulid,
+        so the per-session host uid stays stable across the rename;
+      * realign the stored ``cwd`` to the new ULID path.
+
+    Idempotent (a session already on its ULID dir is skipped, incl. ones born ULID-named) and
+    per-row fail-safe: an OSError on one dir is logged and skipped WITHOUT touching its cwd, so
+    that session still runs off its old dir and the next startup retries. Must run AFTER the
+    ULID backfill (every thread needs its `sid`). Returns the number of sessions migrated.
+    """
+    conn = _require_conn()
+    base = Path(base_workdir)
+    migrated = 0
+    async with _lock:
+        cur = await conn.execute("SELECT thread_id, cwd, sid FROM threads WHERE sid IS NOT NULL")
+        rows = await cur.fetchall()
+        await cur.close()
+        for row in rows:
+            tid = int(row["thread_id"])
+            ulid = row["sid"]
+            cwd = row["cwd"]
+            if not ulid:
+                continue
+            # Already on the ULID dir (cwd's parent dir == the ULID) — skip. Covers sessions
+            # born ULID-named and a re-run after a prior migration.
+            if cwd and os.path.basename(os.path.dirname(os.path.normpath(cwd))) == ulid:
+                continue
+            legacy = _derive_sid(tid)            # the old 6-hex on-disk name
+            old = base / legacy
+            new = base / ulid
+            new_cwd = str(new / "work")
+            try:
+                if old.is_dir() and not new.exists():
+                    os.rename(old, new)
+                    # Re-encode the nested transcript dir so `resume` survives the rename.
+                    old_enc = re.sub(r"[^A-Za-z0-9]", "-", str(old / "work"))
+                    new_enc = re.sub(r"[^A-Za-z0-9]", "-", str(new / "work"))
+                    state = new / "state"
+                    if (state / old_enc).is_dir() and not (state / new_enc).exists():
+                        os.rename(state / old_enc, state / new_enc)
+                    logger.info("migrate_workdirs_to_ulid: thread %s %s -> %s", tid, old, new)
+                elif old.is_dir() and new.is_dir():
+                    logger.warning(
+                        "migrate_workdirs_to_ulid: both %s and %s exist for thread %s; "
+                        "kept new dir, realigned cwd only", old, new, tid)
+                # else: no live dir yet (lazy) or new-only — just realign cwd + uid below.
+                # Re-key the uid registry (keyed by the on-disk dir name) so the uid is stable.
+                await conn.execute("UPDATE session_uid SET sid = ? WHERE sid = ?", (ulid, legacy))
+                if cwd != new_cwd:
+                    await conn.execute(
+                        "UPDATE threads SET cwd = ? WHERE thread_id = ?", (new_cwd, tid))
+                migrated += 1
+            except OSError as exc:
+                logger.warning(
+                    "migrate_workdirs_to_ulid: thread %s (%s -> %s) failed: %s — left as-is",
+                    tid, old, new, exc)
+        if migrated:
+            await conn.commit()
+    return migrated
 
 
 async def migrate_workdirs_to_sid(base_workdir: str) -> int:

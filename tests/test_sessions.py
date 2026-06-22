@@ -8,6 +8,7 @@ text, that snapshot must NOT resurrect and re-flush it as a duplicate message.
 Async tests wrap asyncio.run (no pytest-asyncio), matching the suite convention.
 """
 import asyncio
+import contextlib
 import time
 from types import SimpleNamespace
 
@@ -29,6 +30,7 @@ class _FakeStreamer:
         self.cancelled = False
         self.reasoning = []        # add_reasoning(delta) payloads
         self.phases = []           # set_phase(label) payloads (#262 tool phase)
+        self.web_sources = []      # #318: add_web_source((kind, value)) payloads
 
     async def start(self, placeholder=None):
         pass
@@ -59,6 +61,9 @@ class _FakeStreamer:
         from app.telegram import streamer as _st
         self.phases.append(_st.tool_phase_label(tool_name, tool_input, "en"))
 
+    async def add_web_source(self, kind, value, lang="en"):
+        self.web_sources.append((kind, value))
+
 
 class _FakeSession:
     def __init__(self, events):
@@ -82,9 +87,18 @@ def _ev(kind, text="", **kw):
 def _make(monkeypatch, events, mode="code"):
     async def _noop(*a, **k):
         return None
-    for name in ("log_message", "add_usage", "set_code_session",
-                 "set_chat_session", "set_fork_pending"):
+    for name in ("log_message", "add_usage", "set_fork_pending"):
         monkeypatch.setattr(db, name, _noop)
+    # #324: record session-id persists so the early-persist test can assert them.
+    saved_sessions: list = []
+
+    async def _save_chat(tid, sid):
+        saved_sessions.append(("chat", sid))
+
+    async def _save_code(tid, sid):
+        saved_sessions.append(("code", sid))
+    monkeypatch.setattr(db, "set_chat_session", _save_chat)
+    monkeypatch.setattr(db, "set_code_session", _save_code)
     sm = sessions.SessionManager(
         bot=SimpleNamespace(), settings=SimpleNamespace(), gate=SimpleNamespace()
     )
@@ -93,6 +107,7 @@ def _make(monkeypatch, events, mode="code"):
         session=_FakeSession(events), mode=mode, stream_enabled=True
     )
     streamer = _FakeStreamer()
+    streamer.saved_sessions = saved_sessions   # #324: expose persisted session ids
     asyncio.run(sm._run_one(rec, -1, "prompt", None, streamer))
     return streamer
 
@@ -140,7 +155,7 @@ def test_web_tool_phase_shown_in_chat(monkeypatch):
     ]
     s = _make(monkeypatch, events, mode="chat")
     assert any("web" in p.lower() for p in s.phases), s.phases
-    assert s.segment_breaks == 0          # chat never splits bubbles on a tool
+    assert s.segment_breaks == 0          # #320: no text before the tool here → no split
     assert s.finished_with == "It's sunny."
 
 
@@ -154,6 +169,155 @@ def test_thinking_without_prior_text_does_not_split(monkeypatch):
     s = _make(monkeypatch, events, mode="chat")
     assert s.segment_breaks == 0
     assert s.finished_with == "Only answer."
+
+
+def test_repeated_thinking_after_text_splits_each_time(monkeypatch):
+    # #259/#317: think → text → think → text → think → text. EACH thinking phase that
+    # follows answer text finalizes the prior text as its own bubble and re-opens a fresh
+    # one (re-showing the <tg-thinking> block), so a multi-step interleave renders as
+    # separate messages — not one blob, and no second/third thinking phase is lost.
+    events = [
+        _ev("thinking_delta", "t1"),       # before any text — no split
+        _ev("text_delta", "A. "),
+        _ev("thinking_delta", "t2"),       # after text — split #1
+        _ev("text_delta", "B. "),
+        _ev("thinking_delta", "t3"),       # after text — split #2
+        _ev("text_delta", "C."),
+        _ev("result", "", usage={}, session_id="s1"),
+    ]
+    s = _make(monkeypatch, events, mode="chat")
+    assert s.segment_breaks == 2                       # one split per think-after-text
+    assert s.reasoning == ["t1", "t2", "t3"]           # every thinking phase captured
+    assert s.finished_with == "C."                     # only the final post-reasoning burst
+
+
+# #321: web-search Sources card disabled (call sites commented) — this wiring test is parked
+# with it; re-enable together. was:
+# def test_web_tools_feed_sources_card(monkeypatch):
+#     events = [
+#         _ev("tool", tool_name="WebSearch", tool_input={"query": "weather kyiv"}),
+#         _ev("tool", tool_name="WebFetch", tool_input={"url": "https://example.com/a"}),
+#         _ev("text_delta", "Done."),
+#         _ev("result", "Done.", usage={}, session_id="s1"),
+#     ]
+#     s = _make(monkeypatch, events, mode="chat")
+#     assert ("search", "weather kyiv") in s.web_sources
+#     assert ("fetch", "https://example.com/a") in s.web_sources
+
+
+def test_tool_start_sets_phase_without_split_or_source(monkeypatch):
+    # #319: a tool_start event (a tool BEGINNING — e.g. a slow server-side WebSearch) surfaces
+    # the live phase immediately, but adds NO source and splits NO bubble — those wait for the
+    # assembled `tool` event after the call returns.
+    events = [
+        _ev("tool_start", tool_name="WebSearch", tool_input={}),
+        _ev("text_delta", "Answer."),
+        _ev("result", "Answer.", usage={}, session_id="s1"),
+    ]
+    s = _make(monkeypatch, events, mode="chat")
+    assert any("web" in p.lower() for p in s.phases), s.phases   # phase shown DURING the call
+    assert s.web_sources == []                                   # no source yet (input empty)
+    assert s.segment_breaks == 0
+    assert s.finished_with == "Answer."
+
+
+def test_fair_admission_round_robin_by_user():
+    # #326: when slots are full, waiting turns are admitted ROUND-ROBIN by user — so user A's
+    # burst of sessions can't starve user B. With 1 slot held and the wait-queue [A2, A3, B1]
+    # (A bursts first), fair order serves A2, then B1 (jumps ahead of A3), then A3 — NOT the
+    # plain-FIFO A2, A3, B1 that would make B wait behind A's whole burst.
+    gate = sessions.FairAdmission(slots=1)
+    order = []
+
+    async def scenario():
+        await gate.acquire("holder")          # the only slot is taken
+
+        async def worker(key, tag):
+            await gate.acquire(key)
+            order.append(tag)
+            gate.release()
+
+        tasks = [asyncio.create_task(worker("A", "A2")),
+                 asyncio.create_task(worker("A", "A3")),
+                 asyncio.create_task(worker("B", "B1"))]
+        await asyncio.sleep(0)                 # let all three block in the wait-queue
+        gate.release()                         # holder done → cascade admits round-robin
+        await asyncio.gather(*tasks)
+
+    asyncio.run(scenario())
+    assert order == ["A2", "B1", "A3"], order
+    assert gate.active == 0                    # everything released — no leaked slot
+
+
+def test_fair_admission_cancel_waiter_no_leak():
+    # #326: a waiter cancelled while queued is removed cleanly and never leaks its slot.
+    gate = sessions.FairAdmission(slots=1)
+
+    async def scenario():
+        await gate.acquire("A")                # full
+        t = asyncio.create_task(gate.acquire("B"))
+        await asyncio.sleep(0)                  # B blocks in the queue
+        t.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await t
+        gate.release()                         # holder done; B is gone → the slot must free
+        assert gate.active == 0
+        await gate.acquire("C")                # the gate still works after a cancel
+        assert gate.active == 1
+        gate.release()
+        assert gate.active == 0
+
+    asyncio.run(scenario())
+
+
+def test_drain_waits_for_active_turns_then_returns():
+    # #325: drain() blocks until in-flight turns finish (the idle event), bounded by timeout —
+    # so a graceful restart lets the active turn complete instead of killing it.
+    sm = sessions.SessionManager(
+        bot=SimpleNamespace(), settings=SimpleNamespace(), gate=SimpleNamespace()
+    )
+
+    async def scenario():
+        sm._active_turns = 1
+        sm._idle_event.clear()
+        assert await sm.drain(timeout=0.05) is False   # a turn is active → times out
+        assert sm._draining is True                    # …and draining is latched on
+        sm._active_turns = 0
+        sm._idle_event.set()
+        assert await sm.drain(timeout=0.05) is True     # turn finished → returns immediately
+    asyncio.run(scenario())
+
+
+def test_session_id_persisted_early_not_only_at_result(monkeypatch):
+    # #324: the engine reports the session id up-front (the init message → a "session" event)
+    # and the consumer persists it IMMEDIATELY — so a turn killed mid-flight (a restart/crash
+    # before the terminal result) still leaves a resumable id. (Incident: a service restart
+    # killed an SVG turn before its result; the id was never saved; the next message lost all
+    # context and started a fresh "новая сессия".)
+    events = [
+        _ev("session", session_id="sid-1"),
+        _ev("text_delta", "Drawing the SVG…"),
+        _ev("result", "Done.", usage={}, session_id="sid-1"),
+    ]
+    s = _make(monkeypatch, events, mode="chat")
+    assert s.saved_sessions[0] == ("chat", "sid-1")    # persisted by the EARLY session event…
+    assert s.saved_sessions[-1] == ("chat", "sid-1")   # …and again at the terminal result
+
+
+def test_chat_text_before_tool_is_kept_as_its_own_bubble(monkeypatch):
+    # #320: in CHAT, when the model writes text, THEN runs a web search, THEN answers (it
+    # commented before searching), the pre-tool text is committed as its OWN bubble
+    # (segment_break) instead of being shown and then clobbered by the final answer. Mirrors
+    # the real "Уточните…/А пока поищу… → [search] → Вот обзор…" transcript that looked janky.
+    events = [
+        _ev("text_delta", "Let me look that up. Meanwhile, searching… "),
+        _ev("tool", tool_name="WebSearch", tool_input={"query": "news"}),
+        _ev("text_delta", "Here is the overview."),
+        _ev("result", "Here is the overview.", usage={}, session_id="s1"),
+    ]
+    s = _make(monkeypatch, events, mode="chat")
+    assert s.segment_breaks == 1                          # pre-tool text kept as a bubble
+    assert s.finished_with == "Here is the overview."     # final = the post-tool answer only
 
 
 # --- #260: adopt Claude Code's transcript ai-title as the session name --------- #

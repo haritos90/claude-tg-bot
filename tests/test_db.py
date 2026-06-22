@@ -7,7 +7,9 @@ this avoids needing pytest-asyncio (and the cross-loop lock reuse it would risk)
 """
 
 import asyncio
+import re
 import tempfile
+from pathlib import Path
 
 from app.storage import db
 
@@ -26,12 +28,14 @@ def test_allocate_dm_session_negative_key_and_mode():
         assert code < 0 and chat < 0 and code != chat
         sc, sh = await db.get_thread(code), await db.get_thread(chat)
         assert sc.mode == "code" and sh.mode == "chat"
-        # #140: per-session working dir is named by the public sid, not the key.
-        # #181: nested layout — the cwd is <sid>/work (state is the sibling).
-        # was: assert sc.cwd.endswith(str(code))            # pre-#140
-        # was: assert sc.cwd.endswith(db.session_sid(code))  # pre-#181
-        assert sc.cwd.endswith(db.session_sid(code) + "/work")
-        assert sh.cwd.endswith(db.session_sid(chat) + "/work")
+        # #140: per-session working dir is named by the public id, not the key.
+        # #181: nested layout — the cwd is <id>/work (state is the sibling).
+        # #332: that public id is the ULID (was the 6-hex session_sid).
+        # was: assert sc.cwd.endswith(str(code))                 # pre-#140
+        # was: assert sc.cwd.endswith(db.session_sid(code))       # pre-#181
+        # was: assert sc.cwd.endswith(db.session_sid(code)+"/work")  # pre-#332 (6-hex)
+        assert sc.cwd.endswith(db.session_pubid(code) + "/work")
+        assert sh.cwd.endswith(db.session_pubid(chat) + "/work")
         await db.close_db()
 
     _run(_t)
@@ -300,6 +304,32 @@ def test_usage_units_weighting_and_breakdown():
     _run(_t)
 
 
+def test_usage_survives_session_delete():
+    """#309: a user's token usage must OUTLIVE deleting the session it was spent in —
+    it still feeds their lifetime totals + rolling-limit windows (keyed by chat_id), so
+    deleting a session can't silently shrink recorded spend or dodge the caps."""
+    async def _t():
+        await db.init_db(tempfile.mktemp(suffix=".db"))
+        uid = 7
+        key = await db.allocate_dm_session(uid, "s", "m", "/tmp", mode="code")
+        await db.add_usage(key, {"input_tokens": 1000, "output_tokens": 100}, 0.0)
+        # Baseline: the spend is attributed to the user across all three aggregations.
+        assert await db.get_user_usage_window(uid, measure="raw") == 1100
+        assert (await db.get_user_breakdown(uid))["total"] == 1100
+        assert any(r["uid"] == uid for r in await db.get_all_users_breakdown())
+        # Delete the session the usage was spent in.
+        assert await db.delete_dm_session(uid, key) is True
+        assert await db.get_thread(key) is None            # session gone…
+        # …but the usage still counts toward the user's totals + rolling window.
+        assert await db.get_user_usage_window(uid, measure="raw") == 1100
+        bd = await db.get_user_breakdown(uid)
+        assert bd["total"] == 1100 and bd["requests"] == 1
+        assert any(r["uid"] == uid for r in await db.get_all_users_breakdown())
+        await db.close_db()
+
+    _run(_t)
+
+
 def test_claim_session_uid_stable_and_collision_free():
     """#221: the host-uid registry hands out the preferred hash uid when free, the SAME
     uid on repeat (stability), a DIFFERENT uid when two sids' hashes collide, and reuses
@@ -373,3 +403,149 @@ def test_sandbox_uid_collisions_scan():
     solo = tempfile.mkdtemp()
     os.makedirs(os.path.join(solo, "sidX", "work"))
     assert db.sandbox_uid_collisions(solo) == {}
+
+
+def test_user_last_active_roundtrip_default_zero():
+    # #329: per-USER idle clock (not per-session) — defaults to 0, set/get roundtrips durably.
+    async def _t():
+        await db.init_db(tempfile.mktemp(suffix=".db"))
+        before = await db.get_user_last_active(777)
+        await db.set_user_last_active(777, 12345.0)
+        after = await db.get_user_last_active(777)
+        await db.close_db()
+        return before, after
+    before, after = _run(_t)
+    assert before == 0.0
+    assert after == 12345.0
+
+
+def test_new_ulid_format_uniqueness_and_time_sortable():
+    # #327: 26-char Crockford base32, collision-free, timestamp prefix monotonic (sortable).
+    ids = [db.new_ulid() for _ in range(64)]
+    assert all(len(u) == 26 for u in ids)
+    assert all(c in db._CROCKFORD for u in ids for c in u)
+    assert len(set(ids)) == 64
+    prefixes = [u[:10] for u in ids]                 # the 48-bit ms timestamp portion
+    assert prefixes == sorted(prefixes)              # generated in time order → non-decreasing
+
+
+def test_session_sid_is_6hex_and_pubid_uses_cache():
+    # #327 (decoupled): session_sid is ALWAYS the stable 6-hex workdir id; session_pubid is the
+    # public ULID from the cache (falling back to the 6-hex id when not yet backfilled).
+    db._SID_BY_THREAD.pop(-424242, None)
+    wid = db.session_sid(-424242)
+    assert len(wid) == 6 and all(c in "0123456789abcdef" for c in wid)
+    assert db.session_pubid(-424242) == wid  # uncached → falls back to the 6-hex id
+    db._SID_BY_THREAD[-424242] = "01KVQGK3G01ZH0J9CQZBW3EFD3"
+    assert db.session_pubid(-424242) == "01KVQGK3G01ZH0J9CQZBW3EFD3"  # cached → ULID
+    assert db.session_sid(-424242) == wid  # session_sid stays the 6-hex id (never the cache)
+    db._SID_BY_THREAD.pop(-424242, None)
+
+
+def test_allocate_names_workdir_by_ulid():
+    # #332: a new session's WORKDIR is named by the PUBLIC ULID (= the sid column = the id shown
+    # in the UI), NOT the legacy 6-hex session_sid. was: test_allocate_public_ulid_but_workdir_
+    # stays_6hex (the #327-decoupled, pre-#332 behaviour).
+    async def _t():
+        await db.init_db(tempfile.mktemp(suffix=".db"))
+        base = tempfile.mkdtemp()
+        key = await db.allocate_dm_session(7, "n", "opus", base, mode="code")
+        cur = await db._conn.execute(
+            "SELECT sid, cwd FROM threads WHERE thread_id=?", (key,))
+        row = await cur.fetchone()
+        await cur.close()
+        await db.close_db()
+        return key, row["sid"], row["cwd"]
+    key, sid, cwd = _run(_t)
+    assert len(sid) == 26 and all(c in db._CROCKFORD for c in sid)  # public id = ULID
+    assert cwd.endswith(sid + "/work")                      # #332: workdir on the ULID
+    assert not cwd.endswith(db.session_sid(key) + "/work")  # NOT the legacy 6-hex
+    assert db._SID_BY_THREAD.get(key) == sid                # cached as the public id
+    assert db.session_pubid(key) == sid
+
+
+def test_migrate_backfills_public_ulid_db_only_and_idempotent():
+    # #327 (decoupled): a legacy row (no stored sid) is backfilled with a public ULID — DB ONLY, the
+    # cwd/workdir is UNCHANGED. A 2nd run is a no-op.
+    async def _t():
+        await db.init_db(tempfile.mktemp(suffix=".db"))
+        base = tempfile.mkdtemp()
+        key = await db.allocate_dm_session(7, "n", "opus", base, mode="chat")
+        row0 = await (await db._conn.execute(
+            "SELECT cwd FROM threads WHERE thread_id=?", (key,))).fetchone()
+        cwd_before = row0["cwd"]
+        await db._conn.execute("UPDATE threads SET sid=NULL WHERE thread_id=?", (key,))
+        await db._conn.commit()
+        db._SID_BY_THREAD.pop(key, None)
+        n1 = await db.migrate_sessions_to_ulid(base)
+        await db.load_sid_cache()
+        cur = await db._conn.execute(
+            "SELECT sid, cwd FROM threads WHERE thread_id=?", (key,))
+        row = await cur.fetchone()
+        await cur.close()
+        n2 = await db.migrate_sessions_to_ulid(base)
+        await db.close_db()
+        return key, n1, n2, row["sid"], row["cwd"], cwd_before
+    key, n1, n2, sid, cwd, cwd_before = _run(_t)
+    assert n1 == 1 and n2 == 0
+    assert len(sid) == 26 and all(c in db._CROCKFORD for c in sid)  # backfilled public ULID
+    assert cwd == cwd_before  # cwd UNCHANGED — migrate_sessions_to_ulid is DB-only
+    # #332: the workdir is ULID-named at allocation; the DB-only ULID backfill never touches the
+    # cwd, so it still ends in the allocate-time ULID dir (a 26-char id).
+    assert len(Path(cwd).parent.name) == 26
+    assert db._SID_BY_THREAD.get(key) == sid
+
+
+def test_migrate_workdirs_to_ulid_renames_reencodes_rekeys_idempotent():
+    # #332: migrate_workdirs_to_ulid renames a legacy 6-hex workdir to the ULID, re-encodes the
+    # nested transcript dir (so `resume` survives), re-keys the session_uid registry, realigns
+    # cwd, SKIPS an already-ULID session, and is idempotent.
+    def _enc(p):
+        return re.sub(r"[^A-Za-z0-9]", "-", str(p))
+
+    async def _t():
+        await db.init_db(tempfile.mktemp(suffix=".db"))
+        base = Path(tempfile.mkdtemp())
+        # A legacy session: allocate, then force its on-disk layout to the 6-hex name (simulating
+        # a pre-#332 session) and repoint cwd at it.
+        key = await db.allocate_dm_session(7, "n", "opus", str(base), mode="code")
+        ulid = db.session_pubid(key)
+        legacy = db._derive_sid(key)
+        work = base / legacy / "work"
+        work.mkdir(parents=True)
+        (work / "f.txt").write_text("x")
+        tx = base / legacy / "state" / _enc(work)
+        tx.mkdir(parents=True)
+        (tx / "t.jsonl").write_text("{}")
+        await db._conn.execute("UPDATE threads SET cwd=? WHERE thread_id=?", (str(work), key))
+        await db._conn.execute("INSERT INTO session_uid (sid, uid) VALUES (?,?)", (legacy, 700123))
+        await db._conn.commit()
+        # An already-ULID session (born ULID-named per #332) must be left untouched.
+        key2 = await db.allocate_dm_session(7, "m", "opus", str(base), mode="chat")
+        cwd2_before = (await db.get_thread(key2)).cwd
+
+        n1 = await db.migrate_workdirs_to_ulid(str(base))
+        n2 = await db.migrate_workdirs_to_ulid(str(base))   # idempotency
+
+        st = await db.get_thread(key)
+        new_uid = await (await db._conn.execute(
+            "SELECT uid FROM session_uid WHERE sid=?", (ulid,))).fetchone()
+        old_uid = await (await db._conn.execute(
+            "SELECT uid FROM session_uid WHERE sid=?", (legacy,))).fetchone()
+        cwd2_after = (await db.get_thread(key2)).cwd
+        await db.close_db()
+        new_work = base / ulid / "work"
+        new_tx = base / ulid / "state" / _enc(new_work) / "t.jsonl"
+        return dict(
+            n1=n1, n2=n2, cwd=st.cwd, expect=str(new_work),
+            new_work=new_work.exists(), old_gone=not (base / legacy).exists(),
+            new_tx=new_tx.exists(), new_uid=(new_uid["uid"] if new_uid else None),
+            old_uid_gone=(old_uid is None), cwd2_same=(cwd2_after == cwd2_before))
+
+    r = _run(_t)
+    assert r["n1"] == 1 and r["n2"] == 0            # migrated the legacy one; idempotent re-run
+    assert r["cwd"] == r["expect"]                  # cwd realigned to the ULID path
+    assert r["new_work"] and r["old_gone"]          # dir renamed 6hex -> ULID
+    assert r["new_tx"]                              # transcript re-encoded under the ULID path
+    assert r["new_uid"] == 700123 and r["old_uid_gone"]  # session_uid re-keyed, old key dropped
+    assert r["cwd2_same"]                           # the already-ULID session was untouched

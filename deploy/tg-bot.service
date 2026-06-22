@@ -43,6 +43,10 @@ WatchdogSec=180
 # start-timeout restart loop.
 TimeoutStartSec=300
 TimeoutStopSec=60
+# #325: on stop, SIGTERM only the MAIN process (the bot), NOT the whole control-group — so the
+# bot can gracefully DRAIN in-flight turns (let the jailed `claude` children finish) instead of
+# systemd killing them mid-turn (exit -15). systemd SIGKILLs any stragglers after TimeoutStopSec.
+KillMode=mixed
 
 User=root
 WorkingDirectory=/opt/claude-tg-bot
