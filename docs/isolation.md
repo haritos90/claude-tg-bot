@@ -15,8 +15,9 @@ open egress for `WebFetch`. The jail, per-session uid, broker (§3) and seccomp 
 
 The layers are **independent**. The bare bubblewrap jail (#104/#180) is **always on** and
 confines the filesystem; the four #119 layers (broker, egress, secrets, DoS/seccomp) are
-deployer-gated in `.env` (all **enabled on this deployment**) and turn the jail into real
-containment for a semi-trusted user.
+**on by default** and turn the jail into real containment for a semi-trusted user. A host
+that can't support a layer opts out via its `.env` flag (`CRED_BROKER`, `SANDBOX_EGRESS`,
+`SANDBOX_SECCOMP`, `SANDBOX_PER_SESSION_UID` = `0`); on this deployment all four are on.
 
 ---
 
@@ -61,13 +62,17 @@ proxy) is dropped by the firewall. The real token is never inside the jail.
 ## 2. Layer 0 — the bubblewrap jail (#104 / #180, on by default)
 
 `engine._enable_sandbox` points the SDK's `cli_path` at
-[`deploy/sandbox-claude.sh`](deploy/sandbox-claude.sh), which `exec`s `bwrap` with:
+[`deploy/sandbox-claude.sh`](../deploy/sandbox-claude.sh), which `exec`s `bwrap` with:
 
 - `--unshare-user --uid 65534` — the agent runs as an unprivileged uid INSIDE the jail.
   By default the userns maps that to the outer service uid (root); with
   `SANDBOX_PER_SESSION_UID` on (the recommended posture) the launcher instead runs bwrap
   via `setpriv` as a DISTINCT non-root HOST uid per session (`SANDBOX_UID_BASE` +
-  `int(sid,16) % SANDBOX_UID_RANGE`) and chowns the session's `work/` + `state/` to it.
+  `int(sid,16) % SANDBOX_UID_RANGE` for a legacy hex sid, or a byte-sum of the sid since
+  the #332 ULID rename made it non-hex — this is only the *preferred* value; a per-session
+  registry (`session_uid`, keyed by the on-disk dir name) probes to a free uid on collision
+  and is authoritative, so each session keeps a stable distinct uid) and chowns the
+  session's `work/` + `state/` to it.
   So a userns/kernel escape lands as an unprivileged user (not host root) AND cannot read
   another session's files (owned by a different uid, mode `0700`). This requires
   `BASE_WORKDIR` outside the root-only `/root` — it is `/var/lib/claude-tg-bot/workdirs`,
@@ -92,7 +97,7 @@ firewall alone can't do that (the agent can `cat` the token and the bot streams 
 output back to the user; or POST it to an *allowed* host). So the token must not be
 in the jail at all.
 
-**Mechanism** ([`deploy/cred-broker.py`](deploy/cred-broker.py), a host sidecar
+**Mechanism** ([`deploy/cred-broker.py`](../deploy/cred-broker.py), a host sidecar
 started by `bot.main`):
 
 1. The launcher gives the jail a **dummy** credentials file
@@ -163,23 +168,23 @@ every jail regardless of mode.
 
 **Mechanism — option E (domain filtering + a hard no-bypass block):**
 
-1. **cgroup placement.** [`deploy/sandbox-claude.sh`](deploy/sandbox-claude.sh) puts the
+1. **cgroup placement.** [`deploy/sandbox-claude.sh`](../deploy/sandbox-claude.sh) puts the
    jail into a **manually-created** cgroup leaf `/sys/fs/cgroup/sbx/<pid>` (writes its
    own PID to `cgroup.procs`, then `exec bwrap` — the same PID becomes bwrap, and
    `claude` inherits the cgroup). It is **not** `systemd-run --scope`: a scope forks the
    target under PID 1, so a `SIGKILL` on the SDK's child would orphan the ~500 MB
    `claude` and defeat the idle reaper (#179). The manual leaf keeps the process tree
    `SDK → launcher/bwrap → claude` intact so the existing kill/reap path still works.
-2. **The firewall** ([`deploy/egress-setup.sh`](deploy/egress-setup.sh)) creates a
+2. **The firewall** ([`deploy/egress-setup.sh`](../deploy/egress-setup.sh)) creates a
    **dedicated** `SBX_EGRESS` iptables chain and **one** `OUTPUT` jump that fires only
    for that cgroup: `iptables -I OUTPUT -m cgroup --path sbx -j SBX_EGRESS`. Inside the
    chain: ACCEPT loopback to the broker (8789) + proxy (8790); REJECT everything else.
    IPv6 egress from the cgroup is rejected wholesale. **It never touches the OUTPUT
    policy or any other chain** — SSH, the bot, Docker are never matched — and it is
-   fully reverted by [`deploy/egress-teardown.sh`](deploy/egress-teardown.sh). The match
+   fully reverted by [`deploy/egress-teardown.sh`](../deploy/egress-teardown.sh). The match
    is by **cgroup, not uid**: the jail runs `--uid 65534`, so from the host the socket's
    owner is outer-root and a `--uid` match would miss.
-3. **The proxy** ([`deploy/egress-proxy.py`](deploy/egress-proxy.py)) is a tiny
+3. **The proxy** ([`deploy/egress-proxy.py`](../deploy/egress-proxy.py)) is a tiny
    loopback CONNECT proxy: it allows `CONNECT host:443` only for an allowlisted set of
    hosts (`api.anthropic.com`, `github.com`, `pypi.org`, `npmjs.org`, … + anything in
    `EGRESS_ALLOW_HOSTS`, matched by exact host or dot-suffix), **tunnels** the TLS (no
@@ -213,7 +218,7 @@ wipes them; `/secret clear NAME` removes one.
 - **cgroup limits** on the same leaf: `memory.max` / `cpu.max` / `pids.max` from
   `SANDBOX_MEM_MB` / `SANDBOX_CPU_PERCENT` (% of one core) / `SANDBOX_PIDS_MAX`
   (0 = unlimited). Plus the always-on `ulimit -u 512` (#116).
-- **seccomp** (`SANDBOX_SECCOMP=1`): [`deploy/make-seccomp.py`](deploy/make-seccomp.py)
+- **seccomp** (`SANDBOX_SECCOMP=1`): [`deploy/make-seccomp.py`](../deploy/make-seccomp.py)
   compiles an **x86_64 denylist** BPF that returns `EPERM` for ~29 exotic, high-blast
   syscalls (`ptrace`, `bpf`, `kexec_*`, `keyctl`/`add_key`, module-load, `userfaultfd`,
   `perf_event_open`, time-set, …), loaded via `bwrap --seccomp`. It's a **denylist**

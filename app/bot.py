@@ -22,7 +22,9 @@ from aiogram.client.default import DefaultBotProperties
 from aiogram.exceptions import TelegramNetworkError
 
 from app.config import load_settings
-from app.storage.db import init_db, close_db, migrate_workdirs_to_sid, sandbox_uid_collisions
+from app.storage.db import (init_db, close_db, migrate_workdirs_to_sid,
+                            migrate_workdirs_to_ulid,
+                            migrate_sessions_to_ulid, load_sid_cache, sandbox_uid_collisions)
 from app.access.allowlist import Allowlist
 from app.access.access import AllowlistMiddleware, LanguageMiddleware
 from app.access.permissions import PermissionGate
@@ -71,6 +73,26 @@ async def main() -> None:
         n = await migrate_workdirs_to_sid(str(settings.base_workdir))
         if n:
             logger.info("Migrated %d session workdir(s) to sid-based names (#140)", n)
+
+    # #327 (decoupled): backfill a stored PUBLIC ULID id for each session — DB-ONLY. The workdir /
+    # transcript / jail-uid stay on the stable 6-hex session_sid, so the filesystem is NEVER touched
+    # and `resume` can't break. Idempotent + run-once. Then load the thread_id->ULID cache that
+    # session_pubid() reads on the hot path.
+    with contextlib.suppress(Exception):
+        n = await migrate_sessions_to_ulid(str(settings.base_workdir))
+        if n:
+            logger.info("Backfilled %d session(s) with a public ULID id (#327)", n)
+    with contextlib.suppress(Exception):
+        await load_sid_cache()
+
+    # #332: rename per-session workdirs from the legacy 6-hex sid to the PUBLIC ULID
+    # (collision-safe, matches the UI id). Re-encodes the nested transcripts + re-keys the
+    # per-session uids so `resume` and uids survive the rename. Idempotent; runs AFTER the
+    # ULID backfill + cache so every thread has its sid. A hiccup must never block startup.
+    with contextlib.suppress(Exception):
+        n = await migrate_workdirs_to_ulid(str(settings.base_workdir))
+        if n:
+            logger.info("Migrated %d session workdir(s) to ULID names (#332)", n)
 
     # #221 doctor: scan on-disk session workdirs for any host uid shared by >1 session
     # (a per-session isolation break). With the uid registry this is always empty; it
@@ -320,6 +342,12 @@ async def main() -> None:
             wd_task.cancel()
             with contextlib.suppress(BaseException):
                 await wd_task
+        # #325: GRACEFUL DRAIN first — stop starting new turns and wait for in-flight ones to
+        # finish, so a restart doesn't kill a turn mid-generation / tear its transcript (the
+        # #324 incident). Bounded (< TimeoutStopSec=60); needs KillMode=mixed in the unit so
+        # systemd's SIGTERM hits only this process, not the jailed `claude` children.
+        with contextlib.suppress(Exception):
+            await sessions.drain(timeout=40.0)
         # Disconnect live Claude sessions (cancel workers + close the claude CLI
         # subprocesses) BEFORE closing the DB, so an in-flight turn's best-effort
         # writes are not aimed at a closed connection. Best-effort: a teardown

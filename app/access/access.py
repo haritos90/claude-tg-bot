@@ -9,6 +9,7 @@ update type without an identifiable user.
 from __future__ import annotations
 
 import contextlib
+import os
 import time
 from typing import Any, Awaitable, Callable, Optional
 
@@ -19,6 +20,19 @@ from aiogram.types import (InlineKeyboardButton, InlineKeyboardMarkup,
 from app.storage import db
 from app import i18n
 from app.telegram import markup
+
+# #328: maintenance freeze. While the sentinel file exists, the bot replies a "back soon" stub
+# to every allowed user and DROPS the update (no handler runs → no new session/turn data is
+# created), so the dataset stays stable for a migration. Toggled LIVE (no restart) via
+# `touch`/`rm` of the file; checked per-update (a cheap stat).
+_MAINTENANCE_SENTINEL = os.environ.get("MAINTENANCE_FILE", "MAINTENANCE")
+
+
+def maintenance_active() -> bool:
+    try:
+        return os.path.exists(_MAINTENANCE_SENTINEL)
+    except OSError:
+        return False
 
 
 class AllowlistMiddleware(BaseMiddleware):
@@ -66,12 +80,28 @@ class AllowlistMiddleware(BaseMiddleware):
             with contextlib.suppress(Exception):
                 await self._maybe_notify_owner(event, uid, uname)
             return None
+        # #328: maintenance freeze — reply a stub and DROP the update (no handler → no new
+        # session/turn data), keeping the dataset stable for a migration.
+        if maintenance_active():
+            with contextlib.suppress(Exception):
+                await self._reply_maintenance(event, uid)
+            return None
         # Best-effort pin of the latest known username for this user.
         try:
             self.allowlist.pin(uid, uname)
         except Exception:
             pass
         return await handler(event, data)
+
+    async def _reply_maintenance(self, event: TelegramObject, uid: Optional[int]) -> None:
+        """#328: tell an allowed user the bot is briefly down for maintenance. A CallbackQuery
+        (button tap) gets a toast; a Message gets a reply."""
+        lang = i18n.cached_lang(uid) if uid is not None else i18n.DEFAULT_LANG
+        text = i18n.t("maintenance.notice", lang)
+        if getattr(event, "data", None) is not None:      # CallbackQuery → toast
+            await event.answer(text, show_alert=True)
+        else:                                             # Message → reply
+            await event.answer(text)
 
     async def _maybe_notify_owner(self, event: TelegramObject, uid: Optional[int],
                                   uname: Optional[str]) -> None:

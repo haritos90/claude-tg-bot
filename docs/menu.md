@@ -265,6 +265,7 @@ Conventions legend).
 |---|---|---|---|---|
 | `/users` | List allowed users (owner) | Список пользователей (владелец) | none → cards | 👑 |
 | `/userstats` | 📊 User usage stats — table (owner) | 📊 Статистика пользователей — таблица (владелец) | none → table | 👑 |
+| `/whois` | 🔎 A user's sessions → workdir → transcript (owner) | 🔎 Сессии пользователя → каталог → транскрипт (владелец) | id (or prompts) → list | 👑 |
 | `/allow` | Allow a user (owner) | Разрешить пользователя (владелец) | prompts (capture) | 👑 |
 | `/deny` | Remove a user (owner) | Удалить пользователя (владелец) | prompts (capture) | 👑 |
 | `/level` | Set a user's access level (owner) | Уровень доступа (владелец) | prompts (capture) | 👑 |

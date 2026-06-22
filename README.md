@@ -97,7 +97,7 @@ HTML, and very long output falls back to a `.md` document — a message is never
 
 One client gap: a code block renders as plain monospace inside a rich message (no
 language label or copy button) because the Telegram client does not yet style
-`RichBlockPreformatted` (#174).
+`RichBlockPreformatted`.
 
 The rendering paths, the Markdown→HTML contract, the rich tag catalog, and the size
 rules are specified in [markup.md](docs/markup.md). Telegram reference:
@@ -121,11 +121,11 @@ The code is grouped into the `app` package (run with `python -m app`):
 | `app/i18n.py` | Localization table + `t(key, lang, …)`; `en` canonical, `ru` translation. |
 | `app/core/engine.py` | `ClaudeSession` over the Agent SDK — all SDK code lives here, including the sandbox launcher. |
 | `app/core/sessions.py` | `SessionManager`: per-session worker, the chaining queue, `/stop`, usage accounting. |
-| `app/core/token_refresh.py` | Background refresh of the subscription OAuth credential (#191). |
+| `app/core/token_refresh.py` | Background refresh of the subscription OAuth credential. |
 | `app/core/schedules.py` | Recurring / one-shot schedule runner. |
 | `app/core/agent_context.md` | Agent self-description loaded into the system prompt (runtime asset, co-located with `engine`). |
 | `app/storage/db.py` | `aiosqlite` state: sessions, usage, conversation log, key-value store. |
-| `app/storage/archive.py` | Cold storage (#177): on delete, bundle a session's workdir + transcript into one gzip archive. |
+| `app/storage/archive.py` | Cold storage: on delete, bundle a session's workdir + transcript into one gzip archive. |
 | `app/storage/usage.py` | Formatters for the 5h / 7d subscription windows. |
 | `app/access/access.py` | Middleware: allowlist (drops non-allowed updates) + per-user language. |
 | `app/access/allowlist.py` | JSON-backed access store: levels, expiry, usage caps; owner always allowed; fail-closed. |
@@ -136,8 +136,8 @@ The code is grouped into the `app` package (run with `python -m app`):
 | `app/telegram/streamer.py` | Live reply: draft streaming in DM, code/table rendering, usage footer. |
 | `app/telegram/markup.py` | Telegram formatting: Markdown→HTML, 4096-safe splitting, long-output-as-file. |
 | `app/telegram/rich_message.py` | Binding for Bot API 10.1 `sendRichMessage` — native tables. |
-| `app/telegram/svg_image.py` | Rasterizes a chat reply's inline `<svg>` diagram to PNG (#295). |
-| `app/telegram/table_image.py` | Dormant PNG-table fallback (#162), kept for wide tables. |
+| `app/telegram/svg_image.py` | Rasterizes a chat reply's inline `<svg>` diagram to PNG. |
+| `app/telegram/table_image.py` | Dormant PNG-table fallback, kept for wide tables. |
 | `deploy/` | Out-of-process helpers: `tg-bot.service` (systemd unit), `sandbox-claude.sh` (bubblewrap launcher), the egress / broker / seccomp scripts. |
 | `docs/` | Design docs: `data-model.md`, `isolation.md`, `menu.md`, `markup.md`, `rich-message-spec.md`, `CONTRIBUTING.md`, `SECURITY.md`. |
 
@@ -165,18 +165,18 @@ file is the service user (whoever ran `claude setup-token` and the systemd unit)
 └── bot.log                      ← run log                                     [gitignored]
 
 /var/lib/claude-tg-bot/workdirs/  (= BASE_WORKDIR — outside /root so a per-session jail uid can reach it)
-├── <sid>/                       ← one directory per session, named by the public sid (#181); 0711
+├── <sid>/                       ← one directory per session, named by the public sid; 0711
 │   ├── work/                    ←  the agent's cwd (owned by the session's host uid, 0700), bound into the jail
 │   ├── state/                   ←  the jail HOME → ~/.claude/projects: the transcript. NOT bound into the jail.
-│   └── secrets.env              ←  optional per-session user creds (#119d), 0600, injected into THIS jail only
-└── _archive/<owner_id>/<sid>-<stamp>.tar.gz   ← cold storage on delete (#177); purged after retention (#178)
+│   └── secrets.env              ←  optional per-session user creds, 0600, injected into THIS jail only
+└── _archive/<owner_id>/<sid>-<stamp>.tar.gz   ← cold storage on delete; purged after retention
 ```
 
 `<sid>` is the public session id shown in `/sessions`, never the internal numeric id.
 Isolation is structural: each session sees only its own `work/`, and with
 `SANDBOX_PER_SESSION_UID` on, `work/` is owned by a distinct non-root uid, so even a
 jail escape cannot read another session's files. The subscription credential is injected
-read-only in the bare jail, or — with the broker (#119b) — kept out of the jail entirely
+read-only in the bare jail, or — with the broker — kept out of the jail entirely
 (a `BROKER-PLACEHOLDER` dummy is injected and a host broker supplies the real token). See
 [Security & isolation](#security--isolation) and [`isolation.md`](docs/isolation.md).
 
@@ -186,21 +186,21 @@ SQLite tables in `bot.db` (additive-migration only; full schema in
 | Table | One row per | Holds |
 |---|---|---|
 | `threads` | session | mode, model, cwd, resumable chat/code session ids, and every per-session toggle (effort, permission mode, max-turns, favorite, enabled tools, …) |
-| `usage` | turn | `input/output_tokens`, `cache_read/creation`, `cost_usd`, plus `model` + `context_tokens` for the weighted usage-units metric (#165); rolls up per user by `chat_id` |
+| `usage` | turn | `input/output_tokens`, `cache_read/creation`, `cost_usd`, plus `model` + `context_tokens` for the weighted usage-units metric; rolls up per user by `chat_id` |
 | `messages` | message | conversation log feeding `/last`, `/recap`, `/history` |
 | `kv` | key | small state: current-session pointer, usage display mode, language, pinned-message id, access overrides, user defaults |
 | `rate_history` | snapshot | subscription rate-limit samples for the `/status` trend |
 
 The subscription credential lives outside the repo, in the service user's
 `~/.claude/.credentials.json` (written by `claude setup-token`, refreshed by
-`token_refresh.py`, #191). It is never stored in `bot.db` or copied into a session
-directory; with the broker (#119b) on, it never enters a jail.
+`token_refresh.py`). It is never stored in `bot.db` or copied into a session
+directory; with the broker on, it never enters a jail.
 
 ---
 
 ## Requirements & dependencies
 
-- A Linux server you control, Python 3.11+, and a Telegram account.
+- A Linux server you control, Python 3.11+, and a Telegram account (no Telegram Premium needed).
 - The Claude Code CLI (`claude`), logged in to a Pro/Max subscription
   (`claude setup-token`).
 - Python packages (`pip install -r requirements.txt`):
@@ -214,13 +214,15 @@ directory; with the broker (#119b) on, it never enters a jail.
   | `Pillow==12.2.0` | Renders the PNG-table fallback (`table_image.py`); needs the DejaVu Sans Mono font. |
   | `cairosvg==2.9.0` | Rasterizes a chat reply's inline `<svg>` diagram to PNG (`svg_image.py`); needs the system library `libcairo2` (`apt install libcairo2`). |
 
-- Optional: `bubblewrap` for the code sandbox; `pytest` + `ruff`
-  (`requirements-dev.txt`) for development. `cairosvg` needs the system `libcairo2`
-  library (`apt install libcairo2`); without it the SVG-diagram feature falls back to
-  sending the raw `.svg` file.
-- Optional (for the #119 egress allowlist, `SANDBOX_EGRESS`): `iptables` (the
+- Required: `bubblewrap` (`apt install bubblewrap`). Every session — chat **and** code —
+  runs in a bubblewrap jail; the sandbox is mandatory, with no per-session toggle.
+- Optional: `pytest` + `ruff` (`requirements-dev.txt`) for development. `cairosvg` needs
+  the system `libcairo2` library (`apt install libcairo2`); without it the SVG-diagram
+  feature falls back to sending the raw `.svg` file.
+- For the egress allowlist (`SANDBOX_EGRESS`, on by default): `iptables` (the
   `iptables-nft` backend works) + the `xt_cgroup` kernel module + cgroup v2. No
-  `nftables` and no extra Python packages. See [`isolation.md`](docs/isolation.md).
+  `nftables` and no extra Python packages. A host that can't provide these must set
+  `SANDBOX_EGRESS=0`. See [`isolation.md`](docs/isolation.md).
 
 ### Resource requirements & concurrency limits
 
@@ -251,12 +253,12 @@ Tunables (`.env`, all optional — defaults derived from the box):
 | `IDLE_TTL_SEC` | `360` | Reap a session's subprocess after this many seconds idle (~6 min, the warm-cache window). |
 | `SHELL_TTL_SEC` | `86400` | A persistent shell (`/shell`) outlives the subprocess reap (~3 MB vs ~500 MB), kept this long (~24h). `0` = until delete. |
 | `MIN_FREE_MB` | `400` | Below this much free RAM, evict idle sessions before starting a turn. |
-| `CRED_BROKER` | `0` | Keep the subscription token out of every jail — a host broker injects it (#119b). |
-| `SANDBOX_EGRESS` | `0` | Hard-block jail egress to loopback only; dev hosts via the CONNECT proxy (#119c). |
+| `CRED_BROKER` | `1` | Keep the subscription token out of every jail — a host broker injects it. On by default; set `0` only if you can't run the broker sidecar. |
+| `SANDBOX_EGRESS` | `1` | Hard-block jail egress to loopback only; dev hosts via the CONNECT proxy. On by default; needs the iptables/cgroup prereqs above (else set `0`). |
 | `EGRESS_ALLOW_HOSTS` | _(empty)_ | Extra CONNECT-allowlisted hosts, comma/space separated. |
-| `SANDBOX_MEM_MB` / `SANDBOX_CPU_PERCENT` / `SANDBOX_PIDS_MAX` | `0` | Per-jail cgroup limits (0 = unlimited) (#119e). |
-| `SANDBOX_SECCOMP` | `0` | Load an x86_64 seccomp denylist into the jail (#119e). |
-| `SANDBOX_PER_SESSION_UID` | `0` | Run each jail as a distinct non-root host uid; needs `BASE_WORKDIR` outside `/root`. |
+| `SANDBOX_MEM_MB` / `SANDBOX_CPU_PERCENT` / `SANDBOX_PIDS_MAX` | `0` | Per-jail cgroup limits (0 = unlimited). |
+| `SANDBOX_SECCOMP` | `1` | Load an x86_64 seccomp denylist into the jail. On by default; needs the generated seccomp profile. |
+| `SANDBOX_PER_SESSION_UID` | `1` | Run each jail as a distinct non-root host uid; needs `BASE_WORKDIR` outside `/root`. On by default. |
 | `SANDBOX_UID_BASE` / `SANDBOX_UID_RANGE` | `700000` / `60000` | Host-uid range for per-session uids. |
 | `MAX_SESSIONS_PER_USER` | `500` | Default cap on sessions per user (owner-overridable in Settings → Admin and per user; 0 = unlimited). |
 
@@ -268,9 +270,7 @@ Tunables (`.env`, all optional — defaults derived from the box):
 
 1. In [@BotFather](https://t.me/BotFather) send `/newbot`, pick a name and a `…bot`
    username; copy the token → `.env` as `TELEGRAM_BOT_TOKEN`.
-2. Get your numeric id from [@userinfobot](https://t.me/userinfobot) → `.env` as
-   `OWNER_ID` (or send the running bot `/whoami`).
-3. Open a DM with the bot and send `/start`. (Telegram Premium is not required.)
+2. Open a DM with the bot and send `/start`.
 
 ### 2. Server
 
@@ -301,6 +301,9 @@ cp .env.example .env                       # fill TELEGRAM_BOT_TOKEN + OWNER_ID
 cp allowlist.example.json allowlist.json   # add any users besides yourself
 ```
 
+`OWNER_ID` is your own numeric Telegram id — find it by messaging
+[@userinfobot](https://t.me/userinfobot), or send the running bot `/whoami`.
+
 `.env` requires `TELEGRAM_BOT_TOKEN` and `OWNER_ID`; the rest (`DEFAULT_MODEL`,
 `BASE_WORKDIR`, `DB_PATH`, `ALLOWLIST_PATH`, the sandbox flags, and the concurrency
 caps) have defaults.
@@ -326,7 +329,7 @@ update is dropped before any handler runs (fail-closed — a missing or corrupt
 Each user has a level (`chat` = chat only, or `code` = chat + code), an optional expiry,
 and optional rolling usage caps (a trailing-5h and a trailing-7d cap). Caps count
 weighted usage units — a cost-aware metric (model weight + output + cache) that mirrors
-how the shared subscription windows fill, rather than raw input+output tokens (#165).
+how the shared subscription windows fill, rather than raw input+output tokens.
 Manage from Telegram (owner only): `/allow <id|@user>`, `/deny`, `/level`, `/expire`,
 `/limit`, `/users`.
 
@@ -366,31 +369,31 @@ full menu structure is in [menu.md](docs/menu.md).
 
 - Access is owner + allowlist, fail-closed; the bot token and `allowlist.json` are
   gitignored and never logged. Subscription only — no API key.
-- Every session runs in a sandbox (#180/#231). Each session's `claude` — chat and code
+- Every session runs in a sandbox. Each session's `claude` — chat and code
   — runs in a [bubblewrap](https://github.com/containers/bubblewrap) jail: an
   unprivileged uid (not host root), filesystem confined to the session's own workdir,
   read-only root, the bot's env wiped, and the credential injected read-only. The
   sandbox is mandatory, with no per-session toggle. Risky code tools (Bash/Write/Edit)
   are still gated behind an Allow/Deny tap (or `/auto on`).
-- Full isolation is opt-in, off by default. The bare jail confines the filesystem; the
-  flags below turn it into containment for a semi-trusted code user. Until you enable
-  them (at least the broker + egress), grant `code` only to people you trust. All
-  OS/network mechanism lives in [`deploy/`](deploy/), gated behind these flags (#119).
-  - Credential broker (`CRED_BROKER=1`, #119b): keeps the OAuth token out of every jail.
+- Full isolation is **on by default**. The bare jail confines the filesystem; the layers
+  below turn it into real containment for a semi-trusted code user, and ship enabled. All
+  OS/network mechanism lives in [`deploy/`](deploy/); disable a layer only if a host can't
+  support it (via its env flag).
+  - Credential broker (`CRED_BROKER=1`): keeps the OAuth token out of every jail.
     The jailed `claude` gets a dummy `BROKER-PLACEHOLDER` plus `ANTHROPIC_BASE_URL`
     pointing at a host broker ([`deploy/cred-broker.py`](deploy/cred-broker.py)) that
     injects the real bearer and forwards to `api.anthropic.com`. OAuth only.
-  - Egress allowlist (`SANDBOX_EGRESS=1`, #119c — code sessions): a code jail's egress
+  - Egress allowlist (`SANDBOX_EGRESS=1` — code sessions): a code jail's egress
     is hard-blocked to loopback only by a cgroup-scoped iptables rule (never global).
     `claude` reaches Anthropic via the broker; the agent's tools reach an allowlisted set
     of dev hosts (Anthropic + GitHub/PyPI/npm by default, extend with
     `EGRESS_ALLOW_HOSTS`) via a CONNECT proxy
     ([`deploy/egress-proxy.py`](deploy/egress-proxy.py)). Chat sessions keep open egress
     (no Bash to exfil with; the web tools need arbitrary URLs).
-  - Per-session secrets (`/secret`, #119d): a code user stores their own service creds
+  - Per-session secrets (`/secret`): a code user stores their own service creds
     for the current session, injected as env vars into that jail only. The owner's
     credentials never enter any jail.
-  - DoS limits + seccomp (#119e): per-jail memory/CPU/process caps and an optional
+  - DoS limits + seccomp: per-jail memory/CPU/process caps and an optional
     x86_64 syscall denylist (`SANDBOX_SECCOMP=1`).
   - Per-session host uid (`SANDBOX_PER_SESSION_UID=1`): each jail runs as a distinct
     non-root uid (via `setpriv` + a user namespace), with its workdir chowned to it. An
@@ -404,8 +407,8 @@ full menu structure is in [menu.md](docs/menu.md).
   `/effort`.
 
 Deleting a session bundles its `<sid>/` folder (files + transcript) into one gzip
-archive and removes the live copies (#177); archives older than the retention period are
-auto-purged (#178; default 6 months, owner-configurable under Settings → Admin → Archive
+archive and removes the live copies; archives older than the retention period are
+auto-purged (default 6 months, owner-configurable under Settings → Admin → Archive
 retention or `ARCHIVE_RETENTION_DAYS`).
 
 Report vulnerabilities privately — see [`SECURITY.md`](docs/SECURITY.md).
@@ -451,10 +454,10 @@ Resilience:
 
 - `Restart=always` + `StartLimitIntervalSec=0`: respawns on any crash/exit and on boot,
   and never gives up (a long Telegram outage keeps retrying).
-- Connection watchdog (`Type=notify` + `WatchdogSec=180`, [`watchdog.py`](watchdog.py)):
+- Connection watchdog (`Type=notify` + `WatchdogSec=180`, [`app/watchdog.py`](app/watchdog.py)):
   the bot pings systemd only after a successful Telegram probe, so ~3 minutes without
   reaching Telegram triggers a force-restart.
-- OAuth token refresh ([`token_refresh.py`](token_refresh.py)): the subscription access
+- OAuth token refresh ([`app/core/token_refresh.py`](app/core/token_refresh.py)): the subscription access
   token has a ~8h life; a background loop renews it via the `refresh_token` grant and
   rewrites `~/.claude/.credentials.json` before it expires (subscription only, never an
   API key). Tunable via `OAUTH_REFRESH`, `OAUTH_REFRESH_INTERVAL_SEC` (1800),

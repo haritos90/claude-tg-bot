@@ -109,6 +109,18 @@ therefore it can't be received in messages."* Fields: `type` = `"thinking"`, `te
 custom emoji from t.me/addemoji/AIActions are recommended). Used inline in a draft as
 `<tg-thinking>Thinking…</tg-thinking>`.
 
+**Custom (premium) emoji in the indicator (#323).** The 💭 / 🔎 icons become CUSTOM animated emoji
+when the bot is allowed to send them — which needs the bot OWNER to have Telegram Premium
+(auto-detected from the owner's `from_user.is_premium` → `streamer.set_owner_premium`) OR the bot to
+own a Fragment username; viewers NEVER need Premium (everyone sees them animated). Ids are
+configured via the `THINKING_EMOJI_IDS` env (`think:<custom_emoji_id>,search:<id>` — e.g. from the
+AIActions pack); empty → plain unicode (default, no change). `streamer._emoji(uni, role)` emits
+`<tg-emoji emoji-id="…">uni</tg-emoji>` only when (owner-premium AND an id is set); the `uni` is the
+required fallback. A draft the server rejects self-heals back to unicode for the turn. NOTE (not yet
+verified live): the owner-Premium pathway is documented for *sent messages*; whether it also covers
+custom emoji inside a DRAFT (`sendRichMessageDraft`) needs a live check with a Premium owner — the
+Fragment-username pathway is the safe one.
+
 **Why Telegram added it / what it affects.** It is the OFFICIAL primitive for the "AI is
 working" state during streaming. Unlike plain text, the client renders it as a distinct,
 animated *reasoning/working* indicator (the ChatGPT-style "Thinking…" shimmer), and because it
@@ -122,16 +134,34 @@ the CURRENT phase — "Thinking…", "Reading files…", "Running `pytest`…", 
 optionally with the AIActions custom emoji. Update it (reuse the same `draft_id`) as the agent
 moves between phases; replace it with real content once output starts.
 
-**How THIS bot uses it now (#239):** `streamer.py` sends
-`SendRichMessageDraft({"html": "<tg-thinking>Thinking…</tg-thinking>"})` (constant
-`_THINKING_HTML`) as the initial `start()` placeholder and on the segment reset between tool
-calls. It is static "Thinking…" — the block's `text` is not yet driven from the live tool activity,
-and no custom emoji is added and it is not localized (the `Streamer` has no `lang`).
+**How THIS bot uses it (#240/#294/#319):** `start()` sends
+`SendRichMessageDraft({"html": "<tg-thinking>…</tg-thinking>"})` and the animation loop
+(`streamer._render_draft`, ~0.2 s/tick) keeps repainting it until real output starts. The inner
+text is, in priority order: the model's live REASONING tail (extended thinking) → a SEARCH-themed
+rotating gerund (`stream.searching_words`, 🔎) while a web search/fetch is in flight → a fixed
+tool phase ("📖 Reading `sessions.py`") for other tools → otherwise a generic rotating gerund
+(`stream.thinking_words`, 💭). All localized to the user's language.
 
-**Potential (not done):** route the agent's tool-status / phase into the `<tg-thinking>` `text`
-so the block shows the live action (and AIActions emoji), instead of (or alongside) the separate
-"Working…" control plate — a native, self-cleaning "what the agent is doing" line. Keep it
-DRAFT-ONLY; finish() must stay `{"markdown": full_text}` with no thinking block.
+### Animation & "still-working" feedback — the hard constraints (#319)
+
+Only the `<tg-thinking>` block streamed as a rich DRAFT animates smoothly — Telegram drives the
+token-by-token motion client-side. Everything else is effectively STATIC:
+
+- **Regular message edits** (`EditMessage` / `EditRichMessage`) are throttled to roughly ONE
+  update per second. That's fine for an occasionally-updated SIDE message (e.g. the TodoWrite
+  task card) but NOT usable for animation or — especially — streaming generated text. Stream
+  text and any "alive" animation through the DRAFT, never through edits.
+- **A fixed string** in the thinking block (e.g. a static "🌐 Searching the web…" phase) does NOT
+  animate — only a CHANGING draft does. A long, silent operation therefore needs the placeholder
+  to keep CHANGING (a rotating gerund), not a frozen label.
+
+Rule: whenever the bot is working and NOT streaming text, it MUST show an animating
+`<tg-thinking>` draft — it is the only non-verbal "I'm still alive" signal. During a web search
+the placeholder rotates the search-themed subset (`stream.searching_words`, 🔎) so the motion
+reads as info-gathering — the thinking tag ALONE, no separate "sources" card (#321: a card
+listing the queries was tried and removed — it read as clutter and mislabelled the queries as
+"sources", which the model already cites itself as links in the answer).
+Keep the block DRAFT-ONLY; `finish()` must stay `{"markdown": full_text}` with no thinking block.
 
 ## Math / formulas — `mathematical_expression` (#297)
 

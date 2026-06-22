@@ -118,3 +118,15 @@ def test_display_helpers():
     assert i18n.mode_word("chat", "ru") == "чат"
     assert i18n.lang_name("ru") == "Русский"
     assert i18n.lang_name("xx") == "xx"  # unknown code -> code itself
+
+
+def test_stream_rotation_words_parity_across_locales():
+    """#316/#319: the rotating <tg-thinking> gerund subsets must have the SAME count in every
+    locale (thinking_words shipped once as 17 en vs 12 ru with no test). Pin equal length per
+    subset so neither drifts: thinking_words == 30, searching_words == 16."""
+    for key, expect in (("stream.thinking_words", 30), ("stream.searching_words", 16)):
+        row = i18n.CATALOG[key]
+        counts = {lang: len([w for w in text.split(",") if w.strip()])
+                  for lang, text in row.items()}
+        assert len(set(counts.values())) == 1, f"{key} length differs across locales: {counts}"
+        assert all(c == expect for c in counts.values()), f"{key} expected {expect}: {counts}"
