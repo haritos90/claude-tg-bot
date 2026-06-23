@@ -355,9 +355,16 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         send_kwargs: dict = {}
         if message.chat.type != "private" and message.message_thread_id:
             send_kwargs["message_thread_id"] = message.message_thread_id
+        # #339: the rich {"html"} field collapses raw newlines (HTML whitespace folding), which
+        # glued /status's plain lines + section headers onto adjacent text (the <ul> checklists
+        # still break as blocks, but the prose between them merged). Convert \n → <br> for the
+        # rich send, like _send_menu (#202). Assumes no <pre> blocks in the content (#209 —
+        # true for the sole caller, /status). The classic fallback keeps the RAW text
+        # (parse_mode="HTML" renders \n as a newline and ignores <br>).
+        rich_html = html.replace("\n", "<br>")
         try:
             await bot(SendRichMessage(chat_id=message.chat.id,
-                                      rich_message={"html": html}, **send_kwargs))
+                                      rich_message={"html": rich_html}, **send_kwargs))
         except Exception:
             await reply(message, html)
 
@@ -4137,7 +4144,10 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             lvl = allowlist.level_of(uid, None)
             if lvl:
                 label = i18n.t("whois.label", lang, level=markup.escape_html(str(lvl)))
-        out = [i18n.t("whois.head", lang, uid=uid, n=total, label=label)]
+        # #335: report the count of LISTED rows (the loop iterates `rows`, capped at
+        # limit=500), not the full browse_threads COUNT — they agree at the ~10 per-user
+        # cap but would misreport "n" vs the visible list if the cap were ever raised.
+        out = [i18n.t("whois.head", lang, uid=uid, n=len(rows), label=label)]
         for r in rows:
             tid = r["thread_id"]
             st = await db.get_thread(tid)
@@ -4147,9 +4157,10 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             cwd = (st.cwd if st else "") or ""
             status = i18n.t("whois.tx_none", lang)
             if cwd:
-                # The sandboxed transcript lives at <sid>/state/<encoded-cwd>/ (the cwd
-                # with every non-alphanumeric char → '-'); see archive.transcript_dir.
-                tdir = Path(cwd).parent / "state" / re.sub(r"[^A-Za-z0-9]", "-", cwd)
+                # #335: the sandboxed transcript lives at <sid>/state/<encoded-cwd>/;
+                # use the SHARED encoder (archive.live_transcript_dir) so this matches the
+                # ai-title reader and what's actually on disk (was a private re.sub here).
+                tdir = archive.live_transcript_dir(cwd)
                 if tdir.is_dir() and any(tdir.glob("*.jsonl")):
                     status = i18n.t("whois.tx_live", lang)
                 else:

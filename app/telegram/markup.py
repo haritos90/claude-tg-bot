@@ -551,7 +551,12 @@ def summarize_todos(todos: list) -> tuple[int, int, int, str]:
             done += 1
         lines.append(f"{_TODO_GLYPH.get(status, '⬜')} {content}")
     total = len(lines)
-    return total, done, total - done, "\n".join(lines)
+    # #339: join with a markdown HARD break ("  \n", two trailing spaces), NOT a bare "\n":
+    # in Telegram's rich {"markdown"} field a single "\n" is a SOFT break = space, so the
+    # glyph lines (plain text, not "- " list items) would all COLLAPSE onto one line. The
+    # hard break renders each task on its own line. (Verified via parsed rich_message.blocks.)
+    # was: "\n".join(lines)
+    return total, done, total - done, "  \n".join(lines)
 
 
 # #243: a sentinel marking where a >20-column table was removed from the rich-markdown

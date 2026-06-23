@@ -1158,7 +1158,10 @@ class Streamer:
         if total == 0:
             return
         header = i18n.t("todo.card_header", lang, n=total, done=done, open=open_)
-        rich = {"markdown": f"{header}\n{body}"}
+        # #339: header → body needs a markdown HARD break ("  \n") too; a bare "\n" is a
+        # soft break (space) in the rich {"markdown"} field, which glued the header onto the
+        # first task. was: f"{header}\n{body}"
+        rich = {"markdown": f"{header}  \n{body}"}
         try:
             if self._todo_msg_id is None:
                 msg = await self.bot(
@@ -1254,8 +1257,10 @@ class Streamer:
         md = full_text.strip() or "…"
         if footer:
             # Italicize each footer line separately — markdown italic can't span a
-            # newline, and the usage footer is 2 lines (5h / 7d) (#169).
-            foot = "\n".join(f"_{ln}_" for ln in footer.splitlines() if ln.strip())
+            # newline, and the usage footer is 2 lines (5h / 7d) (#169). #339: join the
+            # lines with a HARD break ("  \n"); a bare "\n" is a soft break (space) in the
+            # rich {"markdown"} field, which collapsed the 2 footer lines onto one.
+            foot = "  \n".join(f"_{ln}_" for ln in footer.splitlines() if ln.strip())
             md = f"{md}\n\n{foot}"
         try:
             await self.bot(
@@ -1310,7 +1315,7 @@ class Streamer:
             else:
                 md = seg.strip()
                 if want_footer:
-                    foot = "\n".join(f"_{ln}_" for ln in footer.splitlines() if ln.strip())
+                    foot = "  \n".join(f"_{ln}_" for ln in footer.splitlines() if ln.strip())
                     md = f"{md}\n\n{foot}"
                     want_footer = False
                 try:
