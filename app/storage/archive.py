@@ -42,18 +42,37 @@ log = logging.getLogger("archive")
 ARCHIVE_DIRNAME = "_archive"
 
 
+def encode_workdir(workdir: str | Path) -> str:
+    """Claude Code's project-dir name for a working directory: every
+    non-alphanumeric character replaced with ``-`` (so ``/var/lib/claude-tg-bot/
+    workdirs/cf8c89/work`` → ``-var-lib-claude-tg-bot-workdirs-cf8c89-work``).
+    Verified against the live deployment's project dirs.
+
+    #335: THE single shared encoder. Anything that reconstructs a transcript path
+    from a cwd MUST go through this (or the helpers below) — a divergent encoder
+    (e.g. a plain ``cwd.replace('/', '-')``) silently resolves the WRONG dir for
+    any cwd containing ``.``/``_``/other punctuation.
+    """
+    return re.sub(r"[^A-Za-z0-9]", "-", str(Path(workdir)))
+
+
+def live_transcript_dir(cwd: str | Path) -> Path:
+    """#335: the JAILED session's live transcript dir on disk for an agent ``cwd``:
+    ``<sid>/state/<encoded-cwd>``. The jail HOME (``state``) is the sibling of the
+    agent cwd (``<sid>/work``), and the project dir under it is named by
+    :func:`encode_workdir`. Used by both the ai-title reader and ``/whois``."""
+    cwd = Path(cwd)
+    return cwd.parent / "state" / encode_workdir(cwd)
+
+
 def transcript_dir(workdir: str | Path, claude_home: Path | None = None) -> Path:
     """The ``~/.claude/projects/<encoded>`` directory holding a session's
     transcript ``*.jsonl`` for the given working directory.
 
-    Claude Code names the project dir after the cwd, replacing every
-    non-alphanumeric character with ``-`` (so ``/var/lib/claude-tg-bot/workdirs/
-    cf8c89/work`` → ``-var-lib-claude-tg-bot-workdirs-cf8c89-work``). Verified
-    against the live deployment's project dirs.
+    Claude Code names the project dir after the cwd via :func:`encode_workdir`.
     """
     home = claude_home or (Path.home() / ".claude")
-    encoded = re.sub(r"[^A-Za-z0-9]", "-", str(Path(workdir)))
-    return home / "projects" / encoded
+    return home / "projects" / encode_workdir(workdir)
 
 
 def _dir_size(path: Path) -> int:

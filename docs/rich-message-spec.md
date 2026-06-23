@@ -82,6 +82,42 @@ A table can be expressed in EITHER form (server converts both to a `RichBlockTab
   quotes, details). ≤ 16 nesting levels. ≤ 50 media attachments. **≤ 20 columns in a table.**
 - Media is a separate block (HTTP/HTTPS URLs only); not inside table cells.
 
+## Line breaks, paragraphs & code blocks — VERIFIED (2026-06-22, via parsed `rich_message.blocks`)
+
+The two fields handle newlines DIFFERENTLY. Verified empirically by sending each form and
+reading the server-parsed `result.rich_message.blocks` (ground truth — stronger than the prose
+docs, which truncate in a fetch). This corrected a wrong assumption ("markdown honours real
+newlines") that was about to drive the #310 migration the wrong way.
+
+| Source text | Rich HTML → parsed | Rich Markdown → parsed |
+|---|---|---|
+| single `\n` | collapsed to a SPACE (one paragraph) | soft break = SPACE (one paragraph) |
+| `<br>` (html) / `  \n` two trailing spaces (md) | `\n` INSIDE one paragraph | `\n` INSIDE one paragraph |
+| blank line `\n\n` | collapsed to a SPACE (one paragraph) | SEPARATE `paragraph` blocks |
+
+- **Rich HTML collapses ALL newlines** (single AND double) to spaces, exactly like real HTML —
+  a visible line break needs `<br>`; paragraph separation needs block tags. This is WHY the menu
+  path runs `\n`→`<br>` (#202): without it every line collapses onto one wrapped line.
+- **Rich Markdown (GFM/CommonMark):** a single `\n` is a SOFT break (renders as a space); a
+  blank line `\n\n` is a PARAGRAPH break; two trailing spaces + `\n` is a HARD break.
+- **1:1 line-break equivalence (verified `blocks ==` equal):** HTML `<br>` and markdown `  \n`
+  (two trailing spaces) parse to the IDENTICAL block (`{"type":"paragraph","text":"A\nB\nC"}`).
+  So a `\n`→`<br>` HTML string maps to a `\n`→`  \n` markdown string — NOT "drop the `<br>`,
+  markdown honours newlines" (it does NOT honour a single `\n`). Block constructs (lists `- x`,
+  tables, `` ```fences ``, headings) break on their own and need no hard break.
+
+### Code blocks (`RichBlockPreformatted`, parsed `"type":"pre"`)
+
+- `<pre><code class="language-python">…</code></pre>` (html) and `` ```python … ``` `` (markdown)
+  BOTH parse to the SAME block `{"type":"pre","text":…,"language":"python"}` — the `language`
+  IS captured in both forms (verified). Inline `<code>` / backticks → `{"type":"code",…}`
+  (RichTextCode). So html and markdown are byte-identical for code.
+- Telegram CLIENTS render `pre` as PLAIN MONOSPACE; syntax-HIGHLIGHTING (colourisation) is a
+  per-client decision and is NOT applied in (at least) the macOS Desktop client even though
+  `language` is set. "No colours" is therefore a client rendering choice, NOT a bot/API bug, and
+  is identical across the html/markdown fields — nothing to fix on our side. Re-verify with the
+  parsed-blocks probe (`sendRichMessage` → read `result.rich_message.blocks`).
+
 ## How THIS bot maps onto the spec
 
 - `rich_message.py` — `SendRichMessage` / `EditRichMessage` / `SendRichMessageDraft`

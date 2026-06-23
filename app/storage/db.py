@@ -1337,6 +1337,11 @@ async def browse_threads(
             "created_at": r["created_at"],
             "created_by": r["created_by"],
             "favorite": bool(r["favorite"]),
+            # #334: surface name_auto so the empty-session GC's "spare manually-renamed"
+            # guard (handlers `_gc_untitled_empties`) actually sees it — it was SELECTed
+            # (COALESCE above) but dropped from the page dict, so the guard's
+            # `.get("name_auto", True)` always defaulted True and never fired.
+            "name_auto": bool(r["name_auto"]),
         }
         for r in rows
     ]
@@ -1694,6 +1699,9 @@ async def migrate_workdirs_to_ulid(base_workdir: str) -> int:
                 if old.is_dir() and not new.exists():
                     os.rename(old, new)
                     # Re-encode the nested transcript dir so `resume` survives the rename.
+                    # #335: this regex MUST stay in sync with archive.encode_workdir (the
+                    # shared cwd→project-dir encoder the runtime readers use); leaf db.py
+                    # keeps its own copy rather than import archive for one migration line.
                     old_enc = re.sub(r"[^A-Za-z0-9]", "-", str(old / "work"))
                     new_enc = re.sub(r"[^A-Za-z0-9]", "-", str(new / "work"))
                     state = new / "state"
@@ -1701,9 +1709,19 @@ async def migrate_workdirs_to_ulid(base_workdir: str) -> int:
                         os.rename(state / old_enc, state / new_enc)
                     logger.info("migrate_workdirs_to_ulid: thread %s %s -> %s", tid, old, new)
                 elif old.is_dir() and new.is_dir():
-                    logger.warning(
-                        "migrate_workdirs_to_ulid: both %s and %s exist for thread %s; "
-                        "kept new dir, realigned cwd only", old, new, tid)
+                    # #338: both exist — keep the ULID dir, realign cwd. Remove the orphaned
+                    # legacy dir ONLY if it is empty (os.rmdir fails on a non-empty dir → a
+                    # legacy dir still holding files is LEFT IN PLACE, never silently deleted).
+                    try:
+                        os.rmdir(old)
+                        logger.info(
+                            "migrate_workdirs_to_ulid: both %s and %s existed for thread %s; "
+                            "removed empty legacy dir, realigned cwd", old, new, tid)
+                    except OSError:
+                        logger.warning(
+                            "migrate_workdirs_to_ulid: both %s and %s exist for thread %s; "
+                            "kept new dir, legacy dir not empty — left in place, cwd realigned",
+                            old, new, tid)
                 # else: no live dir yet (lazy) or new-only — just realign cwd + uid below.
                 # Re-key the uid registry (keyed by the on-disk dir name) so the uid is stable.
                 await conn.execute("UPDATE session_uid SET sid = ? WHERE sid = ?", (ulid, legacy))

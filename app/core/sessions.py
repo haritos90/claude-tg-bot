@@ -141,12 +141,14 @@ def _read_ai_title(cwd: str | None, session_id: str | None) -> str | None:
 
     The transcript lives at ``<sid>/state/<encoded-cwd>/<session_id>.jsonl`` where the
     jail HOME is the sibling ``state`` dir (~/.claude/projects) and encoded-cwd is the
-    cwd with every '/' turned into '-'. Cheap: a line at a time, JSON-parsing only the
-    rare ai-title lines, keeping the last match."""
+    cwd run through the SHARED encoder (#335: ``archive.encode_workdir`` — every
+    non-alphanumeric char → '-', matching what claude writes on disk; was a divergent
+    ``cwd.replace('/', '-')`` that mis-resolved cwds containing '.'/'_'). Cheap: a line
+    at a time, JSON-parsing only the rare ai-title lines, keeping the last match."""
     if not cwd or not session_id:
         return None
     try:
-        path = Path(cwd).parent / "state" / cwd.replace("/", "-") / f"{session_id}.jsonl"
+        path = archive.live_transcript_dir(cwd) / f"{session_id}.jsonl"
         if not path.is_file():
             return None
         title = None
@@ -511,8 +513,9 @@ class SessionManager:
         # #135: background task polling the account /api/oauth/usage endpoint for the
         # REAL per-window % (the SDK rate-events only send it near a limit).
         self._usage_task: asyncio.Task | None = None
-        # #179/#326: concurrency / RAM management. the fair _turn_gate caps SIMULTANEOUS active turns
-        # (the generation spike); _reaper_task periodically aclose()s idle live clients
+        # #326 (was #179's _turn_sem): concurrency / RAM management. the fair _turn_gate
+        # (a FairAdmission gate that replaced #179's plain Semaphore) caps SIMULTANEOUS active
+        # turns (the generation spike); _reaper_task periodically aclose()s idle live clients
         # (each ~400–600 MB) so N idle sessions don't pin N processes until restart.
         # History lives on disk (transcript) → `resume` rebuilds it; nothing is lost.
         # Resolve caps with getattr fallbacks so a minimal settings stub (tests) still
@@ -563,11 +566,12 @@ class SessionManager:
         return rec
 
     def _default_cwd(self, thread_id: int) -> str:
-        """Per-thread working directory: BASE_WORKDIR/<sid> (#140).
+        """Per-thread working directory: BASE_WORKDIR/<pubid>/work (#140, #332).
 
-        Named by the stable PUBLIC session id (session_sid) rather than the raw
+        Named by the PUBLIC ULID (``db.session_pubid``) rather than the raw
         thread_id so the on-disk name matches the id shown in /sessions / exports
-        and never leaks the internal numbering.
+        and never leaks the internal numbering. (#332: was the legacy 6-hex
+        ``session_sid``; the dir is the collision-safe ULID now.)
         """
         # was: return str(Path(self.settings.base_workdir) / str(thread_id))
         #      — replaced for #140 (sid-named workdirs)

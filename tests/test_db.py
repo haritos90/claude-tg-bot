@@ -101,6 +101,35 @@ def test_session_name_auto_then_manual_pin(tmp_path):
     _run(_t)
 
 
+def test_browse_threads_surfaces_name_auto_for_gc_guard(tmp_path):
+    # #334: the empty-session GC (_gc_untitled_empties) spares a MANUALLY-renamed session via
+    # `r.get("name_auto", True)` — which only works if browse_threads actually RETURNS name_auto
+    # in its page dicts. It was SELECTed but dropped from the dict, so the guard always saw the
+    # default True and a renamed-but-empty session was wrongly reset + archived. Lock the field
+    # in, and mirror the GC's candidate predicate to prove the renamed session is now spared.
+    async def _t():
+        await db.init_db(str(tmp_path / "gc.db"))
+        uid = 5
+        auto = await db.allocate_dm_session(uid, "Auto", "m", "/tmp", mode="chat")
+        named = await db.allocate_dm_session(uid, "Auto2", "m", "/tmp", mode="chat")
+        await db.set_session_name(named, "My project")   # manual /rename → name_auto False
+        page, _ = await db.browse_threads(uid, None, limit=100, offset=0)
+        await db.close_db()
+        return page, auto, named
+    page, auto, named = _run(_t)
+    by_id = {r["thread_id"]: r for r in page}
+    # The field is surfaced and reflects the manual rename (KeyError here pre-#334).
+    assert by_id[auto]["name_auto"] is True
+    assert by_id[named]["name_auto"] is False
+    # The GC's candidate filter (handlers `_gc_untitled_empties`) now spares the renamed one.
+    keep = auto  # pretend `auto` is the current/target session, never a candidate
+    cands = {r["thread_id"] for r in page
+             if r["thread_id"] != keep and r["thread_id"] < 0
+             and not r.get("favorite") and r.get("name_auto", True)}
+    assert named not in cands   # manually-renamed empty session is NOT collected by the GC
+    assert auto not in cands    # the kept/current session is never a candidate either
+
+
 def test_last_active_and_idle_rotation_keeps_messages(tmp_path):
     # #261: last_active roundtrips; rotate_session_for_idle drops the resume ids but
     # keeps the message log + cwd (unlike reset_thread, which wipes messages).
@@ -304,12 +333,13 @@ def test_usage_units_weighting_and_breakdown():
     _run(_t)
 
 
-def test_usage_survives_session_delete():
+def test_usage_survives_session_delete(tmp_path):
     """#309: a user's token usage must OUTLIVE deleting the session it was spent in —
     it still feeds their lifetime totals + rolling-limit windows (keyed by chat_id), so
     deleting a session can't silently shrink recorded spend or dodge the caps."""
     async def _t():
-        await db.init_db(tempfile.mktemp(suffix=".db"))
+        # #337: tmp_path (pytest auto-cleans) instead of tempfile.mktemp (leaks .db files).
+        await db.init_db(str(tmp_path / "usage.db"))
         uid = 7
         key = await db.allocate_dm_session(uid, "s", "m", "/tmp", mode="code")
         await db.add_usage(key, {"input_tokens": 1000, "output_tokens": 100}, 0.0)
@@ -442,13 +472,14 @@ def test_session_sid_is_6hex_and_pubid_uses_cache():
     db._SID_BY_THREAD.pop(-424242, None)
 
 
-def test_allocate_names_workdir_by_ulid():
+def test_allocate_names_workdir_by_ulid(tmp_path):
     # #332: a new session's WORKDIR is named by the PUBLIC ULID (= the sid column = the id shown
     # in the UI), NOT the legacy 6-hex session_sid. was: test_allocate_public_ulid_but_workdir_
     # stays_6hex (the #327-decoupled, pre-#332 behaviour).
     async def _t():
-        await db.init_db(tempfile.mktemp(suffix=".db"))
-        base = tempfile.mkdtemp()
+        # #337: tmp_path (pytest auto-cleans) instead of tempfile.mktemp/mkdtemp (leaks).
+        await db.init_db(str(tmp_path / "alloc.db"))
+        base = str(tmp_path / "base")
         key = await db.allocate_dm_session(7, "n", "opus", base, mode="code")
         cur = await db._conn.execute(
             "SELECT sid, cwd FROM threads WHERE thread_id=?", (key,))
@@ -464,12 +495,13 @@ def test_allocate_names_workdir_by_ulid():
     assert db.session_pubid(key) == sid
 
 
-def test_migrate_backfills_public_ulid_db_only_and_idempotent():
+def test_migrate_backfills_public_ulid_db_only_and_idempotent(tmp_path):
     # #327 (decoupled): a legacy row (no stored sid) is backfilled with a public ULID — DB ONLY, the
     # cwd/workdir is UNCHANGED. A 2nd run is a no-op.
     async def _t():
-        await db.init_db(tempfile.mktemp(suffix=".db"))
-        base = tempfile.mkdtemp()
+        # #337: tmp_path (pytest auto-cleans) instead of tempfile.mktemp/mkdtemp (leaks).
+        await db.init_db(str(tmp_path / "backfill.db"))
+        base = str(tmp_path / "base")
         key = await db.allocate_dm_session(7, "n", "opus", base, mode="chat")
         row0 = await (await db._conn.execute(
             "SELECT cwd FROM threads WHERE thread_id=?", (key,))).fetchone()
@@ -496,7 +528,7 @@ def test_migrate_backfills_public_ulid_db_only_and_idempotent():
     assert db._SID_BY_THREAD.get(key) == sid
 
 
-def test_migrate_workdirs_to_ulid_renames_reencodes_rekeys_idempotent():
+def test_migrate_workdirs_to_ulid_renames_reencodes_rekeys_idempotent(tmp_path):
     # #332: migrate_workdirs_to_ulid renames a legacy 6-hex workdir to the ULID, re-encodes the
     # nested transcript dir (so `resume` survives), re-keys the session_uid registry, realigns
     # cwd, SKIPS an already-ULID session, and is idempotent.
@@ -504,8 +536,9 @@ def test_migrate_workdirs_to_ulid_renames_reencodes_rekeys_idempotent():
         return re.sub(r"[^A-Za-z0-9]", "-", str(p))
 
     async def _t():
-        await db.init_db(tempfile.mktemp(suffix=".db"))
-        base = Path(tempfile.mkdtemp())
+        # #337: tmp_path (pytest auto-cleans) instead of tempfile.mktemp/mkdtemp (leaks).
+        await db.init_db(str(tmp_path / "workdirs.db"))
+        base = tmp_path / "base"
         # A legacy session: allocate, then force its on-disk layout to the 6-hex name (simulating
         # a pre-#332 session) and repoint cwd at it.
         key = await db.allocate_dm_session(7, "n", "opus", str(base), mode="code")

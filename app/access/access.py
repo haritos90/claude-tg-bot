@@ -19,13 +19,19 @@ from aiogram.types import (InlineKeyboardButton, InlineKeyboardMarkup,
 
 from app.storage import db
 from app import i18n
+from app import REPO_ROOT
 from app.telegram import markup
 
 # #328: maintenance freeze. While the sentinel file exists, the bot replies a "back soon" stub
 # to every allowed user and DROPS the update (no handler runs → no new session/turn data is
 # created), so the dataset stays stable for a migration. Toggled LIVE (no restart) via
 # `touch`/`rm` of the file; checked per-update (a cheap stat).
-_MAINTENANCE_SENTINEL = os.environ.get("MAINTENANCE_FILE", "MAINTENANCE")
+# #338: default to an ABSOLUTE path under the repo root so the freeze is found regardless of
+# the process cwd. systemd sets WorkingDirectory=/opt/claude-tg-bot (so the old relative
+# "MAINTENANCE" resolved correctly there), but a dev run from another cwd would silently stat
+# the wrong path. REPO_ROOT == /opt/claude-tg-bot here, so the on-disk path is unchanged.
+# Override with MAINTENANCE_FILE (absolute or relative).
+_MAINTENANCE_SENTINEL = os.environ.get("MAINTENANCE_FILE") or str(REPO_ROOT / "MAINTENANCE")
 
 
 def maintenance_active() -> bool:

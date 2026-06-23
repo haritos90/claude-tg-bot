@@ -13,6 +13,7 @@ import time
 from types import SimpleNamespace
 
 from app.storage import db
+from app.storage import archive
 from app import i18n
 from app.core import sessions
 
@@ -329,7 +330,10 @@ def _write_transcript(tmp_path, sid, lines):
     root = tmp_path / "sess"
     cwd = root / "work"
     cwd.mkdir(parents=True)
-    tdir = root / "state" / str(cwd).replace("/", "-")
+    # #335: encode the cwd EXACTLY as claude writes it on disk (and as _read_ai_title now
+    # reads it) — via the shared archive helper (every non-alnum → '-'), NOT a plain
+    # '/'→'-' (which diverges for a tmp_path containing '_'/'.' — the #335 bug this catches).
+    tdir = archive.live_transcript_dir(str(cwd))
     tdir.mkdir(parents=True)
     (tdir / f"{sid}.jsonl").write_text(
         "\n".join(_json.dumps(o, ensure_ascii=False) for o in lines) + "\n",

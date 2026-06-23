@@ -1381,7 +1381,7 @@ CATALOG: dict[str, dict[str, str]] = {
     "users.entry_usage": {
         # #308: monospace + compact; values are NBSP-padded in handlers so the day/week/total
         # columns line up across users. The <code> wraps the WHOLE line so the row renders as
-        # one monospace span (like the /sessions stat row). The shorter label ("units"/"ед.")
+        # one monospace span (like the /sessions stat row). The units label (shorter than tokens)
         # gets a trailing NBSP ( ) right after its colon so the "5h …" columns also line
         # up vertically against the longer-label tokens line below it (else tokens shifts +1).
         "en": "<code>↳ units:  5h {day} · wk {week} · tot {total}</code>",

@@ -398,6 +398,9 @@ def test_summarize_todos_counts_and_glyphs():
     total, done, open_, body = markup.summarize_todos(todos)
     assert (total, done, open_) == (3, 1, 2)
     assert "✅ Fix X" in body and "🔄 Do Y" in body and "⬜ Do Z" in body
+    # #339: tasks are joined by a markdown HARD break ("  \n"), NOT a bare "\n" — a soft
+    # break collapses them onto one line in the rich {"markdown"} card (verified via blocks).
+    assert body.split("  \n") == ["✅ Fix X", "🔄 Do Y", "⬜ Do Z"]
 
 
 def test_summarize_todos_skips_blank_and_invalid():
