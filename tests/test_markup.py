@@ -517,6 +517,42 @@ def test_extract_svgs_fenced_and_raw():
     assert markup.extract_svgs("plain text") == ("plain text", [])
 
 
+def test_extract_locations():
+    """#344: a fenced ```location block with valid lat/lon is pulled out → a token + a coerced
+    dict; a venue keeps title+address; bad/out-of-range/non-JSON blocks stay as text; no block
+    leaves the text untouched."""
+    from app.telegram import markup
+    # plain pin (lat/lon only) → token + dict, surrounding prose kept
+    pin = "It is here:\n\n```location\n{\"lat\": 48.8584, \"lon\": 2.2945}\n```\n\nEnjoy."
+    out, locs = markup.extract_locations(pin)
+    assert len(locs) == 1 and locs[0] == {"lat": 48.8584, "lon": 2.2945}
+    assert markup.LOCATION_TOKEN in out and "```" not in out
+    assert "It is here" in out and "Enjoy." in out
+    # venue (title+address) + key aliases (latitude/longitude) → both carried through
+    venue = ("```location\n{\"latitude\": 51.5, \"longitude\": -0.12, "
+             "\"title\": \"Big Ben\", \"address\": \"London\"}\n```")
+    _o, vlocs = markup.extract_locations(venue)
+    assert vlocs == [{"lat": 51.5, "lon": -0.12, "title": "Big Ben", "address": "London"}]
+    # ```geo alias + numeric strings are coerced
+    geo = "```geo\n{\"lat\": \"40\", \"lng\": \"-3\"}\n```"
+    _o2, glocs = markup.extract_locations(geo)
+    assert glocs == [{"lat": 40.0, "lon": -3.0}]
+    # two blocks → two tokens in document order
+    two = "```location\n{\"lat\":1,\"lon\":2}\n```\nmid\n```location\n{\"lat\":3,\"lon\":4}\n```"
+    o3, locs3 = markup.extract_locations(two)
+    assert [p["lat"] for p in locs3] == [1.0, 3.0] and o3.count(markup.LOCATION_TOKEN) == 2
+    # out-of-range coords → left as text, NOT sent as a pin
+    bad = "```location\n{\"lat\": 999, \"lon\": 0}\n```"
+    o4, locs4 = markup.extract_locations(bad)
+    assert locs4 == [] and o4 == bad
+    # non-JSON body → left verbatim
+    junk = "```location\nnot json\n```"
+    o5, locs5 = markup.extract_locations(junk)
+    assert locs5 == [] and o5 == junk
+    # no location block → unchanged, empty list
+    assert markup.extract_locations("plain text") == ("plain text", [])
+
+
 def test_render_svg_png_smoke():
     """#295: a minimal SVG rasterizes to a valid PNG; junk raises so the caller can fall back."""
     from app.telegram import svg_image

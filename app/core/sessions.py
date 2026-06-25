@@ -134,38 +134,89 @@ _CTX_STATUS_MIN = 50_000
 _AI_TITLE_MAX = 64
 
 
-def _read_ai_title(cwd: str | None, session_id: str | None) -> str | None:
-    """#260: the auto-title Claude Code writes into the session transcript as
-    ``{"type":"ai-title","aiTitle":…}`` — the same name shown in the browser. Returns
-    the LAST one (it is rewritten as the topic evolves) or None.
+def _user_text(obj: dict) -> str:
+    """#345: the plain text of a transcript ``user`` line — content is a str or a list
+    of blocks; '' for an image-only / tool-result message (no text block to name by)."""
+    msg = obj.get("message") or {}
+    c = msg.get("content")
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        return " ".join(
+            b.get("text", "") for b in c
+            if isinstance(b, dict) and b.get("type") == "text"
+        )
+    return ""
 
-    The transcript lives at ``<sid>/state/<encoded-cwd>/<session_id>.jsonl`` where the
-    jail HOME is the sibling ``state`` dir (~/.claude/projects) and encoded-cwd is the
-    cwd run through the SHARED encoder (#335: ``archive.encode_workdir`` — every
-    non-alphanumeric char → '-', matching what claude writes on disk; was a divergent
-    ``cwd.replace('/', '-')`` that mis-resolved cwds containing '.'/'_'). Cheap: a line
-    at a time, JSON-parsing only the rare ai-title lines, keeping the last match."""
-    if not cwd or not session_id:
+
+# #345: injected/automatic user prompts that are NOT a real topic — never name a
+# session after one (the auto-recap prompt is the one that lands as a user line).
+_NON_TOPIC_PREFIXES = ("recap our conversation",)
+
+
+def _topic_from_text(txt: str) -> str | None:
+    """#345: a session-name candidate from a user message, or None if the message is too
+    thin to name a topic by — a bare greeting/probe ("спишь?", "hi") or an injected
+    prompt. Conservative on purpose: this only fires when the engine never wrote an
+    ai-title, so 'leave it unnamed' beats coining a junk name."""
+    if not txt:
         return None
+    s = " ".join(txt.split())  # collapse newlines / runs of whitespace
+    if any(s.lower().startswith(p) for p in _NON_TOPIC_PREFIXES):
+        return None
+    if sum(c.isalpha() for c in s) < 10:  # greetings / acks ("ok", "да", "привет")
+        return None
+    return s[:_AI_TITLE_MAX].strip() or None
+
+
+def _read_session_title(
+    cwd: str | None, session_id: str | None
+) -> tuple[str | None, str | None]:
+    """Read a session transcript ONCE, returning ``(ai_title, fallback)``.
+
+    ``ai_title`` (#260) is Claude Code's own ``{"type":"ai-title","aiTitle":…}`` — the
+    name shown in the browser, the LAST one (rewritten as the topic evolves), or None.
+    ``fallback`` (#345) is a name derived from the FIRST substantive user message; the
+    caller uses it only when ``ai_title`` is None. The engine writes the ai-title from
+    the conversation OPENING, so a session whose first turn(s) errored (API 5xx /
+    Overloaded) or opened with a contentless greeting can stay nameless forever even
+    though it holds real content — and the empty-GC won't reap a *used* session either,
+    so it lingers on the "Not named yet" placeholder. One pass returns both so we never
+    scan the (unbounded — #285) transcript twice.
+
+    Transcript path / encoding: ``<sid>/state/<encoded-cwd>/<session_id>.jsonl`` (#335 —
+    ``archive.encode_workdir``: every non-alphanumeric char → '-', matching what claude
+    writes on disk). Cheap: a line at a time, JSON-parsing only ai-title lines and (until
+    one qualifies) user lines."""
+    # was _read_ai_title (#260) — extended to also surface a first-user fallback (#345).
+    if not cwd or not session_id:
+        return (None, None)
     try:
         path = archive.live_transcript_dir(cwd) / f"{session_id}.jsonl"
         if not path.is_file():
-            return None
+            return (None, None)
         title = None
+        fallback = None
         with open(path, encoding="utf-8", errors="replace") as fh:
             for line in fh:
-                # Prefilter — skip the JSON parse unless this is an ai-title line.
-                if '"ai-title"' not in line:
-                    continue
-                try:
-                    obj = json.loads(line)
-                except ValueError:
-                    continue
-                if obj.get("type") == "ai-title" and obj.get("aiTitle"):
-                    title = str(obj["aiTitle"]).strip()
-        return title[:_AI_TITLE_MAX] if title else None
+                # Prefilter — skip the JSON parse unless this line can carry what we need.
+                if '"ai-title"' in line:
+                    try:
+                        obj = json.loads(line)
+                    except ValueError:
+                        continue
+                    if obj.get("type") == "ai-title" and obj.get("aiTitle"):
+                        title = str(obj["aiTitle"]).strip()
+                elif fallback is None and '"user"' in line:  # #345: hunt a fallback name
+                    try:
+                        obj = json.loads(line)
+                    except ValueError:
+                        continue
+                    if obj.get("type") == "user":
+                        fallback = _topic_from_text(_user_text(obj))
+        return (title[:_AI_TITLE_MAX] if title else None, fallback)
     except OSError:
-        return None
+        return (None, None)
 
 
 def _ctx_total(info) -> int:
@@ -1495,14 +1546,21 @@ class SessionManager:
                             with contextlib.suppress(Exception):
                                 # #285: the transcript JSONL grows unbounded; scan it off the
                                 # event loop so a long session's turn-end doesn't stall others.
-                                title = await asyncio.to_thread(
-                                    _read_ai_title, getattr(rec, "cwd", None), ev.session_id
+                                # #345: one pass returns the engine ai-title AND a first-user
+                                # fallback — was _read_ai_title returning the title alone.
+                                ai_title, fb_title = await asyncio.to_thread(
+                                    _read_session_title, getattr(rec, "cwd", None), ev.session_id
                                 )
-                                if title and title != getattr(rec, "name", None):
+                                # Prefer the engine's own ai-title; fall back to the first
+                                # substantive user message when it never wrote one (a trivial
+                                # or API-errored opening — #345). manual=False keeps the name
+                                # auto, so a real ai-title on a later turn still supersedes it.
+                                new_name = ai_title or fb_title
+                                if new_name and new_name != getattr(rec, "name", None):
                                     await db.set_session_name(
-                                        thread_id, title, manual=False
+                                        thread_id, new_name, manual=False
                                     )
-                                    rec.name = title
+                                    rec.name = new_name
                         # One-shot fork done: the branched id is now persisted, so
                         # clear the flag — subsequent turns continue this branch (#23).
                         if rec.fork:

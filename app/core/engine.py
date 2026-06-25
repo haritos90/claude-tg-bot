@@ -59,6 +59,23 @@ def _classify_stderr(text: str) -> str | None:
     return None
 
 
+# #343: bound how long a turn may wait for the model's FIRST streamed message before we stop
+# waiting and surface a clear "service unavailable" error. When the Anthropic service is
+# overloaded/erroring (5xx/529) the CLI retries the request INTERNALLY with backoff and emits
+# NO message for minutes, so the user just sees an endless "thinking…" animation (reported:
+# 2–5 min before any error finally appeared). A healthy turn — even with a huge context or
+# extended thinking — yields its first event within seconds, so a long initial gap means the
+# service is down/overloaded, not slow. Only the time-to-FIRST-token is bounded: once the
+# model is streaming we never time it out, because a legitimate long tool call / build
+# produces no events for minutes. Tunable via env; 0 disables the watchdog.
+try:
+    _FIRST_TOKEN_TIMEOUT_SEC = float(
+        os.environ.get("MODEL_FIRST_TOKEN_TIMEOUT_SEC", "60") or "60"
+    )
+except ValueError:
+    _FIRST_TOKEN_TIMEOUT_SEC = 60.0
+
+
 # #134: request the 1M-token context window via the [1m] model-id SUFFIX, NOT the
 # `betas` param. Under the OAuth subscription `betas` are IGNORED ("Custom betas are
 # only available for API key users. Ignoring provided betas."), but the suffix works
@@ -1444,7 +1461,46 @@ class ClaudeSession:
         try:
             await self._send_query(prompt, attachments)
 
-            async for msg in self.client.receive_response():
+            # #343: wrap the SDK stream so a turn that produces NO first message within
+            # _FIRST_TOKEN_TIMEOUT_SEC (service overloaded/unavailable, CLI silently
+            # retrying the request) is cut short with a clear error instead of an endless
+            # "thinking…" hang. Only the wait for the FIRST event is bounded — once the
+            # model is streaming (_progressed) we never time it out (a long tool call /
+            # build legitimately emits no events for minutes).
+            # was: `async for msg in self.client.receive_response():`
+            _stream_iter = self.client.receive_response().__aiter__()
+            _progressed = False
+            while True:
+                try:
+                    _next = _stream_iter.__anext__()
+                    if _progressed or _FIRST_TOKEN_TIMEOUT_SEC <= 0:
+                        msg = await _next
+                    else:
+                        msg = await asyncio.wait_for(_next, _FIRST_TOKEN_TIMEOUT_SEC)
+                except StopAsyncIteration:
+                    break
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "turn stalled: no model response in %.0fs — treating as service "
+                        "unavailable", _FIRST_TOKEN_TIMEOUT_SEC,
+                    )
+                    await self._drop_client()
+                    yield EngineEvent(
+                        kind="error",
+                        text=("The service is taking too long to respond — it may be "
+                              "temporarily overloaded or unavailable. Please try again."),
+                        error_key="err.service_unavailable",
+                        error_detail=("no model response within %ds"
+                                      % int(_FIRST_TOKEN_TIMEOUT_SEC)),
+                    )
+                    return
+                # First real streamed message → the service IS responding, so stop bounding
+                # the wait. The init SystemMessage / UserMessage don't count (they arrive from
+                # local subprocess startup, before the API is even called).
+                if not _progressed and isinstance(
+                    msg, (StreamEvent, AssistantMessage, ResultMessage, RateLimitEvent)
+                ):
+                    _progressed = True
                 # #324: persist the session id as SOON as any message carries it (the init
                 # SystemMessage does), not only the terminal ResultMessage — so a turn KILLED
                 # mid-flight (a restart/crash/reap before the result) still leaves a RESUMABLE id.

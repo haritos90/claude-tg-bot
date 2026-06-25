@@ -13,6 +13,7 @@ Public surface (callers in streamer.py / handlers.py depend on these):
 
 from __future__ import annotations
 
+import json
 import re
 
 from aiogram.types import BufferedInputFile
@@ -629,6 +630,73 @@ def extract_svgs(text: str):
 
     out = _SVG_BLOCK_RE.sub(_take, text)
     return out, svgs
+
+
+# #344: a chat OR code reply can place a point on the map — the user asks "where is X", for
+# coordinates, or to "show it on a map". Telegram has no inline map, so a fenced ```location
+# block carrying a small JSON object is pulled out and sent as a real sendLocation pin (or a
+# sendVenue card when it names a place). Mirrors the SVG / wide-table token scheme: the block
+# is replaced IN PLACE by LOCATION_TOKEN and a localized note is left where it was; the pin is
+# delivered as its own message after the bubble. The <svg>→PNG path (above) is untouched.
+LOCATION_TOKEN = "\x00LOCATION\x00"
+_LOCATION_BLOCK_RE = re.compile(
+    r"```[ \t]*(?:location|geo)[ \t]*\r?\n(.*?)\r?\n?```",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def _coerce_location(obj):
+    """#344: validate one parsed ```location JSON object → a normalized ``{"lat","lon"[,"title",
+    "address"]}`` dict, or ``None`` if it is not a usable point. Accepts ``lat``/``latitude`` and
+    ``lon``/``lng``/``longitude`` (numbers or numeric strings); ``title``/``address`` are optional
+    strings (both present → a venue card). Out-of-range or non-numeric coordinates are rejected so
+    a malformed block is left as text, never sent as a bogus pin."""
+    if not isinstance(obj, dict):
+        return None
+    lat = obj.get("lat", obj.get("latitude"))
+    lon = obj.get("lon", obj.get("lng", obj.get("longitude")))
+    try:
+        lat = float(lat)
+        lon = float(lon)
+    except (TypeError, ValueError):
+        return None
+    if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+        return None
+    out = {"lat": lat, "lon": lon}
+    title = obj.get("title") or obj.get("name")
+    address = obj.get("address") or obj.get("addr")
+    if isinstance(title, str) and title.strip():
+        out["title"] = title.strip()
+    if isinstance(address, str) and address.strip():
+        out["address"] = address.strip()
+    return out
+
+
+def extract_locations(text: str):
+    """#344: pull complete ```location (or ```geo) blocks out of ``text`` so each can be sent as a
+    real Telegram map pin instead of dumping raw JSON in the bubble. The fenced block must hold a
+    JSON object with ``lat``/``lon`` (``title``+``address`` optional → a venue). Each VALID block
+    is replaced IN PLACE by ``LOCATION_TOKEN``; returns ``(new_text, [loc, …])`` in document order.
+    An unparseable / out-of-range block is left verbatim so nothing is lost. No ```` ```location ````
+    → ``(text, [])`` so the common case is untouched."""
+    low = (text or "").lower()
+    if "```location" not in low and "```geo" not in low:
+        return text, []
+    locs: list[dict] = []
+
+    def _take(m) -> str:
+        try:
+            obj = json.loads(m.group(1))
+        except (ValueError, TypeError):
+            return m.group(0)  # not JSON → leave the block exactly as the user wrote it
+        loc = _coerce_location(obj)
+        if loc is None:
+            return m.group(0)  # missing / out-of-range coords → leave as text, never a bad pin
+        locs.append(loc)
+        return LOCATION_TOKEN
+
+    out = _LOCATION_BLOCK_RE.sub(_take, text)
+    return out, locs
 
 
 def has_code_block(text: str) -> bool:

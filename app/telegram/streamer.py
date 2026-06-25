@@ -602,6 +602,13 @@ class Streamer:
             body, _svgs = markup.extract_svgs(body)
             body = self._svg_notes(body, _svgs)
             body = self._hide_unclosed_svg(body)
+        # #344: while a ```location block streams, hide its raw JSON from the draft (show the
+        # note instead). Complete ones become the note; an unclosed one at the frontier is cut.
+        _low = body.lower()
+        if "```location" in _low or "```geo" in _low:
+            body, _locs = markup.extract_locations(body)
+            body = self._location_notes(body, _locs)
+            body = self._hide_unclosed_location(body)
         if not body:
             # Animate the <tg-thinking> placeholder. Priority (most → least specific):
             #   #240c: live REASONING (extended-thinking) text — show its tail, "unfurling";
@@ -1114,6 +1121,54 @@ class Streamer:
             )
         )
 
+    def _location_notes(self, rich_text: str, locations: list) -> str:
+        """#344: replace each ``markup.LOCATION_TOKEN`` (left by ``markup.extract_locations``)
+        with the localized ``stream.location`` note; the pin itself is sent separately as a native
+        map message. Shared by the final commit and the draft path so the streamed body matches the
+        final bubble instead of showing raw JSON. No-op when there are no locations."""
+        if not locations:
+            return rich_text
+        lang = i18n.cached_lang(self.chat_id)
+        parts = rich_text.split(markup.LOCATION_TOKEN)
+        out = parts[0]
+        note = i18n.t("stream.location", lang)
+        for idx in range(len(locations)):
+            out += note + (parts[idx + 1] if idx + 1 < len(parts) else "")
+        return out
+
+    def _hide_unclosed_location(self, body: str) -> str:
+        """#344: in a streaming draft, a ```location fence that hasn't closed yet would show as raw
+        JSON. Cut from the still-open fence to the end and leave the note, so the draft never
+        animates the coordinates before the pin is ready. Complete blocks are already gone (turned
+        into the note by ``extract_locations`` + ``_location_notes``), so this only trims the tail."""
+        low = body.lower()
+        cut = max(low.rfind("```location"), low.rfind("```geo"))
+        if cut == -1 or "```" in body[cut + 3:]:  # no open fence, or it already closed → leave it
+            return body
+        note = i18n.t("stream.location", i18n.cached_lang(self.chat_id))
+        return (body[:cut].rstrip() + "\n" + note).strip()
+
+    async def _send_location(self, loc: dict) -> None:
+        """#344: deliver one extracted ```location block as a real Telegram map message — a
+        sendVenue card when it names a place (title+address both present), else a plain sendLocation
+        pin. Always a silent intermediate (it follows the already-sent reply bubble)."""
+        lat, lon = loc["lat"], loc["lon"]
+        if loc.get("title") and loc.get("address"):
+            await self._safe(
+                lambda: self.bot.send_venue(
+                    chat_id=self.chat_id, latitude=lat, longitude=lon,
+                    title=loc["title"], address=loc["address"],
+                    disable_notification=True, **self._kwargs(),
+                )
+            )
+        else:
+            await self._safe(
+                lambda: self.bot.send_location(
+                    chat_id=self.chat_id, latitude=lat, longitude=lon,
+                    disable_notification=True, **self._kwargs(),
+                )
+            )
+
     async def _send_wide_table_image(self, table) -> None:
         """#243: send one wide (>20-column) table as its own PNG photo — a native rich table
         caps at 20 columns. If PNG rendering is unavailable (e.g. the table-image font is not
@@ -1326,7 +1381,9 @@ class Streamer:
                         )
                     )
                 except Exception:
-                    seg_html = markup.md_to_html(seg)
+                    # was md_to_html(seg) — dropped the usage footer on rich-send
+                    # fallback (the footer lives on md, not seg); render md. #342
+                    seg_html = markup.md_to_html(md)
                     await self._safe(
                         lambda h=seg_html, s=silent: self.bot.send_message(
                             chat_id=self.chat_id, text=h, parse_mode="HTML",
@@ -1369,17 +1426,23 @@ class Streamer:
         # leave a note where it was, send the rich markdown, then send each wide table as a PNG
         # image (rich tables ≤20 cols stream/render natively as before).
         # #295: pull out <svg> diagrams first (they're sent as images), then wide tables.
-        svg_text, svgs = markup.extract_svgs(full_text)
+        # #344: also pull out ```location map pins (sent as native sendLocation/sendVenue); each
+        # extractor leaves a localized note in the body and is additive — order is independent.
+        loc_text, locations = markup.extract_locations(full_text)
+        svg_text, svgs = markup.extract_svgs(loc_text)
         rich_text, wide_tables = markup.extract_wide_tables(svg_text)
         # was (#243): inline token→note expansion here — factored to _wide_table_notes so the
         # draft path (#256) reuses the SAME substitution and draft↔final stay consistent.
         rich_text = self._wide_table_notes(rich_text, wide_tables)
         rich_text = self._svg_notes(rich_text, svgs)
+        rich_text = self._location_notes(rich_text, locations)
         if await self._commit_rich_markdown(rich_text, footer, silent_first, reply_markup=reply_markup):
             for tbl in wide_tables:  # empty unless a >20-col table was extracted (#243)
                 await self._send_wide_table_image(tbl)
             for svg in svgs:         # empty unless the reply contained an <svg> diagram (#295)
                 await self._send_svg_image(svg)
+            for loc in locations:    # empty unless the reply contained a ```location block (#344)
+                await self._send_location(loc)
             return
         # # was (#176): split a code reply → rich prose/tables + classic code block:
         # if markup.has_code_block(full_text):
