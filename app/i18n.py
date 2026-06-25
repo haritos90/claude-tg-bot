@@ -1799,6 +1799,12 @@ CATALOG: dict[str, dict[str, str]] = {
         "ru": "🖼 Схема — отправлена изображением ниже.",
     },
     "stream.svg_rendering": {"en": "🖼 Rendering a diagram…", "ru": "🖼 Рисую схему…"},
+    # #344: a reply can place a point on the map — a fenced ```location block is pulled out and
+    # sent as a real Telegram map pin (sendLocation / sendVenue); this note marks where it was.
+    "stream.location": {
+        "en": "📍 Location — sent on the map below.",
+        "ru": "📍 Локация — отправлена на карте ниже.",
+    },
     # #229: header of the live task-list card ({n} total, {done} completed, {open} not done).
     "todo.card_header": {
         "en": "📋 {n} tasks ({done} done, {open} open)",
@@ -1991,6 +1997,15 @@ CATALOG: dict[str, dict[str, str]] = {
     "err.server_error": {
         "en": "Server-side error. Please try again.",
         "ru": "Ошибка на стороне сервера. Попробуйте ещё раз.",
+    },
+    # #343: surfaced by the engine's time-to-first-token watchdog when the service emits no
+    # response within MODEL_FIRST_TOKEN_TIMEOUT_SEC (overloaded/unavailable), instead of
+    # leaving the user on an endless "thinking…" animation while the CLI silently retries.
+    "err.service_unavailable": {
+        "en": "The service is taking too long to respond — it may be temporarily "
+              "overloaded or unavailable. Please try again.",
+        "ru": "Сервис слишком долго не отвечает — возможно, он временно перегружен "
+              "или недоступен. Попробуйте ещё раз.",
     },
     "err.unknown_model": {"en": "Unknown model error.", "ru": "Неизвестная ошибка модели."},
     "err.model_error": {"en": "Model error: {detail}", "ru": "Ошибка модели: {detail}"},

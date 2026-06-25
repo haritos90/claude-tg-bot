@@ -90,6 +90,11 @@ def test_session_name_auto_then_manual_pin(tmp_path):
         await db.set_session_name(k, "Auto title", manual=False)
         st = await db.get_thread(k)
         assert st.name == "Auto title" and st.name_auto is True
+        # #345: a LATER auto write (the agent's ai-title) overrides an earlier auto name
+        # (the #345 message fallback) while still auto — i.e. agent name > fallback.
+        await db.set_session_name(k, "Better auto title", manual=False)
+        st = await db.get_thread(k)
+        assert st.name == "Better auto title" and st.name_auto is True
         await db.set_session_name(k, "My name")   # manual /rename (default)
         st = await db.get_thread(k)
         assert st.name == "My name" and st.name_auto is False

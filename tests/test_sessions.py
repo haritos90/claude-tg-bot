@@ -342,6 +342,16 @@ def _write_transcript(tmp_path, sid, lines):
     return str(cwd)
 
 
+def _u(text):
+    """#345: a transcript ``user`` line in the real message.content shape."""
+    return {"type": "user", "message": {"role": "user", "content": text}}
+
+
+def _a(text):
+    """#345: a transcript ``assistant`` line (never a name source — here for realism)."""
+    return {"type": "assistant", "message": {"role": "assistant", "content": text}}
+
+
 def test_read_ai_title_returns_last_and_caps(tmp_path):
     cwd = _write_transcript(tmp_path, "s1", [
         {"type": "user", "text": "hi"},
@@ -349,20 +359,20 @@ def test_read_ai_title_returns_last_and_caps(tmp_path):
         {"type": "assistant", "text": "x"},
         {"type": "ai-title", "aiTitle": "Refined title", "sessionId": "s1"},
     ])
-    assert sessions._read_ai_title(cwd, "s1") == "Refined title"  # the LAST one
+    assert sessions._read_session_title(cwd, "s1")[0] == "Refined title"  # the LAST one
     # length cap
     long = "z" * 200
     cwd2 = _write_transcript(tmp_path / "b", "s1", [
         {"type": "ai-title", "aiTitle": long, "sessionId": "s1"},
     ])
-    assert sessions._read_ai_title(cwd2, "s1") == long[:sessions._AI_TITLE_MAX]
+    assert sessions._read_session_title(cwd2, "s1")[0] == long[:sessions._AI_TITLE_MAX]
 
 
 def test_read_ai_title_missing_returns_none(tmp_path):
-    assert sessions._read_ai_title(None, "s1") is None
-    assert sessions._read_ai_title("/nope/work", None) is None
+    assert sessions._read_session_title(None, "s1")[0] is None
+    assert sessions._read_session_title("/nope/work", None)[0] is None
     cwd = _write_transcript(tmp_path, "s1", [{"type": "user", "text": "no title"}])
-    assert sessions._read_ai_title(cwd, "s1") is None  # no ai-title line
+    assert sessions._read_session_title(cwd, "s1")[0] is None  # no ai-title line
 
 
 def test_auto_name_adopts_title_on_turn_end(monkeypatch, tmp_path):
@@ -415,6 +425,70 @@ def test_auto_name_skipped_when_pinned(monkeypatch, tmp_path):
     )
     asyncio.run(sm._run_one(rec, -1, "prompt", None, _FakeStreamer()))
     assert calls == []
+
+
+def test_auto_name_falls_back_to_first_user_message(monkeypatch, tmp_path):
+    # #345: no engine ai-title (a trivial / API-errored opening) → the namer falls back
+    # to the first SUBSTANTIVE user message, still manual=False so a later ai-title wins.
+    cwd = _write_transcript(tmp_path, "s1", [
+        _u("hi"),                                  # greeting — skipped
+        _a("API Error: 529 Overloaded"),
+        _u("Compare the two SAP reports by aggregation totals"),
+    ])
+    calls = []
+    async def _capture(thread_id, name, *, manual=True):
+        calls.append((thread_id, name, manual))
+    monkeypatch.setattr(db, "set_session_name", _capture)
+    async def _noop(*a, **k):
+        return None
+    for name in ("log_message", "add_usage", "set_code_session"):
+        monkeypatch.setattr(db, name, _noop)
+    sm = sessions.SessionManager(
+        bot=SimpleNamespace(), settings=SimpleNamespace(), gate=SimpleNamespace()
+    )
+    monkeypatch.setattr(sm, "usage_footer", lambda lang, chat_id=None: "")
+    rec = sessions._ThreadRecord(
+        session=_FakeSession([_ev("result", "done", usage={}, session_id="s1")]),
+        mode="code", stream_enabled=True, cwd=cwd, name=None, name_auto=True,
+    )
+    asyncio.run(sm._run_one(rec, -1, "prompt", None, _FakeStreamer()))
+    assert calls == [(-1, "Compare the two SAP reports by aggregation totals", False)]
+    assert rec.name == "Compare the two SAP reports by aggregation totals"
+
+
+def test_agent_ai_title_overrides_fallback_on_later_turn(monkeypatch, tmp_path):
+    # #345 priority (user > AGENT ai-title > message fallback > placeholder): a turn-1
+    # fallback name is SUPERSEDED when the agent writes its own ai-title on a later turn.
+    # Both writes go through manual=False, so the name stays auto and the agent's title
+    # wins — the exact "if the agent named it later, take it" requirement.
+    reads = iter([
+        (None, "Compare the two SAP reports"),                          # turn 1: no ai-title yet
+        ("SAP report reconciliation", "Compare the two SAP reports"),   # turn 2: agent titled it
+    ])
+    monkeypatch.setattr(sessions, "_read_session_title", lambda cwd, sid: next(reads))
+    calls = []
+    async def _capture(thread_id, name, *, manual=True):
+        calls.append((name, manual))
+    monkeypatch.setattr(db, "set_session_name", _capture)
+    async def _noop(*a, **k):
+        return None
+    for name in ("log_message", "add_usage", "set_code_session"):
+        monkeypatch.setattr(db, name, _noop)
+    sm = sessions.SessionManager(
+        bot=SimpleNamespace(), settings=SimpleNamespace(), gate=SimpleNamespace()
+    )
+    monkeypatch.setattr(sm, "usage_footer", lambda lang, chat_id=None: "")
+    cwd = _write_transcript(tmp_path, "s1", [_u("hi")])  # content unused (read is mocked)
+    rec = sessions._ThreadRecord(
+        session=_FakeSession([_ev("result", "done", usage={}, session_id="s1")]),
+        mode="code", stream_enabled=True, cwd=cwd, name=None, name_auto=True,
+    )
+    asyncio.run(sm._run_one(rec, -1, "prompt", None, _FakeStreamer()))
+    assert calls[-1] == ("Compare the two SAP reports", False)   # turn 1 → fallback
+    assert rec.name == "Compare the two SAP reports"
+    asyncio.run(sm._run_one(rec, -1, "prompt", None, _FakeStreamer()))
+    assert calls[-1] == ("SAP report reconciliation", False)     # turn 2 → agent title wins
+    assert rec.name == "SAP report reconciliation"
 
 
 # --- #261/#266: idle → new-session window resolution + in-place fallback ------ #
@@ -1039,3 +1113,65 @@ def test_shell_keypad_builds():
         assert cb in datas, cb
     mdatas = [b.callback_data for row in sessions.shell_keypad(more=True).inline_keyboard for b in row]
     assert "shk:space" in mdatas and "shk:less" in mdatas and "shk:pgup" in mdatas
+
+
+# --- #345: session-name fallback when the engine never wrote an ai-title ----------
+
+def test_topic_from_text_skips_thin_keeps_substantive():
+    """#345: greetings/probes/acks and the injected recap prompt are NOT topics; a
+    real message is kept (whitespace-collapsed) and capped at _AI_TITLE_MAX. The
+    threshold is letter-count, so it is language-agnostic (a short non-English probe
+    is filtered by the same rule)."""
+    tf = sessions._topic_from_text
+    assert tf("hi") is None
+    assert tf("you up?") is None          # 5 letters < 10
+    assert tf("  ok  ") is None
+    assert tf("Recap our conversation so far in one short sentence.") is None
+    assert tf("Compare the two SAP reports by aggregation totals") == (
+        "Compare the two SAP reports by aggregation totals"
+    )
+    assert tf("first line of a real ask\nmore detail") == "first line of a real ask more detail"
+    assert len(tf("name " + "z" * 200)) == sessions._AI_TITLE_MAX
+
+
+def test_read_session_title_prefers_ai_title(tmp_path):
+    """When the engine wrote an ai-title, that wins (the fallback is still computed in
+    the same single pass, but the caller takes ai_title)."""
+    cwd = _write_transcript(tmp_path, "s1", [
+        _u("Compare the two SAP reports by aggregation totals"),
+        {"type": "ai-title", "aiTitle": "SAP report comparison"},
+        _a("..."),
+        {"type": "ai-title", "aiTitle": "SAP report comparison (final)"},  # LAST wins
+    ])
+    ai, fb = sessions._read_session_title(cwd, "s1")
+    assert ai == "SAP report comparison (final)"
+    assert fb == "Compare the two SAP reports by aggregation totals"
+
+
+def test_read_session_title_fallback_on_errored_trivial_opening(tmp_path):
+    """The #345 stuck-session shape: a contentless opener whose first turns ERROR (so the
+    engine never wrote an ai-title), then a substantive turn → fallback names it from the
+    first substantive user message, skipping the greetings and the API-error replies."""
+    cwd = _write_transcript(tmp_path, "s2", [
+        _u("hi"),
+        _a("API Error: 500 Internal server error"),
+        _u("hi"),
+        _a("API Error: 529 Overloaded"),
+        _u("Compare the two SAP reports by aggregation totals"),
+    ])
+    ai, fb = sessions._read_session_title(cwd, "s2")
+    assert ai is None
+    assert fb == "Compare the two SAP reports by aggregation totals"
+
+
+def test_read_session_title_all_trivial_stays_unnamed(tmp_path):
+    """A genuinely contentless session (only a greeting) yields no name at all — better
+    unnamed than a junk label."""
+    cwd = _write_transcript(tmp_path, "s3", [_u("hi"), _a("Not asleep — how can I help?")])
+    ai, fb = sessions._read_session_title(cwd, "s3")
+    assert ai is None and fb is None
+
+
+def test_read_session_title_missing_or_empty_args(tmp_path):
+    assert sessions._read_session_title(None, None) == (None, None)
+    assert sessions._read_session_title(str(tmp_path / "work"), "nope") == (None, None)

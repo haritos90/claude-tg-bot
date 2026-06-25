@@ -86,8 +86,9 @@ A table can be expressed in EITHER form (server converts both to a `RichBlockTab
 
 The two fields handle newlines DIFFERENTLY. Verified empirically by sending each form and
 reading the server-parsed `result.rich_message.blocks` (ground truth — stronger than the prose
-docs, which truncate in a fetch). This corrected a wrong assumption ("markdown honours real
-newlines") that was about to drive the #310 migration the wrong way.
+docs, which truncate in a fetch). A single `\n` is NOT honoured as a line break in either rich
+field (a frequent misconception, and the distinction the #310 migration hinges on) — see the
+per-field table below.
 
 | Source text | Rich HTML → parsed | Rich Markdown → parsed |
 |---|---|---|
@@ -115,7 +116,7 @@ newlines") that was about to drive the #310 migration the wrong way.
 - Telegram CLIENTS render `pre` as PLAIN MONOSPACE; syntax-HIGHLIGHTING (colourisation) is a
   per-client decision and is NOT applied in (at least) the macOS Desktop client even though
   `language` is set. "No colours" is therefore a client rendering choice, NOT a bot/API bug, and
-  is identical across the html/markdown fields — nothing to fix on our side. Re-verify with the
+  is identical across the html/markdown fields. Re-verify with the
   parsed-blocks probe (`sendRichMessage` → read `result.rich_message.blocks`).
 
 ## How THIS bot maps onto the spec
