@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import json
 import logging
 import os
@@ -156,7 +157,7 @@ _NON_TOPIC_PREFIXES = ("recap our conversation",)
 
 def _topic_from_text(txt: str) -> str | None:
     """#345: a session-name candidate from a user message, or None if the message is too
-    thin to name a topic by — a bare greeting/probe ("спишь?", "hi") or an injected
+    thin to name a topic by — a bare greeting/probe ("yo", "u up?") or an injected
     prompt. Conservative on purpose: this only fires when the engine never wrote an
     ai-title, so 'leave it unnamed' beats coining a junk name."""
     if not txt:
@@ -164,7 +165,7 @@ def _topic_from_text(txt: str) -> str | None:
     s = " ".join(txt.split())  # collapse newlines / runs of whitespace
     if any(s.lower().startswith(p) for p in _NON_TOPIC_PREFIXES):
         return None
-    if sum(c.isalpha() for c in s) < 10:  # greetings / acks ("ok", "да", "привет")
+    if sum(c.isalpha() for c in s) < 10:  # greetings / acks ("ok", "hi", "yo")
         return None
     return s[:_AI_TITLE_MAX].strip() or None
 
@@ -894,6 +895,10 @@ class SessionManager:
             extra_blocked_keywords=getattr(self.settings, "extra_blocked_keywords", None),
             auto_compact=eff.get("auto_compact", True),  # #168
             user_level=self._owner_level(state),  # #276: drives the "this session" prompt note
+            # #352: per-topic agent-driven session memory — the current saved blob plus the
+            # async persistence hook the `remember` tool calls (scoped to THIS thread).
+            session_notes=state.session_notes,
+            on_remember=functools.partial(db.set_session_notes, state.thread_id),
         )
 
     async def _get_session(

@@ -27,6 +27,9 @@ SAFE_TOOLS: set[str] = {
     "LS",
     "NotebookRead",
     "TodoWrite",
+    # #352: the in-process session-memory tool writes ONLY to this topic's own notes
+    # (no external effect), so it never prompts. Name mirrors engine.MEMORY_TOOL.
+    "mcp__memory__remember",
 }
 
 # File-editing tools, auto-allowed under the "acceptEdits" policy. Plain Bash is

@@ -902,6 +902,19 @@ CATALOG: dict[str, dict[str, str]] = {
         "en": "Big memory <b>off</b> — back to the standard context window.{note}",
         "ru": "Большая память <b>выкл</b> — назад к стандартному окну контекста.{note}",
     },
+    # #352: session memory (agent-saved per-topic notes via the `remember` tool).
+    "memory.notes": {
+        "en": "\n📝 Session memory: <b>{n}</b> chars saved by the agent (use /forget to clear).",
+        "ru": "\n📝 Память сессии: <b>{n}</b> символов сохранил агент (/forget — очистить).",
+    },
+    "forget.empty": {
+        "en": "📝 Session memory is already empty — nothing to forget.",
+        "ru": "📝 Память сессии уже пуста — забывать нечего.",
+    },
+    "forget.done": {
+        "en": "📝 Session memory cleared (<b>{n}</b> chars).{note}",
+        "ru": "📝 Память сессии очищена (<b>{n}</b> символов).{note}",
+    },
 
     # -- /cwd --------------------------------------------------------------- #
     "cwd.current": {

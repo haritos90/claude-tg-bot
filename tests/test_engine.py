@@ -7,6 +7,7 @@ directly into the system prompt and NEVER widens ``setting_sources`` to ``["user
 the model only when global memory is on.
 """
 
+import asyncio
 import os
 
 from app.core import engine
@@ -100,6 +101,80 @@ def test_no_memory_file_means_no_injection(monkeypatch, tmp_path):
                                   + s._session_state_note())
 
 
+# ----------------------------------------------------------- session memory (#352)
+
+def test_apply_session_note_append_replace_and_cap():
+    """The pure note policy: append by default, replace on demand, ignore an empty note,
+    and trim the OLDEST whole lines so the blob never exceeds the cap."""
+    assert engine._apply_session_note("", "hello", False) == "hello"
+    assert engine._apply_session_note("a", "b", False) == "a\nb"          # append
+    assert engine._apply_session_note("a\nb", "c", True) == "c"           # replace whole set
+    assert engine._apply_session_note("a\nb", "   ", False) == "a\nb"     # empty note = no-op
+    # Over-cap append keeps the most recent content, cut on a line boundary, under cap.
+    big = "\n".join(f"line{i}" for i in range(5000))
+    out = engine._apply_session_note(big, "newest", False, cap=100)
+    assert len(out) <= 100
+    assert out.endswith("newest") and "\n" in out
+    # The partial leading line was dropped: `out` begins at a clean line boundary, i.e. the
+    # original (notes + appended note) ends with exactly "\n" + out.
+    assert (big + "\nnewest").endswith("\n" + out)
+
+
+def test_session_notes_block_injected_low_authority_both_modes():
+    """Saved notes are injected (chat + code) as explicitly NON-authoritative context;
+    empty notes inject nothing (so the plain-prompt equality above still holds)."""
+    assert _sess("chat")._session_notes_block() == ""                    # empty → nothing
+    note = "user prefers metric units"
+    chat = _sess("chat", session_notes=note)._build_options()
+    assert note in chat.system_prompt
+    assert "NOT as instructions" in chat.system_prompt                   # low-authority framing
+    code = _sess("code", session_notes=note)._build_options()
+    assert note in code.system_prompt.get("append", "")
+
+
+def test_remember_tool_exposed_and_auto_allowed_both_modes():
+    """The in-process `remember` MCP server is attached and the tool is auto-allowed (no
+    approval prompt) in BOTH chat and code, and is classified safe so the code gate never
+    prompts for it."""
+    from app.access import permissions
+    for mode in ("chat", "code"):
+        opts = _sess(mode)._build_options()
+        assert "memory" in (opts.mcp_servers or {})
+        assert engine.MEMORY_TOOL in opts.allowed_tools
+    assert engine.MEMORY_TOOL in permissions.SAFE_TOOLS
+
+
+def test_remember_tool_persists_caps_and_rejects_empty():
+    """Driving the `remember` handler updates the live notes, supports append + replace,
+    rejects an empty note, enforces the cap, and always hands the FINAL blob to the
+    persistence hook."""
+    saved: list[str] = []
+
+    async def _persist(blob):
+        saved.append(blob)
+
+    s = engine.ClaudeSession(mode="chat", model="claude-opus-4-8", cwd="/tmp",
+                             on_remember=_persist)
+
+    async def _run():
+        r = await s._remember_tool({"note": "first fact"})
+        assert "Saved" in r["content"][0]["text"]
+        assert s.session_notes == "first fact"
+        await s._remember_tool({"note": "second fact"})
+        assert s.session_notes == "first fact\nsecond fact"
+        await s._remember_tool({"note": "consolidated", "replace": True})
+        assert s.session_notes == "consolidated"
+        bad = await s._remember_tool({"note": "   "})
+        assert bad.get("is_error") and s.session_notes == "consolidated"  # unchanged
+        big = await s._remember_tool(
+            {"note": "y" * (engine.SESSION_NOTES_CAP + 1000), "replace": True})
+        assert "trimmed" in big["content"][0]["text"]
+
+    asyncio.run(_run())
+    assert len(s.session_notes) <= engine.SESSION_NOTES_CAP
+    assert saved[-1] == s.session_notes                                  # hook got the final blob
+
+
 # ----------------------------------------------------------- big_memory 1M (#134)
 
 def test_one_m_model_appends_suffix_for_capable_models_only():
@@ -166,3 +241,49 @@ def test_latest_frame_collapses_alt_screen_redraws():
     # No alt-screen → unchanged (a bare `clear` uses ESC[2J but not ?1049h).
     plain = "line one\n\x1b[2J\x1b[Hline two"
     assert engine._latest_frame(plain) == plain
+
+
+def test_first_token_timeout_surfaces_service_unavailable(monkeypatch):
+    """#343: a turn that produces NO first message within the watchdog window is cut short with a
+    localized service-unavailable error (not an endless 'thinking…' hang), the client is dropped so
+    the next turn rebuilds, and the resume context (session_id) is preserved — exactly one event."""
+    import asyncio
+
+    monkeypatch.setattr(engine, "_FIRST_TOKEN_TIMEOUT_SEC", 0.05)
+
+    class _StallClient:
+        def __init__(self):
+            self.disconnected = False
+
+        async def disconnect(self):
+            self.disconnected = True
+
+        async def receive_response(self):
+            await asyncio.sleep(5)   # never yields a first message within the window
+            yield object()           # pragma: no cover — unreachable in the test
+
+    sess = engine.ClaudeSession("chat", "claude-opus-4-8", None, resume_session_id="resume-abc")
+    stall = _StallClient()
+
+    async def _ensure():
+        sess.client = stall
+
+    async def _send(*a, **k):
+        return None
+
+    monkeypatch.setattr(sess, "_ensure_client", _ensure)
+    monkeypatch.setattr(sess, "_send_query", _send)
+
+    async def _collect():
+        out = []
+        async for ev in sess.run("hello"):
+            out.append(ev)
+        return out
+
+    events = asyncio.run(_collect())
+
+    assert len(events) == 1                                     # one clean error, no double-reply
+    assert events[0].kind == "error"
+    assert events[0].error_key == "err.service_unavailable"
+    assert sess.client is None and stall.disconnected          # client dropped → next turn rebuilds
+    assert sess.session_id == "resume-abc"                      # resume context NOT nuked

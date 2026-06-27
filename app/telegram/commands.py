@@ -94,6 +94,8 @@ COMMANDS: tuple[Cmd, ...] = (
                    "ru": "Глубина рассуждений: low … max"}, help_group="settings"),
     Cmd("memory", {"en": "1M context window (chat): on | off",
                    "ru": "Окно контекста 1M (чат): on | off"}, help_group="settings"),
+    Cmd("forget", {"en": "Clear this topic's agent-saved memory",
+                   "ru": "Очистить память темы, сохранённую агентом"}, help_group="settings"),
     Cmd("language", {"en": "Choose the interface language",
                      "ru": "Выбрать язык интерфейса"}, help_group="settings"),
     # — Tier C · occasional · run + session content —

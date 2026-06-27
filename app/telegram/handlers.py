@@ -2896,6 +2896,8 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         key = await _session_key(message)
         lang = _lang(message)
         arg = _command_arg(message).lower()
+        _n = len((state.session_notes or "").strip())  # #352: show agent-saved memory size
+        mem_suffix = i18n.t("memory.notes", lang, n=_n) if _n else ""
 
         if not arg:
             # No arg → toggle in place (menu.md §2: "none → toggle"; #145). Was a
@@ -2904,7 +2906,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             await db.set_big_memory(key, on)
             deferred = await _rebuild_session(key)
             note = i18n.t("common.defer_note", lang) if deferred else ""
-            await reply(message, i18n.t("memory.on" if on else "memory.off", lang, note=note))
+            await reply(message, i18n.t("memory.on" if on else "memory.off", lang, note=note) + mem_suffix)
             return
 
         if arg not in ("on", "off"):
@@ -2919,7 +2921,22 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         await db.set_big_memory(key, on)
         deferred = await _rebuild_session(key)
         note = i18n.t("common.defer_note", lang) if deferred else ""
-        await reply(message, i18n.t("memory.on" if on else "memory.off", lang, note=note))
+        await reply(message, i18n.t("memory.on" if on else "memory.off", lang, note=note) + mem_suffix)
+
+    @router.message(Command("forget"))
+    async def cmd_forget(message: Message) -> None:
+        """#352: clear this topic's agent-saved session memory (the `remember` notes)."""
+        state = await _ensure_state(message)
+        key = await _session_key(message)
+        lang = _lang(message)
+        prior = (state.session_notes or "").strip()
+        if not prior:
+            await reply(message, i18n.t("forget.empty", lang))
+            return
+        await db.set_session_notes(key, "")
+        deferred = await _rebuild_session(key)
+        note = i18n.t("common.defer_note", lang) if deferred else ""
+        await reply(message, i18n.t("forget.done", lang, n=len(prior), note=note))
 
     def _build_tree(root: Path, max_entries: int = 120, max_depth: int = 4) -> str:
         """A compact, read-only directory tree (depth- and entry-capped) for /files."""
