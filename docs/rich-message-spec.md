@@ -106,6 +106,11 @@ per-field table below.
   So a `\n`→`<br>` HTML string maps to a `\n`→`  \n` markdown string — NOT "drop the `<br>`,
   markdown honours newlines" (it does NOT honour a single `\n`). Block constructs (lists `- x`,
   tables, `` ```fences ``, headings) break on their own and need no hard break.
+- **Paragraph vertical margin (#353):** consecutive plain `\n\n` paragraphs render with only a
+  SMALL inter-paragraph margin, whereas a heading / list / table BLOCK gets a larger one. So
+  demoting a heading to a bold PARAGRAPH (to drop the heading font, `markup.demote_headings`)
+  looks cramped — a `U+00A0` (non-breaking-space) SPACER paragraph above it restores the gap
+  (verified on-device: a whitespace-only paragraph is NOT trimmed when it holds a nbsp).
 
 ### Code blocks (`RichBlockPreformatted`, parsed `"type":"pre"`)
 
@@ -130,6 +135,13 @@ per-field table below.
 - `streamer._commit_rich_markdown` (finish) — `SendRichMessage({"markdown": full_text})`:
   the WHOLE reply as one rich message (#176). SAME renderer as the draft, so a complete
   table renders identically; the draft is just an earlier valid prefix of it.
+- `markup.demote_headings` — rewrites ATX headings (`# …` → `**bold**`) on the rich
+  `{"markdown"}` BEFORE both the draft frontier and `_commit_rich_markdown` (#353): a heading
+  BLOCK renders in the client's distinct heading typeface, which clashed with the body font
+  ("jumping fonts"). Demoting keeps ONE font (headings just bold, like Path A `md_to_html`);
+  the model's heading text + any leading emoji are kept verbatim, `#` inside code fences is
+  skipped, and a `U+00A0` spacer paragraph is inserted above each heading to restore the
+  block's vertical gap (the **V2** choice; skipped for a first-line heading).
 - `markup.table_to_rich_html` — builds the `<table>` HTML form (the #164 native-table path /
   `_send_rich` fallback).
 

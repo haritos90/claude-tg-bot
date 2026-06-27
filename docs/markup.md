@@ -67,6 +67,19 @@ block with **no change here**. Sending the whole reply as one rich message keeps
 font consistent across prose, tables and code, rather than splitting a reply into
 mixed rich + classic bubbles.
 
+**Headings are demoted to bold, not emitted as heading blocks (#353).** Telegram renders a
+markdown heading (`## …`) as a heading BLOCK in the client's own heading typeface —
+larger/heavier, and a visually distinct face on some clients — which reads as a different
+FONT beside the body paragraph font. `markup.demote_headings` (applied to the rich
+`{"markdown"}` on BOTH the draft frontier and the final `_commit_rich_markdown`) rewrites
+every ATX heading (`# …`–`###### …`) to `**bold**`, so the whole reply stays in one body font
+(headings just bold) — mirroring what `md_to_html` (Path A) already did. It preserves the
+model's heading text verbatim **including any leading emoji** (the per-heading emoji choice
+stays the model's — never bot-injected), skips `#` lines inside code fences, and inserts a
+non-breaking-space (`U+00A0`) spacer paragraph above each heading to restore the vertical gap
+a heading block had (the **V2** fix — a lone bold paragraph gets only a small inter-paragraph
+margin; verified on-device). The spacer is skipped for a heading that is the first content.
+
 A split-by-segment alternative — prose/tables as rich, each code block as a classic,
 copyable `<pre><code>` bubble — is implemented in `streamer._commit_mixed` (with
 `markup.split_code_blocks`) but **un-called**. It can be re-enabled in
@@ -151,7 +164,7 @@ Tags `sendRichMessage` (Path B) can render. Status legend:
 ### Blocks
 | Tag(s) | Meaning | Status |
 |---|---|---|
-| `<h1>`…`<h6>` | headings | 🟡 (Path A renders `#` as bold) |
+| `<h1>`…`<h6>` | headings | **demoted** — `#` → **bold** on BOTH paths (Path A `md_to_html`; Path B `markup.demote_headings`, #353); the native heading block is intentionally NOT emitted (its separate font clashed with body text) |
 | `<p>` | paragraph | 🟡 |
 | `<pre>` / `<pre><code class="language-…">` | code block | ✅ via rich (renders plain monospace pending client styling, #174); Path A renders a full classic code block |
 | `<footer>` | footer text | 🟡 |
@@ -181,6 +194,7 @@ Tags `sendRichMessage` (Path B) can render. Status legend:
 | Concern | Location |
 |---|---|
 | Markdown → classic HTML | `markup.md_to_html` |
+| Heading demotion (rich path → one font, #353) | `markup.demote_headings` |
 | Escaping | `markup.escape_html` |
 | Native table split / render | `markup.split_rich_tables`, `markup.table_to_rich_html`, `markup.RichTable` |
 | Rich method bindings | `rich_message.py` (`SendRichMessage`, `SendRichMessageDraft`, `EditRichMessage`) |

@@ -468,7 +468,7 @@ def test_agent_ai_title_overrides_fallback_on_later_turn(monkeypatch, tmp_path):
     monkeypatch.setattr(sessions, "_read_session_title", lambda cwd, sid: next(reads))
     calls = []
     async def _capture(thread_id, name, *, manual=True):
-        calls.append((name, manual))
+        calls.append((thread_id, name, manual))
     monkeypatch.setattr(db, "set_session_name", _capture)
     async def _noop(*a, **k):
         return None
@@ -484,10 +484,10 @@ def test_agent_ai_title_overrides_fallback_on_later_turn(monkeypatch, tmp_path):
         mode="code", stream_enabled=True, cwd=cwd, name=None, name_auto=True,
     )
     asyncio.run(sm._run_one(rec, -1, "prompt", None, _FakeStreamer()))
-    assert calls[-1] == ("Compare the two SAP reports", False)   # turn 1 → fallback
+    assert calls[-1] == (-1, "Compare the two SAP reports", False)   # turn 1 → fallback
     assert rec.name == "Compare the two SAP reports"
     asyncio.run(sm._run_one(rec, -1, "prompt", None, _FakeStreamer()))
-    assert calls[-1] == ("SAP report reconciliation", False)     # turn 2 → agent title wins
+    assert calls[-1] == (-1, "SAP report reconciliation", False)     # turn 2 → agent title wins
     assert rec.name == "SAP report reconciliation"
 
 

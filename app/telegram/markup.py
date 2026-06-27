@@ -82,6 +82,10 @@ _CODE_FENCE_BLOCK_RE = re.compile(
     r"|~~~[ \t]*[A-Za-z0-9_+\-.#]*[ \t]*\r?\n.*?~~~",
     re.DOTALL,
 )
+# #353: a ``` or ~~~ fence open/close line (language optional). Used by demote_headings to
+# leave a ``# comment`` INSIDE a code fence untouched (mirrors split_markdown's fence
+# tracking via _FENCE_LINE_RE, but also accepts ~~~ fences).
+_FENCE_TOGGLE_RE = re.compile(r"^[ \t]*(?:```|~~~)")
 _INLINE_CODE_RE = re.compile(r"`([^`\n]+?)`")
 _BOLD_STAR_RE = re.compile(r"\*\*(.+?)\*\*", re.DOTALL)
 _BOLD_USCORE_RE = re.compile(r"__(.+?)__", re.DOTALL)
@@ -384,6 +388,59 @@ def clip_partial_table(text: str) -> str:
     return text
 
 
+def demote_headings(text: str) -> str:
+    """#353: demote ATX headings (``# ``..``###### ``) to ``**bold**`` for the RICH
+    ``{"markdown"}`` path (draft + commit).
+
+    Telegram renders a markdown heading BLOCK in its own heading typography — larger /
+    heavier, and a visually DISTINCT face on some clients — so ``## Heading`` reads as a
+    different FONT beside the body paragraph font (the "jumping fonts" feedback). The rich
+    reply is streamed and persisted verbatim as ``{"markdown"}``, so those headings reach
+    Telegram raw. Demoting them keeps the whole reply in ONE (body) font, headings just
+    bold — MIRRORING what the classic-HTML fallback already does (``md_to_html`` step 3c).
+
+    No CONTENT decoration is added: whatever the model put on the heading line (a leading
+    emoji or not) is preserved verbatim, so the per-heading emoji choice stays the AGENT's. A
+    non-breaking-space SPACER paragraph IS inserted above each demoted heading (#353 V2): a
+    bold paragraph gets only a small inter-paragraph margin where a heading BLOCK had a larger
+    one, so without it the heading looked cramped (verified on-device — the nbsp renders as the
+    gap and is not trimmed). The spacer is skipped for a heading that is the very first content
+    (no empty line at the message top).
+
+    The transform is LINE-LOCAL and SKIPS fenced code (a ``# comment`` inside a ``` / ~~~
+    block is left alone — fence state at any position is fixed by the text BEFORE it, so a
+    streaming draft and the full text agree on what is code). Each draft frame stays VALID
+    markdown: a COMPLETE heading demotes identically in the draft and the final (no snap), and
+    a heading still being TYPED renders as a complete, early-closed ``**bold**`` span that just
+    extends as more text arrives — like a half-typed ``**bold**`` (#237), and crucially with NO
+    heading-FONT flash that then snaps to bold. Pure + testable; no-op when the text has no
+    ``#``. Inner ``**``/``__`` in the title are dropped (the whole line is already bold),
+    matching md_to_html step 3c."""
+    if "#" not in text:
+        return text
+    out: list[str] = []
+    in_fence = False
+    for line in text.split("\n"):
+        if _FENCE_TOGGLE_RE.match(line):
+            in_fence = not in_fence
+            out.append(line)
+            continue
+        m = _ATX_HEADER_RE.match(line) if not in_fence else None
+        if m is None:
+            out.append(line)
+            continue
+        # #353 (V2): insert a non-breaking-space SPACER paragraph above the demoted heading to
+        # restore the visual gap a heading block had (a plain bold paragraph gets only a small
+        # margin). Skip it when the heading is the FIRST content (out empty) — no top blank line.
+        if out:
+            if out[-1] != "":
+                out.append("")          # guarantee a blank line before the spacer
+            out.append("\u00A0")        # nbsp spacer paragraph = the visual gap (V2)
+            out.append("")              # blank line after → the spacer is its own paragraph
+        out.append("**" + m.group(2).replace("**", "").replace("__", "") + "**")
+    return "\n".join(out)
+
+
 # --------------------------------------------------------------------------- #
 # NATIVE Telegram tables — Bot API 10.1 rich messages (#164)
 # --------------------------------------------------------------------------- #
@@ -643,6 +700,14 @@ _LOCATION_BLOCK_RE = re.compile(
     r"```[ \t]*(?:location|geo)[ \t]*\r?\n(.*?)\r?\n?```",
     re.DOTALL | re.IGNORECASE,
 )
+# #347: a ```location block NESTED inside a longer (4+ backtick) fence is an EXAMPLE — the docs /
+# the model demoing the feature wrap the 3-backtick block in a ```` fence — not a live pin. Match
+# those outer spans so extract_locations skips any block inside one (it extracts only top-level).
+_OUTER_FENCE_RE = re.compile(r"(`{4,})[^\n]*\n.*?\n\1", re.DOTALL)
+# #347: Telegram rejects an over-long venue title/address with a 400 (and the venue send has no
+# silent retry), so the model-supplied strings are capped to safe lengths before sending.
+_VENUE_TITLE_MAX = 256
+_VENUE_ADDRESS_MAX = 256
 
 
 def _coerce_location(obj):
@@ -663,12 +728,15 @@ def _coerce_location(obj):
     if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
         return None
     out = {"lat": lat, "lon": lon}
-    title = obj.get("title") or obj.get("name")
-    address = obj.get("address") or obj.get("addr")
+    # #347: only the documented `title`/`address` keys (was: also `name`/`addr` — dropped the
+    # undocumented aliases to keep the recognized schema tight), each capped so an over-long
+    # model string can't make sendVenue return a 400.
+    title = obj.get("title")
+    address = obj.get("address")
     if isinstance(title, str) and title.strip():
-        out["title"] = title.strip()
+        out["title"] = title.strip()[:_VENUE_TITLE_MAX]
     if isinstance(address, str) and address.strip():
-        out["address"] = address.strip()
+        out["address"] = address.strip()[:_VENUE_ADDRESS_MAX]
     return out
 
 
@@ -683,8 +751,12 @@ def extract_locations(text: str):
     if "```location" not in low and "```geo" not in low:
         return text, []
     locs: list[dict] = []
+    # #347: spans of any enclosing 4+ backtick fence — a ```location inside one is a demo, not a pin.
+    outer = [(m.start(), m.end()) for m in _OUTER_FENCE_RE.finditer(text)]
 
     def _take(m) -> str:
+        if any(a <= m.start() < b for a, b in outer):
+            return m.group(0)  # #347: nested in a demo fence → leave verbatim, no pin
         try:
             obj = json.loads(m.group(1))
         except (ValueError, TypeError):

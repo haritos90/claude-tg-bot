@@ -86,6 +86,10 @@ class ThreadState:
     chat_session_id: str | None = None
     # Per-topic "big memory": 1M context window in chat + durable chat session.
     big_memory: bool = False
+    # #352: per-topic agent-driven "session memory" — short notes the model saves via the
+    # in-process `remember` tool, re-injected into the system prompt each build (size-capped
+    # in the engine). Scoped to THIS topic; cleared by /forget.
+    session_notes: str = ""
     created_at: float = 0.0
     created_by: int | None = None
     # Live-streaming display preference (persisted so /stream survives restart).
@@ -289,6 +293,8 @@ async def init_db(db_path: str) -> None:
             await _conn.execute(
                 "ALTER TABLE threads ADD COLUMN big_memory INTEGER DEFAULT 0"
             )
+        if "session_notes" not in existing:  # #352
+            await _conn.execute("ALTER TABLE threads ADD COLUMN session_notes TEXT")
         if "created_by" not in existing:
             await _conn.execute("ALTER TABLE threads ADD COLUMN created_by INTEGER")
         if "stream_enabled" not in existing:
@@ -425,6 +431,7 @@ async def get_thread(thread_id: int) -> ThreadState | None:
             "COALESCE(permission_mode, 'acceptEdits') AS permission_mode, "
             "chat_session_id, "
             "COALESCE(big_memory, 0) AS big_memory, "
+            "COALESCE(session_notes, '') AS session_notes, "
             "COALESCE(created_at, 0) AS created_at, created_by, "
             "COALESCE(stream_enabled, 1) AS stream_enabled, "
             "effort, max_turns, add_dirs, COALESCE(fork_pending, 0) AS fork_pending, "
@@ -455,6 +462,7 @@ async def get_thread(thread_id: int) -> ThreadState | None:
         permission_mode=row["permission_mode"],
         chat_session_id=row["chat_session_id"],
         big_memory=bool(row["big_memory"]),
+        session_notes=row["session_notes"] or "",  # #352
         created_at=float(row["created_at"] or 0),
         created_by=row["created_by"],
         stream_enabled=bool(row["stream_enabled"]),
@@ -880,6 +888,19 @@ async def set_big_memory(thread_id: int, on: bool) -> None:
         await conn.execute(
             "UPDATE threads SET big_memory = ? WHERE thread_id = ?",
             (1 if on else 0, thread_id),
+        )
+        await conn.commit()
+
+
+async def set_session_notes(thread_id: int, notes: str) -> None:
+    """#352: replace the per-topic session-memory blob. Both the agent's `remember` tool
+    (via the engine's on_remember hook) and /forget write here; the engine caps size before
+    this is called, so the value is stored verbatim."""
+    conn = _require_conn()
+    async with _lock:
+        await conn.execute(
+            "UPDATE threads SET session_notes = ? WHERE thread_id = ?",
+            (notes, thread_id),
         )
         await conn.commit()
 

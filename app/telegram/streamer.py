@@ -669,6 +669,10 @@ class Streamer:
         # #241: drafts are RICH messages → use the 32768 limit, not the classic 3900. For a
         # normal reply the whole growing text is one chunk (streams in full); only a >32768
         # reply splits and we track the tail frontier.
+        # #353: demote ATX headings (## ..) to **bold** so the rich draft stays in ONE font
+        # (a heading BLOCK renders in Telegram's distinct heading typeface — "jumping fonts").
+        # Same transform as the final commit → the draft stays consistent with the final bubble.
+        body = markup.demote_headings(body)
         raw_chunks = markup.split_markdown(body, limit=markup.RICH_LIMIT)
         frontier = raw_chunks[-1] if raw_chunks else body
         # #242: re-send an unchanged frontier before the ~30s draft expiry (e.g. a mid-reply
@@ -1153,21 +1157,24 @@ class Streamer:
         sendVenue card when it names a place (title+address both present), else a plain sendLocation
         pin. Always a silent intermediate (it follows the already-sent reply bubble)."""
         lat, lon = loc["lat"], loc["lon"]
+        # #347: try the venue card first; if Telegram rejects it (e.g. an over-long title/address
+        # 400) _safe returns None — fall through to a plain pin so valid coordinates always drop a
+        # marker instead of vanishing. was: a bare if/else with no venue fallback.
         if loc.get("title") and loc.get("address"):
-            await self._safe(
+            if await self._safe(
                 lambda: self.bot.send_venue(
                     chat_id=self.chat_id, latitude=lat, longitude=lon,
                     title=loc["title"], address=loc["address"],
                     disable_notification=True, **self._kwargs(),
                 )
+            ):
+                return
+        await self._safe(
+            lambda: self.bot.send_location(
+                chat_id=self.chat_id, latitude=lat, longitude=lon,
+                disable_notification=True, **self._kwargs(),
             )
-        else:
-            await self._safe(
-                lambda: self.bot.send_location(
-                    chat_id=self.chat_id, latitude=lat, longitude=lon,
-                    disable_notification=True, **self._kwargs(),
-                )
-            )
+        )
 
     async def _send_wide_table_image(self, table) -> None:
         """#243: send one wide (>20-column) table as its own PNG photo — a native rich table
@@ -1309,7 +1316,9 @@ class Streamer:
         consistent rich message instead of splitting; when the client styles
         RichBlockPreformatted, code renders as a full code block with NO change here.
         (The split-by-segment alternative lives in _commit_mixed.)"""
-        md = full_text.strip() or "…"
+        # #353: demote ATX headings to **bold** so the persisted rich reply stays in ONE font
+        # (matches the draft; decoration like a leading emoji is left to the model).
+        md = markup.demote_headings(full_text).strip() or "…"  # was: full_text.strip()
         if footer:
             # Italicize each footer line separately — markdown italic can't span a
             # newline, and the usage footer is 2 lines (5h / 7d) (#169). #339: join the
@@ -1368,7 +1377,7 @@ class Streamer:
                     )
                 )
             else:
-                md = seg.strip()
+                md = markup.demote_headings(seg).strip()  # #353: one font (was: seg.strip())
                 if want_footer:
                     foot = "  \n".join(f"_{ln}_" for ln in footer.splitlines() if ln.strip())
                     md = f"{md}\n\n{foot}"
@@ -1449,8 +1458,14 @@ class Streamer:
         #     await self._commit_mixed(full_text, footer, silent_first)
         #     return
 
+        # #346: the rich path above stripped the ```location blocks AND sent the pins; the two
+        # fallbacks below render the RAW text, so build a location-stripped body (blocks → notes)
+        # for them and send the pins in whichever branch actually delivers — otherwise the raw
+        # JSON leaks to the user and no pin is sent. was: both fallbacks used the raw full_text.
+        loc_noted = self._location_notes(loc_text, locations)
+
         # Very long output (fallback): deliver as a document so we do not spam chunks.
-        if markup.should_send_as_file(full_text):
+        if markup.should_send_as_file(loc_noted):  # was: should_send_as_file(full_text) — #346
             note_chunk = self._render_chunks(
                 i18n.t("stream.too_long", i18n.cached_lang(self.chat_id))
             )[0]
@@ -1464,7 +1479,7 @@ class Streamer:
                         link_preview_options=_NO_PREVIEW,
                     )
                 )
-            document = markup.as_document(full_text, "response.md")
+            document = markup.as_document(loc_noted, "response.md")  # was: full_text — #346
             await self._safe(
                 lambda: self.bot.send_document(
                     chat_id=self.chat_id,
@@ -1486,6 +1501,8 @@ class Streamer:
                     )
                 )
             self._rendered_text = note_chunk
+            for loc in locations:  # #346: deliver the pins on the document fallback too
+                await self._send_location(loc)
             return
 
         # ---- legacy fallback (pre-#169): md_to_html chunks + native-table bubbles +
@@ -1502,7 +1519,7 @@ class Streamer:
         # chunks + native-table bubbles. Code-containing replies never reach here —
         # they are handled by _commit_mixed (rich prose/tables + classic code).
         render_fn = self._render_message_chunks if self._split_code_messages else self._render_chunks
-        sendables = self._build_sendables(full_text, render_fn) or [("text", "…")]
+        sendables = self._build_sendables(loc_noted, render_fn) or [("text", "…")]  # was: full_text — #346
 
         # Append the footer to the last TEXT sendable when it fits, else send it alone.
         footer_as_message = bool(footer_line)
@@ -1589,3 +1606,8 @@ class Streamer:
                     **self._kwargs(),
                 )
             )
+
+        # #346: deliver the ```location pins on the legacy fallback path as well (the rich path
+        # returns earlier, so this runs only when that path was not taken — pins are sent once).
+        for loc in locations:
+            await self._send_location(loc)

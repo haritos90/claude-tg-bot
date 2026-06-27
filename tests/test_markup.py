@@ -551,6 +551,33 @@ def test_extract_locations():
     assert locs5 == [] and o5 == junk
     # no location block → unchanged, empty list
     assert markup.extract_locations("plain text") == ("plain text", [])
+    # #349: missing a coordinate → left as text (no half-pin)
+    miss = "```location\n{\"lon\": 2}\n```"
+    om, mlocs = markup.extract_locations(miss)
+    assert mlocs == [] and om == miss
+    # #349: lon out of range → left as text (only lat was covered above)
+    badlon = "```location\n{\"lat\": 0, \"lon\": 999}\n```"
+    obl, bllocs = markup.extract_locations(badlon)
+    assert bllocs == [] and obl == badlon
+    # #349: title WITHOUT address → title carried, no address (a plain pin at send time)
+    tonly = "```location\n{\"lat\":1,\"lon\":2,\"title\":\"X\"}\n```"
+    _ot, tlocs = markup.extract_locations(tonly)
+    assert tlocs == [{"lat": 1.0, "lon": 2.0, "title": "X"}]
+    # #347: undocumented name/addr aliases are NOT recognized (only title/address)
+    alias = "```location\n{\"lat\":1,\"lon\":2,\"name\":\"N\",\"addr\":\"A\"}\n```"
+    _oa, alocs = markup.extract_locations(alias)
+    assert alocs == [{"lat": 1.0, "lon": 2.0}]
+    # #347: an over-long venue title/address is capped (so sendVenue cannot 400)
+    longstr = "x" * 400
+    over = ("```location\n{\"lat\":1,\"lon\":2,\"title\":\"" + longstr
+            + "\",\"address\":\"" + longstr + "\"}\n```")
+    _ov, ovlocs = markup.extract_locations(over)
+    assert len(ovlocs) == 1
+    assert len(ovlocs[0]["title"]) == 256 and len(ovlocs[0]["address"]) == 256
+    # #347: a ```location block NESTED in a 4-backtick demo fence is an example, not a live pin
+    demo = "````\n```location\n{\"lat\":1,\"lon\":2}\n```\n````"
+    od, dlocs = markup.extract_locations(demo)
+    assert dlocs == [] and od == demo
 
 
 def test_render_svg_png_smoke():
@@ -564,3 +591,42 @@ def test_render_svg_png_smoke():
     import pytest
     with pytest.raises(ValueError):
         svg_image.render_svg_png("not an svg")
+
+
+def test_demote_headings():
+    """#353: ATX headings → **bold** for the rich {"markdown"} path, so the reply stays in
+    ONE font (no separate Telegram heading typeface). Decoration is the model's (a leading
+    emoji is preserved verbatim), and code fences are skipped so a `# comment` is not bolded."""
+    # each ATX level → bold, title verbatim
+    assert markup.demote_headings("# Title") == "**Title**"
+    assert markup.demote_headings("###### Deep") == "**Deep**"
+    # the model's OWN leading emoji is ARBITRARY content (not a bot-added icon) and is
+    # preserved verbatim — we neither add nor strip it. Neutral, non-#154 glyph on purpose.
+    assert markup.demote_headings("## 🚀 Launch plan") == "**🚀 Launch plan**"
+    # body prose + an inline bold lead-in on a list item are untouched; a heading that FOLLOWS
+    # content gets a \u00A0 spacer paragraph above it (#353 V2 — restores the heading gap)
+    src = "Intro line.\n\n## Section\n\n- **Lead** — rest of the line."
+    assert (markup.demote_headings(src)
+            == "Intro line.\n\n\u00A0\n\n**Section**\n\n- **Lead** — rest of the line.")
+    # a bare '#' (no space) and a mid-line '#' are NOT headings
+    assert markup.demote_headings("#nospace") == "#nospace"
+    assert markup.demote_headings("see # 3 below") == "see # 3 below"
+    # CRITICAL: a '# comment' INSIDE a ``` or ~~~ code fence must NOT be demoted
+    fenced = "```python\n# a comment\nx = 1  # trailing\n```"
+    assert markup.demote_headings(fenced) == fenced
+    tilde = "~~~\n# also a comment\n~~~"
+    assert markup.demote_headings(tilde) == tilde
+    # a heading AFTER a closed fence IS demoted again (fence toggles back), spacer added too
+    mixed = "```\ncode\n```\n## After"
+    assert markup.demote_headings(mixed) == "```\ncode\n```\n\n\u00A0\n\n**After**"
+    # inner ** in the title is dropped (the whole line is already bold)
+    assert markup.demote_headings("## **Bold** part") == "**Bold part**"
+    # a heading still being typed at the frontier is already bold (no bare '##' that would
+    # flash the heading font then snap) — it just extends as more text streams in
+    assert markup.demote_headings("## My Hea") == "**My Hea**"
+    # #353 V2 spacer: a FIRST-content heading has none (no blank line at the top); a heading
+    # FOLLOWING content gets the \u00A0 spacer paragraph above it.
+    assert markup.demote_headings("## First\n\nbody") == "**First**\n\nbody"
+    assert markup.demote_headings("intro\n\n## Sec") == "intro\n\n\u00A0\n\n**Sec**"
+    # no-op fast path when there is no '#'
+    assert markup.demote_headings("plain text only") == "plain text only"
