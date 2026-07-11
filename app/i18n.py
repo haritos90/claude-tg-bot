@@ -340,7 +340,7 @@ CATALOG: dict[str, dict[str, str]] = {
     },
     "settings.row_streaming": {"en": "Streaming: {val}", "ru": "Стриминг: {val}"},
     # #154: 🗄 is the canonical memory/context emoji (🧠 is reserved for MODEL).
-    "settings.row_memory": {"en": "🗄 Big memory: {val}", "ru": "🗄 Большая память: {val}"},
+    "settings.row_memory": {"en": "🗄 1M context: {val}", "ru": "🗄 Контекст 1M: {val}"},
     # #140-fix: dedicated max_turns label (was reusing settings.row_model, which
     # rendered TWO "🧠 Model" rows in the registry-driven /settings hub).
     "settings.row_maxturns": {"en": "🔁 Max turns: {val} ▸", "ru": "🔁 Лимит ходов: {val} ▸"},
@@ -869,13 +869,13 @@ CATALOG: dict[str, dict[str, str]] = {
 
     # -- /memory ------------------------------------------------------------ #
     "memory.show": {
-        "en": "Big memory: <b>{current}</b>.\nWhen <b>on</b>, this session requests "
+        "en": "1M context: <b>{current}</b>.\nWhen <b>on</b>, this session requests "
               "the <b>1M-token</b> context window via the model's [1m] variant — active "
               "on <b>Opus</b> (auto-included on Max). On Sonnet 1M needs paid "
               "usage-credits and Haiku has no 1M, so it has no effect there. Your "
               "conversation persists across restarts either way. Toggle with "
               "<code>/memory on</code> / <code>/memory off</code>.",
-        "ru": "Большая память: <b>{current}</b>.\nКогда <b>вкл</b>, эта сессия "
+        "ru": "Контекст 1M: <b>{current}</b>.\nКогда <b>вкл</b>, эта сессия "
               "запрашивает окно контекста на <b>1M токенов</b> через [1m]-вариант "
               "модели — работает на <b>Opus</b> (включено на Max). На Sonnet для 1M "
               "нужны платные кредиты, а у Haiku 1M нет, так что там это ни на что не "
@@ -887,20 +887,20 @@ CATALOG: dict[str, dict[str, str]] = {
         "ru": "Использование: <code>/memory on</code> или <code>/memory off</code>.",
     },
     "memory.already": {
-        "en": "Big memory is already <b>{state}</b>.",
-        "ru": "Большая память уже <b>{state}</b>.",
+        "en": "1M context is already <b>{state}</b>.",
+        "ru": "Контекст 1M уже <b>{state}</b>.",
     },
     "memory.on": {
-        "en": "Big memory <b>on</b> — on <b>Opus</b> this session now uses the 1M-token "
+        "en": "1M context <b>on</b> — on <b>Opus</b> this session now uses the 1M-token "
               "context window (on Sonnet/Haiku 1M isn't available, so context stays "
               "standard).{note}",
-        "ru": "Большая память <b>вкл</b> — на <b>Opus</b> эта сессия теперь использует "
+        "ru": "Контекст 1M <b>вкл</b> — на <b>Opus</b> эта сессия теперь использует "
               "окно контекста на 1M токенов (на Sonnet/Haiku 1M недоступно, контекст "
               "остаётся стандартным).{note}",
     },
     "memory.off": {
-        "en": "Big memory <b>off</b> — back to the standard context window.{note}",
-        "ru": "Большая память <b>выкл</b> — назад к стандартному окну контекста.{note}",
+        "en": "1M context <b>off</b> — back to the standard context window.{note}",
+        "ru": "Контекст 1M <b>выкл</b> — назад к стандартному окну контекста.{note}",
     },
     # #352: session memory (agent-saved per-topic notes via the `remember` tool).
     "memory.notes": {
@@ -1537,13 +1537,13 @@ CATALOG: dict[str, dict[str, str]] = {
         "ru": "Показ использования: <b>{usage}</b>",
     },
     "status.streaming": {"en": "Streaming: <b>{state}</b>", "ru": "Стриминг: <b>{state}</b>"},
-    "status.big_memory": {"en": "Big memory: <b>{state}</b>", "ru": "Большая память: <b>{state}</b>"},
+    "status.big_memory": {"en": "1M context: <b>{state}</b>", "ru": "Контекст 1M: <b>{state}</b>"},
     "status.busy": {
         "en": "Busy: {busy}; queued: {queued}",
         "ru": "Занят: {busy}; в очереди: {queued}",
     },
     # #170: native-checklist labels (the checkbox itself shows on/off).
-    "status.chk_bigmem": {"en": "Big memory (1M context)", "ru": "Большая память (1M контекст)"},
+    "status.chk_bigmem": {"en": "1M context", "ru": "Контекст 1M"},
     "status.chk_busy": {"en": "Busy ({queued} queued)", "ru": "Занят (в очереди: {queued})"},
     "status.cache": {
         "en": "Cache window (5 min): ~{secs}s left",
@@ -1940,6 +1940,31 @@ CATALOG: dict[str, dict[str, str]] = {
         "ru": "[ещё {n} файл(ов) из этого альбома пропущено — превышен лимит]",
     },
 
+    # -- voice notes (on_voice, #363) --------------------------------------- #
+    "voice.transcribing": {"en": "🎙 Transcribing…", "ru": "🎙 Расшифровываю…"},
+    "voice.transcript_prefix": {"en": "🎙 <i>{text}</i>", "ru": "🎙 <i>{text}</i>"},
+    # PREPENDED to the transcript that goes to the MODEL (plain text — not shown to the
+    # user) so the agent KNOWS it was a voice note and doesn't guess / hedge about the
+    # medium ("looks like speech recognition"). The on-screen bubble stays clean.
+    "voice.model_note": {
+        "en": "[Voice message — automatic transcription below; it may contain "
+              "speech-recognition errors, so interpret it by intent.]\n\n{text}",
+        "ru": "[Голосовое сообщение — ниже автоматическая расшифровка; возможны ошибки "
+              "распознавания речи, понимай по смыслу.]\n\n{text}",
+    },
+    "voice.too_long": {
+        "en": "🎙 Voice message is too long (max {sec}s).",
+        "ru": "🎙 Голосовое сообщение слишком длинное (макс. {sec} с).",
+    },
+    "voice.transcribe_failed": {
+        "en": "🎙 Could not transcribe the voice message.",
+        "ru": "🎙 Не удалось расшифровать голосовое сообщение.",
+    },
+    "voice.disabled": {
+        "en": "🎙 Voice transcription is unavailable (missing ffmpeg or the speech model).",
+        "ru": "🎙 Расшифровка голоса недоступна (нет ffmpeg или модели распознавания).",
+    },
+
     # -- permission gate (permissions.py) ----------------------------------- #
     "permgate.allow_btn": {"en": "✅ Allow", "ru": "✅ Разрешить"},
     "permgate.deny_btn": {"en": "⛔ Deny", "ru": "⛔ Запретить"},
@@ -2006,6 +2031,26 @@ CATALOG: dict[str, dict[str, str]] = {
     "err.invalid_request": {
         "en": "Invalid request to the model.",
         "ru": "Некорректный запрос к модели.",
+    },
+    # #361: a model REFUSAL (stop_reason == "refusal") arrives from the API as an
+    # invalid_request; the engine (_refine_error) relabels it to one of these distinct
+    # keys so a safety refusal is never shown as the misleading "Invalid request to the
+    # model." A cyber-safeguard refusal (category "cyber") gets its own message.
+    "err.cyber_refusal": {
+        "en": "The model declined this turn under its cybersecurity safeguards — a "
+              "safety refusal, not a bug or a malformed request. Try a new session "
+              "(/new) with a narrower, factual question, or switch model (/model).",
+        "ru": "Модель отклонила этот запрос из-за защиты по теме кибербезопасности — "
+              "это отказ по соображениям безопасности, а не ошибка запроса. Начните "
+              "новую сессию (/new) с более узким, фактическим вопросом или смените "
+              "модель (/model).",
+    },
+    "err.model_refusal": {
+        "en": "The model declined to answer this turn (a safety refusal). Try "
+              "rephrasing in a new session (/new), or switch model (/model).",
+        "ru": "Модель отказалась отвечать на этот запрос (отказ по соображениям "
+              "безопасности). Переформулируйте в новой сессии (/new) или смените "
+              "модель (/model).",
     },
     "err.server_error": {
         "en": "Server-side error. Please try again.",

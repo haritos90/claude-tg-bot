@@ -24,7 +24,18 @@ Relevant doc sections: *Rich Message Formatting Options*, *sendRichMessage*,
   - `message_thread_id` (optional).
 - **`sendRichMessage`** — persists the final message. `chat_id`, `rich_message` (required);
   `disable_notification`, `protect_content`, `message_thread_id`, … (optional). Returns the
-  sent `Message`.
+  sent `Message`. It carries **no `draft_id`** and does NOT dismiss an associated draft.
+- **No explicit draft-end / cancel exists** (re-verified against the live docs 2026-06-27). The
+  API exposes ONLY `sendMessageDraft` / `sendRichMessageDraft` — there is no
+  `deleteRichMessageDraft` / clear method, and `draft_id` MUST be non-zero (so it can't signal a
+  clear). Sending EMPTY content does NOT clear a draft: the plain-draft spec says *"Pass an empty
+  text to show a 'Thinking…' placeholder"* — empty ⇒ the thinking block, the OPPOSITE of clearing.
+  **A draft is cleared only when a real message lands in the chat** — the final `sendRichMessage`
+  that every normal turn sends via `streamer.finish()`; it cannot be force-removed early. The
+  streamer's ~20 s keepalive re-sends the draft to PREVENT expiry while streaming, so it must stop
+  at turn end and the turn must reach `finish()`. A turn that never does (wedged, or interrupted
+  by a restart before it finished) leaves an orphaned `<tg-thinking>` frame — for that incident, its diagnosis and recovery,
+  and the `_STALL_TIMEOUT_SEC` watchdog (#358), see **[`troubleshooting.md`](troubleshooting.md)**.
 
 ## InputRichMessage
 
@@ -109,8 +120,10 @@ per-field table below.
 - **Paragraph vertical margin (#353):** consecutive plain `\n\n` paragraphs render with only a
   SMALL inter-paragraph margin, whereas a heading / list / table BLOCK gets a larger one. So
   demoting a heading to a bold PARAGRAPH (to drop the heading font, `markup.demote_headings`)
-  looks cramped — a `U+00A0` (non-breaking-space) SPACER paragraph above it restores the gap
-  (verified on-device: a whitespace-only paragraph is NOT trimmed when it holds a nbsp).
+  looks cramped — a `U+00A0` (non-breaking-space) SPACER paragraph above AND below it restores
+  the gap on both sides (#360, was above-only in #353; verified on-device: a whitespace-only
+  paragraph is trimmed UNLESS it holds a nbsp, so a blank line won't do — the below spacer is
+  added lazily so it never trails the message, and adjacent headings share one deduped gap).
 
 ### Code blocks (`RichBlockPreformatted`, parsed `"type":"pre"`)
 
@@ -140,8 +153,10 @@ per-field table below.
   BLOCK renders in the client's distinct heading typeface, which clashed with the body font
   ("jumping fonts"). Demoting keeps ONE font (headings just bold, like Path A `md_to_html`);
   the model's heading text + any leading emoji are kept verbatim, `#` inside code fences is
-  skipped, and a `U+00A0` spacer paragraph is inserted above each heading to restore the
-  block's vertical gap (the **V2** choice; skipped for a first-line heading).
+  skipped, and a `U+00A0` spacer paragraph is inserted above AND below each heading to restore
+  the block's vertical gap on both sides (#360, was above-only in #353; the above spacer is
+  skipped for a first-line heading, the below one is lazy so it never trails, and adjacent
+  headings share one deduped gap).
 - `markup.table_to_rich_html` — builds the `<table>` HTML form (the #164 native-table path /
   `_send_rich` fallback).
 

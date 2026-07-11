@@ -32,14 +32,19 @@ Anthropic API key and no per-token billing**.
 
 ## 1. Where the work is defined
 
-All tasks live in [`TODO.md`](TODO.md). **Read its "How this file works" section
-first** — it is the source of truth for the `Backlog → Open → Closed → Deferred`
-lifecycle, the `Pri` / `Eff` / `Theme` columns, and the next-free-ID counter.
-Work the task you were handed, or an **Open** one.
+All tasks live in **`backlog/`** ([Backlog.md](https://github.com/MrLesk/Backlog.md)) —
+one markdown file per task under `backlog/tasks/` (`task-<N> - <slug>.md`), managed with
+the `backlog` CLI. Statuses flow `To Do → In Progress → Done`, with `Deferred` for parked
+work. Task **numbers are permanent and load-bearing**: the `task-<N>` id equals the `#N`
+referenced in code comments, so **never renumber, reuse, or backfill a gap** — new tasks
+auto-increment. Work the task you were handed, or a `To Do` one.
 
-- **New idea** → add a row to **Backlog** (+ an optional **Details** block).
-- **Closing** a task → move it to **Closed**, fill the **Resolution** column,
-  delete its Details block.
+- **Browse / find** → `backlog task list`, `backlog board`, `backlog search "…"`, or the
+  web UI (`backlog browser`).
+- **New idea** → `backlog task create "Title" -l <theme>` (a fresh `task-<N>` is assigned).
+- **Closing** a task → `backlog task edit <id> -s Done --notes "<how it was resolved>"`;
+  the resolution — the "decision" — lives in the task's **Implementation Notes**.
+- **Key architectural decisions** are recorded as ADRs under `backlog/decisions/`.
 
 **Docs are part of the change, not an afterthought — always update them, never
 break their structure.** Every change ships with the doc updates it implies, in
@@ -47,18 +52,20 @@ the SAME batch:
 
 - **Always update.** A DB/schema change updates [`data-model.md`](docs/data-model.md);
   a UX/menu/command change updates [`menu.md`](docs/menu.md); a config/env or
-  operational change updates `README.md` (and the `CLAUDE.md` "Operating" notes);
-  every task moves through the `TODO.md` ledger. A code change with no matching
+  operational change updates `README.md` (and the `CLAUDE.md` "Operating" notes); a
+  production incident plus its diagnosis/recovery updates
+  [`troubleshooting.md`](docs/troubleshooting.md); every task lives in the `backlog/`
+  ledger. A code change with no matching
   doc update is incomplete — treat the docs as the spec, not as commentary.
 - **Never break structure.** Each doc has a documented shape — obey it. For
-  `TODO.md`: keep the row/Details/Resolution forms, the column sets, table
-  ordering, never delete a section's header row, and **keep the next-free-ID
-  counter in sync** (it is the max allocated ID + 1 — verify against the actual
-  rows, don't trust a stale value). Re-read a doc's own "how this works" / format
-  preamble before editing it, rather than guessing the format.
+  `backlog/` tasks: keep the frontmatter + section forms (Description, Implementation
+  Notes), and **never change an existing task's number** (code comments reference it).
+  Prefer the `backlog` CLI over hand-editing files so the format and ids stay valid.
+  Re-read a doc's own "how this works" / format preamble before editing it, rather
+  than guessing the format.
 - **Spec voice, English only.** Declarative, present-tense, no first-person, no
-  provenance / chat quotes / dated "owner said" lines — see Golden rule 1 and the
-  `TODO.md` preamble. State the decision as a neutral fact.
+  provenance / chat quotes / dated "owner said" lines — see Golden rule 1. State
+  the decision as a neutral fact.
 
 ---
 
@@ -75,7 +82,7 @@ the SAME batch:
    **Non-English text (e.g. Cyrillic) is allowed ONLY in the three translation
    surfaces** — `i18n.py` `ru` values, `commands.py` `ru` labels, `menu.md`
    bilingual label tables — and NOWHERE else, including comments, docstrings,
-   `TODO.md`, and every other `.md`. This holds even when you are *describing* an
+   `backlog/` task files, and every other `.md`. This holds even when you are *describing* an
    i18n change: don't paste the localized string into prose or a ledger
    Resolution to show what changed — reference it by its `i18n.CATALOG` key and
    give only the English. Describe a violation; never reproduce it.
@@ -541,3 +548,7 @@ data-flow diagram: [`isolation.md`](docs/isolation.md).**
 - **Sandbox & isolation architecture:** [`isolation.md`](docs/isolation.md) — the bwrap jail
   plus the #119 credential broker / egress allowlist / per-session uid / per-session
   secrets / DoS+seccomp scheme, with a data-flow diagram.
+- **Rich streaming & tables:** [`rich-message-spec.md`](docs/rich-message-spec.md) — the
+  `sendRichMessage` / draft contract (verified against the live Bot API).
+- **Troubleshooting runbook:** [`troubleshooting.md`](docs/troubleshooting.md) — operator
+  diagnosis + recovery for production incidents (e.g. a stuck `<tg-thinking>` draft).

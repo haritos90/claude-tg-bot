@@ -401,11 +401,13 @@ def demote_headings(text: str) -> str:
 
     No CONTENT decoration is added: whatever the model put on the heading line (a leading
     emoji or not) is preserved verbatim, so the per-heading emoji choice stays the AGENT's. A
-    non-breaking-space SPACER paragraph IS inserted above each demoted heading (#353 V2): a
-    bold paragraph gets only a small inter-paragraph margin where a heading BLOCK had a larger
-    one, so without it the heading looked cramped (verified on-device — the nbsp renders as the
-    gap and is not trimmed). The spacer is skipped for a heading that is the very first content
-    (no empty line at the message top).
+    non-breaking-space SPACER paragraph is inserted BOTH above AND below each demoted heading
+    (#360, extending the #353 V2 above-only spacer): a bold paragraph gets only a small
+    inter-paragraph margin where a heading BLOCK had a larger one, so the heading is set off on
+    both sides (verified on-device — the nbsp renders as the gap and, unlike a blank line, is
+    not trimmed). The ABOVE spacer is skipped for a first-content heading (no blank line at the
+    message top); the BELOW spacer is added lazily — only once real content follows, so it
+    never trails the message frontier — and adjacent headings/spacers never stack (one gap).
 
     The transform is LINE-LOCAL and SKIPS fenced code (a ``# comment`` inside a ``` / ~~~
     block is left alone — fence state at any position is fixed by the text BEFORE it, so a
@@ -420,7 +422,26 @@ def demote_headings(text: str) -> str:
         return text
     out: list[str] = []
     in_fence = False
+    # #360: a just-demoted heading awaits its BELOW nbsp spacer, added lazily on the next line
+    # so it appears only once real content follows (never trailing the message frontier).
+    pending_after = False
+
+    def _add_spacer() -> None:
+        # a U+00A0 paragraph = the visual gap (a blank line alone is trimmed, an nbsp is not).
+        # Deduped: never stack two spacers (e.g. between adjacent headings) -> a single gap.
+        if next((x for x in reversed(out) if x != ""), None) == "\u00A0":
+            return
+        if out and out[-1] != "":
+            out.append("")
+        out.append("\u00A0")
+        out.append("")
+
     for line in text.split("\n"):
+        if pending_after:               # #360: flush the BELOW spacer for the previous heading
+            _add_spacer()
+            pending_after = False
+            if line == "":
+                continue                # the spacer's trailing blank stands in for the model's
         if _FENCE_TOGGLE_RE.match(line):
             in_fence = not in_fence
             out.append(line)
@@ -429,15 +450,13 @@ def demote_headings(text: str) -> str:
         if m is None:
             out.append(line)
             continue
-        # #353 (V2): insert a non-breaking-space SPACER paragraph above the demoted heading to
-        # restore the visual gap a heading block had (a plain bold paragraph gets only a small
-        # margin). Skip it when the heading is the FIRST content (out empty) — no top blank line.
+        # #353 (V2) + #360: nbsp SPACER paragraph above (skipped for first content) AND below
+        # the demoted heading, so the bold heading is set off on both sides like a block was.
+        # was (#353, above-only): if out: [blank?]; out.append(nbsp); out.append("").
         if out:
-            if out[-1] != "":
-                out.append("")          # guarantee a blank line before the spacer
-            out.append("\u00A0")        # nbsp spacer paragraph = the visual gap (V2)
-            out.append("")              # blank line after → the spacer is its own paragraph
+            _add_spacer()
         out.append("**" + m.group(2).replace("**", "").replace("__", "") + "**")
+        pending_after = True            # #360: BELOW spacer added when the next content arrives
     return "\n".join(out)
 
 
@@ -697,7 +716,12 @@ def extract_svgs(text: str):
 # delivered as its own message after the bubble. The <svg>→PNG path (above) is untouched.
 LOCATION_TOKEN = "\x00LOCATION\x00"
 _LOCATION_BLOCK_RE = re.compile(
-    r"```[ \t]*(?:location|geo)[ \t]*\r?\n(.*?)\r?\n?```",
+    # #354: require the CONTIGUOUS ```location / ```geo fence (no space after the backticks) so
+    # the regex agrees with the guards in extract_locations + streamer._hide_unclosed_location,
+    # which test the contiguous literal. A ``` location block (leading space) the regex once
+    # matched was rejected by those guards → its raw JSON reached the bubble and no pin was sent.
+    # was: r"```[ \t]*(?:location|geo)[ \t]*\r?\n(.*?)\r?\n?```"
+    r"```(?:location|geo)[ \t]*\r?\n(.*?)\r?\n?```",
     re.DOTALL | re.IGNORECASE,
 )
 # #347: a ```location block NESTED inside a longer (4+ backtick) fence is an EXAMPLE — the docs /

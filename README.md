@@ -28,6 +28,11 @@ API key, no per-token billing.
 - Diagrams in chat: when a chat reply contains an inline SVG (a schematic, chart, or
   floor plan), the bot rasterizes it to PNG and sends it as an image. Claude has no
   image generator, so this is vector diagrams, not photos.
+- Voice input (optional): send a voice message and the bot transcribes it on-device
+  (`ffmpeg` + `faster-whisper`, CPU-only — no API key, no audio leaves the host) and
+  treats the text as if you had typed it; the recognized text is shown so you can catch
+  mis-hearings. Off by default; recognition need not be perfect since the agent reads
+  through errors like typos. See [`voice.md`](docs/voice.md).
 - Isolated sessions: each is its own Claude session (context, working dir, resume id),
   born chat and upgradeable to code (`/code` ⇄ `/chat`). Nothing leaks between them.
   Browse, switch, rename, star, and delete via `/sessions`.
@@ -140,9 +145,10 @@ The code is grouped into the `app` package (run with `python -m app`):
 | `app/telegram/table_image.py` | Dormant PNG-table fallback, kept for wide tables. |
 | `deploy/` | Out-of-process helpers: `tg-bot.service` (systemd unit), `sandbox-claude.sh` (bubblewrap launcher), the egress / broker / seccomp scripts. |
 | `docs/` | Design docs: `data-model.md`, `isolation.md`, `menu.md`, `markup.md`, `rich-message-spec.md`, `CONTRIBUTING.md`, `SECURITY.md`. |
+| `backlog/` | Task ledger ([Backlog.md](https://github.com/MrLesk/Backlog.md)) — tasks and key-decision ADRs as plain markdown files, managed with the `backlog` CLI. |
 
-Tasks are tracked in [`TODO.md`](TODO.md); contributor rules in [`AGENTS.md`](AGENTS.md)
-and [`CONTRIBUTING.md`](docs/CONTRIBUTING.md).
+Tasks are tracked in [`backlog/`](backlog/) ([Backlog.md](https://github.com/MrLesk/Backlog.md));
+contributor rules in [`AGENTS.md`](AGENTS.md) and [`CONTRIBUTING.md`](docs/CONTRIBUTING.md).
 
 ---
 
@@ -219,6 +225,11 @@ directory; with the broker on, it never enters a jail.
 - Optional: `pytest` + `ruff` (`requirements-dev.txt`) for development. `cairosvg` needs
   the system `libcairo2` library (`apt install libcairo2`); without it the SVG-diagram
   feature falls back to sending the raw `.svg` file.
+- Optional (voice input): `ffmpeg` (`apt install ffmpeg`) + `faster-whisper`
+  (`pip install -r requirements-voice.txt`) enable on-device transcription of Telegram
+  voice notes (set `VOICE_TRANSCRIPTION=1`). Both run locally on CPU — no API key, no
+  audio leaves the host; the ~150 MB speech model downloads once on first use. Without
+  them the feature stays off. See [`voice.md`](docs/voice.md).
 - For the egress allowlist (`SANDBOX_EGRESS`, on by default): `iptables` (the
   `iptables-nft` backend works) + the `xt_cgroup` kernel module + cgroup v2. No
   `nftables` and no extra Python packages. A host that can't provide these must set

@@ -76,9 +76,12 @@ every ATX heading (`# …`–`###### …`) to `**bold**`, so the whole reply sta
 (headings just bold) — mirroring what `md_to_html` (Path A) already did. It preserves the
 model's heading text verbatim **including any leading emoji** (the per-heading emoji choice
 stays the model's — never bot-injected), skips `#` lines inside code fences, and inserts a
-non-breaking-space (`U+00A0`) spacer paragraph above each heading to restore the vertical gap
-a heading block had (the **V2** fix — a lone bold paragraph gets only a small inter-paragraph
-margin; verified on-device). The spacer is skipped for a heading that is the first content.
+non-breaking-space (`U+00A0`) spacer paragraph **above and below** each heading (#360, was
+above-only in #353) to restore the vertical gap a heading block had — a lone bold paragraph
+gets only a small inter-paragraph margin and a blank line alone is trimmed, so only the nbsp
+renders the gap (verified on-device). The ABOVE spacer is skipped for a first-content heading;
+the BELOW spacer is added lazily (only once content follows, never trailing the message) and
+adjacent headings share one deduped gap.
 
 A split-by-segment alternative — prose/tables as rich, each code block as a classic,
 copyable `<pre><code>` bubble — is implemented in `streamer._commit_mixed` (with

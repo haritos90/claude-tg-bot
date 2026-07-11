@@ -24,6 +24,7 @@ import contextlib
 import inspect
 import io
 import json
+import logging
 import re
 # import shutil  # unused after #177 — session-delete teardown moved to archive.py
 import time
@@ -53,10 +54,13 @@ from app.telegram import markup
 from app.telegram import streamer as streamer_mod  # #323: set_owner_premium (custom-emoji gate)
 from app.core import schedules
 from app.core import sessions as _sessions  # module (build_router's `sessions` param is the instance)
+from app.core import transcribe  # #363: local speech-to-text for voice notes
 from app.access import settings_schema as ss
 from app.storage import usage
 from app.access.allowlist import normalize_date
 from app.telegram.rich_message import EditRichMessage, SendRichMessage  # #164/#173: native rich
+
+log = logging.getLogger("handlers")
 
 
 # Friendly aliases mapped to concrete model ids for the /model command.
@@ -106,6 +110,10 @@ ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
 MAX_PDF_BYTES = 20 * 1024 * 1024
 MAX_TEXT_BYTES = 1 * 1024 * 1024
+# #363: voice note (Opus/OGG) raw-size cap. The Telegram Bot API getFile download limit
+# is ~20 MB and a voice note is far smaller; the real gate is the DURATION limit
+# (settings.voice_max_seconds). This just stops a huge forwarded audio from OOMing decode.
+MAX_VOICE_BYTES = 20 * 1024 * 1024
 # A text/code file is inlined into the prompt; cap the characters so a huge file
 # cannot blow up the context window.
 MAX_TEXT_INLINE_CHARS = 200_000
@@ -2896,7 +2904,12 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         key = await _session_key(message)
         lang = _lang(message)
         arg = _command_arg(message).lower()
-        _n = len((state.session_notes or "").strip())  # #352: show agent-saved memory size
+        # #352/#362: the agent-saved session notes are a code-only feature, so only surface
+        # their size in a code session for a code-level user. was (#352): shown in any session.
+        _uid = message.from_user.id if message.from_user else None
+        _uname = message.from_user.username if message.from_user else None
+        _mem_on = state.mode == "code" and _has_code_access(_uid, _uname)
+        _n = len((state.session_notes or "").strip()) if _mem_on else 0
         mem_suffix = i18n.t("memory.notes", lang, n=_n) if _n else ""
 
         if not arg:
@@ -2929,6 +2942,11 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         state = await _ensure_state(message)
         key = await _session_key(message)
         lang = _lang(message)
+        # #362: session memory is a code-only feature — reject in a chat session
+        # (matches /files, /shell, …). was (#352): available in any session.
+        if state.mode != "code":
+            await reply(message, i18n.t("common.code_only", lang))
+            return
         prior = (state.session_notes or "").strip()
         if not prior:
             await reply(message, i18n.t("forget.empty", lang))
@@ -5458,6 +5476,79 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         inline = f"--- {fname} ---\n{content}{note}"
         await _route_attachment(message, caption, None, inline,
                                 "attach.default_doc_prompt", lang)
+
+    @router.message(F.voice)
+    async def on_voice(message: Message) -> None:
+        """A Telegram voice note → local transcription → routed like a typed turn (#363).
+
+        Fully on-device (ffmpeg + faster-whisper run in the HOST process): the audio
+        never enters the per-session jail and never leaves the box. Recognition need not
+        be perfect — the agent tolerates errors the way it tolerates typos. The recognised
+        text is shown back (so mis-recognition is visible at a glance) and then submitted
+        exactly like a typed message. OFF unless VOICE_TRANSCRIPTION is set (optional deps).
+        """
+        if message.from_user is not None and message.from_user.is_bot:
+            return
+        lang = _lang(message)
+        if not settings.voice_transcription:
+            return  # feature off by deployment choice — stay silent (no spammy notice)
+        if not transcribe.available():
+            await reply(message, i18n.t("voice.disabled", lang))
+            return
+        voice = message.voice
+        cap = settings.voice_max_seconds
+        dur = getattr(voice, "duration", None)
+        if cap and dur and dur > cap:
+            await reply(message, i18n.t("voice.too_long", lang, sec=cap))
+            return
+        data, err = await _download(
+            voice, MAX_VOICE_BYTES, getattr(voice, "file_size", None), lang
+        )
+        if err:
+            await reply(message, err)
+            return
+        # A placeholder the user sees while we transcribe; it then BECOMES the recognised
+        # text so a bad transcription is visible. reply() returns nothing to edit, so use
+        # message.answer() (returns the sent Message).
+        holder = None
+        try:
+            holder = await message.answer(i18n.t("voice.transcribing", lang))
+        except Exception:
+            holder = None
+        try:
+            text = await transcribe.transcribe(
+                data,
+                model=settings.voice_model,
+                lang=settings.voice_lang,
+                download_root=(settings.voice_model_path
+                               or transcribe.default_model_root(str(settings.base_workdir))),
+            )
+        except Exception as exc:  # ffmpeg / model / decode failure
+            log.warning("voice transcription failed: %s", exc)
+            text = ""
+        text = (text or "").strip()
+        if not text:
+            failed = i18n.t("voice.transcribe_failed", lang)
+            if holder is not None:
+                try:
+                    await holder.edit_text(failed)
+                    return
+                except Exception:
+                    pass
+            await reply(message, failed)
+            return
+        shown = i18n.t("voice.transcript_prefix", lang, text=markup.escape_html(text))
+        if holder is not None:
+            try:
+                await holder.edit_text(shown, parse_mode="HTML")
+            except Exception:
+                await reply(message, shown)
+        else:
+            await reply(message, shown)
+        # Prepend a marker so the MODEL knows this was a voice note (and may contain
+        # recognition errors) — otherwise it guesses / hedges ("looks like speech
+        # recognition"). The on-screen bubble above stays the clean transcript.
+        await _submit(message, i18n.t("voice.model_note", lang, text=text))
 
     # ------------------------------------------------- permission callbacks
 

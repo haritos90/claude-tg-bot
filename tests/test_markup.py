@@ -578,6 +578,16 @@ def test_extract_locations():
     demo = "````\n```location\n{\"lat\":1,\"lon\":2}\n```\n````"
     od, dlocs = markup.extract_locations(demo)
     assert dlocs == [] and od == demo
+    # #354: a SPACED fence (``` location) is NOT the documented contiguous form. Even alongside a
+    # valid contiguous block (so the cheap pre-guard passes), the regex now agrees with the guards
+    # and leaves the spaced block verbatim — only the contiguous one becomes a pin (was: the old
+    # regex matched the spaced form too, so behavior diverged from the guards that reject it).
+    mixed = ("```location\n{\"lat\":1,\"lon\":2}\n```\nand\n"
+             "``` location\n{\"lat\":3,\"lon\":4}\n```")
+    omx, mxlocs = markup.extract_locations(mixed)
+    assert mxlocs == [{"lat": 1.0, "lon": 2.0}]            # only the contiguous block → a pin
+    assert omx.count(markup.LOCATION_TOKEN) == 1           # spaced fence not tokenized
+    assert '"lat":3' in omx.replace(" ", "")               # spaced block left verbatim as text
 
 
 def test_render_svg_png_smoke():
@@ -594,20 +604,22 @@ def test_render_svg_png_smoke():
 
 
 def test_demote_headings():
-    """#353: ATX headings → **bold** for the rich {"markdown"} path, so the reply stays in
-    ONE font (no separate Telegram heading typeface). Decoration is the model's (a leading
-    emoji is preserved verbatim), and code fences are skipped so a `# comment` is not bolded."""
-    # each ATX level → bold, title verbatim
+    """#353/#360: ATX headings -> **bold** for the rich {"markdown"} path, so the reply stays in
+    ONE font (no separate Telegram heading typeface). Decoration is the model's (a leading emoji
+    is preserved verbatim), and code fences are skipped so a `# comment` is not bolded. A nbsp
+    (U+00A0) SPACER paragraph sets each demoted heading off ABOVE and BELOW (#360, was above-only
+    in #353) — a plain blank line would be trimmed, only the nbsp survives to render the gap."""
+    NB = "\u00A0"  # the spacer paragraph char
+    # each ATX level -> bold, title verbatim. A heading that is the LAST line gets NO trailing
+    # spacer: the BELOW spacer is added lazily, only once real content follows it.
     assert markup.demote_headings("# Title") == "**Title**"
     assert markup.demote_headings("###### Deep") == "**Deep**"
-    # the model's OWN leading emoji is ARBITRARY content (not a bot-added icon) and is
-    # preserved verbatim — we neither add nor strip it. Neutral, non-#154 glyph on purpose.
+    # the model's OWN leading emoji is ARBITRARY content (not a bot-added icon), preserved verbatim.
     assert markup.demote_headings("## 🚀 Launch plan") == "**🚀 Launch plan**"
-    # body prose + an inline bold lead-in on a list item are untouched; a heading that FOLLOWS
-    # content gets a \u00A0 spacer paragraph above it (#353 V2 — restores the heading gap)
+    # #360: a heading with content on BOTH sides gets a spacer paragraph above AND below it.
     src = "Intro line.\n\n## Section\n\n- **Lead** — rest of the line."
     assert (markup.demote_headings(src)
-            == "Intro line.\n\n\u00A0\n\n**Section**\n\n- **Lead** — rest of the line.")
+            == f"Intro line.\n\n{NB}\n\n**Section**\n\n{NB}\n\n- **Lead** — rest of the line.")
     # a bare '#' (no space) and a mid-line '#' are NOT headings
     assert markup.demote_headings("#nospace") == "#nospace"
     assert markup.demote_headings("see # 3 below") == "see # 3 below"
@@ -616,17 +628,23 @@ def test_demote_headings():
     assert markup.demote_headings(fenced) == fenced
     tilde = "~~~\n# also a comment\n~~~"
     assert markup.demote_headings(tilde) == tilde
-    # a heading AFTER a closed fence IS demoted again (fence toggles back), spacer added too
+    # a heading AFTER a closed fence IS demoted (fence toggles back); LAST line -> ABOVE spacer only
     mixed = "```\ncode\n```\n## After"
-    assert markup.demote_headings(mixed) == "```\ncode\n```\n\n\u00A0\n\n**After**"
+    assert markup.demote_headings(mixed) == f"```\ncode\n```\n\n{NB}\n\n**After**"
     # inner ** in the title is dropped (the whole line is already bold)
     assert markup.demote_headings("## **Bold** part") == "**Bold part**"
-    # a heading still being typed at the frontier is already bold (no bare '##' that would
-    # flash the heading font then snap) — it just extends as more text streams in
+    # a heading still being typed at the frontier is already bold (no bare '##' flash); being the
+    # last line it carries no trailing spacer yet — the BELOW gap appears once body streams in.
     assert markup.demote_headings("## My Hea") == "**My Hea**"
-    # #353 V2 spacer: a FIRST-content heading has none (no blank line at the top); a heading
-    # FOLLOWING content gets the \u00A0 spacer paragraph above it.
-    assert markup.demote_headings("## First\n\nbody") == "**First**\n\nbody"
-    assert markup.demote_headings("intro\n\n## Sec") == "intro\n\n\u00A0\n\n**Sec**"
+    # #360 spacer placement: a FIRST-content heading has NO above spacer (no blank line at the
+    # top) but DOES get a below spacer once body follows; a heading FOLLOWING content but LAST
+    # gets the above spacer only.
+    assert markup.demote_headings("## First\n\nbody") == f"**First**\n\n{NB}\n\nbody"
+    assert markup.demote_headings("intro\n\n## Sec") == f"intro\n\n{NB}\n\n**Sec**"
+    # #360: a heading immediately followed by body with NO blank line still gets the BELOW spacer,
+    # so the heading paragraph never soft-break-joins onto the body line.
+    assert markup.demote_headings("## H\nbody") == f"**H**\n\n{NB}\n\nbody"
+    # #360: adjacent headings (no body between) share ONE gap — spacers are deduped, not stacked.
+    assert markup.demote_headings("## A\n## B") == f"**A**\n\n{NB}\n\n**B**"
     # no-op fast path when there is no '#'
     assert markup.demote_headings("plain text only") == "plain text only"

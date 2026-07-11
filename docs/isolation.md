@@ -366,6 +366,6 @@ denylist (seccomp) bound what a single session can consume or call (e.g. `ptrace
 denied → no `strace`/`gdb` inside a code session).
 
 > Historical note: this section preserves the threat model and design rationale that
-> originally lived in the TODO #119 umbrella task (closed once the design shipped). The
+> originally lived in the #119 umbrella task (closed once the design shipped). The
 > deliberated build options (proxy vs netns vs slirp) are settled — the deployment runs
 > the CONNECT proxy + hard cgroup egress block described in §4.

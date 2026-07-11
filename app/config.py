@@ -106,7 +106,7 @@ class Settings:
     # #261: rotate a quiet session to a FRESH context after this long with no activity, so the
     # next message starts clean instead of re-ingesting stale history (context drift). The old
     # transcript + workdir are kept on disk. 0 = never auto-rotate. Per-user override → idle_reset_min.
-    idle_reset_sec: int = 1800     # 30 min
+    idle_reset_sec: int = 2700     # 45 min (was 1800 / 30 min — #359)
     max_concurrent_turns: int = 4  # cap on SIMULTANEOUS active turns (the generation spike)
     min_free_mb: int = 400         # below this MemAvailable, evict idle clients before a turn
     # Extra prompt keyword triggers to neutralize, ON TOP of the built-in defaults
@@ -121,6 +121,17 @@ class Settings:
     # /settings → Admin (persisted in kv `archive_retention_days`, which overrides
     # this startup default).
     archive_retention_days: int = 180
+    # #363: local speech-to-text for Telegram voice notes. OFF by default — needs the
+    # OPTIONAL ffmpeg (system binary) + faster-whisper (pip; see requirements-voice.txt)
+    # deps. When on, a voice note is decoded with ffmpeg and transcribed on-device by
+    # faster-whisper in the HOST process (audio never enters the jail, never leaves the
+    # box), then routed like a typed turn. Recognition need not be perfect — the agent
+    # tolerates errors like typos — so a small/fast model (default "base") is enough.
+    voice_transcription: bool = False
+    voice_model: str = "base"     # faster-whisper size (tiny/base/small/...) or a local model path
+    voice_lang: str = ""          # "" = autodetect; force a language with e.g. "ru" / "en"
+    voice_max_seconds: int = 300  # reject longer notes (protects the CPU box); 0 = no limit
+    voice_model_path: str = ""    # model cache dir; "" = a "models" dir beside BASE_WORKDIR
 
 
 def load_settings() -> Settings:
@@ -242,7 +253,7 @@ def load_settings() -> Settings:
     max_live_clients = max(1, _int("MAX_LIVE_CLIENTS", _default_live))
     idle_ttl_sec = max(60, _int("IDLE_TTL_SEC", 360))  # #179: 6-min default = warm-cache (5m) + 1m
                                                        # buffer (per-user override → #182)
-    idle_reset_sec = max(0, _int("IDLE_RESET_SEC", 1800))  # #261: 30-min idle → fresh session
+    idle_reset_sec = max(0, _int("IDLE_RESET_SEC", 2700))  # #261: 45-min idle → fresh session (was 1800)
                                                            # (0 = off; per-user override → idle_reset_min)
     shell_ttl_sec = max(0, _int("SHELL_TTL_SEC", 86400))   # #274: detached-shell TTL (0 = until delete)
     max_concurrent_turns = max(1, _int("MAX_CONCURRENT_TURNS", _default_turns))
@@ -264,6 +275,15 @@ def load_settings() -> Settings:
     # #178: archive retention in days (0 = keep forever). The startup default; the
     # owner can override it at runtime via /settings → Admin (kv archive_retention_days).
     archive_retention_days = max(0, _int("ARCHIVE_RETENTION_DAYS", 180))
+
+    # #363: voice-note transcription (optional feature; deps in requirements-voice.txt).
+    # voice_lang "" = autodetect; VOICE_MODEL default "base" (VOICE_MODEL can pick tiny =
+    # faster / small = better, or a local path); VOICE_MAX_SECONDS default 300 (0 = off).
+    voice_transcription = _flag("VOICE_TRANSCRIPTION", False)
+    voice_model = (os.environ.get("VOICE_MODEL", "") or "").strip() or "base"
+    voice_lang = (os.environ.get("VOICE_LANG", "") or "").strip()
+    voice_max_seconds = max(0, _int("VOICE_MAX_SECONDS", 300))
+    voice_model_path = (os.environ.get("VOICE_MODEL_PATH", "") or "").strip()
 
     # Extra keyword triggers to neutralize in prompts (on top of the engine
     # defaults). Comma- or whitespace-separated; blanks dropped.
@@ -301,5 +321,10 @@ def load_settings() -> Settings:
         max_concurrent_turns=max_concurrent_turns,
         min_free_mb=min_free_mb,
         archive_retention_days=archive_retention_days,
+        voice_transcription=voice_transcription,
+        voice_model=voice_model,
+        voice_lang=voice_lang,
+        voice_max_seconds=voice_max_seconds,
+        voice_model_path=voice_model_path,
         extra_blocked_keywords=extra_blocked_keywords,
     )

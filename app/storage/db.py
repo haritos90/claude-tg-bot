@@ -1324,7 +1324,7 @@ async def set_created_by(thread_id: int, user_id: int) -> None:
 async def browse_threads(
     chat_id: int, keyword: str | None = None, limit: int = 8, offset: int = 0
 ) -> tuple[list[dict], int]:
-    """Return (page_rows, total) of a chat's sessions, newest first.
+    """Return (page_rows, total) of a chat's sessions, most-recently-active first.
 
     chat_id selects the surface: the supergroup id lists its topics; a user id
     lists that user's DM sessions. An optional keyword does a simple name search.
@@ -1345,7 +1345,15 @@ async def browse_threads(
             "SELECT thread_id, name, mode, created_at, created_by, "
             "COALESCE(favorite, 0) AS favorite, COALESCE(name_auto, 1) AS name_auto "
             f"FROM threads WHERE {where} "
-            "ORDER BY favorite DESC, created_at DESC LIMIT ? OFFSET ?",
+            # #364: order by most-recent ACTIVITY, not creation time, so writing in an
+            # existing session floats it back to the top. last_active is stamped at each
+            # turn end (sessions.set_last_active); a fresh/never-completed session has
+            # last_active=0, so max(last_active, created_at) falls back to created_at and
+            # it still sorts sensibly. SQLite scalar max() over like epoch-seconds floats.
+            # was: "ORDER BY favorite DESC, created_at DESC LIMIT ? OFFSET ?"  (#364)
+            "ORDER BY favorite DESC, "
+            "max(COALESCE(last_active, 0), COALESCE(created_at, 0)) DESC "
+            "LIMIT ? OFFSET ?",
             (*params, limit, offset),
         )
         rows = await cur.fetchall()

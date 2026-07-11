@@ -21,3 +21,8 @@ Pillow==12.2.0
 # render SVG inline). Needs the system library libcairo2 (apt install libcairo2). See
 # svg_image.py. If rendering fails the bot falls back to sending the raw .svg document.
 cairosvg==2.9.0
+
+# Optional: voice-note transcription (#363) — NOT installed by default. Install with
+#   pip install -r requirements-voice.txt      (also needs the ffmpeg system binary)
+# Kept out of the base install so a deploy without voice input doesn't pull the heavy
+# CTranslate2 stack. See requirements-voice.txt and docs/voice.md.

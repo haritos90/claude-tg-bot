@@ -45,11 +45,13 @@ session`. Types: `feat` · `fix` · `docs` · `refactor` · `test` · `build` ·
 
 ## Tasks
 
-Work is tracked in [`TODO.md`](../TODO.md), which flows **Backlog → Open → Closed**
-(with a **Deferred** parking area). Read its "How this file works" section first.
-A new idea goes to **Backlog**; when you pick it up move it to **Open**; when it's
-done move it to **Closed** and fill the **Resolution** column (deleting its Details
-block).
+Work is tracked in [`backlog/`](../backlog) ([Backlog.md](https://github.com/MrLesk/Backlog.md)) —
+one markdown file per task under `backlog/tasks/`, managed with the `backlog` CLI. Statuses
+flow **To Do → In Progress → Done** (with **Deferred** for parked work). A new idea →
+`backlog task create "Title"`; when it's done → `backlog task edit <id> -s Done --notes
+"<resolution>"` (the resolution lives in the task's **Implementation Notes**). Task numbers
+are permanent — code comments reference them, so never renumber. Key architectural
+decisions are recorded as ADRs under `backlog/decisions/`.
 
 ## Before you open a PR
 

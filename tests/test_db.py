@@ -135,6 +135,30 @@ def test_browse_threads_surfaces_name_auto_for_gc_guard(tmp_path):
     assert auto not in cands    # the kept/current session is never a candidate either
 
 
+def test_browse_threads_orders_by_last_activity_not_creation(tmp_path):
+    # #364: writing in an existing session must float it back to the top. The list was
+    # ordered by created_at, so an OLD session you kept chatting in never moved up. Order
+    # by max(last_active, created_at): an active session sorts by last_active; a fresh /
+    # never-completed one (last_active=0) falls back to created_at.
+    async def _t():
+        await db.init_db(str(tmp_path / "order.db"))
+        uid = 9
+        a = await db.allocate_dm_session(uid, "Italy trip", "m", "/tmp", mode="chat")
+        b = await db.allocate_dm_session(uid, "Groceries", "m", "/tmp", mode="chat")
+        c = await db.allocate_dm_session(uid, "Fresh", "m", "/tmp", mode="chat")
+        # last_active is a wall-clock stamp; use values well past created_at (~now) so the
+        # override dominates. `a` was created FIRST but is active MOST recently → top.
+        await db.set_last_active(a, 9_000_000_100.0)
+        await db.set_last_active(b, 9_000_000_050.0)
+        # `c` never completed a turn (last_active stays 0) → sorts by its own created_at,
+        # which is newest, yet it must land LAST because a/b have real activity.
+        page, _ = await db.browse_threads(uid, None, limit=100, offset=0)
+        await db.close_db()
+        return [r["thread_id"] for r in page], a, b, c
+    order, a, b, c = _run(_t)
+    assert order == [a, b, c]   # most-recently-active first; never-active oldest
+
+
 def test_last_active_and_idle_rotation_keeps_messages(tmp_path):
     # #261: last_active roundtrips; rotate_session_for_idle drops the resume ids but
     # keeps the message log + cwd (unlike reset_thread, which wipes messages).

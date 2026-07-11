@@ -2,7 +2,7 @@
 
 Specification of the bot's menus, commands, and settings/access-control model —
 the canonical structure every surface conforms to. Audience: deployer/owner and
-contributors. Open work: `TODO.md`.
+contributors. Open work: `backlog/` (Backlog.md).
 
 **Conventions.**
 
@@ -217,6 +217,7 @@ Conventions legend).
 | `/model` | Switch model: opus \| sonnet \| haiku | Сменить модель: opus \| sonnet \| haiku | none → picker | 🟢 |
 | `/effort` | Reasoning depth: low … max | Глубина рассуждений: low … max | none → picker | 🟢 (`max` gated) |
 | `/memory` | 1M context window (chat): on \| off | Окно контекста 1M (чат): on \| off | none → toggle | 🟢 |
+| `/forget` | Clear this topic's agent-saved memory (code) | Очистить память темы, сохранённую агентом (код) | none | 🟦 |
 | `/language` | Choose the interface language | Выбрать язык интерфейса | none → picker | 🟢 |
 | `/context` | Context-window usage | Использование окна контекста | none | 🟢 |
 | `/limits` | 📊 Your usage limits | 📊 Ваши лимиты использования | none | 🟢 |
@@ -319,7 +320,7 @@ rows appear only in a code session (§1.7).
 | ⚡ Effort: high ▸ | ▮ full width |
 | 🔐 Permissions: auto-edits ▸ *(code)* | ▮ full width |
 | 🔁 Max turns: unlimited ▸ *(code)* | ▮ full width |
-| 🗄 Big memory: off *(granted)* | ▮ full width |
+| 🗄 1M context: off *(granted)* | ▮ full width |
 | 🧪 Sandbox: on ▸ *(owner)* | ▮ full width |
 | 🌐 Language: English ▸ | ▮ full width |
 | 🔥 Warm-cache note: off | ▮ full width |
@@ -340,7 +341,7 @@ rows appear only in a code session (§1.7).
 | Effort | ⚡ Effort: {value} ▸ | ⚡ Усилие: {value} ▸ | 🟢 (`max` gated) |
 | Permissions | 🔐 Permissions: {value} ▸ | 🔐 Права: {value} ▸ | 🟦 |
 | Max turns | 🔁 Max turns: {value} ▸ | 🔁 Лимит ходов: {value} ▸ | 🟦 |
-| Big memory | 🗄 Big memory: {on/off} | 🗄 Большая память: {вкл/выкл} | 🟢 (granted) |
+| 1M context | 🗄 1M context: {on/off} | 🗄 Контекст 1M: {вкл/выкл} | 🟢 (granted) |
 | Sandbox | 🧪 Sandbox: {value} ▸ | 🧪 Песочница: {value} ▸ | 👑 |
 | Language | 🌐 Language: {name} ▸ | 🌐 Язык: {name} ▸ | 🟢 |
 | Warm-cache note | 🔥 Warm-cache note: {on/off} | 🔥 Заметка о тёплом кэше: {вкл/выкл} | 🟢 (delegated) |
@@ -470,12 +471,12 @@ option showing that user's effective access — their **exception** if set, else
 Read-only · Hidden**. This is how *"give it to only some users"* is expressed:
 **leave the base Hidden, then delegate per user here.**
 
-> **Worked example — delegate 🗄 Big memory to specific users.** Big memory's base
+> **Worked example — delegate 🗄 1M context to specific users.** 1M context's base
 > access is **Hidden** (Table 23), so by default no one but the owner sees it. To
-> grant it to a chosen user: **👥 Users → tap the user → 🔑 Access → 🗄 Big memory →
-> Delegated**. That user now sees and toggles big memory; everyone else still has it
+> grant it to a chosen user: **👥 Users → tap the user → 🔑 Access → 🗄 1M context →
+> Delegated**. That user now sees and toggles 1M context; everyone else still has it
 > hidden. (If you previously changed its **Global** base to Read-only, set it back to
-> **Hidden** on 🌍 Global → 🗄 Big memory → 🔑 Base access first.)
+> **Hidden** on 🌍 Global → 🗄 1M context → 🔑 Base access first.)
 
 ### 3.5 Choice pickers
 
@@ -597,7 +598,7 @@ One row per option. *Applies to* marks code-only options (§1.7). *Base access* 
 | `effort` | enum: low, medium, high, xhigh, max, default | high | all | Delegated | `max`: delegated only to granted users |
 | `permission_mode` | enum: ask, auto-edits, plan, full-access | auto-edits | code | Delegated | `full-access`: owner only; default `auto-edits` auto-runs in-jail edits + ordinary shell, prompts only for push/destructive/web |
 | `max_turns` | int 1–1000, or unlimited | unlimited | code | Delegated | — |
-| `memory` | bool | off | all | Hidden | Delegated: granted users (the per-session 1M big-memory toggle) |
+| `memory` | bool | off | all | Hidden | Delegated: granted users (the per-session 1M-context toggle) |
 | `sandbox` | bool | on | all (chat & code) | Hidden | owner: Delegated (#180: jail covers chat sessions too) |
 | `language` | enum: supported locales | en | all (UI) | Delegated | — |
 | `usage_display` | enum: off, footer, pinned, both | footer | account-wide | Read-only | owner: Delegated |

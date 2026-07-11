@@ -1133,12 +1133,13 @@ class Streamer:
         if not locations:
             return rich_text
         lang = i18n.cached_lang(self.chat_id)
-        parts = rich_text.split(markup.LOCATION_TOKEN)
-        out = parts[0]
         note = i18n.t("stream.location", lang)
-        for idx in range(len(locations)):
-            out += note + (parts[idx + 1] if idx + 1 < len(parts) else "")
-        return out
+        # #354: replace EACH LOCATION_TOKEN with the note, driven off the ACTUAL tokens present
+        # (note.join) rather than range(len(locations)). Token and location counts are equal by
+        # construction (extract_locations emits one token per location); joining on the real
+        # tokens can never drop a trailing part or index past the split if they ever diverged.
+        # was: parts=split; out=parts[0]; for idx in range(len(locations)): out+=note+(parts[idx+1] if idx+1<len(parts) else "")
+        return note.join(rich_text.split(markup.LOCATION_TOKEN))
 
     def _hide_unclosed_location(self, body: str) -> str:
         """#344: in a streaming draft, a ```location fence that hasn't closed yet would show as raw

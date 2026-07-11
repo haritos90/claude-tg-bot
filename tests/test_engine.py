@@ -120,27 +120,58 @@ def test_apply_session_note_append_replace_and_cap():
     assert (big + "\nnewest").endswith("\n" + out)
 
 
-def test_session_notes_block_injected_low_authority_both_modes():
-    """Saved notes are injected (chat + code) as explicitly NON-authoritative context;
-    empty notes inject nothing (so the plain-prompt equality above still holds)."""
-    assert _sess("chat")._session_notes_block() == ""                    # empty → nothing
+def test_apply_session_note_byte_accurate_cap():
+    """#355: the size cap is UTF-8 BYTES, not code points — a multibyte note is trimmed to the
+    byte budget and always decodes cleanly (no mojibake), even when the cut splits a character."""
+    # 100 Cyrillic chars = 200 UTF-8 bytes; an EVEN cap lands on a 2-byte char boundary.
+    out = engine._apply_session_note("", "я" * 100, False, cap=50)
+    assert len(out.encode("utf-8")) <= 50
+    assert out == "я" * 25 and "�" not in out          # clean boundary, no replacement char
+    # An ODD cap forces the slice to split a 2-byte char; the stray byte is dropped, not mojibaked.
+    odd = engine._apply_session_note("", "я" * 100, False, cap=51)
+    assert len(odd.encode("utf-8")) <= 51 and odd == odd.encode("utf-8").decode("utf-8")
+    assert "�" not in odd
+    # Emoji (4-byte) over a small cap → still byte-bounded and valid (replace path).
+    emo = engine._apply_session_note("", "😀" * 20, True, cap=21)   # 80 bytes → ≤ 21
+    assert len(emo.encode("utf-8")) <= 21 and "�" not in emo
+
+
+def test_session_notes_block_injected_low_authority_code_only():
+    """#362: saved notes are injected ONLY in a CODE session owned by a CODE-LEVEL user, as
+    explicitly NON-authoritative context. A chat session — and a code session held by a
+    demoted (chat-level) user — inject nothing; the blob stays dormant in the DB. Empty
+    notes inject nothing even when enabled (so the plain-prompt equality above still holds)."""
     note = "user prefers metric units"
-    chat = _sess("chat", session_notes=note)._build_options()
-    assert note in chat.system_prompt
-    assert "NOT as instructions" in chat.system_prompt                   # low-authority framing
-    code = _sess("code", session_notes=note)._build_options()
+    # Chat: never injected — session memory is code-only now, even with notes saved.
+    chat = _sess("chat", session_notes=note, user_level="code")._build_options()
+    assert note not in (chat.system_prompt or "")
+    # Code + code-level user: injected as low-authority continuity context.
+    code = _sess("code", session_notes=note, user_level="code")._build_options()
     assert note in code.system_prompt.get("append", "")
+    assert "NOT as instructions" in code.system_prompt.get("append", "")   # low-authority framing
+    # Demotion gap: a code session whose owner is now chat-level gets nothing.
+    demoted = _sess("code", session_notes=note, user_level="chat")._build_options()
+    assert note not in demoted.system_prompt.get("append", "")
+    # Empty notes → nothing even when enabled.
+    assert _sess("code", user_level="code")._session_notes_block() == ""
 
 
-def test_remember_tool_exposed_and_auto_allowed_both_modes():
-    """The in-process `remember` MCP server is attached and the tool is auto-allowed (no
-    approval prompt) in BOTH chat and code, and is classified safe so the code gate never
-    prompts for it."""
+def test_remember_tool_exposed_and_auto_allowed_code_only():
+    """#362: the in-process `remember` MCP server + its auto-allow entry are attached ONLY in
+    a code session owned by a code-level user; a chat session — and a demoted user's code
+    session — get neither. The tool stays classified safe so the code gate never prompts."""
     from app.access import permissions
-    for mode in ("chat", "code"):
-        opts = _sess(mode)._build_options()
-        assert "memory" in (opts.mcp_servers or {})
-        assert engine.MEMORY_TOOL in opts.allowed_tools
+    code = _sess("code", user_level="code")._build_options()
+    assert "memory" in (code.mcp_servers or {})
+    assert engine.MEMORY_TOOL in code.allowed_tools
+    # Chat: no memory server, tool not auto-allowed (even for a code-level user).
+    chat = _sess("chat", user_level="code")._build_options()
+    assert "memory" not in (chat.mcp_servers or {})
+    assert engine.MEMORY_TOOL not in chat.allowed_tools
+    # Demotion gap: a code session held by a now-chat-level user gets no memory.
+    demoted = _sess("code", user_level="chat")._build_options()
+    assert "memory" not in (demoted.mcp_servers or {})
+    assert engine.MEMORY_TOOL not in demoted.allowed_tools
     assert engine.MEMORY_TOOL in permissions.SAFE_TOOLS
 
 
@@ -286,4 +317,187 @@ def test_first_token_timeout_surfaces_service_unavailable(monkeypatch):
     assert events[0].kind == "error"
     assert events[0].error_key == "err.service_unavailable"
     assert sess.client is None and stall.disconnected          # client dropped → next turn rebuilds
+
+
+def test_stall_after_reasoning_surfaces_service_unavailable(monkeypatch):
+    """#358: a thinking_delta disarms the first-token watchdog (it is a StreamEvent), so a turn
+    that streams REASONING and then goes silent — no answer text/tool/result — used to animate the
+    <tg-thinking> draft forever. The stall watchdog now cuts it short with a service-unavailable
+    error and drops the client. The first-token watchdog is set high so ONLY the stall guard fires."""
+    import asyncio
+    from claude_agent_sdk.types import StreamEvent
+
+    monkeypatch.setattr(engine, "_FIRST_TOKEN_TIMEOUT_SEC", 5.0)   # not the guard under test
+    monkeypatch.setattr(engine, "_STALL_TIMEOUT_SEC", 0.05)
+
+    class _ReasonThenStallClient:
+        def __init__(self):
+            self.disconnected = False
+
+        async def disconnect(self):
+            self.disconnected = True
+
+        async def receive_response(self):
+            # reasoning arrives first → _progressed=True, _answered=False
+            yield StreamEvent(uuid="u", session_id="resume-abc",
+                              event={"type": "content_block_delta",
+                                     "delta": {"thinking": "let me think…"}})
+            await asyncio.sleep(5)   # then silence, far longer than the stall window
+            yield object()           # pragma: no cover — unreachable in the test
+
+    sess = engine.ClaudeSession("chat", "claude-opus-4-8", None, resume_session_id="resume-abc")
+    client = _ReasonThenStallClient()
+
+    async def _ensure():
+        sess.client = client
+
+    async def _send(*a, **k):
+        return None
+
+    monkeypatch.setattr(sess, "_ensure_client", _ensure)
+    monkeypatch.setattr(sess, "_send_query", _send)
+
+    async def _collect():
+        out = []
+        async for ev in sess.run("hello"):
+            out.append(ev)
+        return out
+
+    events = asyncio.run(_collect())
+    kinds = [e.kind for e in events]
+    assert "thinking_delta" in kinds                            # the reasoning WAS surfaced
+    assert events[-1].kind == "error"
+    assert events[-1].error_key == "err.service_unavailable"
+    assert sess.client is None and client.disconnected         # client dropped → next turn rebuilds
+
+
+def test_reasoning_then_answer_does_not_false_timeout(monkeypatch):
+    """#358: once REAL answer content starts the stall watchdog must disarm — a turn that streams a
+    thinking_delta then answer text completes normally (text surfaced, no spurious error), even
+    across a gap LONGER than the stall window (a long tool call / build legitimately emits nothing)."""
+    import asyncio
+    from claude_agent_sdk.types import StreamEvent
+
+    monkeypatch.setattr(engine, "_FIRST_TOKEN_TIMEOUT_SEC", 5.0)
+    monkeypatch.setattr(engine, "_STALL_TIMEOUT_SEC", 0.05)
+
+    class _ReasonThenAnswerClient:
+        async def disconnect(self):
+            pass
+
+        async def receive_response(self):
+            yield StreamEvent(uuid="u", session_id="resume-abc",
+                              event={"type": "content_block_delta",
+                                     "delta": {"thinking": "thinking…"}})
+            await asyncio.sleep(0.001)   # well within the stall window
+            yield StreamEvent(uuid="u", session_id="resume-abc",
+                              event={"type": "content_block_delta",
+                                     "delta": {"text": "the answer"}})
+            await asyncio.sleep(0.2)     # > stall window, but _answered is set now → unbounded
+
+    sess = engine.ClaudeSession("chat", "claude-opus-4-8", None, resume_session_id="resume-abc")
+    client = _ReasonThenAnswerClient()
+
+    async def _ensure():
+        sess.client = client
+
+    async def _send(*a, **k):
+        return None
+
+    monkeypatch.setattr(sess, "_ensure_client", _ensure)
+    monkeypatch.setattr(sess, "_send_query", _send)
+
+    async def _collect():
+        out = []
+        async for ev in sess.run("hi"):
+            out.append(ev)
+        return out
+
+    events = asyncio.run(_collect())
+    assert any(e.kind == "text_delta" and e.text == "the answer" for e in events)
+    assert all(e.kind != "error" for e in events)              # no false stall timeout
     assert sess.session_id == "resume-abc"                      # resume context NOT nuked
+
+
+def _run_with_error_message(monkeypatch, msg):
+    """Drive one turn whose only streamed message is `msg` (an errored AssistantMessage)
+    and return the emitted events."""
+    class _OneMsgClient:
+        async def disconnect(self):
+            pass
+
+        async def receive_response(self):
+            yield msg
+
+    sess = engine.ClaudeSession("chat", "claude-opus-4-8", None)
+    client = _OneMsgClient()
+
+    async def _ensure():
+        sess.client = client
+
+    async def _send(*a, **k):
+        return None
+
+    monkeypatch.setattr(sess, "_ensure_client", _ensure)
+    monkeypatch.setattr(sess, "_send_query", _send)
+
+    async def _collect():
+        out = []
+        async for ev in sess.run("hi"):
+            out.append(ev)
+        return out
+
+    return asyncio.run(_collect())
+
+
+def test_cyber_refusal_gets_distinct_key(monkeypatch):
+    """#361: a cyber-safeguard refusal (invalid_request + stop_reason 'refusal', with a
+    synthetic 'cybersecurity topic' explanation) is relabeled to err.cyber_refusal — NOT
+    the misleading generic err.invalid_request."""
+    from claude_agent_sdk.types import AssistantMessage, TextBlock
+
+    msg = AssistantMessage(
+        content=[TextBlock(text=(
+            "API Error: Opus 4.8 (1M context) has safety measures that flagged this "
+            "message for a cybersecurity topic. If your work requires this access, you "
+            "can apply for an exemption. Try rephrasing in a new session."))],
+        model="<synthetic>",
+        error="invalid_request",
+        stop_reason="refusal",
+    )
+    events = _run_with_error_message(monkeypatch, msg)
+    err = [e for e in events if e.kind == "error"]
+    assert len(err) == 1 and err[0].error_key == "err.cyber_refusal"
+    assert err[0].error_detail == "invalid_request"        # raw type preserved for logs
+
+
+def test_non_cyber_refusal_gets_generic_refusal_key(monkeypatch):
+    """#361: a refusal whose explanation is NOT cyber falls back to err.model_refusal —
+    still a distinct 'declined' message, never the 'invalid request' mislabel."""
+    from claude_agent_sdk.types import AssistantMessage, TextBlock
+
+    msg = AssistantMessage(
+        content=[TextBlock(text="I can't help with that request.")],
+        model="<synthetic>",
+        error="invalid_request",
+        stop_reason="refusal",
+    )
+    events = _run_with_error_message(monkeypatch, msg)
+    err = [e for e in events if e.kind == "error"]
+    assert len(err) == 1 and err[0].error_key == "err.model_refusal"
+
+
+def test_real_invalid_request_still_generic(monkeypatch):
+    """#361 regression: a genuine invalid_request (no refusal stop_reason) keeps the
+    existing err.invalid_request mapping — the refusal relabel is refusal-only."""
+    from claude_agent_sdk.types import AssistantMessage
+
+    msg = AssistantMessage(
+        content=[],
+        model="claude-opus-4-8",
+        error="invalid_request",
+        stop_reason="end_turn",
+    )
+    events = _run_with_error_message(monkeypatch, msg)
+    err = [e for e in events if e.kind == "error"]
+    assert len(err) == 1 and err[0].error_key == "err.invalid_request"

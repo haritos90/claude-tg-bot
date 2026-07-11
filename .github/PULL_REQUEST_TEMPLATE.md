@@ -2,7 +2,7 @@
 
 ## What & why
 
-<!-- What does this change and why? Link the TODO.md task it closes, e.g. #64. -->
+<!-- What does this change and why? Link the backlog task it closes, e.g. #64 (task-64). -->
 
 ## Type
 
@@ -15,7 +15,7 @@
 - [ ] User-facing strings go through `i18n` (`en` **and** `ru`), not hardcoded.
 - [ ] No `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` introduced (subscription-only).
 - [ ] `setting_sources=[]` preserved on every `ClaudeAgentOptions`.
-- [ ] `TODO.md` updated (task moved to **Closed** with a **Resolution**).
+- [ ] `backlog/` updated (task set **Done** with a resolution in Implementation Notes).
 
 ## Notes for reviewers
 

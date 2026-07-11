@@ -77,6 +77,23 @@ try:
 except ValueError:
     _FIRST_TOKEN_TIMEOUT_SEC = 60.0
 
+# #358: a thinking_delta IS a StreamEvent, so the first-token watchdog above disarms the moment
+# extended-thinking starts streaming. But the streamer keeps the <tg-thinking> draft alive with a
+# ~20s keepalive, so if the upstream then goes SILENT after reasoning — no answer text, no tool
+# call, no ResultMessage — the unbounded wait below hangs and "Thinking…" animates FOREVER (the
+# reported stuck-thinking bug; a draft cannot be force-cleared via the Bot API — it only self-
+# expires ~30s after the LAST draft send, which the keepalive keeps pushing back). So ALSO bound
+# each inter-event wait while the turn is still in the THINKING phase (progressed, but no ANSWER
+# content yet). NOT applied once real answer content / a tool call / a result has started — a long
+# legitimate tool call or build emits nothing for minutes. Generous (active thinking emits deltas
+# sub-second, so a multi-minute gap means a wedge). Tunable via env; 0 disables it.
+try:
+    _STALL_TIMEOUT_SEC = float(
+        os.environ.get("MODEL_STALL_TIMEOUT_SEC", "180") or "180"
+    )
+except ValueError:
+    _STALL_TIMEOUT_SEC = 180.0
+
 
 # #134: request the 1M-token context window via the [1m] model-id SUFFIX, NOT the
 # `betas` param. Under the OAuth subscription `betas` are IGNORED ("Custom betas are
@@ -302,13 +319,16 @@ CHAT_TOOLS = [
 
 # --- #352: agent-driven per-topic "session memory" -----------------------------
 # A single in-process tool (`remember`) the model can call to persist short notes for
-# ITS OWN topic. Chat has no file tools, so it cannot keep a ./CLAUDE.md (#314); this
-# is the tool-free equivalent — the agent decides what is worth remembering across a
-# long/complex session. Notes are stored on the ThreadState (scoped to one topic),
-# size-capped, and re-injected into the system prompt each build. The tool is served
-# over the SDK stdio CONTROL channel (see the SDK's _handle_sdk_mcp_request), so it
-# works identically inside the bubblewrap jail — it needs no fs/net and only ever
-# writes to THIS session's notes (no cross-topic bleed, the #2 isolation invariant).
+# ITS OWN topic — the durable-note companion of the workdir ./CLAUDE.md (#314) for a long
+# or complex session: the agent decides what is worth remembering across it.
+# #362: gated to CODE sessions owned by a CODE-LEVEL user (see ClaudeSession._session_memory_on)
+# — chat is short-form Q&A with no use for durable per-topic notes, and a user demoted
+# code→chat must not keep the capability on a leftover code session. was (#352): the tool +
+# notes were attached in BOTH modes for everyone. Notes are stored on the ThreadState (scoped
+# to one topic), size-capped, and re-injected into the system prompt each build. The tool is
+# served over the SDK stdio CONTROL channel (see the SDK's _handle_sdk_mcp_request), so it
+# works identically inside the bubblewrap jail — it needs no fs/net and only ever writes to
+# THIS session's notes (no cross-topic bleed, the #2 isolation invariant).
 SESSION_NOTES_CAP = 16384  # 16 KB — mirrors the workdir-CLAUDE.md cap (#314)
 MEMORY_SERVER_NAME = "memory"
 MEMORY_TOOL = f"mcp__{MEMORY_SERVER_NAME}__remember"  # SDK-namespaced name the model/allowlist see
@@ -326,12 +346,17 @@ def _apply_session_note(prior: str, note: str, replace: bool,
     if not note:
         return prior
     blob = note if replace else (f"{prior}\n{note}" if prior else note)
-    if len(blob) > cap:
-        # Keep the most RECENT content; drop the partial leading line after the cut.
-        blob = blob[-cap:]
-        nl = blob.find("\n")
+    # #355: measure / slice on UTF-8 BYTES — the documented unit — not code points. was:
+    # len(blob) / blob[-cap:], which let a Cyrillic/CJK/emoji note reach ~2-4x the byte cap.
+    encoded = blob.encode("utf-8")
+    if len(encoded) > cap:
+        # Keep the most RECENT content; drop the partial leading line after the cut. The cut can
+        # land mid-multibyte-char, so decode(errors="ignore") drops any stray leading bytes.
+        encoded = encoded[-cap:]
+        nl = encoded.find(b"\n")
         if nl != -1:
-            blob = blob[nl + 1:]
+            encoded = encoded[nl + 1:]
+        blob = encoded.decode("utf-8", "ignore")
     return blob
 
 
@@ -449,6 +474,59 @@ def _error_key(error: object) -> str:
     text carries the raw type as {detail}."""
     key = str(error) if error is not None else "unknown"
     return _ERROR_KEYS.get(key, "err.model_error")
+
+
+# #361: a model REFUSAL is delivered in-band as an AssistantMessage with
+# error == "invalid_request" AND stop_reason == "refusal" — it is NOT a malformed
+# request. The bare "invalid_request" text ("Invalid request to the model.") mislabels
+# it as a client bug, so we relabel refusals to a distinct message, and a CYBER-safeguard
+# refusal (the API's stop_details.category == "cyber") to its own. The SDK's
+# AssistantMessage exposes error + stop_reason + content but NOT stop_details, so the
+# cyber category is read off the synthetic explanation text (lowercased substring). The
+# markers cover the current wording ("...flagged this message for a cybersecurity topic",
+# "cyber-related safeguards"); a future rewording simply falls back to the generic
+# refusal message — never to the old "invalid request" mislabel.
+_CYBER_REFUSAL_MARKERS = ("cybersecurity", "cyber-related", "cyber safeguard", "cyber-safety")
+
+# English fallbacks for a refusal (see _refine_error). Kept separate from _ERROR_MESSAGES
+# (keyed by the SDK error enum) — a refusal is a stop_reason, not an error type. The
+# localized text lives under err.cyber_refusal / err.model_refusal.
+_REFUSAL_MESSAGES = {
+    "cyber": (
+        "The model declined this turn under its cybersecurity safeguards — a safety "
+        "refusal, not a bug or a malformed request. Try a new session (/new) with a "
+        "narrower, factual question, or switch model (/model)."
+    ),
+    "generic": (
+        "The model declined to answer this turn (a safety refusal). Try rephrasing in "
+        "a new session (/new), or switch model (/model)."
+    ),
+}
+
+
+def _assistant_text(msg: object) -> str:
+    """The concatenated text of an AssistantMessage's TextBlocks. For a refusal this is
+    the synthetic explanation the API returns in place of an answer."""
+    parts = []
+    for block in getattr(msg, "content", None) or []:
+        text = getattr(block, "text", None)
+        if text:
+            parts.append(text)
+    return " ".join(parts)
+
+
+def _refine_error(msg: object) -> tuple[str, str]:
+    """(error_key, english_text) for an errored AssistantMessage. A model REFUSAL
+    (stop_reason == "refusal", surfaced by the API as invalid_request) is relabeled from
+    the generic "invalid request" to a distinct refusal message — a cyber-specific one
+    when the safeguard explanation names a cybersecurity topic (#361). Every other error
+    keeps its existing enum-based mapping."""
+    error = getattr(msg, "error", None)
+    if str(error) == "invalid_request" and getattr(msg, "stop_reason", None) == "refusal":
+        if any(m in _assistant_text(msg).lower() for m in _CYBER_REFUSAL_MARKERS):
+            return "err.cyber_refusal", _REFUSAL_MESSAGES["cyber"]
+        return "err.model_refusal", _REFUSAL_MESSAGES["generic"]
+    return _error_key(error), _error_message(error)
 
 
 # #227a: unique marker a persistent-shell command emits when it finishes, carrying its exit
@@ -1034,12 +1112,26 @@ class ClaudeSession:
             "treat them as standing project guidance for this session:\n\n" + text
         )
 
+    def _session_memory_on(self) -> bool:
+        """#362: whether the agent-driven session-memory tool (`remember`) and its
+        re-injected notes are active for THIS session — CODE sessions owned by a
+        CODE-LEVEL user only (a chat session has no durable per-topic notes, and the
+        demotion gap — a user dropped code→chat who still holds a code session — must
+        not keep the capability). Gates the `remember` MCP server, its auto-allow entry,
+        and _session_notes_block. was (#352): the tool + notes were attached in BOTH modes
+        for everyone."""
+        return self.mode == "code" and self.user_level == "code"
+
     def _session_notes_block(self) -> str:
         """#352: the per-topic session memory (the agent's own `remember` notes) wrapped as
         an injectable system-prompt section, or "" when empty. Framed as LOW-AUTHORITY
         continuity context — explicitly NOT instructions — so a note that entered via web
         content (indirect prompt injection) cannot escalate into a command. Size is capped
         on write (see _apply_session_note / _remember_tool)."""
+        # #362: code-only feature — nothing injected for chat sessions or non-code-level
+        # users (see _session_memory_on); any saved blob stays dormant in the DB.
+        if not self._session_memory_on():
+            return ""
         notes = (self.session_notes or "").strip()
         if not notes:
             return ""
@@ -1064,9 +1156,14 @@ class ClaudeSession:
                                  "text": "Nothing saved: the note was empty."}],
                     "is_error": True}
         replace = bool(args.get("replace"))
-        # Untrimmed length (huge cap = never trims) tells us whether the cap kicked in.
-        over_cap = len(_apply_session_note(self.session_notes, note, replace,
-                                           cap=10 ** 12)) > SESSION_NOTES_CAP
+        # #355: detect whether the cap will trim from the UNTRIMMED byte size computed directly
+        # from the inputs, so _apply_session_note runs ONCE. was: a second _apply_session_note
+        # call with cap=10**12 purely to measure the untrimmed length (redundant recompute).
+        prior = (self.session_notes or "").strip()
+        untrimmed = len(note.encode("utf-8"))  # note is already stripped above
+        if not replace and prior:
+            untrimmed += len(prior.encode("utf-8")) + 1  # +1 for the joining "\n"
+        over_cap = untrimmed > SESSION_NOTES_CAP
         self.session_notes = _apply_session_note(self.session_notes, note, replace)
         if self._on_remember is not None:
             with contextlib.suppress(Exception):
@@ -1335,9 +1432,12 @@ class ClaudeSession:
             # SDK's generic "Check stderr output for details". was: no stderr key.
             "stderr": self._on_stderr,
         }
-        # #352: the in-process session-memory tool (agent-driven `remember`) is available in
-        # BOTH modes; served over the SDK stdio control channel so it works in the jail.
-        common["mcp_servers"] = {MEMORY_SERVER_NAME: self._memory_server()}
+        # #352/#362: the in-process session-memory tool (agent-driven `remember`) is a
+        # CODE-session feature for code-level users only (see _session_memory_on) — served
+        # over the SDK stdio control channel so it works in the jail. was (#352): attached in
+        # BOTH modes for everyone → `common["mcp_servers"] = {MEMORY_SERVER_NAME: self._memory_server()}`
+        if self._session_memory_on():
+            common["mcp_servers"] = {MEMORY_SERVER_NAME: self._memory_server()}
         if self.session_id:
             common["resume"] = self.session_id
             # One-shot fork: resume the prior session but branch to a NEW id so the
@@ -1391,7 +1491,11 @@ class ClaudeSession:
                 # tools are usable but not auto-allowed, so the CLI evaluates them as
                 # "ask" and our can_use_tool gate fires for each before execution.
                 tools=code_tools,
-                allowed_tools=[t for t in code_tools if t in CODE_AUTO_ALLOW_TOOLS] + [MEMORY_TOOL],
+                # #362: auto-allow the `remember` tool only when session memory is on
+                # (code session + code-level user — excludes a demoted user's code session).
+                # was (#352): unconditional `... + [MEMORY_TOOL]`.
+                allowed_tools=([t for t in code_tools if t in CODE_AUTO_ALLOW_TOOLS]
+                               + ([MEMORY_TOOL] if self._session_memory_on() else [])),
                 add_dirs=list(self.add_dirs),
                 **code_extra,
                 **common,
@@ -1421,15 +1525,19 @@ class ClaudeSession:
         return ClaudeAgentOptions(
             # #130: append the owner's CLAUDE.md/memory directly (mem_block is "" when
             # global memory is off or empty), instead of loading it via setting_sources.
+            # #362: chat has no session memory (a code-only feature now) — was (#352):
+            #   ... + mem_block + self._session_notes_block()
             system_prompt=(CHAT_SYSTEM_PROMPT + BOT_CONTEXT_NOTE + self._session_state_note()
-                           + mem_block + self._session_notes_block()),  # #352
+                           + mem_block),
             # Chat now runs in the per-session workdir too (#133), so its conversation
             # transcript lives in the SAME project as code mode — that's what lets a
             # session upgrade chat→code (or back) and keep one continuous conversation.
             # Chat has no file tools, so the cwd is only transcript storage here.
             cwd=self.cwd,
             tools=list(chat_tools),
-            allowed_tools=list(chat_tools) + [MEMORY_TOOL],
+            # #362: chat no longer exposes the `remember` tool (code-only now).
+            # was (#352): `allowed_tools=list(chat_tools) + [MEMORY_TOOL]`.
+            allowed_tools=list(chat_tools),
             permission_mode="default",
             **chat_extra,
             **common,
@@ -1602,19 +1710,32 @@ class ClaudeSession:
             # was: `async for msg in self.client.receive_response():`
             _stream_iter = self.client.receive_response().__aiter__()
             _progressed = False
+            _answered = False  # #358: real ANSWER content started (text/tool/result), not thinking
             while True:
                 try:
                     _next = _stream_iter.__anext__()
-                    if _progressed or _FIRST_TOKEN_TIMEOUT_SEC <= 0:
-                        msg = await _next
+                    # #358: bound THIS wait by phase — before any event: the first-token watchdog;
+                    # after thinking started but before any answer content: the stall watchdog (a
+                    # silent-after-reasoning upstream must not animate <tg-thinking> forever); once
+                    # answering: unbounded (a long tool call / build emits nothing for minutes).
+                    # was: `if _progressed or _FIRST_TOKEN_TIMEOUT_SEC <= 0: msg = await _next`
+                    if _answered:
+                        _wait = 0.0
+                    elif not _progressed:
+                        _wait = _FIRST_TOKEN_TIMEOUT_SEC
                     else:
-                        msg = await asyncio.wait_for(_next, _FIRST_TOKEN_TIMEOUT_SEC)
+                        _wait = _STALL_TIMEOUT_SEC
+                    if _wait and _wait > 0:
+                        msg = await asyncio.wait_for(_next, _wait)
+                    else:
+                        msg = await _next
                 except StopAsyncIteration:
                     break
                 except asyncio.TimeoutError:
                     logger.warning(
-                        "turn stalled: no model response in %.0fs — treating as service "
-                        "unavailable", _FIRST_TOKEN_TIMEOUT_SEC,
+                        "turn stalled: no %s in %.0fs — treating as service unavailable",
+                        "model response" if not _progressed else "answer after reasoning",
+                        _wait,
                     )
                     # #350: close the abandoned response generator (suppressing errors) before
                     # tearing down the transport, so it is not left to the GC async-gen finalizer.
@@ -1655,6 +1776,7 @@ class ClaudeSession:
                         delta = event.get("delta") or {}
                         piece = delta.get("text")
                         if piece:
+                            _answered = True  # #358: real answer text → stop bounding the wait
                             running_text += piece
                             yield EngineEvent(kind="text_delta", text=piece)
                         else:
@@ -1678,6 +1800,7 @@ class ClaudeSession:
                             _name = {"web_search": "WebSearch",
                                      "web_fetch": "WebFetch"}.get(_raw, _raw)
                             if _name:
+                                _answered = True  # #358: a tool call is answer progress
                                 yield EngineEvent(
                                     kind="tool_start", tool_name=_name, tool_input={})
                     continue
@@ -1700,10 +1823,15 @@ class ClaudeSession:
                         # OAuth refresh so a single subprocess never goes stale.)
                         if str(msg.error) in ("authentication_failed", "billing_error"):
                             await self._drop_client()
+                        # #361: relabel a model REFUSAL (invalid_request + stop_reason
+                        # "refusal") to a distinct message instead of the generic "Invalid
+                        # request to the model." — a cyber-safeguard refusal gets its own.
+                        # was: text=_error_message(msg.error), error_key=_error_key(msg.error)
+                        _err_key, _err_text = _refine_error(msg)
                         yield EngineEvent(
                             kind="error",
-                            text=_error_message(msg.error),
-                            error_key=_error_key(msg.error),
+                            text=_err_text,
+                            error_key=_err_key,
                             error_detail=str(msg.error),
                             # #137: a mid-turn rate_limit means the window is spent —
                             # let the consumer flip the usage display to "limited".
@@ -1714,6 +1842,7 @@ class ClaudeSession:
 
                     for block in msg.content or []:
                         if isinstance(block, TextBlock):
+                            _answered = True  # #358: assistant text block is answer content
                             # Provide the full accumulated text as a fallback for
                             # consumers; deltas above are still preferred.
                             text = block.text or ""
@@ -1721,6 +1850,7 @@ class ClaudeSession:
                                 running_text += text
                             yield EngineEvent(kind="text_full", text=running_text)
                         elif isinstance(block, ToolUseBlock):
+                            _answered = True  # #358: assistant tool-use block is answer content
                             yield EngineEvent(
                                 kind="tool",
                                 tool_name=block.name or "",
