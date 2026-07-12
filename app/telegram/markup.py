@@ -436,12 +436,19 @@ def demote_headings(text: str) -> str:
         out.append("\u00A0")
         out.append("")
 
+    # #368: after flushing a heading's BELOW spacer, swallow the model's own blank line(s) too —
+    # the spacer already supplies the gap, so a heading followed by 2+ blank lines no longer
+    # emits an extra empty paragraph.
+    skip_blank = False
     for line in text.split("\n"):
         if pending_after:               # #360: flush the BELOW spacer for the previous heading
             _add_spacer()
             pending_after = False
+            skip_blank = True
+        if skip_blank:
             if line == "":
                 continue                # the spacer's trailing blank stands in for the model's
+            skip_blank = False
         if _FENCE_TOGGLE_RE.match(line):
             in_fence = not in_fence
             out.append(line)

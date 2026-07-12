@@ -379,7 +379,7 @@ def test_reasoning_then_answer_does_not_false_timeout(monkeypatch):
     from claude_agent_sdk.types import StreamEvent
 
     monkeypatch.setattr(engine, "_FIRST_TOKEN_TIMEOUT_SEC", 5.0)
-    monkeypatch.setattr(engine, "_STALL_TIMEOUT_SEC", 0.05)
+    monkeypatch.setattr(engine, "_STALL_TIMEOUT_SEC", 0.2)
 
     class _ReasonThenAnswerClient:
         async def disconnect(self):
@@ -389,11 +389,11 @@ def test_reasoning_then_answer_does_not_false_timeout(monkeypatch):
             yield StreamEvent(uuid="u", session_id="resume-abc",
                               event={"type": "content_block_delta",
                                      "delta": {"thinking": "thinking…"}})
-            await asyncio.sleep(0.001)   # well within the stall window
+            await asyncio.sleep(0)       # #368: yield only — near-instant, can't race the window
             yield StreamEvent(uuid="u", session_id="resume-abc",
                               event={"type": "content_block_delta",
                                      "delta": {"text": "the answer"}})
-            await asyncio.sleep(0.2)     # > stall window, but _answered is set now → unbounded
+            await asyncio.sleep(0.4)     # > stall window, but _answered is set now → unbounded
 
     sess = engine.ClaudeSession("chat", "claude-opus-4-8", None, resume_session_id="resume-abc")
     client = _ReasonThenAnswerClient()

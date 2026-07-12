@@ -84,6 +84,14 @@ async def _get_model(name: str, compute_type: str, download_root: str, cpu_threa
         return _model
 
 
+def _safe_unlink(path: str) -> None:
+    """Remove a temp file, ignoring a missing-file / permission error."""
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+
+
 def _decode_to_wav(ogg: bytes) -> str:
     """Opus/OGG bytes → path to a fresh 16 kHz mono wav temp file (caller unlinks it)."""
     fd, src = tempfile.mkstemp(suffix=".oga")
@@ -95,11 +103,14 @@ def _decode_to_wav(ogg: bytes) -> str:
             ["ffmpeg", "-y", "-nostdin", "-i", src, "-ar", "16000", "-ac", "1", "-f", "wav", dst],
             check=True, capture_output=True, timeout=120,
         )
+    except Exception:
+        # #366: on ffmpeg failure/timeout the caller never learns `dst` (it unlinks the wav
+        # only on the SUCCESS path), so the partial file ffmpeg may already have written would
+        # leak — costly on a RAM-backed /tmp. Remove it here before re-raising.
+        _safe_unlink(dst)
+        raise
     finally:
-        try:
-            os.unlink(src)
-        except OSError:
-            pass
+        _safe_unlink(src)                      # the source .oga is never needed past decode
     return dst
 
 
@@ -111,6 +122,7 @@ async def transcribe(
     compute_type: str = "int8",
     download_root: str,
     cpu_threads: int = 2,
+    max_seconds: int = 0,
 ) -> str:
     """Transcribe Opus/OGG voice bytes to text.
 
@@ -121,6 +133,17 @@ async def transcribe(
     m = await _get_model(model, compute_type, download_root, cpu_threads)
     wav = await asyncio.to_thread(_decode_to_wav, ogg)
     try:
+        if max_seconds and max_seconds > 0:
+            # #366: defense-in-depth cap on the ACTUAL decoded audio. The caller gates on the
+            # Telegram-reported duration, but that metadata can be absent/understated; bounding
+            # the decoded WAV keeps a long note from holding the single _infer_lock unboundedly.
+            # 16 kHz mono s16le ≈ 32 kB/s; +64 kB slack covers the container header.
+            try:
+                actual = os.path.getsize(wav)
+            except OSError:
+                actual = 0
+            if actual > 32000 * max_seconds + 65536:
+                raise ValueError(f"decoded audio {actual} bytes exceeds the {max_seconds}s cap")
         async with _infer_lock:
             def _run():
                 # beam_size=1 (greedy) + VAD (drop silence, curb hallucinated loops) +
@@ -133,7 +156,4 @@ async def transcribe(
 
             return await asyncio.to_thread(_run)
     finally:
-        try:
-            os.unlink(wav)
-        except OSError:
-            pass
+        _safe_unlink(wav)

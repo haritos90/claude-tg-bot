@@ -12,8 +12,7 @@ recognition errors the same way it reads through typos, so a small, fast model i
 Everything runs **on-device on the host** (CPU): the audio is never sent to a third-party
 speech service, never leaves the server, and never enters the per-session sandbox. This
 matches the bot's isolation posture — no API key, no external egress for the audio.
-(On-device speech engines are exactly what ship inside offline products such as car head
-units; here we use faster-whisper.)
+Recognition is performed on-device by faster-whisper (CTranslate2, CPU int8).
 
 ## Dependencies
 

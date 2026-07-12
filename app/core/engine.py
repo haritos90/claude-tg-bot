@@ -1159,6 +1159,8 @@ class ClaudeSession:
         # #355: detect whether the cap will trim from the UNTRIMMED byte size computed directly
         # from the inputs, so _apply_session_note runs ONCE. was: a second _apply_session_note
         # call with cap=10**12 purely to measure the untrimmed length (redundant recompute).
+        # session_notes is always stored as a single clean blob, so .strip() here matches what
+        # _apply_session_note concatenates — the over-cap estimate and the real write agree.
         prior = (self.session_notes or "").strip()
         untrimmed = len(note.encode("utf-8"))  # note is already stripped above
         if not replace and prior:
@@ -1725,7 +1727,7 @@ class ClaudeSession:
                         _wait = _FIRST_TOKEN_TIMEOUT_SEC
                     else:
                         _wait = _STALL_TIMEOUT_SEC
-                    if _wait and _wait > 0:
+                    if _wait > 0:              # 0.0 (answering) / negative → unbounded await
                         msg = await asyncio.wait_for(_next, _wait)
                     else:
                         msg = await _next

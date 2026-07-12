@@ -21,7 +21,7 @@ messages queue behind the wedged turn.
 
 - DM streaming uses Telegram **rich-message drafts** (`sendRichMessageDraft`); the
   `<tg-thinking>` block shows until the real answer replaces it. The streamer re-sends the
-  draft every ~20 s (`_DRAFT_KEEPALIVE`) to keep it alive while the turn runs.
+  draft every ~20 s (`_DRAFT_KEEPALIVE_SECS`) to keep it alive while the turn runs.
 - A draft is **cleared only when a real message lands in that chat** — the final
   `sendRichMessage` that every normal turn sends via `streamer.finish()`. The Bot API has
   **no draft delete/clear method**, and empty content shows "Thinking…" (not a clear) — see

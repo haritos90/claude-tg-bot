@@ -5501,10 +5501,28 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         if cap and dur and dur > cap:
             await reply(message, i18n.t("voice.too_long", lang, sec=cap))
             return
+        # #365: a voice note may be the free-text ARGUMENT a command is awaiting (e.g. /rename
+        # asked for a name). Pop that pending action up front (like on_text); if present, the
+        # transcript becomes the argument, not a model turn (restored below on a mis-hear).
+        action = pending.pop(_pkey(message), None)
+        # #365: for a real turn, gate BEFORE the expensive download + CPU transcription so a
+        # quota-exhausted / code-denied user can't burn the single inference lock. A pending
+        # management action is not a model turn, so — like on_text — it skips the gate.
+        key = None
+        if action is None:
+            key = await _session_key_for_turn(message)   # #266: may start a fresh session on idle
+            uid = message.from_user.id if message.from_user else 0
+            uname = message.from_user.username if message.from_user else None
+            block = await _access_block(uid, uname, lang, key)
+            if block:
+                await reply(message, block)
+                return
         data, err = await _download(
             voice, MAX_VOICE_BYTES, getattr(voice, "file_size", None), lang
         )
         if err:
+            if action is not None:
+                pending[_pkey(message)] = action         # #365: keep the capture alive on failure
             await reply(message, err)
             return
         # A placeholder the user sees while we transcribe; it then BECOMES the recognised
@@ -5512,7 +5530,12 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         # message.answer() (returns the sent Message).
         holder = None
         try:
-            holder = await message.answer(i18n.t("voice.transcribing", lang))
+            # message_thread_id keeps the placeholder in the originating forum topic if group
+            # sessions are ever revived (None / ignored in a DM, the live surface).
+            holder = await message.answer(
+                i18n.t("voice.transcribing", lang),
+                message_thread_id=message.message_thread_id,
+            )
         except Exception:
             holder = None
         try:
@@ -5520,6 +5543,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 data,
                 model=settings.voice_model,
                 lang=settings.voice_lang,
+                max_seconds=cap,                         # #366: bound the decoded audio too
                 download_root=(settings.voice_model_path
                                or transcribe.default_model_root(str(settings.base_workdir))),
             )
@@ -5528,6 +5552,8 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             text = ""
         text = (text or "").strip()
         if not text:
+            if action is not None:
+                pending[_pkey(message)] = action         # #365: keep the capture alive on failure
             failed = i18n.t("voice.transcribe_failed", lang)
             if holder is not None:
                 try:
@@ -5545,10 +5571,14 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 await reply(message, shown)
         else:
             await reply(message, shown)
+        # #365: a captured argument runs its command with the transcript; otherwise it's a turn.
+        if action is not None:
+            await _run_pending(action, message, text)
+            return
         # Prepend a marker so the MODEL knows this was a voice note (and may contain
         # recognition errors) — otherwise it guesses / hedges ("looks like speech
         # recognition"). The on-screen bubble above stays the clean transcript.
-        await _submit(message, i18n.t("voice.model_note", lang, text=text))
+        await _submit(message, i18n.t("voice.model_note", lang, text=text), key=key)
 
     # ------------------------------------------------- permission callbacks
 
