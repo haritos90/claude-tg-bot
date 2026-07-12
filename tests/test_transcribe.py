@@ -4,6 +4,7 @@ These cover the pure/glue logic — model-cache path derivation, availability pr
 and the public API shape. The heavy path (ffmpeg decode + faster-whisper inference)
 needs the optional deps and a ~150 MB model, so it is exercised out-of-band, not here.
 """
+import asyncio
 import inspect
 import os
 import subprocess
@@ -92,3 +93,85 @@ def test_decode_to_wav_returns_wav_and_removes_source_on_success(monkeypatch, tm
         assert not os.path.exists(seen["src"])         # source .oga cleaned in the finally
     finally:
         os.unlink(wav)
+
+
+def test_decode_to_wav_cleans_source_when_write_fails(monkeypatch, tmp_path):
+    """#370: if writing the source .oga fails (e.g. ENOSPC on a RAM-backed /tmp) BEFORE ffmpeg
+    runs, the source temp must STILL be unlinked. Pre-#370 the mkstemp+write ran outside the
+    try/finally, so a write failure orphaned the .oga."""
+    seen = {}
+    real_mkstemp = tempfile.mkstemp
+
+    def fake_mkstemp(suffix=""):
+        fd, path = real_mkstemp(suffix=suffix, dir=tmp_path)
+        seen["src"] = path
+        return fd, path
+
+    class _BoomFile:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def write(self, *a):
+            raise OSError("ENOSPC")
+
+    def fake_fdopen(fd, *a, **k):
+        os.close(fd)                 # release the real fd from mkstemp; the write is what fails
+        return _BoomFile()
+
+    monkeypatch.setattr(tempfile, "mkstemp", fake_mkstemp)
+    monkeypatch.setattr(os, "fdopen", fake_fdopen)
+
+    with pytest.raises(OSError):
+        transcribe._decode_to_wav(b"opus-bytes")
+    assert not os.path.exists(seen["src"]), "source .oga leaked on a write failure"
+
+
+def test_decode_to_wav_cleans_up_on_ffmpeg_timeout(monkeypatch, tmp_path):
+    """#370: the 120s ffmpeg TimeoutExpired arm must also leave no temp file behind (same cleanup
+    path as CalledProcessError, but a distinct exception type)."""
+    seen = {}
+    real_mkstemp = tempfile.mkstemp
+
+    def fake_mkstemp(suffix=""):
+        fd, path = real_mkstemp(suffix=suffix, dir=tmp_path)
+        seen["src"] = path
+        return fd, path
+
+    def fake_run(argv, **kwargs):
+        with open(argv[-1], "wb") as fh:            # ffmpeg wrote a partial WAV...
+            fh.write(b"RIFFpartial")
+        raise subprocess.TimeoutExpired(argv, 120)  # ...then the 120s kill fires
+
+    monkeypatch.setattr(tempfile, "mkstemp", fake_mkstemp)
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    with pytest.raises(subprocess.TimeoutExpired):
+        transcribe._decode_to_wav(b"opus-bytes")
+    src = seen["src"]
+    dst = src[:-4] + "_16k.wav"
+    assert not os.path.exists(src) and not os.path.exists(dst), "temp files leaked on timeout"
+
+
+def test_transcribe_rejects_oversized_decoded_audio(monkeypatch, tmp_path):
+    """#370: an oversized decoded WAV (Telegram duration metadata absent/understated) is rejected
+    with AudioTooLong BEFORE the inference lock, and the WAV is unlinked -- so a pathological note
+    can neither hold the single _infer_lock nor run inference."""
+    wav = tmp_path / "big_16k.wav"
+    wav.write_bytes(b"\0" * (32000 * 5 + 65536 + 1))   # 1 byte over the 5s byte cap
+
+    class _Model:
+        def transcribe(self, *a, **k):
+            raise AssertionError("inference must not run when the cap is exceeded")
+
+    async def fake_get_model(*a, **k):
+        return _Model()
+
+    monkeypatch.setattr(transcribe, "_get_model", fake_get_model)
+    monkeypatch.setattr(transcribe, "_decode_to_wav", lambda ogg: str(wav))
+
+    with pytest.raises(transcribe.AudioTooLong):
+        asyncio.run(transcribe.transcribe(b"x", download_root=str(tmp_path), max_seconds=5))
+    assert not wav.exists()          # #370: the oversized WAV is cleaned in the finally

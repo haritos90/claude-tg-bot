@@ -123,12 +123,13 @@ def test_apply_session_note_append_replace_and_cap():
 def test_apply_session_note_byte_accurate_cap():
     """#355: the size cap is UTF-8 BYTES, not code points — a multibyte note is trimmed to the
     byte budget and always decodes cleanly (no mojibake), even when the cut splits a character."""
-    # 100 Cyrillic chars = 200 UTF-8 bytes; an EVEN cap lands on a 2-byte char boundary.
-    out = engine._apply_session_note("", "я" * 100, False, cap=50)
+    # #372: 100 two-byte chars (U+00E9) = 200 UTF-8 bytes; an EVEN cap lands on a 2-byte
+    # boundary. (English-only rule: a neutral 2-byte char, not Cyrillic — byte math is identical.)
+    out = engine._apply_session_note("", "\u00e9" * 100, False, cap=50)
     assert len(out.encode("utf-8")) <= 50
-    assert out == "я" * 25 and "�" not in out          # clean boundary, no replacement char
+    assert out == "\u00e9" * 25 and "�" not in out          # clean boundary, no replacement char
     # An ODD cap forces the slice to split a 2-byte char; the stray byte is dropped, not mojibaked.
-    odd = engine._apply_session_note("", "я" * 100, False, cap=51)
+    odd = engine._apply_session_note("", "\u00e9" * 100, False, cap=51)
     assert len(odd.encode("utf-8")) <= 51 and odd == odd.encode("utf-8").decode("utf-8")
     assert "�" not in odd
     # Emoji (4-byte) over a small cap → still byte-bounded and valid (replace path).

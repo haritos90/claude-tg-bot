@@ -1,5 +1,6 @@
 """Unit tests for streamer pure helpers (#240)."""
 
+from app import i18n
 from app.telegram import streamer
 
 
@@ -120,3 +121,19 @@ def test_set_tool_phase_routes_web_to_searching_mode():
     sg = streamer._thinking_label(0.0, "en", searching=True)
     assert sg in i18n.t("stream.searching_words", "en")
     assert sg != streamer._thinking_label(0.0, "en", searching=False)
+
+
+def test_location_notes_replaces_every_token_and_is_noop_when_none():
+    """#354/#371: each markup.LOCATION_TOKEN is swapped for the localized stream.location note
+    (the draft + final paths share this helper), with none left over even when several pins
+    appear; a no-op when there are no locations."""
+    from app.telegram import markup
+    s = streamer.Streamer(None, 123, None)
+    note = i18n.t("stream.location", i18n.cached_lang(123))
+    text = f"a {markup.LOCATION_TOKEN} b {markup.LOCATION_TOKEN} c"
+    out = s._location_notes(text, [{"lat": 1, "lon": 2}, {"lat": 3, "lon": 4}])
+    assert markup.LOCATION_TOKEN not in out            # every token expanded
+    assert out.count(note) == 2                         # one note per pin, none dropped
+    assert out == f"a {note} b {note} c"
+    # no-op fast path when there are no locations
+    assert s._location_notes("plain text", []) == "plain text"

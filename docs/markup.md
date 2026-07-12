@@ -108,7 +108,7 @@ error it returns a fully-escaped plain string (a message is never dropped for ba
 | `[text](url)` | `<a href>` | |
 | `# Heading` (ATX) | bold line | classic HTML has no `<h1>` |
 | `- item` / `1. item` | left as text | classic HTML has no `<ul>/<ol>` |
-| LaTeX (`\frac`, `$…$`, `x^2`) | Unicode (½, ×, x²) | #51. **Fallback path only** — the rich-markdown reply path (#176) ships `$…$` / `$$…$$` straight to Telegram, which renders native math (#297); this Unicode degradation now applies only when a rich send fails and we fall back to classic HTML, which still can't render LaTeX. |
+| LaTeX (`\frac`, `$…$`, `x^2`) | Unicode (½, ×, x²) | #51. **Fallback path only** — the rich-markdown reply path (#176) ships `$…$` / `$$…$$` straight to Telegram, which renders native math (#297); this Unicode degradation now applies only when a rich send fails and classic HTML is used as the fallback, which still can't render LaTeX. |
 
 Table helpers (used by the `/userstats` table and as the html-table builder):
 - `markup.split_rich_tables(text)` → plain-text runs + `RichTable` objects (per-column

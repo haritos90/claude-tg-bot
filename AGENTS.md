@@ -224,8 +224,8 @@ These are SDK/Telegram traps that have caused real bugs. Re-check them before ed
 - **Permission gating hinges on `tools` vs `allowed_tools`.** `allowed_tools` is
   the **auto-allow** list — those tools execute *without ever calling*
   `can_use_tool`. So dangerous tools must live in `tools` (the callable universe)
-  but **not** in `allowed_tools`; only then do they hit the "ask" path and our
-  gate fires. Putting a dangerous tool in `allowed_tools` silently bypasses the
+  but **not** in `allowed_tools`; only then do they hit the "ask" path and the
+  approval gate fires. Putting a dangerous tool in `allowed_tools` silently bypasses the
   approval buttons.
 - **Chat ships ONLY the web research tools — and `tools` is an EXPLICIT list, never
   `None`.** `tools=None` does NOT mean "no tools": the SDK omits `--tools` and the

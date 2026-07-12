@@ -8,4 +8,4 @@
 # Runs fully on-device (CTranslate2, CPU int8) — no audio leaves the host, no API key.
 # Without these installed, VOICE_TRANSCRIPTION stays effectively off: the bot detects the
 # missing pieces and replies that voice transcription is unavailable. See docs/voice.md.
-faster-whisper>=1.0
+faster-whisper>=1.0,<2   # #370: bound the major — the repo pins exact/upper-bounded, and a 2.x could break the API

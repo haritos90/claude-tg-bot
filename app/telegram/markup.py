@@ -431,24 +431,28 @@ def demote_headings(text: str) -> str:
         # Deduped: never stack two spacers (e.g. between adjacent headings) -> a single gap.
         if next((x for x in reversed(out) if x != ""), None) == "\u00A0":
             return
-        if out and out[-1] != "":
+        # #371: collapse any pre-existing blank RUN first, so a heading PRECEDED by 2+ blank lines
+        # gets the same single-gap treatment as the below side. was: `if out and out[-1] != "":
+        # out.append("")` added only ONE blank and left the model's extra blank paragraph(s) above
+        # the heading (the below-side #368 fix, now mirrored).
+        while out and out[-1] == "":
+            out.pop()
+        if out:
             out.append("")
         out.append("\u00A0")
         out.append("")
 
-    # #368: after flushing a heading's BELOW spacer, swallow the model's own blank line(s) too —
-    # the spacer already supplies the gap, so a heading followed by 2+ blank lines no longer
-    # emits an extra empty paragraph.
-    skip_blank = False
     for line in text.split("\n"):
-        if pending_after:               # #360: flush the BELOW spacer for the previous heading
+        # #360/#368/#371: defer a heading's BELOW spacer until real content follows, swallowing the
+        # model's own blank line(s) in between. This supplies the only gap (no extra empty paragraph)
+        # AND stops a heading trailing a streaming-draft frontier with a lone floating spacer.
+        # was (#360/#368): flush the spacer on the very NEXT line, then a `skip_blank` flag ate the
+        # model's blanks — which still emitted that floating spacer when a draft ended on the heading.
+        if pending_after:
+            if line == "":
+                continue
             _add_spacer()
             pending_after = False
-            skip_blank = True
-        if skip_blank:
-            if line == "":
-                continue                # the spacer's trailing blank stands in for the model's
-            skip_blank = False
         if _FENCE_TOGGLE_RE.match(line):
             in_fence = not in_fence
             out.append(line)

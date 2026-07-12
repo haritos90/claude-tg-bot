@@ -92,13 +92,22 @@ def _safe_unlink(path: str) -> None:
         pass
 
 
+class AudioTooLong(ValueError):
+    """#370: the decoded audio exceeds the caller's ``max_seconds`` byte cap. Subclasses
+    ValueError so existing ``except ValueError`` sites still catch it, but is distinct so the
+    voice handler can show 'too long' instead of the generic 'could not transcribe'."""
+
+
 def _decode_to_wav(ogg: bytes) -> str:
     """Opus/OGG bytes → path to a fresh 16 kHz mono wav temp file (caller unlinks it)."""
     fd, src = tempfile.mkstemp(suffix=".oga")
-    with os.fdopen(fd, "wb") as fh:
-        fh.write(ogg)
     dst = src[:-4] + "_16k.wav"
+    # #370: the source WRITE now runs inside the try/finally too. was (pre-#370): `with
+    # os.fdopen(fd) as fh: fh.write(ogg)` ran BEFORE the try, so a write failure (e.g. ENOSPC on
+    # the RAM-backed /tmp — the very leak #366 cared about) orphaned the source .oga.
     try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(ogg)
         subprocess.run(
             ["ffmpeg", "-y", "-nostdin", "-i", src, "-ar", "16000", "-ac", "1", "-f", "wav", dst],
             check=True, capture_output=True, timeout=120,
@@ -106,7 +115,8 @@ def _decode_to_wav(ogg: bytes) -> str:
     except Exception:
         # #366: on ffmpeg failure/timeout the caller never learns `dst` (it unlinks the wav
         # only on the SUCCESS path), so the partial file ffmpeg may already have written would
-        # leak — costly on a RAM-backed /tmp. Remove it here before re-raising.
+        # leak — costly on a RAM-backed /tmp. Remove it here before re-raising. (A no-op unlink
+        # if we failed at the source-write step above, before ffmpeg wrote anything.)
         _safe_unlink(dst)
         raise
     finally:
@@ -143,7 +153,9 @@ async def transcribe(
             except OSError:
                 actual = 0
             if actual > 32000 * max_seconds + 65536:
-                raise ValueError(f"decoded audio {actual} bytes exceeds the {max_seconds}s cap")
+                # #370: AudioTooLong (a ValueError subclass) so on_voice can reply "too long"
+                # rather than the generic "could not transcribe".
+                raise AudioTooLong(f"decoded audio {actual} bytes exceeds the {max_seconds}s cap")
         async with _infer_lock:
             def _run():
                 # beam_size=1 (greedy) + VAD (drop silence, curb hallucinated loops) +

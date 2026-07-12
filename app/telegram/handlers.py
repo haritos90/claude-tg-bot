@@ -2947,6 +2947,13 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         if state.mode != "code":
             await reply(message, i18n.t("common.code_only", lang))
             return
+        # #369: gate on the caller's LEVEL too, not just the session mode — a user demoted
+        # code->chat must not wipe session memory on a stale code-mode session (the demotion gap;
+        # matches cmd_memory / cmd_shell / cmd_files — see _has_code_access).
+        if not _has_code_access(message.from_user.id if message.from_user else 0,
+                                message.from_user.username if message.from_user else None):
+            await reply(message, i18n.t("access.code_denied", lang))
+            return
         prior = (state.session_notes or "").strip()
         if not prior:
             await reply(message, i18n.t("forget.empty", lang))
@@ -5286,20 +5293,26 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         except Exception:
             pass
 
-    async def _submit(message: Message, text: str, attachments=None, key: int | None = None) -> None:
+    async def _submit(message: Message, text: str, attachments=None, key: int | None = None,
+                      gated: bool = False) -> None:
         """Route a turn (text + optional content blocks) into the thread session.
 
         #266: a conversational turn resolves the key via _session_key_for_turn (may start a
         fresh session on idle). A caller that must target the CURRENT session without rotating
-        (e.g. /recap summarizing this session) passes an explicit `key`."""
+        (e.g. /recap summarizing this session) passes an explicit `key`.
+
+        #370: `gated=True` means the caller (on_voice) already ran _access_block for this key
+        before its expensive work, so skip the redundant re-check (which otherwise doubles the
+        per-turn rate-window queries)."""
         if key is None:
             key = await _session_key_for_turn(message)
-        uid = message.from_user.id if message.from_user else 0
-        uname = message.from_user.username if message.from_user else None
-        block = await _access_block(uid, uname, _lang(message), key)
-        if block:
-            await reply(message, block)
-            return
+        if not gated:
+            uid = message.from_user.id if message.from_user else 0
+            uname = message.from_user.username if message.from_user else None
+            block = await _access_block(uid, uname, _lang(message), key)
+            if block:
+                await reply(message, block)
+                return
         try:
             status = await sessions.handle_text(
                 message.chat.id, key, text, attachments=attachments
@@ -5522,7 +5535,9 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         )
         if err:
             if action is not None:
-                pending[_pkey(message)] = action         # #365: keep the capture alive on failure
+                # #365/#370: keep the capture alive on failure; setdefault so a NEWER pending set
+                # during this await is not clobbered by the restore.
+                pending.setdefault(_pkey(message), action)
             await reply(message, err)
             return
         # A placeholder the user sees while we transcribe; it then BECOMES the recognised
@@ -5538,6 +5553,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             )
         except Exception:
             holder = None
+        fail_msg = i18n.t("voice.transcribe_failed", lang)
         try:
             text = await transcribe.transcribe(
                 data,
@@ -5547,21 +5563,27 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 download_root=(settings.voice_model_path
                                or transcribe.default_model_root(str(settings.base_workdir))),
             )
+        except transcribe.AudioTooLong:
+            # #370: the byte cap tripped (Telegram duration metadata absent/understated) — tell the
+            # user it was too long, not that recognition failed.
+            text = ""
+            fail_msg = i18n.t("voice.too_long", lang, sec=cap)
         except Exception as exc:  # ffmpeg / model / decode failure
             log.warning("voice transcription failed: %s", exc)
             text = ""
         text = (text or "").strip()
         if not text:
             if action is not None:
-                pending[_pkey(message)] = action         # #365: keep the capture alive on failure
-            failed = i18n.t("voice.transcribe_failed", lang)
+                # #365/#370: keep the capture alive on failure; setdefault so a newer pending is
+                # not clobbered.
+                pending.setdefault(_pkey(message), action)
             if holder is not None:
                 try:
-                    await holder.edit_text(failed)
+                    await holder.edit_text(fail_msg)
                     return
                 except Exception:
                     pass
-            await reply(message, failed)
+            await reply(message, fail_msg)
             return
         shown = i18n.t("voice.transcript_prefix", lang, text=markup.escape_html(text))
         if holder is not None:
@@ -5578,7 +5600,9 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         # Prepend a marker so the MODEL knows this was a voice note (and may contain
         # recognition errors) — otherwise it guesses / hedges ("looks like speech
         # recognition"). The on-screen bubble above stays the clean transcript.
-        await _submit(message, i18n.t("voice.model_note", lang, text=text), key=key)
+        # #370: gated=True — the access gate already ran above (before download + transcription),
+        # so skip the now-redundant re-check inside _submit.
+        await _submit(message, i18n.t("voice.model_note", lang, text=text), key=key, gated=True)
 
     # ------------------------------------------------- permission callbacks
 
