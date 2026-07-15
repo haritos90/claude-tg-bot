@@ -137,3 +137,137 @@ def test_location_notes_replaces_every_token_and_is_noop_when_none():
     assert out == f"a {note} b {note} c"
     # no-op fast path when there are no locations
     assert s._location_notes("plain text", []) == "plain text"
+
+
+def test_commit_rich_interleaved_pins_split_and_drop_placeholder():
+    """#373/#374: a pins reply is SPLIT at each LOCATION_TOKEN — the native pin (a venue card when
+    named, else a plain pin) is sent RIGHT WHERE it sat, in document order; consecutive tokens
+    send back-to-back map cards with no empty bubble between them; the streaming placeholder is
+    deleted first and the footer rides the last non-empty text bubble."""
+    import asyncio
+    from app.telegram import markup
+
+    class _FakeBot:
+        def __init__(self):
+            self.calls: list = []
+
+        async def __call__(self, method):        # SendRichMessage(...)
+            self.calls.append(("rich", method.rich_message.get("markdown")))
+
+        async def delete_message(self, chat_id, message_id):
+            self.calls.append(("delete", message_id))
+            return True
+
+        async def send_message(self, **kw):
+            self.calls.append(("html", kw.get("text")))
+
+        async def send_location(self, **kw):
+            self.calls.append(("pin", (kw["latitude"], kw["longitude"])))
+            return object()                      # truthy → _safe treats the send as delivered
+
+        async def send_venue(self, **kw):
+            self.calls.append(("venue", kw["title"]))
+            return object()
+
+    bot = _FakeBot()
+    s = streamer.Streamer(bot, 123, None)
+    s.message_id = 42                            # a live streaming placeholder to clear
+    tok = markup.LOCATION_TOKEN
+    rich_text = f"Intro{tok}Middle{tok}{tok}End"  # 3 pins, incl. two back-to-back
+    locations = [
+        {"lat": 48.8584, "lon": 2.2945, "title": "Eiffel Tower", "address": "Paris"},
+        {"lat": 1.0, "lon": 2.0},
+        {"lat": 3.0, "lon": 4.0},
+    ]
+    asyncio.run(s._commit_rich_interleaved(rich_text, locations, [], [], "5h: 10%", silent_first=True))
+    kinds = [c[0] for c in bot.calls]
+    # placeholder cleared first, then the interleaved run in document order (no empty bubble
+    # for the back-to-back pins → two pins land consecutively).
+    assert bot.calls[0] == ("delete", 42)
+    assert kinds == ["delete", "rich", "venue", "rich", "pin", "pin", "rich"]
+    assert "Intro" in bot.calls[1][1] and "Middle" in bot.calls[3][1] and "End" in bot.calls[6][1]
+    assert all(c[1] and c[1].strip() for c in bot.calls if c[0] == "rich")   # never an empty bubble
+    # a named point becomes a venue card; the plain points become pins; all three delivered.
+    assert bot.calls[2] == ("venue", "Eiffel Tower")
+    assert ("pin", (1.0, 2.0)) in bot.calls and ("pin", (3.0, 4.0)) in bot.calls
+    assert "10%" in bot.calls[6][1]              # footer rides the last non-empty text bubble
+    assert s.message_id is None                  # placeholder reference cleared
+
+
+def test_commit_rich_interleaved_footer_alone_when_reply_is_pure_attachments():
+    """#373/#374: a reply that is NOTHING but attachments (no prose to carry the footer) still
+    delivers each one and sends the footer as its own message — nothing is lost."""
+    import asyncio
+    from app.telegram import markup
+
+    class _FakeBot:
+        def __init__(self):
+            self.calls: list = []
+
+        async def __call__(self, method):
+            self.calls.append(("rich", method.rich_message.get("markdown")))
+
+        async def send_message(self, **kw):
+            self.calls.append(("html", kw.get("text")))
+
+        async def send_location(self, **kw):
+            self.calls.append(("pin", (kw["latitude"], kw["longitude"])))
+            return object()
+
+    bot = _FakeBot()
+    s = streamer.Streamer(bot, 123, None)
+    s.message_id = None                          # a DM draft leaves no placeholder to delete
+    tok = markup.LOCATION_TOKEN
+    asyncio.run(s._commit_rich_interleaved(f"{tok}{tok}", [{"lat": 1, "lon": 2}, {"lat": 3, "lon": 4}],
+                                           [], [], "5h: 42%", silent_first=True))
+    kinds = [c[0] for c in bot.calls]
+    assert kinds == ["pin", "pin", "html"]       # both pins, then the footer on its own line
+    assert "42%" in bot.calls[-1][1]
+    assert not any(c[0] == "rich" for c in bot.calls)   # no empty text bubble was sent
+
+
+def test_commit_rich_interleaved_mixes_diagrams_tables_and_pins_in_order(monkeypatch):
+    """#374: the interleave generalizes BEYOND pins — an <svg> diagram (#295) and a wide table
+    (#243) are each sent as a PNG photo RIGHT WHERE their token sat, mixed with a pin and prose in
+    document order, instead of every attachment batched at the end of the message."""
+    import asyncio
+    from app.telegram import markup
+
+    # rasterization is CPU / library work — stub it so the test asserts ORDER, not pixels.
+    monkeypatch.setattr(streamer.svg_image, "render_svg_png", lambda svg: b"SVGPNG")
+    monkeypatch.setattr(streamer.table_image, "render_table_png", lambda rows: b"TBLPNG")
+
+    class _FakeTable:
+        rows = [["a", "b"]]
+
+    class _FakeBot:
+        def __init__(self):
+            self.calls: list = []
+
+        async def __call__(self, method):
+            self.calls.append(("rich", method.rich_message.get("markdown")))
+
+        async def send_photo(self, **kw):
+            self.calls.append(("photo", kw["photo"].filename))
+
+        async def send_location(self, **kw):
+            self.calls.append(("pin", (kw["latitude"], kw["longitude"])))
+            return object()
+
+    bot = _FakeBot()
+    s = streamer.Streamer(bot, 123, None)
+    s.message_id = None
+    svg, tbl, loc = markup.SVG_TOKEN, markup.WIDE_TABLE_TOKEN, markup.LOCATION_TOKEN
+    rich_text = f"Alpha{svg}Beta{tbl}Gamma{loc}Delta"
+    asyncio.run(s._commit_rich_interleaved(
+        rich_text, [{"lat": 1.0, "lon": 2.0}], ["<svg/>"], [_FakeTable()],
+        "5h: 7%", silent_first=True,
+    ))
+    kinds = [c[0] for c in bot.calls]
+    assert kinds == ["rich", "photo", "rich", "photo", "rich", "pin", "rich"]
+    # each attachment landed at its OWN spot, typed correctly by its photo filename.
+    assert bot.calls[1] == ("photo", "diagram.png")   # the <svg> diagram
+    assert bot.calls[3] == ("photo", "table.png")     # the wide table
+    assert bot.calls[5] == ("pin", (1.0, 2.0))
+    assert "Alpha" in bot.calls[0][1] and "Delta" in bot.calls[6][1]
+    assert "7%" in bot.calls[6][1]                     # footer on the last prose bubble

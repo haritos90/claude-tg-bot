@@ -5604,6 +5604,38 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         # so skip the now-redundant re-check inside _submit.
         await _submit(message, i18n.t("voice.model_note", lang, text=text), key=key, gated=True)
 
+    @router.message(F.location | F.venue)
+    async def on_location(message: Message) -> None:
+        """A location / venue the USER shares from Telegram's attach menu → a map turn (#373).
+
+        The SYMMETRIC inbound half of the bot's own map-pin replies (#344): the user drops a pin
+        (or a named place) from the composer and the model receives the coordinates as an ordinary
+        turn, so "what's near here?" / "is this on my route?" work with no typing. A venue also
+        carries a title + address; a plain pin is just the point. Nothing is echoed back — the
+        user's shared pin already sits in the chat and the model's reply is the acknowledgement.
+        A live-location share delivers its first fix here; later live updates arrive as edited
+        messages (a different router surface) and are ignored — the opening position is enough.
+        """
+        if message.from_user is not None and message.from_user.is_bot:
+            return
+        lang = _lang(message)
+        # A venue message carries BOTH message.venue and message.location; a plain share has only
+        # message.location. Prefer the venue's own point, fall back to the top-level location.
+        venue = message.venue
+        loc = message.location or (venue.location if venue is not None else None)
+        if loc is None:
+            return
+        # 5 decimals ≈ 1 m — plenty of precision, and keeps the model note compact.
+        lat = f"{loc.latitude:.5f}"
+        lon = f"{loc.longitude:.5f}"
+        if venue is not None:
+            note = i18n.t("location.venue_model_note", lang, title=venue.title,
+                          address=venue.address, lat=lat, lon=lon)
+        else:
+            note = i18n.t("location.model_note", lang, lat=lat, lon=lon)
+        # _submit resolves the session key (may rotate on idle) and runs the access gate.
+        await _submit(message, note)
+
     # ------------------------------------------------- permission callbacks
 
     @router.callback_query(F.data.startswith("perm:"))

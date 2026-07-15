@@ -806,6 +806,24 @@ def extract_locations(text: str):
     return out, locs
 
 
+# #374: one regex over EVERY out-of-band attachment token — a pin (#344), an <svg> diagram (#295),
+# or a wide (>20-col) table (#243). The streamer splits the reply on these (keeping the tokens, via
+# the capture group) so it can send each block's native message — a map pin or a PNG photo — RIGHT
+# WHERE it sat in the text, in document order, instead of leaving a placeholder note and batching
+# every attachment at the very end (detached from the prose that introduces it).
+_ATTACH_TOKEN_RE = re.compile(
+    "(" + "|".join(re.escape(t) for t in (LOCATION_TOKEN, SVG_TOKEN, WIDE_TABLE_TOKEN)) + ")"
+)
+
+
+def split_on_attachment_tokens(text: str) -> list[str]:
+    """#374: split ``text`` on any LOCATION / SVG / WIDE_TABLE token, KEEPING the tokens. Returns
+    the ``re.split`` list — EVEN indices are prose runs, ODD indices are one of the ``*_TOKEN``
+    sentinels — so the caller can walk it and drop each attachment at its exact spot. No token →
+    a single-element ``[text]`` list, so the common (no-attachment) case is a trivial pass-through."""
+    return _ATTACH_TOKEN_RE.split(text or "")
+
+
 def has_code_block(text: str) -> bool:
     """True if ``text`` contains a real (multi-line) fenced code block (#176)."""
     return bool(_CODE_FENCE_BLOCK_RE.search(text or ""))

@@ -1818,6 +1818,22 @@ CATALOG: dict[str, dict[str, str]] = {
         "en": "📍 Location — sent on the map below.",
         "ru": "📍 Локация — отправлена на карте ниже.",
     },
+    # #373: the SYMMETRIC inbound path — the user drops a pin (or a named venue) from Telegram's
+    # attach menu and the coordinates are handed to the MODEL as a normal turn (plain text, not
+    # shown to the user; their own shared pin already sits in the chat). So "what's near here?" /
+    # "is this on my route?" just work. Kept English-only intent but localized like voice.model_note.
+    "location.model_note": {
+        "en": "[The user shared a location from Telegram. "
+              "Coordinates: latitude {lat}, longitude {lon}.]",
+        "ru": "[Пользователь отправил геопозицию из Telegram. "
+              "Координаты: широта {lat}, долгота {lon}.]",
+    },
+    "location.venue_model_note": {
+        "en": "[The user shared a place from Telegram: {title} — {address}. "
+              "Coordinates: latitude {lat}, longitude {lon}.]",
+        "ru": "[Пользователь отправил место из Telegram: {title} — {address}. "
+              "Координаты: широта {lat}, долгота {lon}.]",
+    },
     # #229: header of the live task-list card ({n} total, {done} completed, {open} not done).
     "todo.card_header": {
         "en": "📋 {n} tasks ({done} done, {open} open)",

@@ -1349,6 +1349,85 @@ class Streamer:
         self._rendered_text = md
         return True
 
+    async def _commit_rich_interleaved(self, rich_text: str, locations: list, svgs: list,
+                                       wide_tables: list, footer: str, silent_first: bool,
+                                       reply_markup=None) -> None:
+        """#373/#374: deliver a reply that carries OUT-OF-BAND blocks — map pins (#344), ``<svg>``
+        diagrams (#295), and wide (>20-col) tables (#243) — by INTERLEAVING them: SPLIT the rich
+        body at each block's token and send its native message (a sendLocation/sendVenue pin, or a
+        PNG photo) RIGHT WHERE it sat, in document order, instead of leaving a placeholder note and
+        batching every attachment at the very end (detached from the prose that introduces it — the
+        #373 screenshot bug for pins, generalized here to diagrams + wide tables).
+
+        Send order is text, block, text, block, …, text. An EMPTY text run (back-to-back blocks)
+        sends no bubble, so several blocks in a row arrive as consecutive cards under the line that
+        lists them. The footer rides the LAST non-empty text bubble (its own message if the reply
+        ends on a block); the keypad (#247) rides that same bubble. Each rich bubble falls back to
+        classic HTML if its send fails (like ``_commit_mixed``) so a reply is never lost. Always
+        delivers — no False/fallback return (unlike ``_commit_rich_markdown``).
+
+        #373 was pins-only (``rich_text.split(LOCATION_TOKEN)``); #374 walks EVERY attachment token
+        via ``markup.split_on_attachment_tokens`` and dispatches by token type. Each extractor emits
+        one token per item in document order, so the per-type queues drain front-to-back in step."""
+        # Ordered queues; each list is already in document order (its extractor ran left→right).
+        loc_q, svg_q, tbl_q = list(locations), list(svgs), list(wide_tables)
+        # split() KEEPS the tokens: even indices are prose, odd indices are one *_TOKEN sentinel.
+        parts = markup.split_on_attachment_tokens(rich_text)
+        # Segments are fresh messages → drop the streaming write-head placeholder
+        # (DM drafts have none; they self-expire), mirroring _commit_mixed.
+        if self.message_id is not None:
+            with contextlib.suppress(Exception):
+                await self.bot.delete_message(self.chat_id, self.message_id)
+            self.message_id = None
+        # Last non-empty PROSE run (even index) → the footer + keypad ride it.
+        last_text_idx = max((i for i, p in enumerate(parts) if i % 2 == 0 and p.strip()), default=-1)
+        first = True
+        for idx, seg in enumerate(parts):
+            if idx % 2:  # odd → an attachment token; drop its native message at this exact spot
+                if seg == markup.LOCATION_TOKEN and loc_q:
+                    await self._send_location(loc_q.pop(0))
+                elif seg == markup.SVG_TOKEN and svg_q:
+                    await self._send_svg_image(svg_q.pop(0))
+                elif seg == markup.WIDE_TABLE_TOKEN and tbl_q:
+                    await self._send_wide_table_image(tbl_q.pop(0))
+                continue
+            if not seg.strip():
+                continue  # empty prose run (leading token / back-to-back blocks) → no bubble
+            silent = silent_first if first else True
+            first = False
+            md = markup.demote_headings(seg).strip()  # #353: one font
+            if footer and idx == last_text_idx:
+                foot = "  \n".join(f"_{ln}_" for ln in footer.splitlines() if ln.strip())
+                md = f"{md}\n\n{foot}"
+            kb = reply_markup if idx == last_text_idx else None
+            try:
+                await self.bot(
+                    SendRichMessage(
+                        chat_id=self.chat_id, rich_message={"markdown": md},
+                        disable_notification=silent, reply_markup=kb, **self._kwargs(),
+                    )
+                )
+            except Exception:
+                seg_html = markup.md_to_html(md)
+                await self._safe(
+                    lambda h=seg_html, s=silent, k=kb: self.bot.send_message(
+                        chat_id=self.chat_id, text=h, parse_mode="HTML",
+                        disable_notification=s, link_preview_options=_NO_PREVIEW,
+                        reply_markup=k, **self._kwargs(),
+                    )
+                )
+        # Reply is nothing but attachments (no text carried the footer) → send the footer alone.
+        if footer and last_text_idx == -1:
+            await self._safe(
+                lambda: self.bot.send_message(
+                    chat_id=self.chat_id,
+                    text=f"<i>{markup.escape_html(footer)}</i>",
+                    parse_mode="HTML", disable_notification=True,
+                    link_preview_options=_NO_PREVIEW, **self._kwargs(),
+                )
+            )
+        self._rendered_text = rich_text
+
     async def _commit_mixed(self, full_text: str, footer: str, silent_first: bool) -> None:
         """#176: a reply that contains code → split by code block. Non-code segments
         (prose, tables, lists, headings) go as RICH messages (consistent font + native
@@ -1441,28 +1520,34 @@ class Streamer:
         loc_text, locations = markup.extract_locations(full_text)
         svg_text, svgs = markup.extract_svgs(loc_text)
         rich_text, wide_tables = markup.extract_wide_tables(svg_text)
-        # was (#243): inline token→note expansion here — factored to _wide_table_notes so the
-        # draft path (#256) reuses the SAME substitution and draft↔final stay consistent.
-        rich_text = self._wide_table_notes(rich_text, wide_tables)
-        rich_text = self._svg_notes(rich_text, svgs)
-        rich_text = self._location_notes(rich_text, locations)
+        # #374: any out-of-band block — a map pin (#344), an <svg> diagram (#295), or a wide
+        # (>20-col) table (#243) — is INTERLEAVED: the bubble is SPLIT at the block's spot and its
+        # native message (a pin / a PNG photo) is sent THERE, in document order, instead of a
+        # placeholder note + every attachment batched at the end (detached from the text — the #373
+        # screenshot bug for pins, generalized here to diagrams + tables). The raw *_TOKEN sentinels
+        # must survive into _commit_rich_interleaved, so the note-substitution helpers are NOT
+        # applied here (was #243/#295/#344: _wide_table_notes + _svg_notes + _location_notes ran on
+        # rich_text before the send). They still run on the DRAFT path so the streamed body shows
+        # notes. The interleaver always delivers (per-segment rich→HTML fallback) — no classic fallback.
+        if locations or svgs or wide_tables:
+            await self._commit_rich_interleaved(
+                rich_text, locations, svgs, wide_tables, footer, silent_first,
+                reply_markup=reply_markup,
+            )
+            return
+        # No out-of-band blocks → the reply is one plain rich bubble (rich_text carries no tokens).
         if await self._commit_rich_markdown(rich_text, footer, silent_first, reply_markup=reply_markup):
-            for tbl in wide_tables:  # empty unless a >20-col table was extracted (#243)
-                await self._send_wide_table_image(tbl)
-            for svg in svgs:         # empty unless the reply contained an <svg> diagram (#295)
-                await self._send_svg_image(svg)
-            for loc in locations:    # empty unless the reply contained a ```location block (#344)
-                await self._send_location(loc)
             return
         # # was (#176): split a code reply → rich prose/tables + classic code block:
         # if markup.has_code_block(full_text):
         #     await self._commit_mixed(full_text, footer, silent_first)
         #     return
 
-        # #346: the rich path above stripped the ```location blocks AND sent the pins; the two
-        # fallbacks below render the RAW text, so build a location-stripped body (blocks → notes)
-        # for them and send the pins in whichever branch actually delivers — otherwise the raw
-        # JSON leaks to the user and no pin is sent. was: both fallbacks used the raw full_text.
+        # #374: the two fallbacks below run ONLY when the reply has NO out-of-band block (the
+        # interleave branch returns for any pin/diagram/table) AND the rich send failed — so
+        # locations/svgs/wide_tables are all empty here and the note/pin handling is inert. It is
+        # kept (was #346, when the rich path could fall through with pins pending) as a defensive
+        # no-op: loc_noted == loc_text == full_text, and the trailing pin loop iterates nothing.
         loc_noted = self._location_notes(loc_text, locations)
 
         # Very long output (fallback): deliver as a document so we do not spam chunks.

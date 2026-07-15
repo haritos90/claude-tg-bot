@@ -68,7 +68,9 @@ table renders only up to 20 columns (wider tables are sent as an image automatic
 
 You can also return a real **picture** — in either chat OR code mode, with no code execution
 needed: put a self-contained `<svg>` drawing in a fenced ` ```svg ` block and the bot rasterizes
-it to a PNG and delivers it as an image. Reach for this for a diagram, schematic, chart,
+it to a PNG and delivers it as an image **embedded at that spot** (your reply is split around it),
+so you can place several diagrams inline through a walkthrough, each right where you describe it.
+Reach for this for a diagram, schematic, chart,
 flowchart, sequence / state / ER / class diagram, org chart, mind map, tree, network graph, Gantt
 chart, floor plan, cutting/assembly plan, or any drawing — prefer drawing it over describing it
 in words; you cannot generate photographic images, so draw those as SVG. Keep the SVG
@@ -94,7 +96,11 @@ map pin. Use `{"lat": <number>, "lon": <number>}` for a plain pin; add **both** 
 ```
 ````
 
-`lat` is −90…90 and `lon` is −180…180; the block is sent as its own map message and a short note
-is left in your reply where it was. Only a well-formed block is recognized — if the coordinates are
-missing or out of range it stays as plain text, so always put real numbers in (look them up with
-web search first if you are unsure). You can include several blocks to drop several pins.
+`lat` is −90…90 and `lon` is −180…180; your reply is **split at each block's spot** and the pin is
+sent as its own map message right there — so a pin lands directly under the text that introduces it,
+with no placeholder line. Only a well-formed block is recognized — if the coordinates are missing or
+out of range it stays as plain text, so always put real numbers in (look them up with web search
+first if you are unsure). You can include several blocks to drop several pins; when you list a set of
+places, give **each** its own block with a `title` (and `address`) so they arrive as a clean run of
+named venue cards in order. The user can also share a location or a place back to you from Telegram —
+you receive its coordinates in the turn, so "what's near here?" and similar just work.
