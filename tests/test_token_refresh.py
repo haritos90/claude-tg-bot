@@ -6,7 +6,10 @@ contract (a bad refresh leaves the creds file untouched).
 """
 
 import asyncio
+import concurrent.futures
+import contextlib
 import json
+import logging
 import os
 import tempfile
 import time
@@ -86,3 +89,86 @@ def test_maybe_refresh_skew_gate(monkeypatch):
 
 def test_missing_file_failsoft():
     assert token_refresh.refresh_now_sync(tempfile.mktemp(suffix=".json")).startswith("skip")
+
+
+def test_maybe_refresh_via_given_executor(monkeypatch):
+    """#378: the blocking refresh runs on a caller-supplied executor (refresh_loop uses a
+    dedicated 1-thread pool so a wedged sweep can't starve the shared executor)."""
+    path = tempfile.mktemp(suffix=".json")
+    _write(path, {"accessToken": "OLD", "refreshToken": "R1", "expiresAt": 1000})
+    monkeypatch.setattr(token_refresh, "_refresh_sync",
+                        lambda rt, to: {"access_token": "NEW", "expires_in": 28800})
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="t")
+    try:
+        out = asyncio.run(token_refresh.maybe_refresh(
+            path=path, skew=3600, force=True, executor=ex))
+    finally:
+        ex.shutdown(wait=False)
+    assert out.startswith("ok")
+    assert _read(path)["claudeAiOauth"]["accessToken"] == "NEW"
+    os.remove(path)
+
+
+async def _run_loop_briefly(**kwargs):
+    """Spin refresh_loop for a handful of fast sweeps, then cancel it cleanly."""
+    task = asyncio.create_task(token_refresh.refresh_loop(**kwargs))
+    await asyncio.sleep(0.1)
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+
+def test_refresh_loop_bounds_a_wedged_sweep(monkeypatch, caplog):
+    """#378: a sweep that blocks past the deadline is abandoned and the loop keeps ticking
+    and logs it — the exact failure mode that once silenced the loop for hours."""
+    async def hang(**kw):
+        await asyncio.sleep(30)          # never returns within the deadline below
+        return "ok: refreshed"
+    monkeypatch.setattr(token_refresh, "maybe_refresh", hang)
+    with caplog.at_level(logging.WARNING, logger="token_refresh"):
+        asyncio.run(_run_loop_briefly(interval=0.005, path="/nope",
+                                      sweep_deadline=0.02, heartbeat_every=0))
+    assert any("sweep exceeded" in r.getMessage() for r in caplog.records)
+
+
+def test_refresh_loop_escalates_and_heartbeats(monkeypatch, caplog):
+    """#378: consecutive failures escalate to WARNING (with a re-login hint) and a liveness
+    heartbeat is emitted — so a stuck loop is distinguishable from a healthy idle one."""
+    async def fail(**kw):
+        return "fail: refresh request rejected"
+    monkeypatch.setattr(token_refresh, "maybe_refresh", fail)
+    with caplog.at_level(logging.INFO, logger="token_refresh"):
+        asyncio.run(_run_loop_briefly(interval=0.005, path="/nope", heartbeat_every=3))
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("consecutive" in m and "re-login" in m for m in msgs)   # escalated
+    assert any(r.levelno == logging.WARNING for r in caplog.records)
+    assert any("alive" in m for m in msgs)                             # heartbeat
+
+
+def test_login_seconds_left_reads_refresh_expiry():
+    """#379: login expiry comes from refreshTokenExpiresAt (the ~monthly deadline), NOT
+    the 8h access-token expiresAt."""
+    path = tempfile.mktemp(suffix=".json")
+    exp = int((time.time() + 2 * 86400) * 1000)          # 2 days out
+    _write(path, {"accessToken": "A", "refreshToken": "R", "expiresAt": 1000,
+                  "refreshTokenExpiresAt": exp})
+    left = token_refresh.login_seconds_left(path)
+    assert left is not None and 1.9 * 86400 < left < 2.1 * 86400
+    os.remove(path)
+
+
+def test_login_seconds_left_absent_field_is_none():
+    path = tempfile.mktemp(suffix=".json")
+    _write(path, {"accessToken": "A", "refreshToken": "R", "expiresAt": 1000})  # no refresh expiry
+    assert token_refresh.login_seconds_left(path) is None
+    os.remove(path)
+
+
+def test_login_warn_days_threshold_and_floor():
+    """#379: only within the window; floors so it never overstates the days left."""
+    day = 86400
+    assert token_refresh.login_warn_days(5 * day, warn_days=3) is None    # outside window
+    assert token_refresh.login_warn_days(2.7 * day, warn_days=3) == 2     # floors, not 3
+    assert token_refresh.login_warn_days(0.3 * day, warn_days=3) == 1     # floor of 1
+    assert token_refresh.login_warn_days(-5 * day, warn_days=3) == 1      # already expired
+    assert token_refresh.login_warn_days(None) is None

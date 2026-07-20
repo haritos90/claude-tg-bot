@@ -2022,6 +2022,13 @@ CATALOG: dict[str, dict[str, str]] = {
         "en": "⚠️ Internal error: {exc}",
         "ru": "⚠️ Внутренняя ошибка: {exc}",
     },
+    # #379: owner-only heads-up prepended above a reply a few days before the host login
+    # (OAuth refresh token) expires. Plain text (no tags) — it rides the same markdown
+    # render path as the model's answer.
+    "session.login_expiry_warn": {
+        "en": "⚠️ Server login expires in {days}d — re-login on the host with the claude CLI to avoid downtime.",
+        "ru": "⚠️ Логин на сервере истекает через {days}д — перелогинься на хосте через claude CLI, чтобы не было простоя.",
+    },
     "busy.queued": {
         "en": "⏳ Server busy — your turn is queued and will run as soon as a slot frees up.",
         "ru": "⏳ Сервер занят — ваш ход в очереди и начнётся, как только освободится слот.",

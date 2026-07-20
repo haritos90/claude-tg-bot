@@ -190,6 +190,20 @@ class _Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
+    # #378: a jailed client that disconnects mid-stream (a reaped/cancelled turn — the
+    # #179 reaper frees the ~500 MB claude client) makes the request handler raise
+    # ConnectionResetError/BrokenPipeError, which socketserver's default handle_error
+    # dumps as a full multi-line traceback PER event — noise that buried the low-rate
+    # token-refresh lines in the shared journal. One line for an expected disconnect;
+    # keep the full traceback for anything genuinely unexpected.
+    def handle_error(self, request, client_address):
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ConnectionResetError, BrokenPipeError, ConnectionAbortedError)):
+            sys.stderr.write(f"[broker] client {client_address} disconnected "
+                             f"({type(exc).__name__})\n")
+            return
+        super().handle_error(request, client_address)
+
 
 def build_server(port: int, creds_path: str, upstream: str) -> _Server:
     handler = type("BoundHandler", (_Handler,),

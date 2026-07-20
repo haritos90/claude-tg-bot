@@ -25,6 +25,7 @@ behaviour — nothing breaks.
 """
 
 import asyncio
+import concurrent.futures
 import contextlib
 import json
 import logging
@@ -54,6 +55,21 @@ def _env_int(name: str, default: int) -> int:
 DEFAULT_SKEW_SECONDS = _env_int("OAUTH_REFRESH_SKEW_SEC", 3600)
 DEFAULT_INTERVAL_SECONDS = _env_int("OAUTH_REFRESH_INTERVAL_SEC", 1800)
 
+# #378: a single sweep must never silently park the loop. urllib's socket timeout does
+# NOT cover DNS resolution (getaddrinfo runs before the socket timeout is armed), so a
+# wedged resolver once parked a sweep for hours with zero further log output. Bound every
+# sweep at the asyncio layer (a timed-out blocking call is abandoned on a dedicated
+# 1-thread pool, never the shared executor) and emit a liveness heartbeat every Nth sweep
+# so a STOPPED loop shows up as a gap instead of looking identical to a healthy idle one.
+DEFAULT_SWEEP_DEADLINE_SECONDS = _env_int("OAUTH_REFRESH_SWEEP_DEADLINE_SEC", 120)
+DEFAULT_HEARTBEAT_EVERY = _env_int("OAUTH_REFRESH_HEARTBEAT_EVERY", 6)  # ~every 3 h at 30-min sweeps
+
+# #379: login-expiry heads-up. The OAuth *refresh* token (the login) has a hard ~monthly
+# life (`refreshTokenExpiresAt`); the refresher above only renews the 8 h access token, so
+# the login still expires and needs a manual `claude` re-login. Warn the owner when the
+# login is within this many days of that deadline.
+LOGIN_EXPIRY_WARN_DAYS = _env_int("LOGIN_EXPIRY_WARN_DAYS", 3)
+
 
 def _read_creds(path: str):
     """Load the WHOLE credentials JSON (so we can rewrite it intact). Returns the dict
@@ -73,6 +89,31 @@ def _seconds_left(oauth) -> float | None:
         return float(exp) / 1000.0 - time.time()
     except (TypeError, ValueError):
         return None
+
+
+def login_seconds_left(path: str = _DEFAULT_CREDS) -> float | None:
+    """#379: seconds until the *login itself* expires, from ``refreshTokenExpiresAt``
+    (epoch MILLIS) — the hard ~monthly deadline after which the OAuth refresh token is dead
+    and a manual ``claude`` re-login is required (the refresher renews only the 8 h access
+    token, never the refresh token). None if the field is absent/unreadable."""
+    creds = _read_creds(path)
+    oauth = creds.get("claudeAiOauth") if isinstance(creds, dict) else None
+    exp = oauth.get("refreshTokenExpiresAt") if isinstance(oauth, dict) else None
+    try:
+        return float(exp) / 1000.0 - time.time()
+    except (TypeError, ValueError):
+        return None
+
+
+def login_warn_days(seconds_left: float | None,
+                    warn_days: int = LOGIN_EXPIRY_WARN_DAYS) -> int | None:
+    """#379: whole days to show in a login-expiry warning when the login is within
+    ``warn_days`` of expiry, else None. Floors (never overstates the time left) with a
+    floor of 1, which also covers an already-expired login. Pure — the caller owns the
+    once-per-day throttle + i18n."""
+    if seconds_left is None or seconds_left > warn_days * 86400:
+        return None
+    return max(1, int(seconds_left // 86400))
 
 
 def _refresh_sync(refresh_token: str, timeout: float):
@@ -151,35 +192,99 @@ def refresh_now_sync(path: str = _DEFAULT_CREDS, timeout: float = 20.0) -> str:
 
 
 async def maybe_refresh(path: str = _DEFAULT_CREDS, skew: float = DEFAULT_SKEW_SECONDS,
-                        timeout: float = 20.0, force: bool = False) -> str:
+                        timeout: float = 20.0, force: bool = False,
+                        executor: "concurrent.futures.Executor | None" = None) -> str:
     """Refresh only if the access token expires within ``skew`` seconds (or ``force``).
-    Runs the blocking HTTP + file I/O in a thread. Returns a status string."""
+    Runs the blocking HTTP + file I/O in a thread. Returns a status string.
+
+    #378: when ``executor`` is given the blocking refresh runs there instead of the
+    default thread pool, so a sweep abandoned by ``refresh_loop``'s ``wait_for`` (a wedged
+    DNS/socket call) can't starve the shared executor the rest of the app depends on."""
     creds = _read_creds(path)
     if creds is None:
         return "skip: creds unreadable"
     left = _seconds_left(creds.get("claudeAiOauth") or {})
     if not force and left is not None and left > skew:
         return f"skip: {int(left)}s left"
+    if executor is not None:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(executor, refresh_now_sync, path, timeout)
     return await asyncio.to_thread(refresh_now_sync, path, timeout)
 
 
 async def refresh_loop(interval: float = DEFAULT_INTERVAL_SECONDS,
                        skew: float = DEFAULT_SKEW_SECONDS,
-                       path: str = _DEFAULT_CREDS) -> None:
+                       path: str = _DEFAULT_CREDS,
+                       sweep_deadline: float = DEFAULT_SWEEP_DEADLINE_SECONDS,
+                       heartbeat_every: int = DEFAULT_HEARTBEAT_EVERY) -> None:
     """Background loop (#191): every ``interval`` seconds, refresh the OAuth token if
     it is within ``skew`` of expiry. Started next to the usage poller / reaper and
-    cancelled on shutdown. Self-contained + fail-soft — a bad sweep only logs."""
-    logger.info("token refresh: sweep every %ds, renew when <%ds left", int(interval), int(skew))
-    while True:
-        try:
-            status = await maybe_refresh(path=path, skew=skew)
-            if not status.startswith("skip"):
-                logger.info("token refresh: %s", status)
-        except asyncio.CancelledError:
-            break
-        except Exception:
-            logger.warning("token refresh sweep failed", exc_info=True)
-        try:
-            await asyncio.sleep(interval)
-        except asyncio.CancelledError:
-            break
+    cancelled on shutdown. Self-contained + fail-soft — a bad sweep only logs.
+
+    #378 hardening (after a loop that went silent for hours): every sweep is bounded by
+    ``sweep_deadline`` so a wedged DNS/socket call can't park the loop; a liveness
+    heartbeat is logged every ``heartbeat_every`` sweeps so a STOPPED loop is a visible
+    gap (not indistinguishable from a healthy idle one — a no-op sweep is otherwise
+    silent); and consecutive failures escalate to WARNING (a revoked refresh_token that
+    needs a manual re-login stops being an easy-to-miss INFO)."""
+    logger.info("token refresh: sweep every %ds, renew when <%ds left (deadline %ds)",
+                int(interval), int(skew), int(sweep_deadline))
+    # #378: dedicated 1-thread pool for the blocking refresh — a sweep abandoned by
+    # wait_for leaves at most ONE stuck thread here, never in the shared default executor.
+    executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=1, thread_name_prefix="oauth-refresh")
+    fails = 0          # consecutive failed sweeps (a revoked refresh_token → re-login)
+    sweeps = 0         # for the liveness heartbeat
+    status = "startup"
+    # was (#191) — replaced for #378 (no per-sweep deadline, no heartbeat, silent on skip;
+    # a wedged sweep parked the loop with zero further output):
+    #   while True:
+    #       try:
+    #           status = await maybe_refresh(path=path, skew=skew)
+    #           if not status.startswith("skip"):
+    #               logger.info("token refresh: %s", status)
+    #       except asyncio.CancelledError:
+    #           break
+    #       except Exception:
+    #           logger.warning("token refresh sweep failed", exc_info=True)
+    #       try:
+    #           await asyncio.sleep(interval)
+    #       except asyncio.CancelledError:
+    #           break
+    try:
+        while True:
+            try:
+                status = await asyncio.wait_for(
+                    maybe_refresh(path=path, skew=skew, executor=executor),
+                    timeout=sweep_deadline)
+                if status.startswith("fail"):
+                    fails += 1
+                    # A revoked/rotated refresh_token fails every sweep — say so LOUDLY
+                    # after the first repeat instead of an easy-to-miss INFO.
+                    level = logging.WARNING if fails >= 2 else logging.INFO
+                    logger.log(level, "token refresh: %s (%d consecutive%s)", status, fails,
+                               "; manual re-login likely needed" if fails >= 2 else "")
+                else:
+                    if not status.startswith("skip"):
+                        logger.info("token refresh: %s", status)   # an actual "ok: refreshed"
+                    fails = 0
+            except asyncio.TimeoutError:
+                fails += 1
+                status = "fail: sweep timed out"
+                logger.warning("token refresh: sweep exceeded %ds (blocked DNS/socket?) — "
+                               "abandoned, will retry (%d consecutive)",
+                               int(sweep_deadline), fails)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.warning("token refresh sweep failed", exc_info=True)
+            sweeps += 1
+            if heartbeat_every > 0 and sweeps % heartbeat_every == 0:
+                logger.info("token refresh: alive — %d sweeps done, last status: %s",
+                            sweeps, status)
+            try:
+                await asyncio.sleep(interval)
+            except asyncio.CancelledError:
+                break
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)

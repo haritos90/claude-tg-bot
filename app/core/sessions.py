@@ -606,6 +606,9 @@ class SessionManager:
         # #191: background task refreshing the subscription OAuth token before it
         # expires (the on-disk token has a hard ~8h life; nothing else rotates it).
         self._token_refresh_task: asyncio.Task | None = None
+        # #379: last time the login-expiry banner was shown to the owner (epoch), so it is
+        # throttled to ~once/day. In-memory is fine — a restart at worst re-shows it once.
+        self._login_warn_last = 0.0
 
     # ------------------------------------------------------------------ records
 
@@ -1594,6 +1597,11 @@ class SessionManager:
         # #164: the account footer is the owner's GLOBAL usage — show it only to the
         # owner (chat_id == owner_id). Delegated users get their own /limits instead.
         footer = self.usage_footer(i18n.cached_lang(streamer.chat_id), chat_id=streamer.chat_id)
+        # #379: a login-expiry heads-up shown ABOVE the answer (never inside the
+        # <tg-thinking> draft), owner-only + throttled ~once/day, so the owner re-logs
+        # before the ~monthly refresh-token deadline. Display-only — NOT logged to history.
+        _banner = self._login_expiry_banner(streamer.chat_id)
+        display_text = f"{_banner}\n\n{flush_text}" if (_banner and flush_text.strip()) else flush_text
         if segmented and not flush_text.strip():
             # Every burst was already committed and the turn ended on a tool with
             # no trailing text — nothing new to post. Stop the stream (the empty
@@ -1603,7 +1611,7 @@ class SessionManager:
         else:
             # The final answer pings the user; intermediate segments stayed silent.
             with contextlib.suppress(Exception):
-                await streamer.finish(flush_text, footer=footer, notify=True)
+                await streamer.finish(display_text, footer=footer, notify=True)
             # Log the assistant's reply (feeds /recap + /history); best-effort.
             with contextlib.suppress(Exception):
                 await db.log_message(thread_id, "assistant", flush_text)
@@ -2045,6 +2053,23 @@ class SessionManager:
         idle_reset_min still overrides it for that owner."""
         self._idle_reset = max(0.0, float(sec))
         await db.set_kv("idle_reset_sec", str(int(self._idle_reset)))
+
+    def _login_expiry_banner(self, chat_id: int) -> str | None:
+        """#379: one-line localized heads-up when the host login (the OAuth refresh token,
+        `refreshTokenExpiresAt`) is within LOGIN_EXPIRY_WARN_DAYS of its ~monthly deadline.
+        OWNER-ONLY (only they can re-login on the host) and throttled to ~once/day, so it
+        nudges without spamming. Returns None when there is nothing to show."""
+        owner_id = getattr(self.settings, "owner_id", None)
+        if owner_id is None or chat_id != owner_id:
+            return None
+        days = token_refresh.login_warn_days(token_refresh.login_seconds_left())
+        if days is None:
+            return None
+        now = time.time()
+        if now - self._login_warn_last < 20 * 3600:   # ~once/day (counts down 3→2→1)
+            return None
+        self._login_warn_last = now
+        return i18n.t("session.login_expiry_warn", i18n.cached_lang(chat_id), days=days)
 
     def usage_footer(self, lang: str = "en", chat_id: int | None = None) -> str:
         """Footer line appended to a finished reply when footer display is on.

@@ -89,23 +89,15 @@ pool is why per-user usage caps exist — see [Access control](#access-control).
 
 ## Message formatting
 
-Claude replies in Markdown. The bot renders every reply as one native rich message (Bot
-API 10.1 `sendRichMessage`, `rich_message={"markdown": …}`), so headings, lists,
-checklists, quotes, side-scrolling tables, math, and code render natively without
-client-side splitting; while generating, the reply streams already-formatted through
-`sendRichMessageDraft`. Command replies and the inline-keyboard menus use the same path
-(`_send_menu` / `_edit_menu`).
+Claude replies in Markdown; the bot renders each reply as one native rich message (Bot
+API 10.1 `sendRichMessage`), so headings, lists, tables, math, and code render without
+client-side splitting, and stream live via `sendRichMessageDraft`. If a rich send fails,
+the reply falls back to classic Markdown→HTML, and very long output to a `.md` file — a
+message is never lost. (One client gap: code blocks show as plain monospace until the
+Telegram client styles `RichBlockPreformatted`.)
 
-Classic `parse_mode="HTML"` (`markup.md_to_html`, a safe-subset Markdown→HTML converter)
-is the fallback only: if a rich send/edit fails, the content is delivered as classic
-HTML, and very long output falls back to a `.md` document — a message is never lost.
-
-One client gap: a code block renders as plain monospace inside a rich message (no
-language label or copy button) because the Telegram client does not yet style
-`RichBlockPreformatted`.
-
-The rendering paths, the Markdown→HTML contract, the rich tag catalog, and the size
-rules are specified in [markup.md](docs/markup.md). Telegram reference:
+The full contract — render paths, HTML fallback, tag catalog, size rules — is in
+[markup.md](docs/markup.md). Telegram reference:
 [Rich message formatting][tg-fmt] · [HTML style][tg-html].
 
 [tg-fmt]: https://core.telegram.org/bots/api#rich-message-formatting-options
@@ -144,11 +136,12 @@ The code is grouped into the `app` package (run with `python -m app`):
 | `app/telegram/svg_image.py` | Rasterizes a chat reply's inline `<svg>` diagram to PNG. |
 | `app/telegram/table_image.py` | Dormant PNG-table fallback, kept for wide tables. |
 | `deploy/` | Out-of-process helpers: `tg-bot.service` (systemd unit), `sandbox-claude.sh` (bubblewrap launcher), the egress / broker / seccomp scripts. |
-| `docs/` | Design docs: `data-model.md`, `isolation.md`, `menu.md`, `markup.md`, `rich-message-spec.md`, `CONTRIBUTING.md`, `SECURITY.md`. |
+| `docs/` | Design docs: `data-model.md`, `isolation.md`, `menu.md`, `markup.md`, `rich-message-spec.md`, `SECURITY.md`. |
+| `CONTRIBUTING.md` | Contributor quickstart (the short version of `AGENTS.md`). |
 | `backlog/` | Task ledger ([Backlog.md](https://github.com/MrLesk/Backlog.md)) — tasks and key-decision ADRs as plain markdown files, managed with the `backlog` CLI. |
 
 Tasks are tracked in [`backlog/`](backlog/) ([Backlog.md](https://github.com/MrLesk/Backlog.md));
-contributor rules in [`AGENTS.md`](AGENTS.md) and [`CONTRIBUTING.md`](docs/CONTRIBUTING.md).
+contributor rules in [`AGENTS.md`](AGENTS.md) and [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ---
 
@@ -468,11 +461,10 @@ Resilience:
 - Connection watchdog (`Type=notify` + `WatchdogSec=180`, [`app/watchdog.py`](app/watchdog.py)):
   the bot pings systemd only after a successful Telegram probe, so ~3 minutes without
   reaching Telegram triggers a force-restart.
-- OAuth token refresh ([`app/core/token_refresh.py`](app/core/token_refresh.py)): the subscription access
-  token has a ~8h life; a background loop renews it via the `refresh_token` grant and
-  rewrites `~/.claude/.credentials.json` before it expires (subscription only, never an
-  API key). Tunable via `OAUTH_REFRESH`, `OAUTH_REFRESH_INTERVAL_SEC` (1800),
-  `OAUTH_REFRESH_SKEW_SEC` (3600).
+- OAuth token refresh ([`app/core/token_refresh.py`](app/core/token_refresh.py)): the
+  subscription access token has a ~8h life; a background loop renews it before expiry
+  (subscription only, never an API key), and warns the owner a few days before the monthly
+  login itself expires so a re-login happens before an outage.
 - Optional daily restart: [`deploy/claude-tg-bot-restart.{service,timer}`](deploy/) —
   `sudo systemctl enable --now claude-tg-bot-restart.timer`.
 

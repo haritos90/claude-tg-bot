@@ -2,7 +2,7 @@
 
 Thanks for helping out. Keep changes **small** and consistent with the file you're
 editing — match the surrounding style, comment the *why* not the *what*, and don't
-add abstractions beyond what the task needs. [`AGENTS.md`](../AGENTS.md) is the single
+add abstractions beyond what the task needs. [`AGENTS.md`](AGENTS.md) is the single
 source of truth for how this project works; this file is the short contributor
 version of its rules.
 
@@ -45,7 +45,7 @@ session`. Types: `feat` · `fix` · `docs` · `refactor` · `test` · `build` ·
 
 ## Tasks
 
-Work is tracked in [`backlog/`](../backlog) ([Backlog.md](https://github.com/MrLesk/Backlog.md)) —
+Work is tracked in [`backlog/`](backlog) ([Backlog.md](https://github.com/MrLesk/Backlog.md)) —
 one markdown file per task under `backlog/tasks/`, managed with the `backlog` CLI. Statuses
 flow **To Do → In Progress → Done** (with **Deferred** for parked work). A new idea →
 `backlog task create "Title"`; when it's done → `backlog task edit <id> -s Done --notes
@@ -75,5 +75,5 @@ And keep these **hard invariants** intact:
   `allowed_tools`) without a deliberate reason — that silently bypasses the
   Allow/Deny approval gate.
 
-For the deeper SDK / Telegram / async invariants, read **[`AGENTS.md`](../AGENTS.md)
+For the deeper SDK / Telegram / async invariants, read **[`AGENTS.md`](AGENTS.md)
 §5** rather than re-deriving them here.
