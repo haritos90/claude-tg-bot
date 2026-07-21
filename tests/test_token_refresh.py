@@ -125,7 +125,9 @@ def test_refresh_loop_bounds_a_wedged_sweep(monkeypatch, caplog):
         await asyncio.sleep(30)          # never returns within the deadline below
         return "ok: refreshed"
     monkeypatch.setattr(token_refresh, "maybe_refresh", hang)
-    with caplog.at_level(logging.WARNING, logger="token_refresh"):
+    # #380: the FIRST timeout logs at INFO now (only a repeat escalates), so capture INFO
+    # to catch it regardless of how many sweeps the brief window happens to fit.
+    with caplog.at_level(logging.INFO, logger="token_refresh"):
         asyncio.run(_run_loop_briefly(interval=0.005, path="/nope",
                                       sweep_deadline=0.02, heartbeat_every=0))
     assert any("sweep exceeded" in r.getMessage() for r in caplog.records)
@@ -172,3 +174,36 @@ def test_login_warn_days_threshold_and_floor():
     assert token_refresh.login_warn_days(0.3 * day, warn_days=3) == 1     # floor of 1
     assert token_refresh.login_warn_days(-5 * day, warn_days=3) == 1      # already expired
     assert token_refresh.login_warn_days(None) is None
+
+
+def test_login_warn_days_exact_boundary():
+    """#380: pin the strict `>` boundary so an off-by-one flip to `>=` is caught — exactly
+    warn_days out is still INSIDE the window, a hair past it is outside."""
+    day = 86400
+    assert token_refresh.login_warn_days(3 * day, warn_days=3) == 3        # exactly at edge → inside
+    assert token_refresh.login_warn_days(3 * day + 1, warn_days=3) is None  # just past → outside
+
+
+def test_refresh_loop_escalation_resets_on_success(monkeypatch, caplog):
+    """#380: a successful sweep resets the consecutive-failure counter, so escalation is
+    CONSECUTIVE-only — after fail,fail (→ one WARNING) an ok resets and the next fail is
+    INFO again, never a second WARNING."""
+    calls = {"n": 0}
+    # fail, fail, ok, fail, then ok forever — the ok tail adds no warnings, so the assertion
+    # does not depend on exactly how many sweeps the brief window fits (only that it runs 4+).
+    script = ["fail: rejected", "fail: rejected", "ok: refreshed", "fail: rejected"]
+
+    async def scripted(**kw):
+        i = calls["n"]
+        calls["n"] += 1
+        return script[i] if i < len(script) else "ok: refreshed"
+
+    monkeypatch.setattr(token_refresh, "maybe_refresh", scripted)
+    with caplog.at_level(logging.INFO, logger="token_refresh"):
+        asyncio.run(_run_loop_briefly(interval=0.002, path="/nope",
+                                      sweep_deadline=1.0, heartbeat_every=0))
+    assert calls["n"] >= 4                          # the whole script actually ran
+    warns = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    # Only the 2nd of the first failure pair escalates; the ok resets fails to 0, so the 4th
+    # (a lone failure, fails == 1) stays INFO — exactly one WARNING total.
+    assert len(warns) == 1 and "2 consecutive" in warns[0]

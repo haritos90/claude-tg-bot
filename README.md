@@ -136,7 +136,7 @@ The code is grouped into the `app` package (run with `python -m app`):
 | `app/telegram/svg_image.py` | Rasterizes a chat reply's inline `<svg>` diagram to PNG. |
 | `app/telegram/table_image.py` | Dormant PNG-table fallback, kept for wide tables. |
 | `deploy/` | Out-of-process helpers: `tg-bot.service` (systemd unit), `sandbox-claude.sh` (bubblewrap launcher), the egress / broker / seccomp scripts. |
-| `docs/` | Design docs: `data-model.md`, `isolation.md`, `menu.md`, `markup.md`, `rich-message-spec.md`, `SECURITY.md`. |
+| `docs/` | Design docs: `data-model.md`, `isolation.md`, `menu.md`, `markup.md`, `rich-message-spec.md`, `troubleshooting.md`, `voice.md`, `SECURITY.md`. |
 | `CONTRIBUTING.md` | Contributor quickstart (the short version of `AGENTS.md`). |
 | `backlog/` | Task ledger ([Backlog.md](https://github.com/MrLesk/Backlog.md)) — tasks and key-decision ADRs as plain markdown files, managed with the `backlog` CLI. |
 
@@ -464,7 +464,10 @@ Resilience:
 - OAuth token refresh ([`app/core/token_refresh.py`](app/core/token_refresh.py)): the
   subscription access token has a ~8h life; a background loop renews it before expiry
   (subscription only, never an API key), and warns the owner a few days before the monthly
-  login itself expires so a re-login happens before an outage.
+  login itself expires so a re-login happens before an outage. Tunable via `.env`:
+  `OAUTH_REFRESH`, `OAUTH_REFRESH_INTERVAL_SEC`, `OAUTH_REFRESH_SKEW_SEC`,
+  `OAUTH_REFRESH_SWEEP_DEADLINE_SEC`, `OAUTH_REFRESH_HEARTBEAT_EVERY`,
+  `LOGIN_EXPIRY_WARN_DAYS`.
 - Optional daily restart: [`deploy/claude-tg-bot-restart.{service,timer}`](deploy/) —
   `sudo systemctl enable --now claude-tg-bot-restart.timer`.
 

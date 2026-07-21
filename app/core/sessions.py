@@ -1600,8 +1600,13 @@ class SessionManager:
         # #379: a login-expiry heads-up shown ABOVE the answer (never inside the
         # <tg-thinking> draft), owner-only + throttled ~once/day, so the owner re-logs
         # before the ~monthly refresh-token deadline. Display-only — NOT logged to history.
-        _banner = self._login_expiry_banner(streamer.chat_id)
-        display_text = f"{_banner}\n\n{flush_text}" if (_banner and flush_text.strip()) else flush_text
+        # #380: computed in the display branch below and gated on real text — NOT here.
+        # Computing it unconditionally spent the ~once/day throttle even when the turn took
+        # the cancel path (or ended with empty text) and the banner was never shown, so the
+        # day's heads-up could be silently eaten by a turn that ends on a tool.
+        # was — replaced for #380:
+        #   _banner = self._login_expiry_banner(streamer.chat_id)
+        #   display_text = f"{_banner}\n\n{flush_text}" if (_banner and flush_text.strip()) else flush_text
         if segmented and not flush_text.strip():
             # Every burst was already committed and the turn ended on a tool with
             # no trailing text — nothing new to post. Stop the stream (the empty
@@ -1609,6 +1614,13 @@ class SessionManager:
             with contextlib.suppress(Exception):
                 streamer.cancel()
         else:
+            # #380: compute the heads-up HERE and only when there is real text to carry it,
+            # so the once/day throttle is spent only when the banner is actually shown.
+            if flush_text.strip():
+                _banner = self._login_expiry_banner(streamer.chat_id)
+                display_text = f"{_banner}\n\n{flush_text}" if _banner else flush_text
+            else:
+                display_text = flush_text
             # The final answer pings the user; intermediate segments stayed silent.
             with contextlib.suppress(Exception):
                 await streamer.finish(display_text, footer=footer, notify=True)
@@ -2062,11 +2074,15 @@ class SessionManager:
         owner_id = getattr(self.settings, "owner_id", None)
         if owner_id is None or chat_id != owner_id:
             return None
-        days = token_refresh.login_warn_days(token_refresh.login_seconds_left())
-        if days is None:
-            return None
+        # #380: check the ~once/day throttle BEFORE the creds-file read below, so an owner
+        # turn does not open+parse the credentials file on the event loop only to discard the
+        # result. Was: login_warn_days(login_seconds_left()) computed first — reordered for
+        # #380 (the file read now happens ~once/day, not on every owner turn-finish).
         now = time.time()
         if now - self._login_warn_last < 20 * 3600:   # ~once/day (counts down 3→2→1)
+            return None
+        days = token_refresh.login_warn_days(token_refresh.login_seconds_left())
+        if days is None:
             return None
         self._login_warn_last = now
         return i18n.t("session.login_expiry_warn", i18n.cached_lang(chat_id), days=days)

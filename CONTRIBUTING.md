@@ -12,7 +12,8 @@ When you **change or remove existing logic, don't delete it outright** — comme
 old version out next to the new code with a short reference to the task/issue it
 changed for (e.g. `# was: <old> — replaced for #120`), so changes stay auditable and
 easy to revert. Full deletion is reserved for tasks whose explicit goal is
-removal/cleanup (e.g. a dead-code sweep). See `#110`/`#118` for the in-tree pattern.
+removal/cleanup (e.g. a dead-code sweep). In-tree, replaced code is kept commented next to its
+replacement rather than deleted, for exactly this reason.
 
 ## Language: English everywhere
 

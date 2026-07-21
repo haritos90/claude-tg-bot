@@ -271,3 +271,44 @@ def test_commit_rich_interleaved_mixes_diagrams_tables_and_pins_in_order(monkeyp
     assert bot.calls[5] == ("pin", (1.0, 2.0))
     assert "Alpha" in bot.calls[0][1] and "Delta" in bot.calls[6][1]
     assert "7%" in bot.calls[6][1]                     # footer on the last prose bubble
+
+
+def test_commit_rich_interleaved_oversize_segment_splits_on_rich_failure():
+    """#381: when the single rich send fails (e.g. a prose run beyond the message limit), the
+    per-segment fallback SIZE-SPLITS the run and sends each piece as HTML — so an oversize run
+    beside a pin is delivered in parts, never dropped; the keypad rides the last piece only."""
+    import asyncio
+    from app.telegram import markup
+
+    class _FakeBot:
+        def __init__(self):
+            self.calls: list = []
+
+        async def __call__(self, method):        # SendRichMessage — force the single send to fail
+            raise RuntimeError("message is too long")
+
+        async def send_message(self, **kw):
+            self.calls.append(("html", kw.get("text"), kw.get("reply_markup")))
+
+        async def send_location(self, **kw):
+            self.calls.append(("pin", (kw["latitude"], kw["longitude"])))
+            return object()
+
+    bot = _FakeBot()
+    s = streamer.Streamer(bot, 123, None)
+    s.message_id = None
+    tok = markup.LOCATION_TOKEN
+    big = "filler words on this line here\n" * 400   # ~12k chars, many newlines → splits cleanly
+    rich_text = f"{big}{tok}tail"                     # one oversize prose run, a pin, a short run
+    asyncio.run(s._commit_rich_interleaved(
+        rich_text, [{"lat": 1.0, "lon": 2.0}], [], [], "5h: 5%",
+        silent_first=True, reply_markup="KP"))
+    htmls = [c for c in bot.calls if c[0] == "html"]
+    # the oversize first segment was split into >1 HTML piece (nothing dropped) ...
+    assert len(htmls) >= 2
+    # ... each piece stays within Telegram's hard per-message ceiling ...
+    assert all(len(c[1]) <= markup.HARD_LIMIT for c in htmls)
+    # ... the pin still landed (delivered, not lost) ...
+    assert ("pin", (1.0, 2.0)) in bot.calls
+    # ... and the keypad rides exactly the LAST html piece, nowhere else.
+    assert htmls[-1][2] == "KP" and all(c[2] is None for c in htmls[:-1])

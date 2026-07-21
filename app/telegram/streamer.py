@@ -1408,14 +1408,27 @@ class Streamer:
                     )
                 )
             except Exception:
-                seg_html = markup.md_to_html(md)
-                await self._safe(
-                    lambda h=seg_html, s=silent, k=kb: self.bot.send_message(
-                        chat_id=self.chat_id, text=h, parse_mode="HTML",
-                        disable_notification=s, link_preview_options=_NO_PREVIEW,
-                        reply_markup=k, **self._kwargs(),
+                # #381: the single rich send failed — most often the prose run exceeds the
+                # message limit (RICH_LIMIT=32768). Split it (split_markdown repairs fences
+                # across the cut) and send each piece as HTML; every piece is <= SAFE_LIMIT so
+                # the 4096-capped HTML send succeeds, instead of one oversize HTML send also
+                # failing and _safe dropping the whole run. The keypad rides the LAST piece;
+                # only the first piece keeps this segment's notification.
+                # was — replaced for #381 (single, unsplit HTML send):
+                #   seg_html = markup.md_to_html(md)
+                #   await self._safe(lambda h=seg_html, s=silent, k=kb: self.bot.send_message(...))
+                pieces = markup.split_markdown(md) or [md]
+                for pi, piece in enumerate(pieces):
+                    p_kb = kb if pi == len(pieces) - 1 else None
+                    p_silent = silent if pi == 0 else True
+                    piece_html = markup.md_to_html(piece)
+                    await self._safe(
+                        lambda h=piece_html, s=p_silent, k=p_kb: self.bot.send_message(
+                            chat_id=self.chat_id, text=h, parse_mode="HTML",
+                            disable_notification=s, link_preview_options=_NO_PREVIEW,
+                            reply_markup=k, **self._kwargs(),
+                        )
                     )
-                )
         # Reply is nothing but attachments (no text carried the footer) → send the footer alone.
         if footer and last_text_idx == -1:
             await self._safe(

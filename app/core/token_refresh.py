@@ -231,6 +231,9 @@ async def refresh_loop(interval: float = DEFAULT_INTERVAL_SECONDS,
                 int(interval), int(skew), int(sweep_deadline))
     # #378: dedicated 1-thread pool for the blocking refresh — a sweep abandoned by
     # wait_for leaves at most ONE stuck thread here, never in the shared default executor.
+    # #380: while that thread stays blocked (a persistent DNS/socket wedge), each later sweep
+    # queues behind it and also times out — that repeat is EXPECTED and self-heals once the
+    # resolver returns; the consecutive-failure escalation below surfaces a sustained wedge.
     executor = concurrent.futures.ThreadPoolExecutor(
         max_workers=1, thread_name_prefix="oauth-refresh")
     fails = 0          # consecutive failed sweeps (a revoked refresh_token → re-login)
@@ -271,9 +274,13 @@ async def refresh_loop(interval: float = DEFAULT_INTERVAL_SECONDS,
             except asyncio.TimeoutError:
                 fails += 1
                 status = "fail: sweep timed out"
-                logger.warning("token refresh: sweep exceeded %ds (blocked DNS/socket?) — "
-                               "abandoned, will retry (%d consecutive)",
-                               int(sweep_deadline), fails)
+                # #380: match the fail-status path above — a single >deadline stall is INFO
+                # (a transient blip), and only a REPEAT (a persistent DNS/socket wedge)
+                # escalates to WARNING. Was: unconditional logger.warning — replaced for #380.
+                level = logging.WARNING if fails >= 2 else logging.INFO
+                logger.log(level, "token refresh: sweep exceeded %ds (blocked DNS/socket?) — "
+                           "abandoned, will retry (%d consecutive)",
+                           int(sweep_deadline), fails)
             except asyncio.CancelledError:
                 break
             except Exception:

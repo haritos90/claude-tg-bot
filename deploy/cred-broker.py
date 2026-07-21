@@ -190,12 +190,14 @@ class _Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    # #378: a jailed client that disconnects mid-stream (a reaped/cancelled turn — the
-    # #179 reaper frees the ~500 MB claude client) makes the request handler raise
-    # ConnectionResetError/BrokenPipeError, which socketserver's default handle_error
-    # dumps as a full multi-line traceback PER event — noise that buried the low-rate
-    # token-refresh lines in the shared journal. One line for an expected disconnect;
-    # keep the full traceback for anything genuinely unexpected.
+    # #378: a jailed client that goes away (a reaped/cancelled turn — the #179 reaper frees
+    # the ~500 MB claude client) makes socketserver raise ConnectionResetError/
+    # BrokenPipeError, whose default handle_error dumps a full multi-line traceback PER event
+    # — noise that buried the low-rate token-refresh lines in the shared journal.
+    # #380: a disconnect DURING the proxied response body is already swallowed by _proxy's own
+    # except (it 502s), so this override does NOT cover that; it covers the OTHER points
+    # socketserver raises through — the request-body read and idle keep-alive reads between
+    # requests. One line for an expected disconnect; keep the full traceback for anything else.
     def handle_error(self, request, client_address):
         exc = sys.exc_info()[1]
         if isinstance(exc, (ConnectionResetError, BrokenPipeError, ConnectionAbortedError)):

@@ -6,6 +6,7 @@ title: >-
 status: Done
 assignee: []
 created_date: '2026-07-19 07:49'
+updated_date: '2026-07-20 13:22'
 labels:
   - reliability
   - auth
@@ -22,11 +23,13 @@ The proactive OAuth refresher (#191) could stop renewing the on-disk token and g
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Each refresh sweep is bounded by a deadline so a blocked DNS/socket call cannot park the loop; the loop logs the timeout and continues
-- [ ] #2 The blocking refresh runs on a dedicated single-thread executor so an abandoned sweep never starves the shared default executor
-- [ ] #3 A liveness heartbeat is logged every N sweeps so a stopped loop is a visible gap; consecutive failures escalate INFO->WARNING with a re-login hint
-- [ ] #4 The broker logs one line for an expected client disconnect (ConnectionReset/BrokenPipe/ConnectionAborted) instead of a full traceback
+- [x] #1 Each refresh sweep is bounded by a deadline so a blocked DNS/socket call cannot park the loop; the loop logs the timeout and continues
+- [x] #2 The blocking refresh runs on a dedicated single-thread executor so an abandoned sweep never starves the shared default executor
+- [x] #3 A liveness heartbeat is logged every N sweeps so a stopped loop is a visible gap; consecutive failures escalate INFO->WARNING with a re-login hint
+- [x] #4 The broker logs one line for an expected client disconnect (ConnectionReset/BrokenPipe/ConnectionAborted) instead of a full traceback
 <!-- AC:END -->
+
+
 
 ## Implementation Notes
 
