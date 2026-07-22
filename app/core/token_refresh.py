@@ -231,9 +231,11 @@ async def refresh_loop(interval: float = DEFAULT_INTERVAL_SECONDS,
                 int(interval), int(skew), int(sweep_deadline))
     # #378: dedicated 1-thread pool for the blocking refresh — a sweep abandoned by
     # wait_for leaves at most ONE stuck thread here, never in the shared default executor.
-    # #380: while that thread stays blocked (a persistent DNS/socket wedge), each later sweep
-    # queues behind it and also times out — that repeat is EXPECTED and self-heals once the
-    # resolver returns; the consecutive-failure escalation below surfaces a sustained wedge.
+    # #380/#385: while that thread stays blocked (a DNS/socket wedge), each later sweep queues
+    # behind it and also times out. A TRANSIENT wedge self-heals once the resolver returns; a
+    # PERMANENT one would occupy the sole worker forever (the token would never refresh again,
+    # yet the heartbeat would still log "alive"), so #385 REPLACES the pool on every timeout
+    # (see the TimeoutError handler) — freeing a live worker and dropping the queued backlog.
     executor = concurrent.futures.ThreadPoolExecutor(
         max_workers=1, thread_name_prefix="oauth-refresh")
     fails = 0          # consecutive failed sweeps (a revoked refresh_token → re-login)
@@ -260,15 +262,21 @@ async def refresh_loop(interval: float = DEFAULT_INTERVAL_SECONDS,
                 status = await asyncio.wait_for(
                     maybe_refresh(path=path, skew=skew, executor=executor),
                     timeout=sweep_deadline)
-                if status.startswith("fail"):
+                # #385: "skip: Ns left" is the only HEALTHY skip (token still fresh) — it resets
+                # the streak. "skip: creds unreadable" / "skip: no refresh token" mean the
+                # refresher is NON-FUNCTIONAL, not idle, so treat them as failures (escalate, do
+                # not reset). Was: every "skip" hit the else branch → silent AND reset fails, so a
+                # broken creds file never escalated and a transient one reset an in-flight streak.
+                healthy_skip = status.startswith("skip") and status.endswith("left")
+                if status.startswith("fail") or (status.startswith("skip") and not healthy_skip):
                     fails += 1
-                    # A revoked/rotated refresh_token fails every sweep — say so LOUDLY
-                    # after the first repeat instead of an easy-to-miss INFO.
+                    # A revoked/rotated refresh_token (or an unreadable creds file) fails every
+                    # sweep — say so LOUDLY after the first repeat instead of an easy-to-miss INFO.
                     level = logging.WARNING if fails >= 2 else logging.INFO
                     logger.log(level, "token refresh: %s (%d consecutive%s)", status, fails,
                                "; manual re-login likely needed" if fails >= 2 else "")
                 else:
-                    if not status.startswith("skip"):
+                    if status.startswith("ok"):
                         logger.info("token refresh: %s", status)   # an actual "ok: refreshed"
                     fails = 0
             except asyncio.TimeoutError:
@@ -281,14 +289,29 @@ async def refresh_loop(interval: float = DEFAULT_INTERVAL_SECONDS,
                 logger.log(level, "token refresh: sweep exceeded %ds (blocked DNS/socket?) — "
                            "abandoned, will retry (%d consecutive)",
                            int(sweep_deadline), fails)
+                # #385: the abandoned worker still holds the SOLE slot of this max_workers=1
+                # pool; a permanent wedge would queue every later sweep behind that dead thread
+                # forever (and, once it cleared, fire a burst of back-to-back token rotations from
+                # the backlog). Replace the pool: the next sweep gets a live worker and
+                # cancel_futures drops the backlog. Leaks at most one thread per distinct
+                # permanent wedge (unavoidable for an uninterruptible getaddrinfo).
+                executor.shutdown(wait=False, cancel_futures=True)
+                executor = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix="oauth-refresh")
             except asyncio.CancelledError:
                 break
-            except Exception:
+            except Exception as exc:
+                # #385: record the failure in `status` so the heartbeat below does not report a
+                # STALE "last status" after an unexpected-exception sweep.
+                status = f"fail: {type(exc).__name__}"
                 logger.warning("token refresh sweep failed", exc_info=True)
             sweeps += 1
             if heartbeat_every > 0 and sweeps % heartbeat_every == 0:
-                logger.info("token refresh: alive — %d sweeps done, last status: %s",
-                            sweeps, status)
+                # #385: these lines sit OUTSIDE the per-sweep try/except — guard the heartbeat log
+                # so a raising handler here cannot escape to `finally` and kill the loop.
+                with contextlib.suppress(Exception):
+                    logger.info("token refresh: alive — %d sweeps done, last status: %s",
+                                sweeps, status)
             try:
                 await asyncio.sleep(interval)
             except asyncio.CancelledError:

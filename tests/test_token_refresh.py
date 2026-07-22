@@ -207,3 +207,34 @@ def test_refresh_loop_escalation_resets_on_success(monkeypatch, caplog):
     # Only the 2nd of the first failure pair escalates; the ok resets fails to 0, so the 4th
     # (a lone failure, fails == 1) stays INFO — exactly one WARNING total.
     assert len(warns) == 1 and "2 consecutive" in warns[0]
+
+
+def test_refresh_loop_timeout_escalates_on_repeat(monkeypatch, caplog):
+    """#380/#386: the SWEEP-TIMEOUT path escalates to WARNING on the 2nd consecutive timeout (the
+    first stays INFO), independently of the fail-status path. The wedged-sweep test only checks
+    the INFO substring, so this pins the level the #380 timeout branch must log."""
+    async def hang(**kw):
+        await asyncio.sleep(30)                 # never returns within the tiny deadline below
+        return "ok: refreshed"
+    monkeypatch.setattr(token_refresh, "maybe_refresh", hang)
+    with caplog.at_level(logging.INFO, logger="token_refresh"):
+        asyncio.run(_run_loop_briefly(interval=0.002, path="/nope",
+                                      sweep_deadline=0.01, heartbeat_every=0))
+    timeouts = [(r.levelno, r.getMessage()) for r in caplog.records
+                if "sweep exceeded" in r.getMessage()]
+    assert any(lv == logging.INFO and "1 consecutive" in m for lv, m in timeouts)     # 1st: INFO
+    warns = [m for lv, m in timeouts if lv == logging.WARNING]
+    assert warns and "2 consecutive" in warns[0]                                      # 2nd: WARNING
+
+
+def test_refresh_loop_broken_skip_counts_as_failure(monkeypatch, caplog):
+    """#385: a 'skip: creds unreadable' / 'skip: no refresh token' means the refresher is broken,
+    not idle — it escalates like a failure (does NOT reset the streak), unlike 'skip: Ns left'."""
+    async def broken(**kw):
+        return "skip: creds unreadable"
+    monkeypatch.setattr(token_refresh, "maybe_refresh", broken)
+    with caplog.at_level(logging.INFO, logger="token_refresh"):
+        asyncio.run(_run_loop_briefly(interval=0.002, path="/nope",
+                                      sweep_deadline=1.0, heartbeat_every=0))
+    warns = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("creds unreadable" in m and "consecutive" in m for m in warns)

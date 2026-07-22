@@ -606,9 +606,16 @@ class SessionManager:
         # #191: background task refreshing the subscription OAuth token before it
         # expires (the on-disk token has a hard ~8h life; nothing else rotates it).
         self._token_refresh_task: asyncio.Task | None = None
-        # #379: last time the login-expiry banner was shown to the owner (epoch), so it is
-        # throttled to ~once/day. In-memory is fine — a restart at worst re-shows it once.
+        # #379: last time the login-expiry banner was shown to the owner (epoch), so the DISPLAY
+        # is throttled to ~once/day. In-memory is fine — a restart at worst re-shows it once.
+        # #384: spent by the finalize CALLER only after finish() delivers the banner (not inside
+        # _login_expiry_banner), so a failed finish does not eat the day's heads-up.
         self._login_warn_last = 0.0
+        # #384: last time the creds file was READ for the login-expiry check (epoch). Separate
+        # from the display throttle: _login_warn_last is advanced only when a banner shows, so it
+        # never gated the read for the ~27/30 days OUTSIDE the warn window — the creds file was
+        # reopened+parsed on the event loop every owner turn-finish. This throttles the READ.
+        self._login_check_last = 0.0
 
     # ------------------------------------------------------------------ records
 
@@ -1614,16 +1621,27 @@ class SessionManager:
             with contextlib.suppress(Exception):
                 streamer.cancel()
         else:
-            # #380: compute the heads-up HERE and only when there is real text to carry it,
-            # so the once/day throttle is spent only when the banner is actually shown.
+            # #380/#384: compute the heads-up HERE and only when there is real text to carry it.
+            # #384: guard the compute (a broken creds read must never drop the answer) and spend
+            # the DISPLAY throttle (_login_warn_last) only AFTER finish() delivers it, so a failed
+            # finish does not silently eat the day's heads-up. The creds READ is throttled inside
+            # _login_expiry_banner (#384) so it is not reopened on every owner turn-finish.
+            # was — replaced for #384:
+            #   if flush_text.strip():
+            #       _banner = self._login_expiry_banner(streamer.chat_id)
+            #       display_text = f"{_banner}\n\n{flush_text}" if _banner else flush_text
+            #   else:
+            #       display_text = flush_text
+            _banner = None
             if flush_text.strip():
-                _banner = self._login_expiry_banner(streamer.chat_id)
-                display_text = f"{_banner}\n\n{flush_text}" if _banner else flush_text
-            else:
-                display_text = flush_text
+                with contextlib.suppress(Exception):
+                    _banner = self._login_expiry_banner(streamer.chat_id)
+            display_text = f"{_banner}\n\n{flush_text}" if _banner else flush_text
             # The final answer pings the user; intermediate segments stayed silent.
             with contextlib.suppress(Exception):
                 await streamer.finish(display_text, footer=footer, notify=True)
+                if _banner:
+                    self._login_warn_last = time.time()   # #384: display throttle spent on delivery
             # Log the assistant's reply (feeds /recap + /history); best-effort.
             with contextlib.suppress(Exception):
                 await db.log_message(thread_id, "assistant", flush_text)
@@ -2074,17 +2092,25 @@ class SessionManager:
         owner_id = getattr(self.settings, "owner_id", None)
         if owner_id is None or chat_id != owner_id:
             return None
-        # #380: check the ~once/day throttle BEFORE the creds-file read below, so an owner
-        # turn does not open+parse the credentials file on the event loop only to discard the
-        # result. Was: login_warn_days(login_seconds_left()) computed first — reordered for
-        # #380 (the file read now happens ~once/day, not on every owner turn-finish).
         now = time.time()
+        # #380: DISPLAY throttle — at most one banner per ~day, spent (by the caller, #384) only
+        # when a banner is actually shown. Checked first: it is the cheapest gate and, when a
+        # banner was shown recently, also spares the creds read below.
         if now - self._login_warn_last < 20 * 3600:   # ~once/day (counts down 3→2→1)
             return None
+        # #384: READ throttle — even when NO banner shows (the ~27/30 days outside the warn
+        # window, where _login_warn_last stays 0.0 and never gated anything), do not reopen the
+        # creds file on the event loop every owner turn. Gate the read on its own once/day stamp.
+        # was — replaced for #384 (read on EVERY owner turn outside the window; #380 had reordered
+        # the _login_warn_last check ahead of it, but that stamp is 0.0 out there so it never hit):
+        #   days = token_refresh.login_warn_days(token_refresh.login_seconds_left())
+        if now - self._login_check_last < 20 * 3600:
+            return None
+        self._login_check_last = now
         days = token_refresh.login_warn_days(token_refresh.login_seconds_left())
         if days is None:
             return None
-        self._login_warn_last = now
+        # #384: do NOT spend _login_warn_last here — the caller spends it after finish() delivers.
         return i18n.t("session.login_expiry_warn", i18n.cached_lang(chat_id), days=days)
 
     def usage_footer(self, lang: str = "en", chat_id: int | None = None) -> str:

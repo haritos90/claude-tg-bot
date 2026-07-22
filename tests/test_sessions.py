@@ -532,6 +532,51 @@ def test_idle_window_per_user_disable(monkeypatch):
     assert asyncio.run(sm.idle_reset_seconds(42)) == 0.0
 
 
+def test_login_expiry_banner_owner_gate_read_throttle_and_display_spend(monkeypatch):
+    """#379/#380/#384: the login-expiry heads-up is owner-only; the creds file is READ at most
+    ~once/day (not on every owner turn — the #384 fix); and _login_expiry_banner does NOT spend
+    the DISPLAY throttle (the caller does that, after finish() delivers — so a failed finish never
+    silently eats the day's heads-up)."""
+    OWNER = 777
+    sm = sessions.SessionManager(
+        bot=SimpleNamespace(),
+        settings=SimpleNamespace(owner_id=OWNER, idle_reset_sec=1800),
+        gate=SimpleNamespace(),
+    )
+    monkeypatch.setattr(sessions.i18n, "cached_lang", lambda cid: "en")
+    reads = {"n": 0}
+
+    def _login_seconds_left(*a, **k):
+        reads["n"] += 1
+        return 2 * 86400                       # 2 days out → inside the default 3-day window
+
+    monkeypatch.setattr(sessions.token_refresh, "login_seconds_left", _login_seconds_left)
+
+    # non-owner → nothing read, no throttle spent
+    assert sm._login_expiry_banner(OWNER + 1) is None
+    assert reads["n"] == 0
+    assert sm._login_check_last == 0.0 and sm._login_warn_last == 0.0
+
+    # owner, in-window → a banner; exactly one read; the READ throttle advanced but the DISPLAY
+    # throttle stays 0.0 (the caller spends it after delivery, #384)
+    banner = sm._login_expiry_banner(OWNER)
+    assert banner and reads["n"] == 1
+    assert sm._login_check_last > 0.0
+    assert sm._login_warn_last == 0.0
+
+    # immediate re-call → throttled to None AND no second read (the #384 fix: not every turn)
+    assert sm._login_expiry_banner(OWNER) is None
+    assert reads["n"] == 1
+
+    # outside the window (far-future login) → None, but the READ throttle is still spent so it is
+    # not reopened every turn, and the DISPLAY throttle stays untouched (spent only when shown)
+    sm._login_check_last = 0.0
+    monkeypatch.setattr(sessions.token_refresh, "login_seconds_left", lambda *a, **k: 60 * 86400)
+    assert sm._login_expiry_banner(OWNER) is None
+    assert sm._login_check_last > 0.0
+    assert sm._login_warn_last == 0.0
+
+
 def test_rotate_in_place_clears_ids_and_drops_client(monkeypatch):
     rotated = []
     async def _rot(tid):

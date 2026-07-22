@@ -289,6 +289,7 @@ def test_commit_rich_interleaved_oversize_segment_splits_on_rich_failure():
 
         async def send_message(self, **kw):
             self.calls.append(("html", kw.get("text"), kw.get("reply_markup")))
+            return object()                      # a real Message is truthy → _safe returns it
 
         async def send_location(self, **kw):
             self.calls.append(("pin", (kw["latitude"], kw["longitude"])))
@@ -299,16 +300,24 @@ def test_commit_rich_interleaved_oversize_segment_splits_on_rich_failure():
     s.message_id = None
     tok = markup.LOCATION_TOKEN
     big = "filler words on this line here\n" * 400   # ~12k chars, many newlines → splits cleanly
-    rich_text = f"{big}{tok}tail"                     # one oversize prose run, a pin, a short run
+    # #383 / #387(F3): the oversize run is the LAST text segment, so it BOTH splits AND carries
+    # the keypad — exercising the per-piece keypad line (keypad-on-every-piece must then fail).
+    rich_text = f"lead paragraph{tok}{big}"          # short lead, a pin, then the oversize run
     asyncio.run(s._commit_rich_interleaved(
         rich_text, [{"lat": 1.0, "lon": 2.0}], [], [], "5h: 5%",
         silent_first=True, reply_markup="KP"))
-    htmls = [c for c in bot.calls if c[0] == "html"]
-    # the oversize first segment was split into >1 HTML piece (nothing dropped) ...
-    assert len(htmls) >= 2
-    # ... each piece stays within Telegram's hard per-message ceiling ...
-    assert all(len(c[1]) <= markup.HARD_LIMIT for c in htmls)
-    # ... the pin still landed (delivered, not lost) ...
-    assert ("pin", (1.0, 2.0)) in bot.calls
-    # ... and the keypad rides exactly the LAST html piece, nowhere else.
-    assert htmls[-1][2] == "KP" and all(c[2] is None for c in htmls[:-1])
+    calls = bot.calls
+    # the pin landed (delivered, not lost) and marks the split point between the two prose runs ...
+    assert ("pin", (1.0, 2.0)) in calls
+    pin_idx = calls.index(("pin", (1.0, 2.0)))
+    lead = [c for c in calls[:pin_idx] if c[0] == "html"]            # short 'lead' run, before pin
+    big_pieces = [c for c in calls[pin_idx + 1:] if c[0] == "html"]  # oversize run, after pin, split
+    assert len(lead) == 1                                            # lead: one piece, ordered first
+    assert len(big_pieces) >= 2                                      # oversize run split into >1 piece
+    # ... every emitted piece stays within Telegram's hard per-message ceiling (the #383 fix) ...
+    assert all(len(c[1]) <= markup.HARD_LIMIT for c in lead + big_pieces)
+    # ... the keypad rides EXACTLY the last piece of the keypad-bearing (oversize) run, nowhere
+    # else — reverting to keypad-on-every-piece would put "KP" on big_pieces[:-1] and fail here ...
+    assert big_pieces[-1][2] == "KP"
+    assert all(c[2] is None for c in big_pieces[:-1])
+    assert lead[0][2] is None                                       # non-final segment: no keypad

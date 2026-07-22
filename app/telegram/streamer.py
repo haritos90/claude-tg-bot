@@ -1170,12 +1170,16 @@ class Streamer:
                 )
             ):
                 return
-        await self._safe(
+        # #387: log a lost pin — unlike _send_svg_image/_send_wide_table_image, a location that
+        # fails BOTH the venue and the plain-pin send otherwise vanishes with no trace.
+        if await self._safe(
             lambda: self.bot.send_location(
                 chat_id=self.chat_id, latitude=lat, longitude=lon,
                 disable_notification=True, **self._kwargs(),
             )
-        )
+        ) is None:
+            logger.warning("interleave: dropped a map pin at (%s, %s) — both sends failed",
+                           lat, lon)
 
     async def _send_wide_table_image(self, table) -> None:
         """#243: send one wide (>20-column) table as its own PNG photo — a native rich table
@@ -1408,35 +1412,50 @@ class Streamer:
                     )
                 )
             except Exception:
-                # #381: the single rich send failed — most often the prose run exceeds the
-                # message limit (RICH_LIMIT=32768). Split it (split_markdown repairs fences
-                # across the cut) and send each piece as HTML; every piece is <= SAFE_LIMIT so
-                # the 4096-capped HTML send succeeds, instead of one oversize HTML send also
-                # failing and _safe dropping the whole run. The keypad rides the LAST piece;
-                # only the first piece keeps this segment's notification.
-                # was — replaced for #381 (single, unsplit HTML send):
-                #   seg_html = markup.md_to_html(md)
-                #   await self._safe(lambda h=seg_html, s=silent, k=kb: self.bot.send_message(...))
-                pieces = markup.split_markdown(md) or [md]
-                for pi, piece in enumerate(pieces):
-                    p_kb = kb if pi == len(pieces) - 1 else None
+                # #381/#383: the single rich send failed — most often the prose run exceeds the
+                # message limit (RICH_LIMIT=32768). Split it and send each piece as HTML. #383:
+                # size the pieces by RENDERED HTML, not raw markdown — md_to_html escaping can
+                # expand a <=SAFE_LIMIT raw chunk past Telegram's 4096 ceiling, and that send
+                # would 400 and be silently dropped by _safe (the very data-loss #381 set out to
+                # fix). render_within_limit re-splits + hard-cuts so every emitted HTML piece is
+                # <= HARD_LIMIT — the same guard the non-interleaved paths use (see line ~387).
+                # The keypad rides the LAST piece; only the first keeps this segment's notify.
+                # was — replaced for #381, re-sized for #383 (split RAW then md_to_html each — a
+                # dense chunk could still render past 4096 and be dropped by _safe):
+                #   pieces = markup.split_markdown(md) or [md]
+                #   for pi, piece in enumerate(pieces):
+                #       p_kb = kb if pi == len(pieces) - 1 else None
+                #       p_silent = silent if pi == 0 else True
+                #       piece_html = markup.md_to_html(piece)
+                #       await self._safe(lambda h=piece_html ...: self.bot.send_message(text=h, ...))
+                htmls = [h for raw in (markup.split_markdown(md) or [md])
+                         for h in markup.render_within_limit(raw)]
+                for pi, piece_html in enumerate(htmls):
+                    p_kb = kb if pi == len(htmls) - 1 else None
                     p_silent = silent if pi == 0 else True
-                    piece_html = markup.md_to_html(piece)
-                    await self._safe(
+                    sent = await self._safe(
                         lambda h=piece_html, s=p_silent, k=p_kb: self.bot.send_message(
                             chat_id=self.chat_id, text=h, parse_mode="HTML",
                             disable_notification=s, link_preview_options=_NO_PREVIEW,
                             reply_markup=k, **self._kwargs(),
                         )
                     )
-        # Reply is nothing but attachments (no text carried the footer) → send the footer alone.
-        if footer and last_text_idx == -1:
+                    if sent is None:
+                        logger.warning("interleave fallback: dropped a %d-char HTML piece "
+                                       "(send failed after render_within_limit)", len(piece_html))
+        # Reply is nothing but attachments (no text carried the footer/keypad) → send a trailing
+        # bubble so neither is dropped. #387: the keypad (reply_markup) rides it too — the footer-
+        # only branch previously omitted reply_markup, silently dropping the keypad on an all-
+        # attachment reply. A keypad with no footer uses an invisible carrier (Telegram rejects
+        # empty text). was: `if footer and last_text_idx == -1:` (text-only, no reply_markup).
+        if last_text_idx == -1 and (footer or reply_markup):
+            foot_html = f"<i>{markup.escape_html(footer)}</i>" if footer else "\u2063"
             await self._safe(
                 lambda: self.bot.send_message(
-                    chat_id=self.chat_id,
-                    text=f"<i>{markup.escape_html(footer)}</i>",
+                    chat_id=self.chat_id, text=foot_html,
                     parse_mode="HTML", disable_notification=True,
-                    link_preview_options=_NO_PREVIEW, **self._kwargs(),
+                    link_preview_options=_NO_PREVIEW, reply_markup=reply_markup,
+                    **self._kwargs(),
                 )
             )
         self._rendered_text = rich_text

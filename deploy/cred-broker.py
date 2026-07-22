@@ -194,10 +194,12 @@ class _Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
     # the ~500 MB claude client) makes socketserver raise ConnectionResetError/
     # BrokenPipeError, whose default handle_error dumps a full multi-line traceback PER event
     # — noise that buried the low-rate token-refresh lines in the shared journal.
-    # #380: a disconnect DURING the proxied response body is already swallowed by _proxy's own
-    # except (it 502s), so this override does NOT cover that; it covers the OTHER points
-    # socketserver raises through — the request-body read and idle keep-alive reads between
-    # requests. One line for an expected disconnect; keep the full traceback for anything else.
+    # #380/#384: a disconnect DURING the proxied response body is owned by _proxy's own except,
+    # NOT here (its send_error(502) is itself a write to the now-gone client and gets swallowed,
+    # so no 502 actually reaches the client — the point is _proxy already handles that path).
+    # This override covers the OTHER points socketserver raises through — the request-body read
+    # and idle keep-alive reads between requests. One line for an expected disconnect; keep the
+    # full traceback for anything else.
     def handle_error(self, request, client_address):
         exc = sys.exc_info()[1]
         if isinstance(exc, (ConnectionResetError, BrokenPipeError, ConnectionAbortedError)):
