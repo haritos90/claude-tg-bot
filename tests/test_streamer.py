@@ -299,7 +299,10 @@ def test_commit_rich_interleaved_oversize_segment_splits_on_rich_failure():
     s = streamer.Streamer(bot, 123, None)
     s.message_id = None
     tok = markup.LOCATION_TOKEN
-    big = "filler words on this line here\n" * 400   # ~12k chars, many newlines → splits cleanly
+    # #383: entity-dense — md_to_html escapes '&'→'&amp;' (5x), so each raw SAFE_LIMIT chunk renders
+    # well past Telegram's 4096 ceiling. Pre-#383 (split raw, md_to_html each) a piece overflowed and
+    # was dropped by _safe; render_within_limit re-splits so every piece fits (asserted below).
+    big = "A & B & C & D & E & F & G & H\n" * 350
     # #383 / #387(F3): the oversize run is the LAST text segment, so it BOTH splits AND carries
     # the keypad — exercising the per-piece keypad line (keypad-on-every-piece must then fail).
     rich_text = f"lead paragraph{tok}{big}"          # short lead, a pin, then the oversize run
@@ -316,6 +319,10 @@ def test_commit_rich_interleaved_oversize_segment_splits_on_rich_failure():
     assert len(big_pieces) >= 2                                      # oversize run split into >1 piece
     # ... every emitted piece stays within Telegram's hard per-message ceiling (the #383 fix) ...
     assert all(len(c[1]) <= markup.HARD_LIMIT for c in lead + big_pieces)
+    # ... and no prose is lost in the re-split: every '&' from the oversize run survives across the
+    # emitted pieces (#389 — a hard-cut that dropped characters would fail this) ...
+    import html as _html
+    assert sum(_html.unescape(c[1]).count("&") for c in big_pieces) == big.count("&")
     # ... the keypad rides EXACTLY the last piece of the keypad-bearing (oversize) run, nowhere
     # else — reverting to keypad-on-every-piece would put "KP" on big_pieces[:-1] and fail here ...
     assert big_pieces[-1][2] == "KP"

@@ -210,13 +210,24 @@ def test_refresh_loop_escalation_resets_on_success(monkeypatch, caplog):
 
 
 def test_refresh_loop_timeout_escalates_on_repeat(monkeypatch, caplog):
-    """#380/#386: the SWEEP-TIMEOUT path escalates to WARNING on the 2nd consecutive timeout (the
-    first stays INFO), independently of the fail-status path. The wedged-sweep test only checks
-    the INFO substring, so this pins the level the #380 timeout branch must log."""
+    """#380/#385/#386: the SWEEP-TIMEOUT path escalates to WARNING on the 2nd consecutive timeout
+    (the first stays INFO), independently of the fail-status path; AND #385 recreates the single-
+    thread executor after each timeout so a permanent DNS/socket wedge self-heals — the wedged
+    worker is abandoned and the next sweep gets a live pool."""
     async def hang(**kw):
         await asyncio.sleep(30)                 # never returns within the tiny deadline below
         return "ok: refreshed"
     monkeypatch.setattr(token_refresh, "maybe_refresh", hang)
+    # #385/#386: record every ThreadPoolExecutor construction — startup makes one and each sweep
+    # timeout must REPLACE it. Delete the recreate in refresh_loop and made["n"] stays 1 → this fails.
+    made = {"n": 0}
+    real_pool = token_refresh.concurrent.futures.ThreadPoolExecutor
+
+    def _recording_pool(*a, **k):
+        made["n"] += 1
+        return real_pool(*a, **k)
+
+    monkeypatch.setattr(token_refresh.concurrent.futures, "ThreadPoolExecutor", _recording_pool)
     with caplog.at_level(logging.INFO, logger="token_refresh"):
         asyncio.run(_run_loop_briefly(interval=0.002, path="/nope",
                                       sweep_deadline=0.01, heartbeat_every=0))
@@ -225,6 +236,7 @@ def test_refresh_loop_timeout_escalates_on_repeat(monkeypatch, caplog):
     assert any(lv == logging.INFO and "1 consecutive" in m for lv, m in timeouts)     # 1st: INFO
     warns = [m for lv, m in timeouts if lv == logging.WARNING]
     assert warns and "2 consecutive" in warns[0]                                      # 2nd: WARNING
+    assert made["n"] >= 2                       # #385: startup pool + at least one per-timeout recreate
 
 
 def test_refresh_loop_broken_skip_counts_as_failure(monkeypatch, caplog):

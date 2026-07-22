@@ -2106,9 +2106,16 @@ class SessionManager:
         #   days = token_refresh.login_warn_days(token_refresh.login_seconds_left())
         if now - self._login_check_last < 20 * 3600:
             return None
-        self._login_check_last = now
+        # was — replaced for #388 (spent the read throttle BEFORE delivery, so an in-window banner
+        # a failed finish() never showed was swallowed for ~20h, breaking the invariant below):
+        #   self._login_check_last = now
         days = token_refresh.login_warn_days(token_refresh.login_seconds_left())
         if days is None:
+            # #388: spend the READ throttle ONLY when there is nothing to show. Outside the warn
+            # window this still limits the creds read to ~once/day (the #384 goal); in-window the
+            # DISPLAY throttle (_login_warn_last, spent by the caller after finish() delivers)
+            # governs the cadence, so a failed finish keeps re-offering the heads-up next turn.
+            self._login_check_last = now
             return None
         # #384: do NOT spend _login_warn_last here — the caller spends it after finish() delivers.
         return i18n.t("session.login_expiry_warn", i18n.cached_lang(chat_id), days=days)

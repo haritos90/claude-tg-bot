@@ -1236,6 +1236,13 @@ def split_markdown(text: str, limit: int = SAFE_LIMIT) -> list[str]:
     return repaired
 
 
+def _tg_len(s: str) -> int:
+    """Telegram measures a message's length in UTF-16 code units, not Python code points — a
+    supplementary-plane char (an emoji) is one code point but two units. #390: measure that so a
+    piece near the 4096 ceiling made of emoji is sized as Telegram sees it, not undercounted."""
+    return len(s.encode("utf-16-le")) // 2
+
+
 def render_within_limit(raw: str, hard_limit: int = HARD_LIMIT) -> list[str]:
     """Render one raw-Markdown chunk to HTML, guaranteeing each result fits
     Telegram's hard per-message limit.
@@ -1248,7 +1255,9 @@ def render_within_limit(raw: str, hard_limit: int = HARD_LIMIT) -> list[str]:
     hard-cut floor so a pathological single long line still terminates.
     """
     html = md_to_html(raw) or "…"
-    if len(html) <= hard_limit:
+    # #390: measure Telegram's UTF-16 code units, not Python code points — a piece at 4096 code
+    # points with supplementary-plane chars (emoji) is up to 2x that in units and would be rejected.
+    if _tg_len(html) <= hard_limit:
         return [html]
     # Re-split the raw source on boundaries with a shrinking budget.
     raw_limit = max(256, len(raw) // 2)
@@ -1256,16 +1265,26 @@ def render_within_limit(raw: str, hard_limit: int = HARD_LIMIT) -> list[str]:
         pieces = split_markdown(raw, limit=raw_limit)
         if len(pieces) > 1:
             rendered = [md_to_html(p) or "…" for p in pieces]
-            if all(len(h) <= hard_limit for h in rendered):
+            if all(_tg_len(h) <= hard_limit for h in rendered):
                 return rendered
         raw_limit //= 2
-    # Last resort: hard-cut the RAW text. md_to_html escapes first, so even a cut
-    # mid-fence yields valid (escaped) HTML, never a broken tag. ``&`` expands to
-    # 5 chars; a raw step of hard_limit//6 keeps each rendered piece in bounds.
-    step = max(256, hard_limit // 6)
-    out: list[str] = []
-    for i in range(0, len(raw), step):
-        out.append(md_to_html(raw[i : i + step]) or "…")
+    # Last resort: hard-cut the RAW text. md_to_html escapes first, so even a cut mid-fence yields
+    # valid (escaped) HTML, never a broken tag. #390: shrink the step until every rendered piece is
+    # within the ceiling (re-verify rather than assume ~5x escaping keeps hard_limit//6 in bounds —
+    # UTF-16-heavy content could otherwise still overflow).
+    # was — replaced for #390 (no re-verification of the hard-cut output):
+    #   step = max(256, hard_limit // 6)
+    #   out: list[str] = []
+    #   for i in range(0, len(raw), step):
+    #       out.append(md_to_html(raw[i : i + step]) or "…")
+    #   return out or ["…"]
+    step = max(64, hard_limit // 6)
+    out: list[str] = ["…"]
+    while step >= 64:
+        out = [md_to_html(raw[i : i + step]) or "…" for i in range(0, len(raw), step)]
+        if all(_tg_len(h) <= hard_limit for h in out):
+            return out or ["…"]
+        step //= 2
     return out or ["…"]
 
 

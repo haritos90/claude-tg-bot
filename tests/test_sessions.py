@@ -294,7 +294,7 @@ def test_session_id_persisted_early_not_only_at_result(monkeypatch):
     # and the consumer persists it IMMEDIATELY — so a turn killed mid-flight (a restart/crash
     # before the terminal result) still leaves a resumable id. (Incident: a service restart
     # killed an SVG turn before its result; the id was never saved; the next message lost all
-    # context and started a fresh "новая сессия".)
+    # context and started a fresh, empty session.)
     events = [
         _ev("session", session_id="sid-1"),
         _ev("text_delta", "Drawing the SVG…"),
@@ -309,7 +309,7 @@ def test_chat_text_before_tool_is_kept_as_its_own_bubble(monkeypatch):
     # #320: in CHAT, when the model writes text, THEN runs a web search, THEN answers (it
     # commented before searching), the pre-tool text is committed as its OWN bubble
     # (segment_break) instead of being shown and then clobbered by the final answer. Mirrors
-    # the real "Уточните…/А пока поищу… → [search] → Вот обзор…" transcript that looked janky.
+    # the real "Let me check…/Meanwhile, searching… → [search] → Here's the overview…" flow that looked janky.
     events = [
         _ev("text_delta", "Let me look that up. Meanwhile, searching… "),
         _ev("tool", tool_name="WebSearch", tool_input={"query": "news"}),
@@ -533,10 +533,11 @@ def test_idle_window_per_user_disable(monkeypatch):
 
 
 def test_login_expiry_banner_owner_gate_read_throttle_and_display_spend(monkeypatch):
-    """#379/#380/#384: the login-expiry heads-up is owner-only; the creds file is READ at most
-    ~once/day (not on every owner turn — the #384 fix); and _login_expiry_banner does NOT spend
-    the DISPLAY throttle (the caller does that, after finish() delivers — so a failed finish never
-    silently eats the day's heads-up)."""
+    """#379/#380/#384/#388: the login-expiry heads-up is owner-only; the creds file is READ at most
+    ~once/day OUTSIDE the warn window (not on every owner turn — #384); and neither throttle swallows
+    an undelivered banner — the DISPLAY throttle is spent by the caller only after finish() delivers,
+    and #388 stops the READ throttle from being spent in-window before delivery, so a failed finish
+    never silently eats the day's heads-up."""
     OWNER = 777
     sm = sessions.SessionManager(
         bot=SimpleNamespace(),
@@ -545,10 +546,11 @@ def test_login_expiry_banner_owner_gate_read_throttle_and_display_spend(monkeypa
     )
     monkeypatch.setattr(sessions.i18n, "cached_lang", lambda cid: "en")
     reads = {"n": 0}
+    seconds_left = {"v": 2 * 86400}            # 2 days out → inside the default 3-day window
 
     def _login_seconds_left(*a, **k):
         reads["n"] += 1
-        return 2 * 86400                       # 2 days out → inside the default 3-day window
+        return seconds_left["v"]
 
     monkeypatch.setattr(sessions.token_refresh, "login_seconds_left", _login_seconds_left)
 
@@ -557,24 +559,35 @@ def test_login_expiry_banner_owner_gate_read_throttle_and_display_spend(monkeypa
     assert reads["n"] == 0
     assert sm._login_check_last == 0.0 and sm._login_warn_last == 0.0
 
-    # owner, in-window → a banner; exactly one read; the READ throttle advanced but the DISPLAY
-    # throttle stays 0.0 (the caller spends it after delivery, #384)
+    # owner, in-window → a banner; #388: the READ throttle is NOT spent before delivery and the
+    # DISPLAY throttle stays 0.0 (the caller spends _login_warn_last only after finish() delivers,
+    # so a failed finish keeps re-offering the heads-up rather than swallowing it for ~a day)
     banner = sm._login_expiry_banner(OWNER)
     assert banner and reads["n"] == 1
-    assert sm._login_check_last > 0.0
+    assert sm._login_check_last == 0.0
     assert sm._login_warn_last == 0.0
 
-    # immediate re-call → throttled to None AND no second read (the #384 fix: not every turn)
-    assert sm._login_expiry_banner(OWNER) is None
-    assert reads["n"] == 1
+    # #388: an undelivered in-window banner is re-offered on the next turn (re-reads, not swallowed)
+    assert sm._login_expiry_banner(OWNER) and reads["n"] == 2
 
-    # outside the window (far-future login) → None, but the READ throttle is still spent so it is
-    # not reopened every turn, and the DISPLAY throttle stays untouched (spent only when shown)
+    # once the caller spends the DISPLAY throttle on delivery, the banner is gated to None for ~a day
+    sm._login_warn_last = sessions.time.time()
+    assert sm._login_expiry_banner(OWNER) is None
+    assert reads["n"] == 2
+
+    # outside the window (far-future login) → None; HERE the READ throttle IS spent so the creds
+    # file is not reopened every turn (#384), and the DISPLAY throttle stays untouched
+    sm._login_warn_last = 0.0
     sm._login_check_last = 0.0
-    monkeypatch.setattr(sessions.token_refresh, "login_seconds_left", lambda *a, **k: 60 * 86400)
+    seconds_left["v"] = 60 * 86400
+    reads_before = reads["n"]
     assert sm._login_expiry_banner(OWNER) is None
+    assert reads["n"] == reads_before + 1                      # it DID read (throttle was clear)…
     assert sm._login_check_last > 0.0
     assert sm._login_warn_last == 0.0
+    # #389: a SECOND outside-window turn does NOT re-read — the read throttle holds (the #384 goal)
+    assert sm._login_expiry_banner(OWNER) is None
+    assert reads["n"] == reads_before + 1
 
 
 def test_rotate_in_place_clears_ids_and_drops_client(monkeypatch):

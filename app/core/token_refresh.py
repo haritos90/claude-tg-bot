@@ -303,6 +303,10 @@ async def refresh_loop(interval: float = DEFAULT_INTERVAL_SECONDS,
             except Exception as exc:
                 # #385: record the failure in `status` so the heartbeat below does not report a
                 # STALE "last status" after an unexpected-exception sweep.
+                # #390: count it as a failed sweep too (parity with the fail/timeout paths) so a
+                # PERSISTENT unexpected exception feeds the consecutive-fail escalation instead of
+                # only a traceback each sweep; a healthy ok / "skip: …s left" still resets fails.
+                fails += 1
                 status = f"fail: {type(exc).__name__}"
                 logger.warning("token refresh sweep failed", exc_info=True)
             sweeps += 1

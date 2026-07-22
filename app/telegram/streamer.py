@@ -384,7 +384,12 @@ class Streamer:
         for raw in markup.split_markdown(body, limit=markup.SAFE_LIMIT):
             # render_within_limit guarantees each HTML piece fits Telegram's hard
             # 4096 ceiling (md_to_html escaping can expand a raw chunk past it).
-            rendered.extend(markup.render_within_limit(raw))
+            for html in markup.render_within_limit(raw):
+                # #387 (AC5): parity with _render_message_chunks — a hard-cut inside a long
+                # single-line fence can leave a lone fence that renders to a blank <pre></pre>; skip it.
+                if markup.is_empty_render(html):
+                    continue
+                rendered.append(html)
         return rendered or ["…"]
 
     def _render_message_chunks(self, body: str) -> list[str]:
@@ -1428,8 +1433,11 @@ class Streamer:
                 #       p_silent = silent if pi == 0 else True
                 #       piece_html = markup.md_to_html(piece)
                 #       await self._safe(lambda h=piece_html ...: self.bot.send_message(text=h, ...))
+                # #387 (AC5): skip blank <pre></pre> renders (a hard-cut inside a fence), keeping at
+                # least one carrier so the keypad on the last piece still rides a real bubble.
                 htmls = [h for raw in (markup.split_markdown(md) or [md])
-                         for h in markup.render_within_limit(raw)]
+                         for h in markup.render_within_limit(raw)
+                         if not markup.is_empty_render(h)] or ["…"]
                 for pi, piece_html in enumerate(htmls):
                     p_kb = kb if pi == len(htmls) - 1 else None
                     p_silent = silent if pi == 0 else True
@@ -1450,14 +1458,30 @@ class Streamer:
         # empty text). was: `if footer and last_text_idx == -1:` (text-only, no reply_markup).
         if last_text_idx == -1 and (footer or reply_markup):
             foot_html = f"<i>{markup.escape_html(footer)}</i>" if footer else "\u2063"
-            await self._safe(
-                lambda: self.bot.send_message(
-                    chat_id=self.chat_id, text=foot_html,
+            sent = await self._safe(
+                lambda h=foot_html: self.bot.send_message(
+                    chat_id=self.chat_id, text=h,
                     parse_mode="HTML", disable_notification=True,
                     link_preview_options=_NO_PREVIEW, reply_markup=reply_markup,
                     **self._kwargs(),
                 )
             )
+            # #387 (AC4): the invisible U+2063 keypad carrier is unverified against Telegram's
+            # empty-text check; if a keypad-only send is rejected, retry once with a visible
+            # known-good carrier so the keypad is never silently lost, then log if even that fails
+            # (parity with _send_location / the interleave fallback, which now warn on a drop).
+            if sent is None and reply_markup is not None:
+                sent = await self._safe(
+                    lambda: self.bot.send_message(
+                        chat_id=self.chat_id, text="\u2026",
+                        parse_mode="HTML", disable_notification=True,
+                        link_preview_options=_NO_PREVIEW, reply_markup=reply_markup,
+                        **self._kwargs(),
+                    )
+                )
+            if sent is None:
+                logger.warning("interleave: dropped the trailing footer/keypad bubble (send "
+                               "failed%s)", " after carrier retry" if reply_markup else "")
         self._rendered_text = rich_text
 
     async def _commit_mixed(self, full_text: str, footer: str, silent_first: bool) -> None:

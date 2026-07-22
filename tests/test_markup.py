@@ -136,6 +136,18 @@ def test_render_within_limit_short_text_single_piece():
     assert markup.render_within_limit("hello world") == [markup.md_to_html("hello world")]
 
 
+def test_render_within_limit_counts_utf16_units():
+    # #390: Telegram measures length in UTF-16 code units — a supplementary-plane emoji is 2 units
+    # but 1 Python code point. 3000 emoji is ~3000 code points (looks under 4096) yet ~6000 units,
+    # so render_within_limit must still split it (and the hard-cut floor must re-verify each piece).
+    raw = "😀" * 3000
+    pieces = markup.render_within_limit(raw)
+    assert pieces
+    for p in pieces:
+        assert len(p.encode("utf-16-le")) // 2 <= markup.HARD_LIMIT   # each piece fits in UTF-16 units
+    assert sum(p.count("😀") for p in pieces) == 3000                  # every emoji survives
+
+
 def test_is_empty_render_flags_blank_code_box():
     # Hard-cutting a single over-long line inside a fence can leave a lone fence
     # that renders to an empty <pre></pre> box (#70). is_empty_render must catch

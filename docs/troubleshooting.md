@@ -165,3 +165,27 @@ model-side policy decision — the bot cannot override it.
 `err.model_refusal` (localized en+ru in `app/i18n.py`) instead of the generic
 `err.invalid_request`. Tests: `tests/test_engine.py` — `test_cyber_refusal_gets_distinct_key`,
 `test_non_cyber_refusal_gets_generic_refusal_key`, `test_real_invalid_request_still_generic`.
+
+## OAuth token refresher wedged or looping — "sweep exceeded", missing heartbeat, or repeated 401s
+
+The background refresher keeps the subscription OAuth credential fresh
+(`app/core/token_refresh.py`). Three distinct log signals map to three different causes:
+
+- **`token refresh: sweep exceeded …s (blocked DNS/socket?)`** — one sweep's blocking refresh ran
+  past its deadline (a wedged resolver/socket). A single one is a transient blip (INFO); a repeat
+  escalates to WARNING. **No action needed:** the loop abandons the wedged worker and recreates its
+  single-thread executor, so the next sweep runs on a live pool and the wedge self-heals.
+- **No `token refresh: alive — N sweeps done …` line for hours** — the liveness heartbeat (emitted
+  every `OAUTH_REFRESH_HEARTBEAT_EVERY` sweeps, ~3 h) has stopped, so the loop itself is dead, not
+  merely idle. Restart the unit: `systemctl restart claude-tg-bot`.
+- **Every turn 401 + `token refresh: fail: refresh request rejected (… consecutive; manual re-login
+  likely needed)`** — the `refresh_token` was revoked or rotated; the refresher cannot recover on
+  its own. **Re-login on the host, THEN restart:** `claude setup-token` (never let
+  `ANTHROPIC_API_KEY` into the env), then `systemctl restart claude-tg-bot`.
+
+```bash
+# Which of the three is it? (timeouts, WARNING escalations, heartbeats)
+journalctl -u claude-tg-bot | grep -E 'token refresh:' | tail -20
+# Confirm the broker still mints a working bearer: a 200 from 127.0.0.1:8789 = token good;
+# a 401 = revoked login → re-login + restart.
+```
