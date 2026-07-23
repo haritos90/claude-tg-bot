@@ -68,5 +68,5 @@ And keep these hard invariants intact:
 - Don't widen `permissions.SAFE_TOOLS` (or move a dangerous tool into `allowed_tools`) without a
   deliberate reason — that silently bypasses the Allow/Deny approval gate.
 
-For the deeper SDK, Telegram, and async invariants, read [`AGENTS.md`](AGENTS.md) §4 rather than
-re-deriving them here.
+For the deeper SDK, Telegram, and async invariants, read [`docs/gotchas.md`](docs/gotchas.md)
+rather than re-deriving them here.

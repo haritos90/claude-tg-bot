@@ -265,10 +265,10 @@ The launcher reads its config from `SBX_*` env vars that `engine._enable_sandbox
 
 ## 11. Build gotchas
 
-See the memory note `sandbox-119-build-gotchas` and [`AGENTS.md`](../AGENTS.md) §5 for the
-traps (manual cgroup vs `systemd-run`; the seccomp fall-through-must-be-ALLOW bug; the
+The traps: manual cgroup leaf vs `systemd-run` and the seccomp fall-through-must-be-ALLOW
+bug (both in the Sandbox section of [`gotchas.md`](gotchas.md)); the
 `iptables -m cgroup --path` "dir must exist + module loaded" requirement; the
-egress-proxy ASCII-decode trap).
+egress-proxy ASCII-decode trap.
 
 ---
 

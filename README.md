@@ -209,6 +209,7 @@ formatting). Out-of-process helpers live in `deploy/`. The full module map is in
 | Document | Covers |
 |---|---|
 | [architecture.md](docs/architecture.md) | Package layout and the module map |
+| [gotchas.md](docs/gotchas.md) | Hard-won SDK / Telegram / lifecycle / sandbox invariants, per subsystem |
 | [configuration.md](docs/configuration.md) | Every `.env` setting, concurrency/resource tunables, capacity planning |
 | [data-model.md](docs/data-model.md) | What is persisted, the on-disk layout, the SQLite schema |
 | [isolation.md](docs/isolation.md) | The sandbox and containment stack, and its threat model |

@@ -13,7 +13,7 @@ message_thread_id=None for key 0 and the key otherwise; reply() handles this.
 Note: the bot is now DM-first — each user's sessions are negative-keyed DM
 sessions in a private chat. The supergroup/forum-Topics path below (positive
 keys, message_thread_id routing) is frozen/dormant; it is kept but not the live
-mode (see AGENTS.md §5).
+mode (see AGENTS.md).
 """
 
 from __future__ import annotations
