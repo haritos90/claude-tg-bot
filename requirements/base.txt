@@ -1,0 +1,26 @@
+# Runtime dependencies — Python 3.11+
+# Setup:
+#   python3 -m venv .venv && . .venv/bin/activate
+#   pip install -r requirements/base.txt
+#
+# claude-agent-sdk drives the Claude Code CLI (`claude`), which must be installed and
+# logged in to a Claude Pro/Max subscription. No ANTHROPIC_API_KEY is used — everything
+# runs on the subscription. See README.md.
+
+aiogram==3.28.2
+claude-agent-sdk==0.2.101
+aiosqlite==0.22.1
+python-dotenv==1.2.2
+# Pillow: render wide tables as PNG images (Telegram has no native table and a wide
+# monospace grid wraps; narrow tables stay text grids). Uses the system DejaVuSansMono
+# font. See app/telegram/table_image.py.
+Pillow==12.2.0
+# cairosvg: rasterize a chat reply's inline <svg> diagram to PNG so it can be sent as an
+# image (Telegram can't render SVG inline). Needs the system library libcairo2
+# (apt install libcairo2). See app/telegram/svg_image.py. On failure the bot falls back
+# to sending the raw .svg document.
+cairosvg==2.9.0
+
+# Optional voice-note transcription is NOT installed by default (it keeps the heavy
+# CTranslate2 stack out of a deploy that does not need it). See requirements/voice.txt
+# and docs/voice.md.

@@ -33,7 +33,7 @@ HOME_DIR=$(getent passwd "$RUN_USER" | cut -d: -f6)
 HOME_DIR=${HOME_DIR:-/root}
 
 [ -x "$PY" ] || { echo "venv python not found at $PY — create it first:" >&2;
-                  echo "  python3 -m venv .venv && .venv/bin/pip install -r requirements.txt" >&2; exit 1; }
+                  echo "  python3 -m venv .venv && .venv/bin/pip install -r requirements/base.txt" >&2; exit 1; }
 
 echo "Installing $UNIT  (dir=$PROJECT_DIR  user=$RUN_USER  home=$HOME_DIR)"
 

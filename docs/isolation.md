@@ -3,18 +3,17 @@
 How a session is contained: what an untrusted `code`-level user (driving the
 agent) cannot do, and the mechanism behind each guarantee.
 
-The jail is MANDATORY for every session. There
-is no per-session opt-out and no toggle. `claude` is jailed identically in both
-modes; the only mode difference is that the egress allowlist + cgroup DoS limits (§4 + §6)
-apply to code sessions only — a `chat` session has no Bash/file surface to leak and needs
-open egress for `WebFetch`. The jail, per-session uid, broker (§3) and seccomp (§6) apply to
-all modes.
+Every session runs inside the jail — it is part of how the bot runs a session, not an
+add-on. `claude` is jailed identically in both modes; the only mode difference is that the
+egress allowlist and cgroup DoS limits (§4 + §6) apply to code sessions only — a `chat`
+session has no Bash/file surface to leak and needs open egress for `WebFetch`. The jail,
+per-session uid, broker (§3), and seccomp (§6) apply to all modes.
 
-The layers are independent. The bare bubblewrap jail is always on and
-confines the filesystem; the four layers (broker, egress, secrets, DoS/seccomp) are
-on by default and turn the jail into real containment for a semi-trusted user. A host
-that can't support a layer opts out via its `.env` flag (`CRED_BROKER`, `SANDBOX_EGRESS`,
-`SANDBOX_SECCOMP`, `SANDBOX_PER_SESSION_UID` = `0`); on this deployment all four are on.
+The bubblewrap jail confines the filesystem; the credential broker, egress allowlist,
+per-session uid, and DoS/seccomp caps build real containment on top of it. All of it is part
+of the project and runs by default. A layer a host cannot support can be turned off through
+its `.env` flag (`CRED_BROKER`, `SANDBOX_EGRESS`, `SANDBOX_SECCOMP`,
+`SANDBOX_PER_SESSION_UID` = `0`), but the project runs with them on.
 
 ---
 
@@ -55,7 +54,7 @@ and the egress proxy. Anything else is dropped by the firewall.
 
 ---
 
-## 2. Layer 0 — the bubblewrap jail (on by default)
+## 2. Layer 0 — the bubblewrap jail
 
 `engine._enable_sandbox` points the SDK's `cli_path` at
 [`deploy/sandbox-claude.sh`](../deploy/sandbox-claude.sh), which `exec`s `bwrap` with:
@@ -78,7 +77,7 @@ and the egress proxy. Anything else is dropped by the firewall.
 
 ---
 
-## 3. Layer 1 — the credential broker (`CRED_BROKER=1`)
+## 3. Layer 1 — the credential broker (`CRED_BROKER`)
 
 **Goal:** the subscription OAuth token must be *un-extractable* by the agent — and a
 firewall alone can't do that (the agent can `cat` the token and the bot streams its
@@ -99,7 +98,7 @@ started by `bot.main`):
 
 ### The token refresh
 
-- **On disk:** `token_refresh.py` (#191) renews the access token before its ~8 h
+- **On disk:** `token_refresh.py` renews the access token before its ~8 h
   expiry (sweep every 30 min, renew when <1 h of life remains). Runs whether or not
   the broker is on.
 - **In the broker:** `_Creds.token()` re-reads the credentials file whenever its
@@ -114,7 +113,7 @@ paid per-token.
 
 ---
 
-## 4. Layer 2 — the egress allowlist (`SANDBOX_EGRESS=1`)
+## 4. Layer 2 — the egress allowlist (`SANDBOX_EGRESS`)
 
 **Goal:** even with no token in the jail, don't let the box reach arbitrary hosts (an
 attack relay / a data-exfil store), while still allowing chosen dev services.
@@ -178,7 +177,7 @@ wipes them; `/secret clear NAME` removes one.
 
 - **cgroup limits** on the same leaf: `memory.max` / `cpu.max` / `pids.max` from
   `SANDBOX_MEM_MB` / `SANDBOX_CPU_PERCENT` (% of one core) / `SANDBOX_PIDS_MAX`
-  (0 = unlimited). Plus the always-on `ulimit -u 512` (#116).
+  (0 = unlimited). Plus the always-on `ulimit -u 512`.
 - **seccomp** (`SANDBOX_SECCOMP=1`): [`deploy/make-seccomp.py`](../deploy/make-seccomp.py)
   compiles an x86_64 denylist BPF that returns `EPERM` for ~29 exotic, high-blast
   syscalls (`ptrace`, `bpf`, `kexec_*`, `keyctl`/`add_key`, module-load, `userfaultfd`,
@@ -192,8 +191,8 @@ wipes them; `/secret clear NAME` removes one.
 
 | Item | Location | In the DB? | In the jail? |
 |---|---|---|---|
-| Subscription OAuth token | `~/.claude/.credentials.json` (host, service user), refreshed by #191 | **No** | **No** — broker mode injects a `BROKER-PLACEHOLDER` dummy (ephemeral tmpfs); raw-jail mode binds it read-only |
-| Per-session user secrets (#119d) | `BASE_WORKDIR/<sid>/secrets.env` (root `0600`) | No | Injected as **env vars** only (values, not the file) |
+| Subscription OAuth token | `~/.claude/.credentials.json` (host, service user), refreshed by `token_refresh.py` | **No** | **No** — broker mode injects a `BROKER-PLACEHOLDER` dummy (ephemeral tmpfs); raw-jail mode binds it read-only |
+| Per-session user secrets | `BASE_WORKDIR/<sid>/secrets.env` (root `0600`) | No | Injected as **env vars** only (values, not the file) |
 | Session metadata / toggles | `bot.db` → `threads` etc. | Yes | No |
 | Agent's files | `BASE_WORKDIR/<sid>/work/` (owned by the session's host uid, `0700`) | No | Yes (the only writable bind) |
 | Transcript | `BASE_WORKDIR/<sid>/state/` → `~/.claude/projects` | No | Bound at HOME, but `state/` itself is not reachable by the agent's tools |
@@ -229,27 +228,34 @@ System tools:
 
 ---
 
-## 10. Enabling it
+## 10. The `.env` flags
 
-In `.env`, then restart (`systemctl restart claude-tg-bot`):
+The layers run by default. Set a flag to `0` in `.env` and restart
+(`systemctl restart claude-tg-bot`) to disable one on a host that can't support it; the caps
+take a value:
 
 ```bash
-CRED_BROKER=1              # token leaves the jail (recommended first)
-SANDBOX_EGRESS=1           # loopback-only egress + the dev-host CONNECT proxy (code sessions)
-EGRESS_ALLOW_HOSTS=git.example.com,internal.registry   # optional extra hosts
-SANDBOX_SECCOMP=1          # x86_64 syscall denylist (optional; blocks ptrace → no strace/gdb)
-SANDBOX_MEM_MB=1536        # per-jail memory cap (optional; 0 = unlimited)
-SANDBOX_CPU_PERCENT=150    # 1.5 cores (optional)
-SANDBOX_PIDS_MAX=512       # per-jail process cap (optional)
-SANDBOX_PER_SESSION_UID=1  # run each jail as a distinct non-root host uid (escape hardening)
+SANDBOX_CODE=1             # default; master switch for the whole sandbox stack (deployer kill-switch)
+CRED_BROKER=1              # default; keeps the token out of the jail (0 binds it read-only instead)
+SANDBOX_EGRESS=1           # default; loopback-only egress + the dev-host CONNECT proxy (code sessions)
+SANDBOX_SECCOMP=1          # default; x86_64 syscall denylist (blocks ptrace → no strace/gdb)
+SANDBOX_PER_SESSION_UID=1  # default; a distinct non-root host uid per jail
+SANDBOX_MEM_MB=1536        # per-jail memory cap (0 = unlimited)
+SANDBOX_CPU_PERCENT=150    # 1.5 cores
+SANDBOX_PIDS_MAX=512       # per-jail process cap (0 = unlimited)
+SANDBOX_EXEC=1             # default; workdir mounted executable (0 = noexec working tree)
+SANDBOX_UID_BASE=700000    # first host uid of the per-session range
+SANDBOX_UID_RANGE=60000    # size of the per-session uid range
+SANDBOX_UID=65534          # single fallback uid when per-session uids are off
+CRED_BROKER_PORT=8789      # loopback port of the credential-broker sidecar
+EGRESS_PROXY_PORT=8790     # loopback port of the CONNECT allowlist proxy
+EGRESS_ALLOW_HOSTS=git.example.com,internal.registry   # extra CONNECT-allowlisted hosts
 ```
 
-`SANDBOX_PER_SESSION_UID` requires `BASE_WORKDIR` outside `/root` (default
+`SANDBOX_PER_SESSION_UID` requires `BASE_WORKDIR` outside `/root` (e.g.
 `/var/lib/claude-tg-bot/workdirs`); the bot stages the CLI at `/usr/local/bin/claude` for
-the unprivileged jails. The recommended combo to graduate a semi-trusted `code` user is
-`CRED_BROKER=1` + `SANDBOX_EGRESS=1` + `SANDBOX_PER_SESSION_UID=1`. Note that the egress
-allowlist also restricts the **owner's** own code sessions to the allowlisted hosts —
-extend it with `EGRESS_ALLOW_HOSTS`.
+the unprivileged jails. The egress allowlist also restricts the owner's own code sessions to
+the allowlisted hosts — extend it with `EGRESS_ALLOW_HOSTS`.
 
 The launcher reads its config from `SBX_*` env vars that `engine._enable_sandbox` sets
 (`SBX_BROKER_URL`, `SBX_PROXY_URL`, `SBX_USE_CGROUP`, `SBX_MEM_MAX`, `SBX_CPU_MAX`,
@@ -321,7 +327,6 @@ enter any jail. A user leaking their own credential is their problem, not the ow
 denylist (seccomp) bound what a single session can consume or call (e.g. `ptrace` is
 denied → no `strace`/`gdb` inside a code session).
 
-> Historical note: this section preserves the threat model and design rationale that
-> originally lived in the #119 umbrella task (closed once the design shipped). The
-> deliberated build options (proxy vs netns vs slirp) are settled — the deployment runs
-> the CONNECT proxy + hard cgroup egress block described in §4.
+> Historical note: this section preserves the original threat model and design
+> rationale. The deliberated build options (proxy vs netns vs slirp) are settled — the
+> deployment runs the CONNECT proxy + hard cgroup egress block described in §4.

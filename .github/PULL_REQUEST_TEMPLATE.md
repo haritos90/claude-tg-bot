@@ -2,7 +2,7 @@
 
 ## What & why
 
-<!-- What does this change and why? Link the backlog task it closes, e.g. #64 (task-64). -->
+<!-- What does this change and why? -->
 
 ## Type
 
@@ -11,11 +11,10 @@
 ## Checklist
 
 - [ ] PR title follows Conventional Commits (`type(scope): summary`).
-- [ ] `python -m compileall -q app conftest.py`, the import smoke (AGENTS.md §3), and `pytest -q` are green.
+- [ ] `python -m compileall -q app conftest.py`, the import smoke (AGENTS.md §2), `ruff check .`, and `pytest -q` are green.
 - [ ] User-facing strings go through `i18n` (`en` **and** `ru`), not hardcoded.
 - [ ] No `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` introduced (subscription-only).
 - [ ] `setting_sources=[]` preserved on every `ClaudeAgentOptions`.
-- [ ] `backlog/` updated (task set **Done** with a resolution in Implementation Notes).
 
 ## Notes for reviewers
 

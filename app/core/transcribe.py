@@ -9,7 +9,7 @@ errors the way it tolerates typos, so a small/fast model is sufficient.
 ffmpeg + faster-whisper are OPTIONAL runtime deps. If either is missing this module
 reports ``available() is False`` and the voice handler degrades gracefully, so a
 checkout without them still imports and runs (the base requirements don't pull the
-heavy CTranslate2 stack — see requirements-voice.txt).
+heavy CTranslate2 stack — see requirements/voice.txt).
 
 Concurrency: the box is small (2 vCPUs), so ``_infer_lock`` serialises inference —
 only one transcription runs at a time — and all blocking work (ffmpeg, model load,

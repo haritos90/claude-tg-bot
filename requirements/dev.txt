@@ -1,0 +1,6 @@
+# Development / CI dependencies (not needed to run the bot).
+#   pip install -r requirements/dev.txt
+-r base.txt
+
+pytest==8.3.4
+ruff

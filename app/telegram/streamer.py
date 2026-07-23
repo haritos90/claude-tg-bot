@@ -1382,6 +1382,11 @@ class Streamer:
         loc_q, svg_q, tbl_q = list(locations), list(svgs), list(wide_tables)
         # split() KEEPS the tokens: even indices are prose, odd indices are one *_TOKEN sentinel.
         parts = markup.split_on_attachment_tokens(rich_text)
+        # #387 (AC2): a token can sit INSIDE a fenced code block (e.g. an <svg> shown among other
+        # content in a ```html block, or a wide table inside a fence); splitting there cuts the
+        # fence and leaves each prose run with unbalanced backticks. Repair the runs so each renders
+        # on its own (a reply with no token-in-a-fence is returned unchanged).
+        parts = markup.repair_fences_across_tokens(parts)
         # Segments are fresh messages → drop the streaming write-head placeholder
         # (DM drafts have none; they self-expire), mirroring _commit_mixed.
         if self.message_id is not None:
@@ -1470,7 +1475,11 @@ class Streamer:
             # empty-text check; if a keypad-only send is rejected, retry once with a visible
             # known-good carrier so the keypad is never silently lost, then log if even that fails
             # (parity with _send_location / the interleave fallback, which now warn on a drop).
-            if sent is None and reply_markup is not None:
+            # #392: scope the "\u2026" carrier swap to the keypad-only case (no footer). It only addresses
+            # Telegram rejecting U+2063 as empty; with a footer the first send already carried visible
+            # text, so a failure is network/other and retrying with "\u2026" would drop the footer without
+            # fixing the cause. was: `if sent is None and reply_markup is not None:`
+            if sent is None and reply_markup is not None and not footer:
                 sent = await self._safe(
                     lambda: self.bot.send_message(
                         chat_id=self.chat_id, text="\u2026",
@@ -1481,7 +1490,7 @@ class Streamer:
                 )
             if sent is None:
                 logger.warning("interleave: dropped the trailing footer/keypad bubble (send "
-                               "failed%s)", " after carrier retry" if reply_markup else "")
+                               "failed%s)", " after carrier retry" if (reply_markup and not footer) else "")
         self._rendered_text = rich_text
 
     async def _commit_mixed(self, full_text: str, footer: str, silent_first: bool) -> None:

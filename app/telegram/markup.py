@@ -1236,6 +1236,52 @@ def split_markdown(text: str, limit: int = SAFE_LIMIT) -> list[str]:
     return repaired
 
 
+def repair_fences_across_tokens(parts: list[str]) -> list[str]:
+    """#387 (AC2): ``split_on_attachment_tokens`` cuts a fenced code block when an attachment token
+    (an ``<svg>`` / wide table that sat INSIDE a fence) falls within it, leaving each prose run with
+    an unbalanced ``` fence that renders as literal backticks. Close an open fence at the end of a
+    prose run and reopen it (same language) on the next, carrying the state ACROSS the intervening
+    token — the same repair ``split_markdown`` applies across size-split boundaries, so every run
+    renders on its own. EVEN indices are prose runs (repaired); ODD indices are attachment sentinels
+    (left verbatim). A run whose fences are already balanced is returned unchanged, so a
+    balanced-fence reply is byte-identical (an unclosed trailing fence is still closed). A token
+    flush against the fence's closing line is not reopened into an empty code box — the reopen and
+    that closing line are dropped (#403). ```-only, like ``split_markdown`` (a ~~~ or 4-backtick
+    fence is left as-is)."""
+    out = list(parts)
+    open_lang: str | None = None  # language of a fence carried across a token, if any
+    for i in range(0, len(out), 2):  # prose runs only; odd-index sentinels stay untouched
+        chunk = out[i]
+        if not chunk.strip():
+            continue  # empty prose run → no bubble; carry any open-fence state across it
+        prefix = f"```{open_lang}\n" if open_lang is not None else ""
+        in_fence = open_lang is not None
+        lang_here = open_lang
+        if in_fence:
+            # #403: a token flush against the fence's closing line would emit a reopen
+            # immediately followed by the close — a blank code box. When the run's first
+            # non-blank line closes the carried fence, drop the reopen and that line.
+            lines = chunk.split("\n")
+            first = next((j for j, ln in enumerate(lines) if ln.strip()), None)
+            if first is not None and _FENCE_LINE_RE.match(lines[first]):
+                chunk = "\n".join(lines[:first] + lines[first + 1 :])
+                prefix, in_fence, lang_here = "", False, None
+        for line in chunk.split("\n"):
+            m = _FENCE_LINE_RE.match(line)
+            if m:
+                in_fence, lang_here = (False, None) if in_fence else (True, m.group(1) or "")
+        body = prefix + chunk
+        if in_fence:  # ends inside a fence → close it, and reopen on the next prose run
+            if not body.endswith("\n"):
+                body += "\n"
+            body += "```"
+            open_lang = lang_here or ""
+        else:
+            open_lang = None
+        out[i] = body
+    return out
+
+
 def _tg_len(s: str) -> int:
     """Telegram measures a message's length in UTF-16 code units, not Python code points — a
     supplementary-plane char (an emoji) is one code point but two units. #390: measure that so a
@@ -1278,14 +1324,31 @@ def render_within_limit(raw: str, hard_limit: int = HARD_LIMIT) -> list[str]:
     #   for i in range(0, len(raw), step):
     #       out.append(md_to_html(raw[i : i + step]) or "…")
     #   return out or ["…"]
+    # was — replaced for #392 (the halving 682→341→170→85→42 trips the `>= 64` guard and skips
+    # the 64 floor; if no tried step verified, the loop fell through returning the LAST, UNVERIFIED
+    # `out` — reachable only for a small custom hard_limit, since callers pass the default 4096):
+    #   step = max(64, hard_limit // 6)
+    #   out: list[str] = ["…"]
+    #   while step >= 64:
+    #       out = [md_to_html(raw[i : i + step]) or "…" for i in range(0, len(raw), step)]
+    #       if all(_tg_len(h) <= hard_limit for h in out):
+    #           return out or ["…"]
+    #       step //= 2
+    #   return out or ["…"]
     step = max(64, hard_limit // 6)
-    out: list[str] = ["…"]
-    while step >= 64:
+    # was: out: list[str] = ["…"] — dead seed (the loop assigns `out` before any read and the
+    # post-loop return is the literal placeholder) — removed for #403.
+    while step >= 1:
         out = [md_to_html(raw[i : i + step]) or "…" for i in range(0, len(raw), step)]
         if all(_tg_len(h) <= hard_limit for h in out):
             return out or ["…"]
-        step //= 2
-    return out or ["…"]
+        # Halve, but land on the intended 64 floor before dropping below it, then keep shrinking to
+        # 1 so a tiny custom hard_limit still yields verified pieces (the default-4096 path returns
+        # on the first step, so it is unchanged).
+        step = 64 if 64 < step <= 128 else step // 2
+    # Every single-char piece still overflows (hard_limit below one escaped char) → a
+    # guaranteed-safe placeholder, never an unverified oversize piece.
+    return ["…"]
 
 
 # A complete fenced code block (``` or ~~~), language optional, on raw text.

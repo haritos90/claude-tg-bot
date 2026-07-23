@@ -35,7 +35,7 @@ messages queue behind the wedged turn.
 
 **Two root causes seen.**
 
-1. **Engine wedge after reasoning — `#358`, fixed.** A `thinking_delta` is a `StreamEvent`,
+1. **Engine wedge after reasoning — fixed.** A `thinking_delta` is a `StreamEvent`,
    so it sets `_progressed=True` and disarms the first-token watchdog
    (`_FIRST_TOKEN_TIMEOUT_SEC`). If the upstream/CLI then goes silent — e.g. the jailed
    `claude` completes its model calls but emits no final result — the engine's per-event
@@ -75,7 +75,8 @@ ss -tnp | grep -E ':8789|:443'
 # 5) Hung web tool (chat sessions have WebSearch/WebFetch)? Look for an egress-proxy outbound.
 ss -tnp | grep 'pid=<egress-proxy pid>' | grep -v ':8790'
 
-# 6) Did a watchdog fire? No "turn stalled" + a wedged turn = the #358 gap (now covered).
+# 6) Did a watchdog fire? No "turn stalled" + a wedged turn = the disarmed-watchdog
+#    gap, now covered by the stall watchdog.
 journalctl -u claude-tg-bot --since "-30min" | grep -iE 'turn stalled|service unavailable'
 ```
 
@@ -83,7 +84,7 @@ Interpretation: model calls returned `-> 200` **but** the turn never finished an
 `turn stalled` was logged ⇒ the engine was parked in the unbounded post-reasoning `await`
 (root cause #1). A jailed `claude` in `do_epoll_wait` with **no** open sockets = it finished
 its API work and went idle without emitting a result — a CLI/upstream-side stall the bot
-can't fix from inside; the `#358` watchdog is the bot-side safety net that ends the turn.
+can't fix from inside; the stall watchdog is the bot-side safety net that ends the turn.
 
 **Recovery.**
 
@@ -108,7 +109,7 @@ commits via `finish()` — a real message that clears the draft. Tunable via
 `test_reasoning_then_answer_does_not_false_timeout`.
 
 **Known limitation / possible future work.** A restart while a turn is **still in flight past
-the ~40 s drain** (a long healthy tool call / build, or — pre-#358 — a wedged turn) cancels it
+the ~40 s drain** (a long healthy tool call / build, or — before the fix — a wedged turn) cancels it
 via `streamer.cancel()` without reaching `finish()`, orphaning its draft (there is no
 shutdown-finalize). A shutdown hook that commits in-flight turns to a real message would close
 that gap, but it would post a message on each such restart — weigh against the "keep background

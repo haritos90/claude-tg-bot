@@ -1,0 +1,10 @@
+# Optional dependency for local voice-note transcription.
+#   pip install -r requirements/voice.txt
+#
+# Also requires the ffmpeg system binary on PATH (Debian/Ubuntu: apt-get install ffmpeg)
+# to decode Telegram Opus/OGG voice notes to 16 kHz mono PCM.
+#
+# Runs on-device (CTranslate2, CPU int8) — no audio leaves the host, no API key. Without
+# these, VOICE_TRANSCRIPTION stays effectively off: the bot detects the missing pieces and
+# replies that voice transcription is unavailable. See docs/voice.md.
+faster-whisper>=1.0,<2   # bound the major: repo pins are exact/upper-bounded, and a 2.x could break the API

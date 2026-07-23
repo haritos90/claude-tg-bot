@@ -16,7 +16,7 @@ structure).
 The bot has two mechanisms for formatted output. **Path B (native rich) is the
 default for every reply and every menu;** Path A (classic HTML) is the fallback.
 
-### Path B — native rich messages (`sendRichMessage`, #164/#169/#172/#173)
+### Path B — native rich messages (`sendRichMessage`)
 
 `sendRichMessage` takes an `InputRichMessage` — a single `markdown` or `html` string
 — and the client renders the full rich tag set: headings, paragraphs, nested lists,
@@ -28,14 +28,14 @@ as `TelegramMethod` subclasses and invoked via `await bot(SendRichMessage(...))`
 |---|---|---|
 | `SendRichMessage` | `sendRichMessage` | send a rich message (optionally with `reply_markup`) |
 | `SendRichMessageDraft` | `sendRichMessageDraft` | stream a partial, animated rich draft (private chats) |
-| `EditRichMessage` | `editMessageText` (+ `rich_message`) | edit a message to rich content in place (#173) |
+| `EditRichMessage` | `editMessageText` (+ `rich_message`) | edit a message to rich content in place |
 
 Input-field selection:
 - **`markdown`** — used for model replies (raw model Markdown is passed straight
   through; the client renders structure natively).
 - **`html`** — used for bot-authored surfaces whose text is already valid Telegram
   HTML: command replies (`reply` → `reply_rich_html`) and the inline-keyboard menus
-  (`_send_menu` / `_edit_menu`, #173).
+  (`_send_menu` / `_edit_menu`).
 
 ### Path A — classic HTML (`parse_mode="HTML"`)
 
@@ -51,23 +51,24 @@ rich call raises, so a message or menu is never lost.
 
 ## 2. Whole-reply rendering
 
-Every model reply is sent as **one** native rich message. `streamer._commit` calls
+A model reply is sent as **one** native rich message (split only around out-of-band
+attachment blocks — §3). `streamer._commit` calls
 `streamer._commit_rich_markdown`, which passes the reply's raw Markdown to
 `sendRichMessage({"markdown": …})`; the client renders headings, lists, tables,
 quotes, code and math natively, with no client-side char splitting. While generating,
-the reply is streamed already-formatted via `sendRichMessageDraft` (#172); long output
+the reply is streamed already-formatted via `sendRichMessageDraft`; long output
 collapses behind a client-side "show more" control.
 
 **Code blocks go through the rich path like everything else.** A fenced block
 (` ```lang `) maps to `RichBlockPreformatted`. The API accepts it, but the current
 Telegram client renders it as **plain monospace** — no language label, no syntax
-styling, no copy button (#174). This is a client-side gap, not a bot-side choice:
+styling, no copy button. This is a client-side gap, not a bot-side choice:
 when the client styles `RichBlockPreformatted`, code begins rendering as a full code
 block with **no change here**. Sending the whole reply as one rich message keeps the
 font consistent across prose, tables and code, rather than splitting a reply into
 mixed rich + classic bubbles.
 
-**Headings are demoted to bold, not emitted as heading blocks (#353).** Telegram renders a
+**Headings are demoted to bold, not emitted as heading blocks.** Telegram renders a
 markdown heading (`## …`) as a heading BLOCK in the client's own heading typeface —
 larger/heavier, and a visually distinct face on some clients — which reads as a different
 FONT beside the body paragraph font. `markup.demote_headings` (applied to the rich
@@ -76,8 +77,8 @@ every ATX heading (`# …`–`###### …`) to `**bold**`, so the whole reply sta
 (headings just bold) — mirroring what `md_to_html` (Path A) already did. It preserves the
 model's heading text verbatim **including any leading emoji** (the per-heading emoji choice
 stays the model's — never bot-injected), skips `#` lines inside code fences, and inserts a
-non-breaking-space (`U+00A0`) spacer paragraph **above and below** each heading (#360, was
-above-only in #353) to restore the vertical gap a heading block had — a lone bold paragraph
+non-breaking-space (`U+00A0`) spacer paragraph **above and below** each heading (was
+above-only) to restore the vertical gap a heading block had — a lone bold paragraph
 gets only a small inter-paragraph margin and a blank line alone is trimmed, so only the nbsp
 renders the gap (verified on-device). The ABOVE spacer is skipped for a first-content heading;
 the BELOW spacer is added lazily (only once content follows, never trailing the message) and
@@ -108,7 +109,7 @@ error it returns a fully-escaped plain string (a message is never dropped for ba
 | `[text](url)` | `<a href>` | |
 | `# Heading` (ATX) | bold line | classic HTML has no `<h1>` |
 | `- item` / `1. item` | left as text | classic HTML has no `<ul>/<ol>` |
-| LaTeX (`\frac`, `$…$`, `x^2`) | Unicode (½, ×, x²) | #51. **Fallback path only** — the rich-markdown reply path (#176) ships `$…$` / `$$…$$` straight to Telegram, which renders native math (#297); this Unicode degradation now applies only when a rich send fails and classic HTML is used as the fallback, which still can't render LaTeX. |
+| LaTeX (`\frac`, `$…$`, `x^2`) | Unicode (½, ×, x²) | **Fallback path only** — the rich-markdown reply path ships `$…$` / `$$…$$` straight to Telegram, which renders native math; this Unicode degradation now applies only when a rich send fails and classic HTML is used as the fallback, which still can't render LaTeX. |
 
 Table helpers (used by the `/userstats` table and as the html-table builder):
 - `markup.split_rich_tables(text)` → plain-text runs + `RichTable` objects (per-column
@@ -121,14 +122,25 @@ Table helpers (used by the `/userstats` table and as the html-table builder):
 
 ## 3. Long messages and splitting
 
-No client-side splitting is required: a single rich message holds far more than the
-classic 4096-char limit, and long output collapses behind a client "show more"
-control. The only size fallback is the **`.md` document** for very large output
+A reply without out-of-band blocks needs no client-side splitting: a single rich message
+holds far more than the classic 4096-char limit, and long output collapses behind a client
+"show more" control. The only size fallback is the **`.md` document** for very large output
 (`markup.should_send_as_file`, `FILE_THRESHOLD = SAFE_LIMIT * 3`), and it triggers
 only if the rich send itself fails.
 
-The earlier PNG table path (`table_image.py`, `split_image_tables`) and the `<pre>`
-monospace grid (`_render_table_pre` / `_tables_to_pre`) are retained but commented out.
+**Out-of-band blocks split the reply around attachments.** An inline `<svg>` drawing, a
+wide (>20-column) table, or a location renders as its own PNG/native message at the spot
+it occupies: `markup.split_on_attachment_tokens` cuts the raw Markdown into prose runs
+around sentinel tokens and `streamer._commit_rich_interleaved` sends run → attachment →
+run in order. `markup.repair_fences_across_tokens` re-balances a ``` fence such a cut
+split across two runs (close + reopen, language carried over), so every run renders on
+its own.
+
+Wide tables render via the live PNG path — `table_image.render_table_png`
+(`streamer._send_wide_table_image`), falling back to a `<pre>` monospace grid
+(`markup._render_table_pre`); the classic-HTML fallback path degrades tables to the same
+grid (`markup._tables_to_pre`). Only the earlier whole-reply PNG splitter
+(`markup.split_image_tables`) is retained commented out.
 
 ---
 
@@ -167,9 +179,9 @@ Tags `sendRichMessage` (Path B) can render. Status legend:
 ### Blocks
 | Tag(s) | Meaning | Status |
 |---|---|---|
-| `<h1>`…`<h6>` | headings | **demoted** — `#` → **bold** on BOTH paths (Path A `md_to_html`; Path B `markup.demote_headings`, #353); the native heading block is intentionally NOT emitted (its separate font clashed with body text) |
+| `<h1>`…`<h6>` | headings | **demoted** — `#` → **bold** on BOTH paths (Path A `md_to_html`; Path B `markup.demote_headings`); the native heading block is intentionally NOT emitted (its separate font clashed with body text) |
 | `<p>` | paragraph | 🟡 |
-| `<pre>` / `<pre><code class="language-…">` | code block | ✅ via rich (renders plain monospace pending client styling, #174); Path A renders a full classic code block |
+| `<pre>` / `<pre><code class="language-…">` | code block | ✅ via rich (renders plain monospace pending client styling); Path A renders a full classic code block |
 | `<footer>` | footer text | 🟡 |
 | `<hr/>` | divider | 🟡 |
 | `<ul><li>` | unordered list | 🟡 (Path A keeps `- ` as text) |
@@ -178,7 +190,7 @@ Tags `sendRichMessage` (Path B) can render. Status legend:
 | `<blockquote>` (+ `<br>`, `<cite>`) | block quote | ✅ |
 | `<aside>` (+ `<cite>`) | pull quote | 🟡 |
 | `<details>`/`<summary>` (+ `open`) | collapsible | 🟡 |
-| `<table>` (`bordered`/`striped`, `<caption>`, `<th>`, `colspan`/`rowspan`, `align`/`valign`) | table | ✅ (#164) |
+| `<table>` (`bordered`/`striped`, `<caption>`, `<th>`, `colspan`/`rowspan`, `align`/`valign`) | table | ✅ |
 | `<tg-math-block>` | display math | 🟡 |
 
 ### Media (require a real URL or uploaded file)
@@ -197,14 +209,15 @@ Tags `sendRichMessage` (Path B) can render. Status legend:
 | Concern | Location |
 |---|---|
 | Markdown → classic HTML | `markup.md_to_html` |
-| Heading demotion (rich path → one font, #353) | `markup.demote_headings` |
+| Heading demotion (rich path → one font) | `markup.demote_headings` |
 | Escaping | `markup.escape_html` |
 | Native table split / render | `markup.split_rich_tables`, `markup.table_to_rich_html`, `markup.RichTable` |
 | Rich method bindings | `rich_message.py` (`SendRichMessage`, `SendRichMessageDraft`, `EditRichMessage`) |
 | Whole-reply rich commit + fallback | `streamer._commit`, `streamer._commit_rich_markdown`, `streamer._commit_mixed` |
 | Native-table send + fallback | `streamer._send_rich`, `streamer._build_sendables` |
-| Rich menu open / in-place edit (#173) | `handlers._send_menu`, `handlers._edit_menu` |
-| PNG fallback (retained, commented) | `table_image.py`, `markup.split_image_tables` |
+| Rich menu open / in-place edit | `handlers._send_menu`, `handlers._edit_menu` |
+| Attachment interleave + fence repair | `markup.split_on_attachment_tokens`, `markup.repair_fences_across_tokens`, `streamer._commit_rich_interleaved` |
+| Wide-table PNG + `<pre>`-grid fallback | `table_image.render_table_png`, `streamer._send_wide_table_image`, `markup._render_table_pre` |
 | Commands & settings structure | **[menu.md](menu.md)** |
 
 See also the **Message formatting** section of the [README](../README.md).

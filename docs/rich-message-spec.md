@@ -1,4 +1,4 @@
-# Rich message, draft & table — authoritative spec (#237)
+# Rich message, draft & table — authoritative spec
 
 Ground truth for streaming + sending rich messages, extracted **verbatim** from the
 official Telegram Bot API docs (<https://core.telegram.org/bots/api>) on 2026-06-19.
@@ -35,7 +35,7 @@ Relevant doc sections: *Rich Message Formatting Options*, *sendRichMessage*,
   streamer's ~20 s keepalive re-sends the draft to PREVENT expiry while streaming, so it must stop
   at turn end and the turn must reach `finish()`. A turn that never does (wedged, or interrupted
   by a restart before it finished) leaves an orphaned `<tg-thinking>` frame — for that incident, its diagnosis and recovery,
-  and the `_STALL_TIMEOUT_SEC` watchdog (#358), see **[`troubleshooting.md`](troubleshooting.md)**.
+  and the `_STALL_TIMEOUT_SEC` watchdog, see **[`troubleshooting.md`](troubleshooting.md)**.
 
 ## InputRichMessage
 
@@ -63,8 +63,8 @@ A table can be expressed in EITHER form (server converts both to a `RichBlockTab
   then data rows. This is standard GFM.
 - **A table is only valid once the header + separator (+ ≥0 complete rows) exist.** A
   half-typed row or a partial separator is NOT a valid table → Telegram renders the header
-  line alone. THIS is the streaming trap (#226): the draft must only ever carry COMPLETE
-  rows. The fix (#237, `markup.clip_partial_table`) clips the in-progress trailing row so
+  line alone. THIS is the streaming trap: the draft must only ever carry COMPLETE
+  rows. The fix (`markup.clip_partial_table`) clips the in-progress trailing row so
   each draft is a valid prefix and the table grows row-by-row with no snap.
 - *"Table cells can contain only inline formatting"* (bold, code, `<sup>`, `<tg-spoiler>`,
   …) — no block elements inside a cell.
@@ -98,8 +98,8 @@ A table can be expressed in EITHER form (server converts both to a `RichBlockTab
 The two fields handle newlines DIFFERENTLY. Verified empirically by sending each form and
 reading the server-parsed `result.rich_message.blocks` (ground truth — stronger than the prose
 docs, which truncate in a fetch). A single `\n` is NOT honoured as a line break in either rich
-field (a frequent misconception, and the distinction the #310 migration hinges on) — see the
-per-field table below.
+field (a frequent misconception, and the distinction the html→markdown rich-field migration
+hinges on) — see the per-field table below.
 
 | Source text | Rich HTML → parsed | Rich Markdown → parsed |
 |---|---|---|
@@ -109,7 +109,7 @@ per-field table below.
 
 - **Rich HTML collapses ALL newlines** (single AND double) to spaces, exactly like real HTML —
   a visible line break needs `<br>`; paragraph separation needs block tags. This is WHY the menu
-  path runs `\n`→`<br>` (#202): without it every line collapses onto one wrapped line.
+  path runs `\n`→`<br>`: without it every line collapses onto one wrapped line.
 - **Rich Markdown (GFM/CommonMark):** a single `\n` is a SOFT break (renders as a space); a
   blank line `\n\n` is a PARAGRAPH break; two trailing spaces + `\n` is a HARD break.
 - **1:1 line-break equivalence (verified `blocks ==` equal):** HTML `<br>` and markdown `  \n`
@@ -117,11 +117,11 @@ per-field table below.
   So a `\n`→`<br>` HTML string maps to a `\n`→`  \n` markdown string — NOT "drop the `<br>`,
   markdown honours newlines" (it does NOT honour a single `\n`). Block constructs (lists `- x`,
   tables, `` ```fences ``, headings) break on their own and need no hard break.
-- **Paragraph vertical margin (#353):** consecutive plain `\n\n` paragraphs render with only a
+- **Paragraph vertical margin:** consecutive plain `\n\n` paragraphs render with only a
   SMALL inter-paragraph margin, whereas a heading / list / table BLOCK gets a larger one. So
   demoting a heading to a bold PARAGRAPH (to drop the heading font, `markup.demote_headings`)
   looks cramped — a `U+00A0` (non-breaking-space) SPACER paragraph above AND below it restores
-  the gap on both sides (#360, was above-only in #353; verified on-device: a whitespace-only
+  the gap on both sides (was above-only; verified on-device: a whitespace-only
   paragraph is trimmed UNLESS it holds a nbsp, so a blank line won't do — the below spacer is
   added lazily so it never trails the message, and adjacent headings share one deduped gap).
 
@@ -144,28 +144,28 @@ per-field table below.
   for replies/drafts, `{"html": …}` for menus and the native-table fallback `table_to_rich_html`).
 - `streamer._render_draft` — `SendRichMessageDraft({"markdown": frontier})`, one fixed
   `_DRAFT_ID`, ~5/sec. **Must send only valid markdown** → `markup.clip_partial_table`
-  trims the in-progress table row (#237).
+  trims the in-progress table row.
 - `streamer._commit_rich_markdown` (finish) — `SendRichMessage({"markdown": full_text})`:
-  the WHOLE reply as one rich message (#176). SAME renderer as the draft, so a complete
+  the WHOLE reply as one rich message. SAME renderer as the draft, so a complete
   table renders identically; the draft is just an earlier valid prefix of it.
 - `markup.demote_headings` — rewrites ATX headings (`# …` → `**bold**`) on the rich
-  `{"markdown"}` BEFORE both the draft frontier and `_commit_rich_markdown` (#353): a heading
+  `{"markdown"}` BEFORE both the draft frontier and `_commit_rich_markdown`: a heading
   BLOCK renders in the client's distinct heading typeface, which clashed with the body font
   ("jumping fonts"). Demoting keeps ONE font (headings just bold, like Path A `md_to_html`);
   the model's heading text + any leading emoji are kept verbatim, `#` inside code fences is
   skipped, and a `U+00A0` spacer paragraph is inserted above AND below each heading to restore
-  the block's vertical gap on both sides (#360, was above-only in #353; the above spacer is
+  the block's vertical gap on both sides (was above-only; the above spacer is
   skipped for a first-line heading, the below one is lazy so it never trails, and adjacent
   headings share one deduped gap).
-- `markup.table_to_rich_html` — builds the `<table>` HTML form (the #164 native-table path /
+- `markup.table_to_rich_html` — builds the `<table>` HTML form (the native-table path /
   `_send_rich` fallback).
 
 **Invariant:** the draft and the final message use the SAME `{"markdown"}` representation, so
 streaming = sending a growing valid PREFIX. If a table looks wrong mid-stream, the draft is
 carrying invalid GFM (a partial row/separator) — fix the prefix, do NOT switch representation
-(no `<pre>` grid, no placeholder — those were the rejected #226 attempts).
+(no `<pre>` grid, no placeholder — those were the rejected attempts).
 
-## `<tg-thinking>` — the "Thinking…" block (RichBlockThinking, #239)
+## `<tg-thinking>` — the "Thinking…" block (RichBlockThinking)
 
 What the docs say (verbatim): *"A block with a 'Thinking…' placeholder, corresponding to the
 custom HTML tag `<tg-thinking>`. The block may be used **only in `sendRichMessageDraft`**,
@@ -173,7 +173,7 @@ therefore it can't be received in messages."* Fields: `type` = `"thinking"`, `te
 custom emoji from t.me/addemoji/AIActions are recommended). Used inline in a draft as
 `<tg-thinking>Thinking…</tg-thinking>`.
 
-**Custom (premium) emoji in the indicator (#323).** The 💭 / 🔎 icons become CUSTOM animated emoji
+**Custom (premium) emoji in the indicator.** The 💭 / 🔎 icons become CUSTOM animated emoji
 when the bot is allowed to send them — which needs the bot OWNER to have Telegram Premium
 (auto-detected from the owner's `from_user.is_premium` → `streamer.set_owner_premium`) OR the bot to
 own a Fragment username; viewers NEVER need Premium (everyone sees them animated). Ids are
@@ -198,7 +198,7 @@ the CURRENT phase — "Thinking…", "Reading files…", "Running `pytest`…", 
 optionally with the AIActions custom emoji. Update it (reuse the same `draft_id`) as the agent
 moves between phases; replace it with real content once output starts.
 
-**How THIS bot uses it (#240/#294/#319):** `start()` sends
+**How THIS bot uses it:** `start()` sends
 `SendRichMessageDraft({"html": "<tg-thinking>…</tg-thinking>"})` and the animation loop
 (`streamer._render_draft`, ~0.2 s/tick) keeps repainting it until real output starts. The inner
 text is, in priority order: the model's live REASONING tail (extended thinking) → a SEARCH-themed
@@ -206,7 +206,7 @@ rotating gerund (`stream.searching_words`, 🔎) while a web search/fetch is in 
 tool phase ("📖 Reading `sessions.py`") for other tools → otherwise a generic rotating gerund
 (`stream.thinking_words`, 💭). All localized to the user's language.
 
-### Animation & "still-working" feedback — the hard constraints (#319)
+### Animation & "still-working" feedback — the hard constraints
 
 Only the `<tg-thinking>` block streamed as a rich DRAFT animates smoothly — Telegram drives the
 token-by-token motion client-side. Everything else is effectively STATIC:
@@ -222,12 +222,12 @@ token-by-token motion client-side. Everything else is effectively STATIC:
 Rule: whenever the bot is working and NOT streaming text, it MUST show an animating
 `<tg-thinking>` draft — it is the only non-verbal "I'm still alive" signal. During a web search
 the placeholder rotates the search-themed subset (`stream.searching_words`, 🔎) so the motion
-reads as info-gathering — the thinking tag ALONE, no separate "sources" card (#321: a card
+reads as info-gathering — the thinking tag ALONE, no separate "sources" card (a card
 listing the queries was tried and removed — it read as clutter and mislabelled the queries as
 "sources", which the model already cites itself as links in the answer).
 Keep the block DRAFT-ONLY; `finish()` must stay `{"markdown": full_text}` with no thinking block.
 
-## Math / formulas — `mathematical_expression` (#297)
+## Math / formulas — `mathematical_expression`
 
 Telegram renders LaTeX math natively (Bot API 10.1: `RichTextMathematicalExpression` inline,
 `RichBlockMathematicalExpression` block). **Verified live** against the API on 2026-06-21 (a
@@ -243,12 +243,12 @@ exact INPUT→block mapping in the **Rich Markdown** form the bot uses:
 | HTML `<math>…</math>` | plain text (tag stripped) | ❌ — in the HTML form use `<tg-math>…</tg-math>` |
 
 - The `expression` is **standard LaTeX** (`\frac`, `\sqrt`, `\sum`, `\int`, `^`, `_`, Greek, …).
-- The bot streams + persists as `{"markdown"}` (#176), so `$…$` / `$$…$$` pass straight through
+- The bot streams + persists as `{"markdown"}`, so `$…$` / `$$…$$` pass straight through
   on BOTH the draft and final send — no special handling needed. The classic-HTML fallback
-  (`markup._latex_to_unicode`, #51) still degrades math to Unicode only when a rich send fails.
+  (`markup._latex_to_unicode`) still degrades math to Unicode only when a rich send fails.
 - The chat prompt (`engine.CHAT_SYSTEM_PROMPT`) and `app/core/agent_context.md` instruct the model to
   emit `$…$` / `$$…$$` and to escape a literal dollar as `\$`.
 - **Streaming note:** an unclosed `$`/`$$` at the draft frontier renders as literal text until
   it closes, then snaps to the formula — the SAME behavior as a half-typed `**bold**`, and
-  harmless (it does NOT break sibling blocks the way a partial table did, #237), so no
+  harmless (it does NOT break sibling blocks the way a partial table did), so no
   clip-partial-math step is needed. Re-verify with `deploy/verify-rich-draft.py --math`.

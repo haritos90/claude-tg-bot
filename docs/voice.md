@@ -14,7 +14,7 @@ Two optional dependencies — both are necessary for voice input:
 | Dependency | Install | Purpose |
 |---|---|---|
 | `ffmpeg` (system binary) | `apt install ffmpeg` | Decode Telegram Opus/OGG → 16 kHz mono PCM. |
-| `faster-whisper` (pip) | `pip install -r requirements-voice.txt` | On-device speech-to-text (CTranslate2, CPU int8). |
+| `faster-whisper` (pip) | `pip install -r requirements/voice.txt` | On-device speech-to-text (CTranslate2, CPU int8). |
 
 If not installed: the bot detects the missing pieces and replies that
 voice transcription is unavailable.

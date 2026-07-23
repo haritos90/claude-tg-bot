@@ -2,7 +2,7 @@
 
 Specification of the bot's menus, commands, and settings/access-control model —
 the canonical structure every surface conforms to. Audience: deployer/owner and
-contributors. Open work: `backlog/` (Backlog.md).
+contributors.
 
 **Conventions.**
 
@@ -36,11 +36,12 @@ aligned over time.
   This holds even for a boolean (a 2-option On/Off picker) or a single-option
   setting: tapping a row shows the choices first, with a **Back** button to leave
   without changing anything, so the user is never surprised by a silent flip and
-  always sees how many values exist (#275). (A direct typed command like `/shell`
+  always sees how many values exist. (A direct typed command like `/shell`
   or `/auto` still toggles immediately — that is explicit user intent, not a menu
   tap.)
-- **Localized.** The visible text comes from the locale catalog; the same button
-  is `«✏️ Rename»` / `«✏️ Переименовать»`. Slugs and callback tokens stay ASCII.
+- **Localized.** The visible text comes from the locale catalog and renders in the
+  viewer's language (the EN/RU label pairs live in the tables below). Slugs and
+  callback tokens stay ASCII.
 
 ### 1.2 Layout by menu type
 
@@ -126,8 +127,8 @@ arguments, and ~90% of use is on a phone. Therefore:
   **`/cancel`** to abort. They never fail with a "usage:" error on an empty
   argument.
 - **Fixed-choice input is always a picker, never typed** — including booleans,
-  which open a 2-option On/Off picker with Back rather than flipping in place
-  (#275). Free-text input is always next-message capture. (Typing `«/model opus»`
+  which open a 2-option On/Off picker with Back rather than flipping in place.
+  Free-text input is always next-message capture. (Typing `«/model opus»`
   still works as a power-user shortcut, but the menu path never requires it.)
 
 ### 1.6 The Telegram command list (the "/" menu)
@@ -207,6 +208,8 @@ Conventions legend).
 | `/clear` (alias `/reset`) | Clear the session context | Очистить контекст сессии | none | 🟢 |
 | `/retry` | Re-run the last prompt | Повторить последний запрос | none | 🟢 |
 | `/status` | Current session info | Сведения о текущей сессии | none | 🟢 |
+| `/schedule` | ⏰ Schedule a recurring prompt | ⏰ Запланировать повторяющийся запрос | text (or prompts + capture) | 🟢 |
+| `/schedules` | List / pause / delete schedules | Список / пауза / удаление расписаний | none → list | 🟢 |
 
 ### Tier C — Occasional (mostly reached via the settings hub or session menu)
 
@@ -275,7 +278,6 @@ Conventions legend).
 | `/auto` | Run code tools without asking (owner) | Запускать инструменты кода без вопросов (владелец) | none → toggle | 👑 |
 | `/codesplit` | Code blocks as separate messages: on/off (owner) | Блоки кода отдельными сообщениями: on/off (владелец) | none → toggle | 👑 |
 | `/workingplate` | ⏳ Working/Stop plate: on \| off (owner) | ⏳ Плашка Working/Stop: on \| off (владелец) | none → toggle | 👑 |
-| `/sandbox` | Toggle this session's sandbox — applies to all sessions, chat & code (owner) | Песочница сессии вкл/выкл — для всех сессий, чат и код (владелец) | none → toggle | 👑 |
 
 > **Not commands:** a plain message is a prompt to the current session; a photo,
 > PDF, or text/code file uses its caption as the prompt. Messages sent while a
@@ -359,8 +361,8 @@ scope badge next to a value (`this session` / `my default` / `global default`)
 names where the effective value comes from (§4).
 
 The **👑 Admin** row (owner only) opens a sub-page that consolidates owner controls
-not surfaced as their own hub rows: the **🗄 Archive retention** picker (#178 —
-purge deleted-session bundles older than 1 / 3 / 6 / 12 months or Never; default
+not surfaced as their own hub rows: the **🗄 Archive retention** picker
+(purge deleted-session bundles older than 1 / 3 / 6 / 12 months or Never; default
 6 months), the global owner toggles **🧩 Code split** and **⏳ Working plate**, and
 quick launchers for the user-management commands (**➕ Allow · ➖ Deny · 🎚 Level ·
 ⏳ Expiry · 💳 Tokens · 📊 Stats**). Each launcher starts the matching command's
@@ -599,7 +601,7 @@ One row per option. *Applies to* marks code-only options (§1.7). *Base access* 
 | `permission_mode` | enum: ask, auto-edits, plan, full-access | auto-edits | code | Delegated | `full-access`: owner only; default `auto-edits` auto-runs in-jail edits + ordinary shell, prompts only for push/destructive/web |
 | `max_turns` | int 1–1000, or unlimited | unlimited | code | Delegated | — |
 | `memory` | bool | off | all | Hidden | Delegated: granted users (the per-session 1M-context toggle) |
-| `sandbox` | bool | on | all (chat & code) | Hidden | owner: Delegated (#180: jail covers chat sessions too) |
+| `sandbox` | bool | on | all (chat & code) | Hidden | owner: Delegated (jail covers chat sessions too) |
 | `language` | enum: supported locales | en | all (UI) | Delegated | — |
 | `usage_display` | enum: off, footer, pinned, both | footer | account-wide | Read-only | owner: Delegated |
 | `hot_cache_timer` | bool | off | all | Delegated | every user may toggle their warm-cache note |

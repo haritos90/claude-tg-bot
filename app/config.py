@@ -122,7 +122,7 @@ class Settings:
     # this startup default).
     archive_retention_days: int = 180
     # #363: local speech-to-text for Telegram voice notes. OFF by default — needs the
-    # OPTIONAL ffmpeg (system binary) + faster-whisper (pip; see requirements-voice.txt)
+    # OPTIONAL ffmpeg (system binary) + faster-whisper (pip; see requirements/voice.txt)
     # deps. When on, a voice note is decoded with ffmpeg and transcribed on-device by
     # faster-whisper in the HOST process (audio never enters the jail, never leaves the
     # box), then routed like a typed turn. Recognition need not be perfect — the agent
@@ -276,7 +276,7 @@ def load_settings() -> Settings:
     # owner can override it at runtime via /settings → Admin (kv archive_retention_days).
     archive_retention_days = max(0, _int("ARCHIVE_RETENTION_DAYS", 180))
 
-    # #363: voice-note transcription (optional feature; deps in requirements-voice.txt).
+    # #363: voice-note transcription (optional feature; deps in requirements/voice.txt).
     # voice_lang "" = autodetect; VOICE_MODEL default "base" (VOICE_MODEL can pick tiny =
     # faster / small = better, or a local path); VOICE_MAX_SECONDS default 300 (0 = off).
     voice_transcription = _flag("VOICE_TRANSCRIPTION", False)

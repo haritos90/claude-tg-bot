@@ -148,6 +148,63 @@ def test_render_within_limit_counts_utf16_units():
     assert sum(p.count("😀") for p in pieces) == 3000                  # every emoji survives
 
 
+def test_render_within_limit_small_hard_limit_returns_only_verified():
+    # #392: with a small custom hard_limit the last-resort hard-cut must never return an
+    # UNVERIFIED oversize piece. The old loop halved 682→…→85 then tripped the `>= 64` guard and
+    # returned the last (unverified) result; now it lands on the 64 floor and below, re-verifying
+    # each round, so every returned piece fits the limit.
+    raw = "&" * 500  # each char escapes to '&amp;' (5 UTF-16 units) → overflows a tiny limit
+    pieces = markup.render_within_limit(raw, hard_limit=200)
+    assert pieces
+    assert all(len(p.encode("utf-16-le")) // 2 <= 200 for p in pieces)
+
+
+def test_repair_fences_across_tokens_balances_split_fence():
+    # #387: an attachment token inside a ``` fence is cut by split_on_attachment_tokens into two
+    # prose runs with unbalanced fences. repair_fences_across_tokens closes and reopens the fence so
+    # each run is self-contained, leaves the sentinel untouched, and returns a no-fenced-token reply
+    # unchanged.
+    tok = markup.SVG_TOKEN
+    parts = ["```python\nbefore\n", tok, "\nafter\n```"]  # the fence straddles the token
+    fixed = markup.repair_fences_across_tokens(parts)
+    assert fixed[1] == tok                          # sentinel untouched
+    assert fixed[0].count("```") % 2 == 0           # first run's fences balanced
+    assert fixed[2].count("```") % 2 == 0           # second run's fences balanced
+    assert fixed[2].startswith("```python\n")       # reopened with the language carried (#403)
+    plain = ["Here is the map:\n", markup.LOCATION_TOKEN, "\nas shown."]  # token not in a fence
+    assert markup.repair_fences_across_tokens(plain) == plain
+
+
+def test_repair_fences_carries_state_across_multiple_tokens():
+    # #403: two tokens inside ONE fence — the whitespace-only middle run must carry the open-fence
+    # state (and its language) across BOTH sentinels; the trailing run reopens with the language.
+    tok = markup.SVG_TOKEN
+    parts = ["```python\na = 1\n", tok, "\n", tok, "\nb = 2\n```"]
+    fixed = markup.repair_fences_across_tokens(parts)
+    assert fixed[1] == tok and fixed[3] == tok      # sentinels untouched
+    assert fixed[2] == "\n"                         # whitespace-only run stays blank (no bubble)
+    assert fixed[0].count("```") % 2 == 0
+    assert fixed[4].count("```") % 2 == 0
+    assert fixed[4].startswith("```python\n")       # language carried across both tokens
+
+
+def test_repair_fences_token_flush_at_fence_edge_no_empty_block():
+    # #403: a token flush against the fence's closing line must not reopen the fence just to close
+    # it on the run's first line (a blank code box) — the reopen and that closing line are dropped.
+    tok = markup.SVG_TOKEN
+    parts = ["```html\nintro\n", tok, "\n```\ntail"]
+    fixed = markup.repair_fences_across_tokens(parts)
+    assert fixed[0].count("```") % 2 == 0           # first run closed as usual
+    assert "```" not in fixed[2]                    # no reopened-then-closed empty block
+    assert "tail" in fixed[2]                       # the prose after the fence survives
+
+
+def test_render_within_limit_last_resort_placeholder():
+    # #403: a hard_limit below even ONE escaped char cannot yield a verified piece — the guaranteed
+    # placeholder comes back, never an unverified oversize piece.
+    assert markup.render_within_limit("&" * 10, hard_limit=3) == ["…"]
+
+
 def test_is_empty_render_flags_blank_code_box():
     # Hard-cutting a single over-long line inside a fence can leave a lone fence
     # that renders to an empty <pre></pre> box (#70). is_empty_render must catch

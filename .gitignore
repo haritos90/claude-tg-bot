@@ -1,29 +1,17 @@
-# Python
 __pycache__/
 *.py[cod]
-*.egg
-*.egg-info/
-.eggs/
 .pytest_cache/
-.mypy_cache/
 .ruff_cache/
-.tox/
-.coverage
-.coverage.*
-htmlcov/
 .venv/
 venv/
 
-# Secrets & local config — never commit these. `.env.*` covers .env.local etc.;
-# the example template is re-included.
 .env
 .env.*
 !.env.example
 
-# Access list — who may use the bot. Keep your real users private.
 allowlist.json
+backlog/
 
-# Runtime data: per-thread SQLite state, code-mode workdirs, logs
 bot.db
 bot.db-shm
 bot.db-wal
@@ -31,26 +19,5 @@ bot.db.bak*
 workdirs/
 *.log
 
-# AI agent files — local-only (see AGENTS.md).
-# CLAUDE.md is a personal overlay (private limit-saving notes); AGENTS.md is the shared, committed doc.
 .claude/
 CLAUDE.md
-
-# Editors / IDEs / tooling
-.idea/
-.vscode/
-*.swp
-*.swo
-*.orig
-
-# OS
-.DS_Store
-.AppleDouble
-.LSOverride
-._*
-.Spotlight-V100
-.Trashes
-Thumbs.db
-ehthumbs.db
-Desktop.ini
-*~
