@@ -25,7 +25,7 @@ explicit goal is removal or cleanup.
 
 ## Language: English everywhere
 
-The repository is English only — it may be released publicly.
+The repository is English only.
 
 | Where | Language |
 |---|---|
@@ -41,8 +41,7 @@ User-facing text is never hardcoded in a handler. Add a row to the `i18n.CATALOG
 with `i18n.t(key, lang, …)`, resolving the acting user's locale. The `en` column is the canonical
 source; `ru` is a translation layer. The two must share identical `{placeholders}` and identical HTML
 tags per row — the test suite enforces this, and `t()` falls back to `en`, then to the raw key, when a
-translation is missing. Only the bot's own UI is localized — never Claude's output, logs, or
-model-facing strings.
+translation is missing. Only the bot's own UI is localized.
 
 ## Commits
 
