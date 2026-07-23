@@ -243,7 +243,7 @@ SANDBOX_PER_SESSION_UID=1  # default; a distinct non-root host uid per jail
 SANDBOX_MEM_MB=1536        # per-jail memory cap (0 = unlimited)
 SANDBOX_CPU_PERCENT=150    # 1.5 cores
 SANDBOX_PIDS_MAX=512       # per-jail process cap (0 = unlimited)
-SANDBOX_EXEC=1             # default; workdir mounted executable (0 = noexec working tree)
+SANDBOX_EXEC=1             # reserved; plumbed to the jail, which currently always mounts the workdir executable
 SANDBOX_UID_BASE=700000    # first host uid of the per-session range
 SANDBOX_UID_RANGE=60000    # size of the per-session uid range
 SANDBOX_UID=65534          # single fallback uid when per-session uids are off

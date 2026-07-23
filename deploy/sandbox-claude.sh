@@ -26,7 +26,7 @@ CLAUDE="${SBX_CLAUDE:-/root/.local/bin/claude}"
 CREDS="${SBX_CREDS:-$HOME/.claude/.credentials.json}"
 # SBX_EXEC ("1" = perm 7 / exec ok, "0" = perm 6 / noexec) is reserved: bwrap 0.8
 # has no per-bind noexec flag and code mode generally needs to run tools, so v1
-# always permits execution (documented in CLAUDE.md as a future refinement).
+# always permits execution (a future refinement).
 
 # Credential onto fd 9 BEFORE dropping privileges; bwrap injects its CONTENT into the
 # jail's tmpfs (never a reachable host path).

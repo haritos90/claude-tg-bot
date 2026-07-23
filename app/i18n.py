@@ -1,7 +1,7 @@
 """Localization (l10n) for the bot's OWN user-facing strings.
 
-English ("en") is the CANONICAL source locale: AGENTS.md golden rule #1 says the
-repo may be released publicly, so the English column must always be complete.
+English ("en") is the CANONICAL source locale (AGENTS.md golden rule #1): the
+English column must always be complete.
 Other locales are translation layers on top — adding a language is just adding a
 column to LANGUAGES and filling that column in CATALOG (missing entries fall back
 to English at lookup time, so a half-translated locale never crashes the bot).
