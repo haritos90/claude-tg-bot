@@ -73,7 +73,7 @@ import time — `main()` runs only via `python -m app` — so the smoke import s
 ## 3. Golden rules
 
 1. English is the canonical language. Code, comments, docstrings, docs, identifiers, and commit
-   messages are English only (this repo may be released publicly). User-facing strings are localized
+   messages are English only. User-facing strings are localized
    via `i18n.py`: never hardcode one in a handler — add a row to `i18n.CATALOG` and render it with
    `i18n.t(key, lang, …)`. Only the bot's own UI is localized; Claude's output is not. Non-English
    text is allowed only in the three translation surfaces — `i18n.py` `ru` values, `commands.py` `ru`
@@ -123,5 +123,3 @@ invariants that have caused real bugs — read the matching section before editi
 | [README.md](README.md) | Setup and the user-facing walkthrough. |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | The contribution guide: PR process, conventions, AI-usage policy. |
 
-`CLAUDE.md` is a local, gitignored personal overlay; this file is the shared, committed agent
-context.
