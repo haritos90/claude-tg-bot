@@ -1,8 +1,9 @@
 # AGENTS.md
 
-The rules for AI coding agents and human contributors: what applies to every change, how to verify
-it, and an index of the reference docs. This file is short by design — pull per-subsystem detail
-from the references in §4, reading the one that covers the area you are about to touch.
+Context for AI coding agents working on this repo: the rules that apply to every change, how to
+verify a change, and an index of the reference docs. Short by design — pull per-subsystem detail
+from the references in §4, reading the one that covers the area being touched. The human
+contribution process (PRs, conventions, AI-usage policy) is in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 This is a private, DM-first Telegram bot: a personal frontend to Claude and Claude Code. Each user
 talks to it in a private chat and keeps named, fully-isolated sessions. A session is born a chat and
@@ -120,7 +121,7 @@ invariants that have caused real bugs — read the matching section before editi
 | [rich-message-spec.md](docs/rich-message-spec.md) | The Bot API 10.1 rich-message and draft-streaming contract. |
 | [troubleshooting.md](docs/troubleshooting.md) | Diagnosing runtime behavior; update it after fixing an incident. |
 | [README.md](README.md) | Setup and the user-facing walkthrough. |
-| [CONTRIBUTING.md](CONTRIBUTING.md) | The short human digest of these rules. |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | The contribution guide: PR process, conventions, AI-usage policy. |
 
-`CLAUDE.md` is a local, gitignored personal overlay; this file is the shared doc every contributor
-follows.
+`CLAUDE.md` is a local, gitignored personal overlay; this file is the shared, committed agent
+context.

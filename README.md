@@ -203,8 +203,8 @@ The code is one package, `app`, run with `python -m app`: `app/core` (the Agent-
 manager, token refresh, schedules, transcription), `app/storage` (SQLite state, archives, usage),
 `app/access` (allowlist, permission gate, settings), and `app/telegram` (handlers, streaming,
 formatting). Out-of-process helpers live in `deploy/`. The full module map is in
-[architecture.md](docs/architecture.md); contributor rules are in [AGENTS.md](AGENTS.md) and
-[CONTRIBUTING.md](CONTRIBUTING.md).
+[architecture.md](docs/architecture.md); the contribution guide is [CONTRIBUTING.md](CONTRIBUTING.md),
+and [AGENTS.md](AGENTS.md) is the context file for AI coding agents.
 
 | Document | Covers |
 |---|---|

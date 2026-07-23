@@ -1,9 +1,20 @@
 # Contributing to claude-tg-bot
 
-Thanks for helping out. Keep changes small and consistent with the file you're editing — match the
+Thanks for helping out. This file is the contribution guide: conventions, language rules, and the
+pre-PR checks. Keep changes small and consistent with the file you're editing — match the
 surrounding style, comment the why not the what, and don't add abstractions beyond what the task
-needs. [`AGENTS.md`](AGENTS.md) is the single source of truth for how this project works; this file
-is the short version. The module map is in [architecture.md](docs/architecture.md).
+needs. The module map is in [architecture.md](docs/architecture.md).
+
+## AI-assisted contributions
+
+Using AI coding tools is welcome. Two rules:
+
+- You are responsible for what you submit. Review and understand every line, run the smoke checks
+  below, and be ready to answer review questions about the change — the model having written it is
+  not a defense.
+- Point your tool at [`AGENTS.md`](AGENTS.md), the agent context file with the always-on rules and
+  a reference index (most agent tools pick it up automatically). Everything in this guide applies
+  to AI-written code exactly as to hand-written code.
 
 ## Editing existing code
 
