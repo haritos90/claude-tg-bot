@@ -477,25 +477,6 @@ user that ran `claude setup-token`.
 
 ---
 
-## Saving subscription limits
-
-Watch `/usage` and `/status`: chain follow-ups within the 5-minute prompt cache, keep one
-project per session, and right-size the model with `/model`. The owner's local notes live
-in a gitignored `CLAUDE.md`; shared conventions in `AGENTS.md`.
-
----
-
-## Known issues
-
-Long answers can look like they retype on Telegram Desktop for macOS. Live replies stream
-as a native message draft, which Telegram caps at ~4096 characters. Past that cap the
-draft tracks the model's frontier, and Telegram Desktop for macOS re-renders the whole
-draft on each jump, so a long answer can appear to rewrite itself while streaming. On iOS
-the same stream animates smoothly. The final posted message is always complete and correct
-on every client.
-
----
-
 ## Legal
 
 For personal, development, and research use. You are solely responsible for how you use
