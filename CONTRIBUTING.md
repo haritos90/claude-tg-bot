@@ -51,10 +51,10 @@ e.g. `feat(engine): stream tool status into the session`. Types: `feat` · `fix`
 
 ## Tasks
 
-Tasks are tracked privately by the maintainer with [Backlog.md](https://github.com/MrLesk/Backlog.md)
-in a local `backlog/` directory (not part of this repo). Code comments reference task numbers as
-`#N`; those numbers are permanent, so never renumber or reuse one. When contributing, describe the
-change in your PR — you don't need the tracker.
+Tasks are tracked privately by the maintainer, outside this repository. Code
+comments reference task numbers as `#N`; those numbers are permanent, so never
+renumber or reuse one. When contributing, describe the change in your PR: you
+don't need the tracker.
 
 ## Before you open a PR
 
