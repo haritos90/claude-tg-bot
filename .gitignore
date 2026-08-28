@@ -4,6 +4,7 @@ __pycache__/
 .ruff_cache/
 .venv/
 venv/
+.DS_Store
 
 .env
 .env.*
@@ -17,3 +18,4 @@ bot.db-wal
 bot.db.bak*
 workdirs/
 *.log
+

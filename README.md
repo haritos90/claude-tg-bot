@@ -1,39 +1,38 @@
 # Telegram bot for Claude via Claude Agent SDK
 
-A private, multi-user Telegram bot that fronts Claude and Claude Code. You run it on your own
-server on a Claude Pro/Max subscription — no Anthropic API key, no per-token billing. The owner
-uses it and can grant access to other Telegram users; each person talks to the bot in a DM and
+A private, multi-user Telegram bot that fronts Claude Code. You run it on your own
+server on a Claude Pro/Max subscription. The subscription owner
+uses it and can grant access to other Telegram users; each user talks to the bot in a DM and
 keeps named, isolated sessions whose histories never cross.
 
 A session starts as chat and can be upgraded to code and back, in the same conversation:
 
-- chat — a Claude conversation with web tools (search and fetch); no terminal or files.
-- code — a Claude Code agent with a working directory on the server; it runs shell commands and
-  edits files. Risky tools wait for an Allow/Deny tap, or run freely with `/auto on`. `/code`
-  upgrades a chat (needs code access); `/chat` downgrades, keeping the files.
+- chat — a Claude conversation with web tools (search and fetch).
+- code — a Claude Code agent with a working directory on the server, it runs shell commands and
+  edits files. Permissions are managed with Allow/Deny tap, with auto mode available `/auto on`. `/code`
+  upgrades a chat (needs code user priviliges); `/chat` downgrades, keeping the files.
 
 Built on the [Claude Agent SDK](https://docs.claude.com/en/api/agent-sdk/overview).
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 ![Python](https://img.shields.io/badge/python-3.11%2B-blue)
 
-> Anyone you grant access to shares your one subscription and trusts you, the server operator, who
+> Anyone you grant access to shares your one subscription and trusts the server operator, who
 > can read every session's messages and files. See [Security, privacy & trust](#security-privacy--trust).
 
 ---
 
 ## Features
 
-- Streaming replies: each reply renders as one native Telegram rich message and streams live as it
-  is written (Bot API 10.1 drafts), DM only.
+- Streaming replies: each reply renders via native Telegram rich messages and stream live as they
+  are written (Bot API 10.1 drafts).
 - Chat and code in one session: chat has web search and fetch; code adds the full agent toolset
   (Bash, file edits, notebooks) with a working directory on the server.
-- Isolated sessions: each has its own context, working directory, and resume id; nothing leaks
-  between them. Browse, switch, rename, star, fork, and delete via `/sessions`.
-- Voice input (optional, off by default): a voice message is transcribed on-device and handled as
+- Isolated sessions: each has its own context and working directory. Browse, switch, rename, favirite, fork,
+  and delete via `/sessions`.
+- Voice input (optional): a voice message is transcribed on-device and handled as
   if typed; the recognized text is shown so a mis-hearing is visible. See [voice.md](docs/voice.md).
-- Diagrams: an inline SVG in a chat reply is rasterized to PNG and sent as an image (vector
-  diagrams, not photos).
+- Diagrams: an inline SVG in a chat reply is captured as PNG and sent as an image.
 - Allowlist access: only the owner and explicitly allowed users can talk to the bot; each user has
   a level (chat or code), an optional expiry, and optional rolling usage caps. See
   [Access control](#access-control).
@@ -52,7 +51,7 @@ Built on the [Claude Agent SDK](https://docs.claude.com/en/api/agent-sdk/overvie
 
 ## How it works
 
-```
+```bash
 You ──DM──▸ @your_bot
              └── /new ──▸ a chat session   (switch with /sessions · upgrade with /code)
                    ├── chat: Agent SDK + web research (WebSearch/WebFetch)
@@ -141,14 +140,14 @@ Fixed-choice commands open an inline picker; commands needing free text prompt f
 message (with `/cancel`). `/help` is generated from the same registry. The full menu structure is
 in [menu.md](docs/menu.md).
 
-| Group | Commands |
-|---|---|
-| Sessions | `/new` `/code` (upgrade) `/chat` (downgrade) `/sessions` `/rename` `/fork` `/clear` (alias `/reset`) |
-| Run | `/status` `/retry` `/context` `/limits` `/queue` `/clearqueue` |
-| Tuning | `/model` `/effort` `/memory` `/language` · *(code)* `/permissions` `/files` `/export` `/maxturns` `/tools` `/shell` `/secret` |
-| Recap & export | `/recap` `/last` `/history` |
-| Meta | `/settings` `/usage` `/help` `/whoami` |
-| Owner | `/users` `/userstats` `/allow` `/deny` `/level` `/expire` `/limit` `/auto` `/codesplit` |
+| Group          | Commands                                                                                                                      |
+| -------------- | ----------------------------------------------------------------------------------------------------------------------------- |
+| Sessions       | `/new` `/code` (upgrade) `/chat` (downgrade) `/sessions` `/rename` `/fork` `/clear` (alias `/reset`)                          |
+| Run            | `/status` `/retry` `/context` `/limits` `/queue` `/clearqueue`                                                                |
+| Tuning         | `/model` `/effort` `/memory` `/language` · _(code)_ `/permissions` `/files` `/export` `/maxturns` `/tools` `/shell` `/secret` |
+| Recap & export | `/recap` `/last` `/history`                                                                                                   |
+| Meta           | `/settings` `/usage` `/help` `/whoami`                                                                                        |
+| Owner          | `/users` `/userstats` `/allow` `/deny` `/level` `/expire` `/limit` `/auto` `/codesplit`                                       |
 
 ---
 
@@ -206,19 +205,19 @@ formatting). Out-of-process helpers live in `deploy/`. The full module map is in
 [architecture.md](docs/architecture.md); the contribution guide is [CONTRIBUTING.md](CONTRIBUTING.md),
 and [AGENTS.md](AGENTS.md) is the context file for AI coding agents.
 
-| Document | Covers |
-|---|---|
-| [architecture.md](docs/architecture.md) | Package layout and the module map |
-| [gotchas.md](docs/gotchas.md) | Hard-won SDK / Telegram / lifecycle / sandbox invariants, per subsystem |
-| [configuration.md](docs/configuration.md) | Every `.env` setting, concurrency/resource tunables, capacity planning |
-| [data-model.md](docs/data-model.md) | What is persisted, the on-disk layout, the SQLite schema |
-| [isolation.md](docs/isolation.md) | The sandbox and containment stack, and its threat model |
-| [menu.md](docs/menu.md) | Every command, menu, and the settings/access model |
-| [markup.md](docs/markup.md) | The message-formatting and rendering contract |
-| [rich-message-spec.md](docs/rich-message-spec.md) | The Bot API 10.1 rich-message / draft / table spec |
-| [voice.md](docs/voice.md) | On-device voice-note transcription |
-| [troubleshooting.md](docs/troubleshooting.md) | Operator runbook for production incidents |
-| [SECURITY.md](docs/SECURITY.md) | Vulnerability-reporting policy |
+| Document                                          | Covers                                                                  |
+| ------------------------------------------------- | ----------------------------------------------------------------------- |
+| [architecture.md](docs/architecture.md)           | Package layout and the module map                                       |
+| [gotchas.md](docs/gotchas.md)                     | Hard-won SDK / Telegram / lifecycle / sandbox invariants, per subsystem |
+| [configuration.md](docs/configuration.md)         | Every `.env` setting, concurrency/resource tunables, capacity planning  |
+| [data-model.md](docs/data-model.md)               | What is persisted, the on-disk layout, the SQLite schema                |
+| [isolation.md](docs/isolation.md)                 | The sandbox and containment stack, and its threat model                 |
+| [menu.md](docs/menu.md)                           | Every command, menu, and the settings/access model                      |
+| [markup.md](docs/markup.md)                       | The message-formatting and rendering contract                           |
+| [rich-message-spec.md](docs/rich-message-spec.md) | The Bot API 10.1 rich-message / draft / table spec                      |
+| [voice.md](docs/voice.md)                         | On-device voice-note transcription                                      |
+| [troubleshooting.md](docs/troubleshooting.md)     | Operator runbook for production incidents                               |
+| [SECURITY.md](docs/SECURITY.md)                   | Vulnerability-reporting policy                                          |
 
 Telegram reference: [Rich message formatting][tg-fmt] · [HTML style][tg-html].
 
