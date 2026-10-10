@@ -1,7 +1,7 @@
 # systemd unit for the Claude Telegram Bot — reliable 24/7 with auto-restart.
 #
 # Install (run as root; adjust paths/User to your install — the values below match
-# the reference deployment at /opt/claude-tg-bot running as root):
+# the reference deployment at /root/Projects/tgbot running as root):
 #   sudo cp deploy/tg-bot.service /etc/systemd/system/claude-tg-bot.service
 #   sudo systemctl daemon-reload
 #   pkill -f 'python -m app$'               # stop any manual copy (avoid a 409)
@@ -49,10 +49,10 @@ TimeoutStopSec=60
 KillMode=mixed
 
 User=root
-WorkingDirectory=/opt/claude-tg-bot
+WorkingDirectory=/root/Projects/tgbot
 # was: ExecStart=… /opt/claude-tg-bot/bot.py — #302: run the app package (python -m app);
 # WorkingDirectory (above) puts the repo root on sys.path so `app` is importable.
-ExecStart=/opt/claude-tg-bot/.venv/bin/python -m app
+ExecStart=/root/Projects/tgbot/.venv/bin/python -m app
 
 # .env is read from WorkingDirectory by python-dotenv. systemd does NOT inherit a
 # login PATH/HOME — set them so the (bundled) claude CLI + its ~/.claude creds are
@@ -75,7 +75,7 @@ MemoryMax=2G
 # NoNewPrivileges=true
 # ProtectSystem=strict
 # ProtectHome=read-only
-# ReadWritePaths=/opt/claude-tg-bot /root/.claude
+# ReadWritePaths=/root/Projects/tgbot /root/.claude
 # PrivateTmp=true
 # ProtectKernelTunables=true
 # ProtectControlGroups=true

@@ -27,9 +27,9 @@ from app.telegram import markup
 # created), so the dataset stays stable for a migration. Toggled LIVE (no restart) via
 # `touch`/`rm` of the file; checked per-update (a cheap stat).
 # #338: default to an ABSOLUTE path under the repo root so the freeze is found regardless of
-# the process cwd. systemd sets WorkingDirectory=/opt/claude-tg-bot (so the old relative
+# the process cwd. systemd sets WorkingDirectory to the repo root (so the old relative
 # "MAINTENANCE" resolved correctly there), but a dev run from another cwd would silently stat
-# the wrong path. REPO_ROOT == /opt/claude-tg-bot here, so the on-disk path is unchanged.
+# the wrong path. REPO_ROOT is that same directory, so the on-disk path is unchanged.
 # Override with MAINTENANCE_FILE (absolute or relative).
 _MAINTENANCE_SENTINEL = os.environ.get("MAINTENANCE_FILE") or str(REPO_ROOT / "MAINTENANCE")
 
