@@ -254,7 +254,11 @@ def all_command_words() -> set[str]:
 # a Cmd row, OR Cmd rows with no live handler. Keep empty; documents the contract.
 # (/stop, /stream handlers are commented out → no handler AND no Cmd row, so they
 #  do not appear here.)
-_HANDLER_EXCEPTIONS: frozenset[str] = frozenset()
+# #435: /sandbox keeps a handler (a courtesy "the sandbox is mandatory" reply, #231) but no
+# registry row — it is retired, not a command. Without this exception the drift check raised
+# at startup and setup_commands silently never ran, so the "/" menus were never refreshed.
+# was: _HANDLER_EXCEPTIONS: frozenset[str] = frozenset()
+_HANDLER_EXCEPTIONS: frozenset[str] = frozenset({"sandbox"})
 
 
 def registered_handler_slugs(handlers_path: str | Path | None = None) -> set[str]:

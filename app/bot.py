@@ -355,10 +355,15 @@ async def main() -> None:
         # Populate the Telegram "/" command menu; best-effort AND time-bounded so a
         # slow Telegram can't hang startup before polling begins. The owner also
         # gets the owner-only admin commands in their private chat.
-        with contextlib.suppress(Exception):
+        # #435: still best-effort, but a failure is LOGGED — a silent drift error hid the
+        # unrefreshed menus for months.
+        # was: with contextlib.suppress(Exception): await asyncio.wait_for(setup_commands(…), 30)
+        try:
             await asyncio.wait_for(
                 setup_commands(bot, owner_id=settings.owner_id), timeout=30
             )
+        except Exception as exc:
+            logger.warning("setup_commands failed; command menus not refreshed: %s", exc)
 
         # #221: if the doctor found on-disk uid collisions, alert the owner now that the
         # bot is connected (best-effort, post-READY — off the startup-critical path).
