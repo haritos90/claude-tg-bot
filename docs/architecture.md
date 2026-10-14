@@ -56,7 +56,11 @@ platform a chat belongs to. The seam is aiogram's own session: every outgoing Bo
 typed method passed to `bot.session`, and the bot's session is a `RoutingSession` that forwards a
 call to the real Telegram session or to `MaxSession` depending on the chat id. Inbound, the MAX
 poller builds ordinary private-chat `Update` objects. MAX has no draft streaming, so a MAX reply is
-delivered whole once complete, with a single "Thinking…" message standing in meanwhile. Identity
+delivered whole once complete, with a single "Thinking…" message standing in meanwhile. It has no
+rich blocks either: the session reports `embeds_rich_media(chat_id) == False`, so the streamer
+skips the embedded rich message and interleaves — the text is cut at each map pin, diagram or
+wide table and that block is sent there as a location or photo message. Voice notes and
+locations arrive through the same handlers as Telegram's. Identity
 spaces are disjoint by construction (see `app/max/ids.py`): a MAX user is never the owner, owner
 commands and access requests stay on Telegram, and a code session's tool-approval prompt is posted
 to the owner's Telegram chat whoever owns the session.

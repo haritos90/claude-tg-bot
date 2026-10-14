@@ -142,8 +142,11 @@ id range (`app/max/ids.py`): a MAX user's sessions, allowlist entry, usage and d
 separate from any Telegram user's, the owner's own MAX account is an ordinary user to allow, and
 admin stays on Telegram — owner commands, access-request notices (which arrive with the MAX user's
 internal id and the one-tap Allow buttons) and code-mode tool approvals. Replies are sent whole
-once complete; a "Thinking…" message stands in while the model works. Group chats and channels
-are ignored. The platform has one global command list (no per-user or per-language scopes), so
+once complete; a "Thinking…" message stands in while the model works. MAX has no rich blocks, so
+a reply with a map pin, a diagram or a wide table is cut at the block's spot and the pin or
+picture is sent there as its own message. A voice message is transcribed on-device exactly like
+a Telegram voice note (`VOICE_TRANSCRIPTION`); a location sent to the bot arrives as a location.
+Group chats and channels are ignored. The platform has one global command list (no per-user or per-language scopes), so
 it carries the whole shared menu — chat and code commands, no owner commands — in the default
 language; the `/` hint list and the inline menus (`/settings`, `/sessions`, pickers) work as on
 Telegram.

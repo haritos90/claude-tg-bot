@@ -1895,8 +1895,11 @@ class Streamer:
             # photos embedded at their spot (InputRichMessage.media) — so the draft is replaced
             # in place instead of splitting into several bubbles. The #374 interleave (split the
             # reply around each attachment) stays as the fallback if that send fails.
-            if await self._commit_rich_embedded(rich_text, locations, svgs, wide_tables,
-                                                footer, silent_first, reply_markup=reply_markup):
+            # A session without rich blocks (MAX) interleaves straight away.
+            embeds = getattr(self.bot.session, "embeds_rich_media", None)
+            if (embeds is None or embeds(self.chat_id)) and await self._commit_rich_embedded(
+                    rich_text, locations, svgs, wide_tables, footer, silent_first,
+                    reply_markup=reply_markup):
                 return
             await self._commit_rich_interleaved(
                 rich_text, locations, svgs, wide_tables, footer, silent_first,

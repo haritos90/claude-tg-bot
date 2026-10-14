@@ -1,6 +1,6 @@
 # Voice-note transcription (local, on-device)
 
-Send a Telegram voice message and the bot transcribes it to text locally, then
+Send a voice message (Telegram or MAX) and the bot transcribes it to text locally, then
 handles that text exactly as if you had typed it — the answer streams back the usual
 way. The recognized text is shown first to make a mis-hearing visible at a glance.
 

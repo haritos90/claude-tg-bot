@@ -90,6 +90,11 @@ class MaxSession(BaseSession):
     async def close(self) -> None:
         await self.api.close()
 
+    @staticmethod
+    def embeds_rich_media(chat_id) -> bool:
+        """MAX has no rich blocks: pins and pictures interleave."""
+        return False
+
     async def make_request(self, bot, method, timeout=None):
         name = method.__api_method__
         handler = self._handlers.get(name)
@@ -251,9 +256,9 @@ class MaxSession(BaseSession):
 
     async def _send_rich(self, bot, method) -> Message:
         rich = method.rich_message or {}
-        if rich.get("media"):
-            # Embedded photos (diagram / wide-table PNGs at their spot) have no MAX equivalent;
-            # refusing makes the streamer take its interleaved send_photo/text fallback.
+        body = rich.get("html") or rich.get("markdown") or ""
+        if rich.get("media") or "<tg-map" in body:
+            # No rich blocks on MAX: refusing makes the streamer interleave.
             raise TelegramBadRequest(method=method, message="MAX: rich media unsupported")
         if "html" in rich:
             html = mhtml.tg_html_to_max(rich["html"])
@@ -458,6 +463,10 @@ class RoutingSession(BaseSession):
         if uid is not None and chat_id is None and is_internal_max(uid):
             return "max"
         return "tg"
+
+    def embeds_rich_media(self, chat_id) -> bool:
+        """False for a MAX chat: no rich blocks there."""
+        return self.max is None or not is_internal_max(chat_id)
 
     async def make_request(self, bot, method, timeout=None):
         where = self.route(method)

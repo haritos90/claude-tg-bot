@@ -54,7 +54,8 @@ Built on the [Claude Agent SDK](https://docs.claude.com/en/api/agent-sdk/overvie
 - _MAX messenger (optional)_: the same bot, commands and sessions model on [MAX](https://max.ru),
   with replies delivered whole once ready and a "Thinking…" message meanwhile. MAX users are a
   separate population — their sessions, access and usage never overlap with Telegram's, and all
-  administration (owner commands, access requests, tool approvals) stays in Telegram.
+  administration (owner commands, access requests, tool approvals) stays in Telegram. Voice
+  messages, locations, diagrams and map pins work as on Telegram.
 
 ---
 

@@ -53,6 +53,11 @@ class FakeApi:
         self.calls.append(("upload", kind, len(data), filename))
         return f"tok-{kind}"
 
+    async def download(self, url, chunk_size=65536):
+        self.calls.append(("download", url))
+        yield b"OggS-voice-"
+        yield b"bytes"
+
     async def patch_commands(self, commands):
         self.calls.append(("commands", commands))
 
@@ -335,6 +340,45 @@ def test_message_created_attachments_map_to_photo_document_voice():
         **base, "body": {"mid": "m3", "seq": 3, "attachments": [
             {"type": "audio", "payload": {"url": "https://a/1", "token": "at"}}]}}})
     assert voice[0]["message"]["voice"]["duration"] == 0
+
+    loc = p.to_updates({"update_type": "message_created", "message": {
+        **base, "body": {"mid": "m4", "seq": 4, "attachments": [
+            {"type": "location", "latitude": 55.75, "longitude": 37.62}]}}})
+    assert loc[0]["message"]["location"] == {"latitude": 55.75, "longitude": 37.62}
+
+
+def test_voice_message_bytes_download_through_the_routing_session():
+    """A MAX voice note reaches the shared voice handler as bytes."""
+    from aiogram.types import Voice
+    p, ms = _poller()
+    upd = p.to_updates({"update_type": "message_created", "message": {
+        "sender": {"user_id": 777, "first_name": "A", "is_bot": False},
+        "recipient": {"chat_id": 1, "chat_type": "dialog"},
+        "body": {"mid": "m5", "seq": 5, "attachments": [
+            {"type": "audio", "payload": {"url": "https://cdn.max/voice.m4a", "token": "vt"},
+             "transcription": "hello"}]}}})
+    v = upd[0]["message"]["voice"]
+    bot = _bot(RoutingSession(RecordingSession(), ms))
+    buf = asyncio.run(bot.download(Voice(file_id=v["file_id"], file_unique_id=v["file_id"],
+                                         duration=0)))
+    assert buf.read() == b"OggS-voice-bytes"
+    assert ("download", "https://cdn.max/voice.m4a") in ms.api.calls
+
+
+def test_rich_map_block_is_refused_so_the_reply_interleaves():
+    """No rich blocks on MAX: a map in a rich message is refused; pins go as locations."""
+    api, ms, bot = _rig()
+    md = 'Here:\n\n<tg-map lat="55.750000" long="37.620000" zoom="15"/>\n\nenjoy'
+    with pytest.raises(TelegramBadRequest):
+        asyncio.run(bot(SendRichMessage(chat_id=UID, rich_message={"markdown": md})))
+    assert api.calls == []
+    routing = RoutingSession(RecordingSession(), ms)
+    assert routing.embeds_rich_media(UID) is False
+    assert routing.embeds_rich_media(2859339) is True
+    assert RoutingSession(RecordingSession(), None).embeds_rich_media(UID) is True
+    asyncio.run(bot.send_location(chat_id=UID, latitude=55.75, longitude=37.62))
+    sent = [c for c in api.calls if c[0] == "send"][-1][2]
+    assert sent["attachments"] == [{"type": "location", "latitude": 55.75, "longitude": 37.62}]
 
 
 def test_group_chat_bots_and_empty_messages_are_ignored():
