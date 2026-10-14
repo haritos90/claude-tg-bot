@@ -48,12 +48,16 @@ Built on the [Claude Agent SDK](https://docs.claude.com/en/api/agent-sdk/overvie
   and per-user access from the Users card — no server login needed.
 - Approvals: code defaults to auto-edits; only risky actions (push/publish, destructive deletes,
   web fetches) pause for a tap. `/permissions` switches modes; `/auto on` runs everything.
-- Task chaining: a follow-up sent during or after a run queues into the same session, reusing
-  context and the warm cache.
+- Follow-ups while it works: a message sent during a reply goes into that run, as in the Claude
+  Code CLI — folded in at the next tool call, or answered right after as its own reply.
 - Usage display: `/usage` and `/status` show the subscription's 5h and 7d windows as "% left".
 - Localized UI: English and Russian, auto-detected and changeable with `/language` (Claude's own
   answers are unaffected).
 - Durable state: sessions, usage, settings, and language live in SQLite and survive a restart.
+- MAX messenger (optional): the same bot, commands and sessions model on [MAX](https://max.ru),
+  with replies delivered whole once ready and a "Thinking…" message meanwhile. MAX users are a
+  separate population — their sessions, access and usage never overlap with Telegram's, and all
+  administration (owner commands, access requests, tool approvals) stays in Telegram.
 
 ---
 
@@ -88,6 +92,15 @@ a rich send fails, so a message is never lost. The rendering contract is in
 1. In [@BotFather](https://t.me/BotFather) send `/newbot`, pick a name and a `…bot` username; copy
    the token into `.env` as `TELEGRAM_BOT_TOKEN`.
 2. Open a DM with the bot and send `/start`.
+
+### MAX (optional)
+
+1. Create a bot at [business.max.ru](https://business.max.ru/self) and copy its token into `.env`
+   as `MAX_BOT_TOKEN`; restart.
+2. Open the bot in MAX and send any message. Your Telegram chat with the bot receives the access
+   request — tap Allow there (the MAX account is a separate user, even when it is yours).
+   The platform's TLS root is bundled; nothing to install. See
+   [configuration.md](docs/configuration.md#max-messenger).
 
 ### Server
 

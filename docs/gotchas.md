@@ -169,6 +169,40 @@ biting:
 - The seccomp BPF is a denylist whose fall-through must be ALLOW (DENY is jumped-to only). Invert it
   and every non-denied syscall returns `EPERM` and the process crashes.
 
+## MAX transport — `app/max/`
+
+- The seam is aiogram's `bot.session`. Handlers, the streamer, the gate and the session manager
+  hold one `Bot`; `RoutingSession` picks Telegram or MAX per call from the chat id. Never add a
+  platform check to a handler — make the translation in `bridge.MaxSession` instead.
+- Identity namespace: a MAX user id enters the bot as `MAX_ID_OFFSET + id` (`app/max/ids.py`),
+  and a DM chat id equals that user id, exactly as on Telegram. Every store keys by that int, so
+  the two platforms are disjoint; never map a MAX account onto a Telegram id (the owner's
+  included) — that would merge session lists and grant owner rights across platforms.
+- No streaming: `sendMessageDraft` / `sendRichMessageDraft` are not forwarded. The first draft
+  for a chat posts one plain "Thinking…" message; later drafts are ignored; the next message to
+  the chat edits that placeholder into itself; an empty draft deletes it. Media never edit into
+  the placeholder (it is removed first). A placeholder older than 15 minutes is dropped.
+- Limits differ: 4000 characters per message (Telegram: 4096), a 1024-byte callback payload,
+  one global command list of 32 — the default-scope `setMyCommands` registers the whole shared
+  menu (`bridge.max_command_list`: in-menu, non-owner), scoped/localized calls are dropped — one `file`
+  attachment per message, images may combine with text. The platform allows ~30 requests/s; the
+  client paces calls.
+- HTML subset: `b i u s code pre a blockquote h1-h4 mark`. `tg-spoiler`, `tg-emoji`, `<pre><code
+  class=…>` and `expandable` are stripped by `html.tg_html_to_max`; markup the platform rejects
+  (400) is re-sent as plain text.
+- Unsupported Bot API methods (pin, forum topics, file_id re-use) raise `TelegramBadRequest` so
+  the callers' existing best-effort `except` paths apply; `editMessageText` without
+  `reply_markup` clears the keyboard (`attachments: []`), matching Telegram.
+- Message ids are strings on MAX; `MidRegistry` hands out process-local ints. A restart forgets
+  them, so an edit of a message sent before the restart fails as a bad request — the same as a
+  stale Telegram message id. A callback carries its message's mid and re-registers it.
+- TLS: the API host is signed by the Russian Trusted Root CA, loaded into the MAX client's SSL
+  context from `deploy/certs/`; the system store is untouched. `platform-api.max.ru` is retired
+  and query-string tokens are refused — use the header.
+- One long-poller per token (as on Telegram); the poll marker is kv `max_marker`. Long polling
+  is also what the platform rate-limits; a webhook needs a public HTTPS endpoint the deployment
+  does not have.
+
 ## Operating the bot
 
 - The venv is not relocatable — moving the project dir breaks `.venv`; recreate it.

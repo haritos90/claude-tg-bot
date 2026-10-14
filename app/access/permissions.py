@@ -168,8 +168,12 @@ def _escape(text: str) -> str:
 class PermissionGate:
     """Owner-driven approval for dangerous tools in code mode."""
 
-    def __init__(self, bot):
+    def __init__(self, bot, owner_id: int | None = None):
         self.bot = bot
+        # #434: where approval prompts go. Only the owner may approve, so a prompt for a
+        # session that is not the owner's own DM is posted to the owner's chat (with the
+        # requesting user's id) instead of to a chat whose user cannot answer it.
+        self.owner_id = owner_id
         # Maps the short request id -> the Future awaited by the SDK callback.
         self._pending: dict[str, asyncio.Future] = {}
         # Maps request id -> (chat_id, message_id) of the prompt message,
@@ -245,9 +249,16 @@ class PermissionGate:
                 ):
                     return PermissionResultAllow()
 
+            # #434: the prompt is always answered by the owner — post it where the owner is.
+            target_chat = chat_id
+            target_thread = send_thread_id
+            if self.owner_id is not None and chat_id != self.owner_id:
+                target_chat = self.owner_id
+                target_thread = None
             # Localize to the owner's interface language (DM chat_id == user id;
             # the prompt is always answered by the owner).
-            lang = i18n.cached_lang(chat_id)
+            # was: lang = i18n.cached_lang(chat_id)  (#434)
+            lang = i18n.cached_lang(target_chat)
 
             request_id = self._next_id()
             loop = asyncio.get_running_loop()
@@ -276,19 +287,22 @@ class PermissionGate:
             ]
             if preview:
                 lines.append(f"<pre>{_escape(preview)}</pre>")
+            if target_chat != chat_id:   # #434: say whose session is asking
+                lines.append(i18n.t("permgate.for_user", lang, uid=chat_id))
             lines.append(i18n.t("permgate.run_q", lang))
             prompt_text = "\n".join(lines)
 
             # Send the approval prompt. If sending fails, deny safely.
             try:
+                # was: send_message(chat_id, …, **self._kwargs(send_thread_id)) — #434
                 sent = await self.bot.send_message(
-                    chat_id,
+                    target_chat,
                     prompt_text,
                     parse_mode="HTML",
                     reply_markup=keyboard,
-                    **self._kwargs(send_thread_id),
+                    **self._kwargs(target_thread),
                 )
-                self._messages[request_id] = (chat_id, sent.message_id)
+                self._messages[request_id] = (target_chat, sent.message_id)
             except Exception as exc:
                 self._pending.pop(request_id, None)
                 self._threads.pop(request_id, None)

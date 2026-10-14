@@ -19,6 +19,7 @@ import sys
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
+from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.exceptions import TelegramNetworkError
 
 from app.config import load_settings
@@ -126,8 +127,28 @@ async def main() -> None:
             logger.info("#221: sandbox uid check clean (no host uid shared across sessions)")
 
     # The bot uses HTML parse mode by default; the markup helpers emit HTML.
+    # #434: one Bot for two platforms. Its session routes each API call by chat id: Telegram
+    # by default, MAX for ids in the MAX namespace. Everything downstream (handlers, streamer,
+    # gate, sessions) keeps holding this single Bot and never learns which platform it talks to.
+    # was (replaced for #434):
+    # bot = Bot(
+    #     token=settings.bot_token,
+    #     default=DefaultBotProperties(parse_mode="HTML"),
+    # )
+    tg_session = AiohttpSession()
+    max_api = max_bridge = None
+    if settings.max_bot_token:
+        from app.max.bridge import MaxSession, RoutingSession
+        from app.max.client import MaxApi
+        max_api = MaxApi(settings.max_bot_token, base=settings.max_api_base,
+                         ca_bundle=settings.max_ca_bundle or None)
+        max_bridge = MaxSession(max_api)
+        session = RoutingSession(tg_session, max_bridge)
+    else:
+        session = tg_session
     bot = Bot(
         token=settings.bot_token,
+        session=session,
         default=DefaultBotProperties(parse_mode="HTML"),
     )
     dp = Dispatcher()
@@ -137,7 +158,9 @@ async def main() -> None:
 
     # Core components, all sharing the single Bot instance. The session manager
     # gets the allowlist so it can resolve per-user GLOBAL MEMORY at build time.
-    gate = PermissionGate(bot)
+    # #434: tool approvals are an owner action, so the Allow/Deny prompt of a non-owner's
+    # code session (a MAX user, or a Telegram guest) is posted to the owner's chat.
+    gate = PermissionGate(bot, owner_id=settings.owner_id)  # was: PermissionGate(bot)
     sessions = SessionManager(bot, settings, gate, allowlist)
 
     # Best-effort restore of usage mode, the persisted rate snapshot and the
@@ -199,6 +222,7 @@ async def main() -> None:
     # so a raise during the sandbox setup that follows could leak it). watchdog.ready()
     # stays here — before the local sandbox setup — so that setup can't delay READY.
     wd_task: asyncio.Task | None = None
+    max_task: asyncio.Task | None = None   # #434
     watchdog.ready()
 
     # #119b: when the credential broker is enabled, run it as a host sidecar so the
@@ -382,6 +406,20 @@ async def main() -> None:
                            count=len(uid_collisions), detail=detail, ts=ts),
                 )
 
+        # #434: the MAX long-poller feeds the same dispatcher. Its failures only log and back
+        # off — a MAX outage must never take the Telegram side down.
+        if max_bridge is not None:
+            from app.max.poller import MaxPoller
+            try:
+                max_me = await max_api.get_me()
+                max_bridge.bot_user = max_me
+                logger.info("MAX: authorized as @%s (id=%s)", max_me.get("username"),
+                            max_me.get("user_id"))
+            except Exception as exc:
+                # Not fatal (the poller retries); a wrong token or an untrusted CA shows here.
+                logger.warning("MAX: startup get_me failed (%s); polling will retry", exc)
+            max_task = asyncio.create_task(MaxPoller(max_api, max_bridge, dp, bot).run())
+
         # Only the update types we actually handle are requested from Telegram.
         # #431: + stopped_message_generation (the experimental draft push button).
         await dp.start_polling(
@@ -395,6 +433,10 @@ async def main() -> None:
             wd_task.cancel()
             with contextlib.suppress(BaseException):
                 await wd_task
+        if max_task is not None:   # #434: stop taking MAX updates before draining turns
+            max_task.cancel()
+            with contextlib.suppress(BaseException):
+                await max_task
         # #325: GRACEFUL DRAIN first — stop starting new turns and wait for in-flight ones to
         # finish, so a restart doesn't kill a turn mid-generation / tear its transcript (the
         # #324 incident). Bounded (< TimeoutStopSec=60); needs KillMode=mixed in the unit so

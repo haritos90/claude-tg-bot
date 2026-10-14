@@ -36,9 +36,30 @@ subprocess per session. All state is one SQLite database.
 | `app/telegram/rich_message.py`  | Binding for Bot API 10.1 `sendRichMessage` — native tables.                                                   |
 | `app/telegram/svg_image.py`     | Rasterizes a reply's inline `<svg>` diagram to PNG (both modes).                                              |
 | `app/telegram/table_image.py`   | PNG rendering for wide (>20-column) tables, sent as an image in place.                                        |
-| `deploy/`                       | Out-of-process helpers: the systemd unit, the bubblewrap launcher, and the egress / broker / seccomp scripts. |
+| `app/max/ids.py`                | The MAX identity namespace: a MAX user id is offset into its own integer range before it enters the dispatcher, so MAX and Telegram users, sessions, allowlist entries and usage never meet. Registries for MAX message ids and attachment URLs behind aiogram-shaped ints / file ids. |
+| `app/max/client.py`             | Thin async client for the MAX Platform API (`platform-api2.max.ru`): token header, TLS against the bundled Russian Trusted Root CA, uploads, pacing under the platform's rate limit. |
+| `app/max/html.py`               | Telegram HTML → MAX HTML, the 4000-character re-split, inline keyboard → MAX `inline_keyboard` attachment.    |
+| `app/max/bridge.py`             | `MaxSession`: an aiogram `BaseSession` that translates outgoing Bot API methods into MAX calls (no streaming — the first draft becomes one "Thinking…" message that the finished reply replaces). `RoutingSession`: the bot's single session, routing each call to Telegram or MAX by its chat id. |
+| `app/max/poller.py`             | MAX long-poller: rewrites `message_created` / `message_callback` / `bot_started` dialog updates as aiogram `Update`s and feeds the shared `Dispatcher`; the poll marker lives in kv. |
+| `deploy/`                       | Out-of-process helpers: the systemd unit, the bubblewrap launcher, and the egress / broker / seccomp scripts, plus `certs/` (the Russian Trusted Root CA the MAX client trusts). |
 
-The Agent SDK is pinned to `claude-agent-sdk==0.2.101`.
+The Agent SDK is pinned to `claude-agent-sdk==0.2.163`. The SDK's bundled CLI is used only by
+an unjailed session; jailed sessions run the host's `claude` (staged at `/usr/local/bin/claude`
+on start-up whenever the host CLI's resolved version path changed), so a model release that
+needs a newer CLI takes effect with a host CLI update plus a service restart.
+
+## Two messengers, one handler layer
+
+The MAX messenger (max.ru) is served by the same `Dispatcher`, router, streamer, permission
+gate and session manager as Telegram; nothing under `app/telegram/` or `app/core/` knows which
+platform a chat belongs to. The seam is aiogram's own session: every outgoing Bot API call is a
+typed method passed to `bot.session`, and the bot's session is a `RoutingSession` that forwards a
+call to the real Telegram session or to `MaxSession` depending on the chat id. Inbound, the MAX
+poller builds ordinary private-chat `Update` objects. MAX has no draft streaming, so a MAX reply is
+delivered whole once complete, with a single "Thinking…" message standing in meanwhile. Identity
+spaces are disjoint by construction (see `app/max/ids.py`): a MAX user is never the owner, owner
+commands and access requests stay on Telegram, and a code session's tool-approval prompt is posted
+to the owner's Telegram chat whoever owns the session.
 
 ## Data and isolation
 

@@ -145,6 +145,13 @@ class Settings:
     voice_lang: str = ""          # "" = autodetect; force a language with e.g. "ru" / "en"
     voice_max_seconds: int = 300  # reject longer notes (protects the CPU box); 0 = no limit
     voice_model_path: str = ""    # model cache dir; "" = a "models" dir beside BASE_WORKDIR
+    # #434: MAX (max.ru) messenger transport. OFF unless MAX_BOT_TOKEN is set. The same
+    # handlers serve both platforms behind a routing Bot session (app/max); MAX users live in
+    # their own id namespace (app.max.ids), so sessions/users never overlap with Telegram and
+    # the owner's MAX account is an ordinary allowlisted user — admin stays on Telegram.
+    max_bot_token: str = ""
+    max_api_base: str = "https://platform-api2.max.ru"
+    max_ca_bundle: str = ""       # "" = bundled deploy/certs/russian_trusted_root_ca.pem; "system" = OS store only
 
 
 def load_settings() -> Settings:
@@ -305,6 +312,11 @@ def load_settings() -> Settings:
     voice_max_seconds = max(0, _int("VOICE_MAX_SECONDS", 300))
     voice_model_path = (os.environ.get("VOICE_MODEL_PATH", "") or "").strip()
 
+    # #434: MAX transport — token empty = off. Never logged.
+    max_bot_token = (os.environ.get("MAX_BOT_TOKEN", "") or "").strip()
+    max_api_base = (os.environ.get("MAX_API_BASE", "") or "").strip() or "https://platform-api2.max.ru"
+    max_ca_bundle = (os.environ.get("MAX_CA_BUNDLE", "") or "").strip()
+
     # Extra keyword triggers to neutralize in prompts (on top of the engine
     # defaults). Comma- or whitespace-separated; blanks dropped.
     raw_keywords = os.environ.get("BLOCKED_PROMPT_KEYWORDS", "") or ""
@@ -348,4 +360,7 @@ def load_settings() -> Settings:
         voice_max_seconds=voice_max_seconds,
         voice_model_path=voice_model_path,
         extra_blocked_keywords=extra_blocked_keywords,
+        max_bot_token=max_bot_token,
+        max_api_base=max_api_base,
+        max_ca_bundle=max_ca_bundle,
     )

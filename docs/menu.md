@@ -145,6 +145,9 @@ roughly the top 5 are reachable before scrolling becomes tedious. Consequences:
 - **The list is filtered by role.** A chat-level user's `/` menu omits code-only
   and owner-only commands; the owner's private chat adds the owner block at the
   end (§1.8).
+- **MAX has one global list.** The platform offers no per-chat or per-language
+  scopes, so its `/` menu carries the whole shared menu (Tiers A–E, chat and
+  code, in the default language); owner commands are Telegram-only there.
 
 ### 1.7 Chat and code sessions are one thing
 

@@ -134,10 +134,31 @@ Set `VOICE_TRANSCRIPTION=1` and install the voice extras. Runs on-device on
 CPU; the speech model (~150 MB) downloads once on first use. Model choice (`VOICE_MODEL`), the
 length cap (`VOICE_MAX_SECONDS`), language, and the full picture are in [voice.md](voice.md).
 
+## MAX messenger
+
+Off by default. Set `MAX_BOT_TOKEN` (from the bot's settings at business.max.ru) and the same bot
+serves MAX dialogs over long polling, with the full command set. MAX identities live in their own
+id range (`app/max/ids.py`): a MAX user's sessions, allowlist entry, usage and defaults are
+separate from any Telegram user's, the owner's own MAX account is an ordinary user to allow, and
+admin stays on Telegram — owner commands, access-request notices (which arrive with the MAX user's
+internal id and the one-tap Allow buttons) and code-mode tool approvals. Replies are sent whole
+once complete; a "Thinking…" message stands in while the model works. Group chats and channels
+are ignored. The platform has one global command list (no per-user or per-language scopes), so
+it carries the whole shared menu — chat and code commands, no owner commands — in the default
+language; the `/` hint list and the inline menus (`/settings`, `/sessions`, pickers) work as on
+Telegram.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `MAX_BOT_TOKEN` | — | MAX bot token; empty = MAX off. |
+| `MAX_API_BASE` | `https://platform-api2.max.ru` | Platform API host. |
+| `MAX_CA_BUNDLE` | bundled | PEM the MAX client trusts in addition to the OS store. Empty = `deploy/certs/russian_trusted_root_ca.pem` (the Russian Trusted Root CA that signs the API host); `system` = the OS store alone. Trusted by the MAX client only, never installed system-wide. |
+
 ## Additional dependencies
 
 | Feature | Needs |
 |---|---|
 | Voice input | `ffmpeg` and `faster-whisper` (`requirements/voice.txt`), `VOICE_TRANSCRIPTION=1` |
+| MAX messenger | `MAX_BOT_TOKEN`; no extra packages (the bundled CA covers TLS) |
 | SVG diagrams in chat | `libcairo2` (`apt install libcairo2`) for `cairosvg`; without it the raw `.svg` is sent |
 | Egress allowlist | `iptables` with the `xt_cgroup` module and cgroup v2 (on by default; set `SANDBOX_EGRESS=0` if the host lacks them) — see [isolation.md](isolation.md) |

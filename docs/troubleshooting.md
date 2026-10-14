@@ -183,10 +183,130 @@ The background refresher keeps the subscription OAuth credential fresh
   likely needed)`** — the `refresh_token` was revoked or rotated; the refresher cannot recover on
   its own. **Re-login on the host, THEN restart:** `claude setup-token` (never let
   `ANTHROPIC_API_KEY` into the env), then `systemctl restart claude-tg-bot`.
+- **`token refresh: skip: no refresh token` / `skip: creds unreadable`** — the credential file no
+  longer holds a usable login (a rejected refresh can leave it stripped). The broker then has no
+  bearer to inject and answers `503`, which the CLI reports as a generic *"server-side issue"* — so
+  the chat blames the model service while the real cause is the host login. Same fix: re-login,
+  then restart.
+
+The owner does not have to be reading the journal for any of this: a persistent failure is pushed
+to their chat (🔴, repeated ~every 6 h while broken, 🟢 once it recovers), and a terminal
+`no refresh token` / `creds unreadable` alerts on the first sweep. Cadence knobs:
+`OAUTH_ALERT_AFTER_FAILS`, `OAUTH_ALERT_REPEAT_SWEEPS`. This is independent of the
+`LOGIN_EXPIRY_WARN_DAYS` heads-up, which only counts down to the login's *nominal* expiry and
+cannot see a login that dies early.
 
 ```bash
-# Which of the three is it? (timeouts, WARNING escalations, heartbeats)
+# Which of these is it? (timeouts, WARNING escalations, heartbeats)
 journalctl -u claude-tg-bot | grep -E 'token refresh:' | tail -20
+# Broker with no bearer at all (host login dead) — one line per blocked request:
+journalctl -u claude-tg-bot | grep 'NO CREDENTIAL' | tail
 # Confirm the broker still mints a working bearer: a 200 from 127.0.0.1:8789 = token good;
 # a 401 = revoked login → re-login + restart.
 ```
+
+---
+
+## Sessions stuck on "Not named yet"
+
+**Symptom.** `/sessions` lists used sessions still called *Not named yet* (or an older placeholder
+such as *New chat*), typically one-line exchanges like "you there?" → "I'm here", or a photo sent
+with a bare "what is this?".
+
+**Mental model.** The Claude Code CLI writes a title only for a first prompt of 10+ characters, and
+the earlier name fallback took only a "substantive" first message (10+ letters), so a short probe —
+usually what an idle rotation's fresh session receives first — named nothing, while the empty-session
+cleanup touched only sessions with zero requests. Now the first user message names the session as
+typed (cut to the button width), the reply's topic covers a captionless photo, and a placeholder
+session with nothing to name it by is archived once it is no longer current.
+
+```bash
+# Placeholder-named sessions with their request counts (read-only):
+cd /root/Projects/tgbot && .venv/bin/python -c "
+import sqlite3; from app import i18n
+c = sqlite3.connect('file:bot.db?mode=ro', uri=True); names = sorted(i18n.placeholder_session_names())
+q = 'SELECT thread_id, chat_id, name, (SELECT COUNT(*) FROM usage u WHERE u.thread_id=t.thread_id) '
+q += 'FROM threads t WHERE name_auto=1 AND name IN (%s)' % ','.join('?' * len(names))
+print(*c.execute(q, names).fetchall(), sep='\n')"
+journalctl -u claude-tg-bot | grep 'untitled sweep' | tail
+```
+
+**Recovery.** Nothing manual: the sweep runs 2 minutes after start and daily, and on opening
+`/sessions`, switching sessions and idle rotation. Archived sessions stay recoverable for the
+archive-retention window.
+
+---
+
+## Table rows empty on iOS until the chat is reopened
+
+**Symptom.** On the Telegram iOS client a streamed reply's table shows its frame (and maybe the
+header) with empty rows; leaving the chat and coming back shows the data. Other clients are fine.
+
+**Mental model.** An iOS client limitation: it builds a rich table's view once and reuses it as the
+table grows in later draft frames without drawing the cells added since; the final message inherits
+the draft's bubble. Details: [rich-message-spec.md](rich-message-spec.md).
+
+**Recovery / workaround.** Reopen the chat. To avoid it for everyone, set
+`DRAFT_HOLD_OPEN_TABLES=1` and restart: tables then appear in the draft only once complete (no
+row-by-row animation).
+
+---
+
+## A new model is missing from `/model`, or turns fail right after a model release
+
+**Symptom.** The picker lacks a just-released model, or a session on a family alias errors out.
+
+**Mental model.** Models, their names and effort levels come from the Claude Code CLI. The bot runs
+`claude update` once a day at `CLI_UPDATE_AT_UTC` (default 12:00 UTC), re-stages the jail copy, and
+re-reads the catalog; idle clients then reconnect on the new binary, a busy one after its reply.
+The Fable family never shows in the picker — it is withheld on purpose (see
+[configuration.md](configuration.md), *Deliberate exceptions*).
+
+```bash
+/root/.local/bin/claude --version; /usr/local/bin/claude --version   # host vs jail copy
+journalctl -u claude-tg-bot | grep -E 'Claude CLI|CLI model catalog|Staged sandbox|recycled' | tail
+```
+
+**Recovery.** Settings → Admin → 🔄 CLI update → 🔄 Check now (or `systemctl restart claude-tg-bot`,
+which also re-stages the CLI and re-probes the catalog).
+
+---
+
+## Raw keys such as `admin.cli_btn` instead of labels in a menu
+
+**Symptom.** A button or page shows a dotted identifier (`admin.cli_btn`, `admin.cli_title`)
+instead of text.
+
+**Mental model.** `i18n.t()` never raises: a key missing from `app/i18n.py` renders as the key
+itself, so a code change that adds a lookup without its catalog row ships silently.
+
+**Fast diagnosis.** `python -m pytest -q tests/test_i18n.py` —
+`test_every_key_used_in_code_exists` lists every literal key the code looks up that the catalog
+lacks.
+
+**Recovery / fix in code.** Add the missing rows (`en` + `ru`) to `app/i18n.py` and restart. The
+test keeps it from recurring.
+
+## MAX side silent, or `certificate verify failed` in the journal
+
+MAX is served by a long-poller next to the Telegram one; its failures only log and back off, so
+the Telegram side keeps working while MAX is down.
+
+```bash
+# Is MAX enabled and authorized? (one line at startup; token never logged)
+journalctl -u claude-tg-bot -n 300 | grep -E 'MAX: (authorized|polling started|get_updates failed|startup get_me)'
+# TLS trust: the API host chains to the Russian Trusted Root CA bundled in deploy/certs/.
+openssl s_client -connect platform-api2.max.ru:443 -servername platform-api2.max.ru \
+  -CAfile deploy/certs/russian_trusted_root_ca.pem </dev/null 2>/dev/null | grep 'Verify return'
+```
+
+- `certificate verify failed` → the bundle is missing or `MAX_CA_BUNDLE` points at the wrong
+  file; `Verify return code: 0 (ok)` above means the bundle is right.
+- `401` on `get_me` → the token is wrong or was regenerated in the bot's MAX settings.
+- A user writes on MAX and nothing happens → they are not allowed yet: the owner's Telegram chat
+  received the access request with the user's internal id (`1000000…`) and Allow buttons.
+- Updates replayed after a restart → the kv `max_marker` was lost; the platform re-delivers
+  unacknowledged updates once. Harmless.
+- A "Thinking…" message that never resolves → the turn ended without a message to that chat
+  (the same root causes as the Telegram indicator above); it is deleted or reused on the next
+  reply and dropped after 15 minutes.

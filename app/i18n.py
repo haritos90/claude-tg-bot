@@ -2039,6 +2039,11 @@ CATALOG: dict[str, dict[str, str]] = {
         "ru": "🔐 Запрос разрешения: <b>{tool}</b>",
     },
     "permgate.run_q": {"en": "Run this tool?", "ru": "Запустить этот инструмент?"},
+    # #434: shown when the prompt is relayed to the owner for another user's session.
+    "permgate.for_user": {
+        "en": "👤 Session owner: <code>{uid}</code>",
+        "ru": "👤 Владелец сессии: <code>{uid}</code>",
+    },
     "permgate.timed_out": {
         "en": "⌛ Approval timed out — denied.",
         "ru": "⌛ Время на подтверждение истекло — отклонено.",
