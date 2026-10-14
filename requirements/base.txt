@@ -7,7 +7,9 @@
 # logged in to a Claude Pro/Max subscription.
 
 aiogram==3.28.2
-claude-agent-sdk==0.2.101
+# #410: claude-agent-sdk 0.2.163 bundles CLI 2.1.286, which knows the Opus 5.5 /
+# Sonnet 5.5 ids; the sandboxed sessions run the host CLI staged at /usr/local/bin/claude.
+claude-agent-sdk==0.2.163
 aiosqlite==0.22.1
 python-dotenv==1.2.2
 # Pillow: renders wide tables as PNG images.
