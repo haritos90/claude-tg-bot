@@ -142,6 +142,13 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         token = self.creds.token()
         if not token:
             self.send_error(503, "broker: no subscription credential")
+            # #408: this path used to return SILENTLY — an unreadable/emptied creds file made
+            # every turn fail with the CLI's generic "server-side issue" text and left ZERO
+            # trace in the journal (no `-> status` line is written when we never reach
+            # upstream), so the outage looked like an Anthropic problem. Log it.
+            # was: (bare `return`)
+            sys.stderr.write("[broker] NO CREDENTIAL (host login dead?) "
+                             f"{self.command} {self.path.split('?')[0]} -> 503\n")
             return
         body = self._read_request_body()
 

@@ -33,6 +33,7 @@ import os
 import time
 import urllib.error
 import urllib.request
+from collections.abc import Awaitable, Callable   # #408: typing for the alert hook
 
 logger = logging.getLogger("token_refresh")
 
@@ -69,6 +70,16 @@ DEFAULT_HEARTBEAT_EVERY = _env_int("OAUTH_REFRESH_HEARTBEAT_EVERY", 6)  # ~every
 # the login still expires and needs a manual `claude` re-login. Warn the owner when the
 # login is within this many days of that deadline.
 LOGIN_EXPIRY_WARN_DAYS = _env_int("LOGIN_EXPIRY_WARN_DAYS", 3)
+
+# #408: the #379 heads-up above fires off `refreshTokenExpiresAt` — the NOMINAL deadline —
+# so a refresh token that dies EARLY (revoked server-side, or rotated out from under us by a
+# second `claude` on the host) never trips it. That failure is only visible as a journald
+# WARNING, which nobody reads; meanwhile every turn fails with a generic "server-side error"
+# that points at Anthropic instead of at the host login. So the refresher also PUSHES an
+# alert to the owner once the failure looks persistent, and again every N sweeps while it
+# stays broken, plus a one-line all-clear when it recovers.
+ALERT_AFTER_FAILS = _env_int("OAUTH_ALERT_AFTER_FAILS", 2)          # same point the log escalates
+ALERT_REPEAT_SWEEPS = _env_int("OAUTH_ALERT_REPEAT_SWEEPS", 12)     # ~every 6 h at 30-min sweeps
 
 
 def _read_creds(path: str):
@@ -216,7 +227,8 @@ async def refresh_loop(interval: float = DEFAULT_INTERVAL_SECONDS,
                        skew: float = DEFAULT_SKEW_SECONDS,
                        path: str = _DEFAULT_CREDS,
                        sweep_deadline: float = DEFAULT_SWEEP_DEADLINE_SECONDS,
-                       heartbeat_every: int = DEFAULT_HEARTBEAT_EVERY) -> None:
+                       heartbeat_every: int = DEFAULT_HEARTBEAT_EVERY,
+                       on_alert: "Callable[[str, int], Awaitable[None]] | None" = None) -> None:
     """Background loop (#191): every ``interval`` seconds, refresh the OAuth token if
     it is within ``skew`` of expiry. Started next to the usage poller / reaper and
     cancelled on shutdown. Self-contained + fail-soft — a bad sweep only logs.
@@ -241,6 +253,7 @@ async def refresh_loop(interval: float = DEFAULT_INTERVAL_SECONDS,
     fails = 0          # consecutive failed sweeps (a revoked refresh_token → re-login)
     sweeps = 0         # for the liveness heartbeat
     status = "startup"
+    alerted = False    # #408: an owner alert is outstanding → send the all-clear on recovery
     # was (#191) — replaced for #378 (no per-sweep deadline, no heartbeat, silent on skip;
     # a wedged sweep parked the loop with zero further output):
     #   while True:
@@ -309,6 +322,25 @@ async def refresh_loop(interval: float = DEFAULT_INTERVAL_SECONDS,
                 fails += 1
                 status = f"fail: {type(exc).__name__}"
                 logger.warning("token refresh sweep failed", exc_info=True)
+            # #408: the escalation above only reaches journald. Push it to the OWNER too —
+            # while the login is dead every turn fails with a generic "server-side error",
+            # so the alert is the only thing that names the real cause (re-login on the host).
+            # A "skip: no refresh token" / "skip: creds unreadable" is TERMINAL (no sweep can
+            # recover it), so it alerts on the FIRST occurrence instead of waiting out the
+            # streak the transient-failure threshold is there to filter.
+            if on_alert is not None:
+                terminal = status.startswith("skip")     # only non-healthy skips reach here
+                threshold = 1 if terminal else ALERT_AFTER_FAILS
+                with contextlib.suppress(Exception):
+                    if fails >= threshold:
+                        since = fails - threshold
+                        if since == 0 or (ALERT_REPEAT_SWEEPS > 0
+                                          and since % ALERT_REPEAT_SWEEPS == 0):
+                            await on_alert(status, fails)
+                            alerted = True
+                    elif fails == 0 and alerted:
+                        await on_alert("ok: recovered", 0)
+                        alerted = False
             sweeps += 1
             if heartbeat_every > 0 and sweeps % heartbeat_every == 0:
                 # #385: these lines sit OUTSIDE the per-sweep try/except — guard the heartbeat log

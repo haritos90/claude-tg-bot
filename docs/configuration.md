@@ -64,6 +64,8 @@ warns the owner before the monthly login credential expires.
 | `OAUTH_REFRESH_SWEEP_DEADLINE_SEC` | Per-sweep deadline; an overrun flags a DNS/network wedge. |
 | `OAUTH_REFRESH_HEARTBEAT_EVERY` | Emit a liveness log line every N sweeps; a gap means the loop died. |
 | `LOGIN_EXPIRY_WARN_DAYS` | Warn the owner this many days before the login credential expires. |
+| `OAUTH_ALERT_AFTER_FAILS` | Alert the owner in chat after this many consecutive failed sweeps (a login that died before its stated expiry). |
+| `OAUTH_ALERT_REPEAT_SWEEPS` | Re-send that alert every N sweeps while the login stays broken. |
 
 ## Voice transcription
 

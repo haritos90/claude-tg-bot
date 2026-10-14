@@ -2684,7 +2684,24 @@ class SessionManager:
         if os.environ.get("OAUTH_REFRESH", "1").strip() in ("0", "false", "off", "no"):
             return
         if self._token_refresh_task is None or self._token_refresh_task.done():
-            self._token_refresh_task = asyncio.create_task(token_refresh.refresh_loop())
+            # was — replaced for #408 (log-only escalation: a dead host login showed up as a
+            # journald WARNING nobody reads, while every turn failed with a generic
+            # "server-side error" that blamed Anthropic):
+            #   self._token_refresh_task = asyncio.create_task(token_refresh.refresh_loop())
+            self._token_refresh_task = asyncio.create_task(
+                token_refresh.refresh_loop(on_alert=self._token_refresh_alert))
+
+    async def _token_refresh_alert(self, status: str, fails: int) -> None:
+        """#408: DM the OWNER when the host OAuth login stops refreshing (and again when it
+        recovers). Owner-only — they are the only one who can re-login on the host — and
+        fail-soft: a Telegram hiccup must never kill the refresher loop."""
+        owner_id = getattr(self.settings, "owner_id", None)
+        if owner_id is None:
+            return
+        lang = i18n.cached_lang(owner_id)
+        key = ("session.login_refresh_recovered" if status.startswith("ok")
+               else "session.login_refresh_failed")
+        await self._notify(owner_id, None, i18n.t(key, lang, status=status, fails=fails))
 
     # ------------------------------------------------------------------ status
 

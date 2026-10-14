@@ -250,3 +250,65 @@ def test_refresh_loop_broken_skip_counts_as_failure(monkeypatch, caplog):
                                       sweep_deadline=1.0, heartbeat_every=0))
     warns = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
     assert any("creds unreadable" in m and "consecutive" in m for m in warns)
+
+
+def test_refresh_loop_alerts_owner_on_persistent_failure(monkeypatch):
+    """#408: a persistent failure reaches the owner (not just journald), repeats on the
+    configured cadence while broken, and is followed by an all-clear once it recovers."""
+    calls: list[tuple[str, int]] = []
+
+    async def alert(status, fails):
+        calls.append((status, fails))
+
+    sweeps = {"n": 0}
+
+    async def fail_then_ok(**kw):
+        sweeps["n"] += 1
+        # Fail long enough to cross the threshold AND hit one repeat, then recover.
+        return "fail: refresh request rejected" if sweeps["n"] <= 5 else "ok: refreshed"
+
+    monkeypatch.setattr(token_refresh, "maybe_refresh", fail_then_ok)
+    monkeypatch.setattr(token_refresh, "ALERT_AFTER_FAILS", 2)
+    monkeypatch.setattr(token_refresh, "ALERT_REPEAT_SWEEPS", 2)
+    asyncio.run(_run_loop_briefly(interval=0.002, path="/nope",
+                                  sweep_deadline=1.0, heartbeat_every=0, on_alert=alert))
+    fired = [c for c in calls if c[0].startswith("fail")]
+    assert fired, "no owner alert on a persistent refresh failure"
+    assert fired[0][1] == 2                       # first alert at the escalation threshold
+    assert [c[1] for c in fired] == [2, 4]        # then one repeat, not one per sweep
+    assert ("ok: recovered", 0) in calls          # all-clear after it starts working again
+
+
+def test_refresh_loop_alerts_immediately_on_terminal_skip(monkeypatch):
+    """#408: 'no refresh token' can never self-heal, so it alerts on the FIRST sweep instead
+    of waiting out the streak that filters transient network failures."""
+    calls: list[tuple[str, int]] = []
+
+    async def alert(status, fails):
+        calls.append((status, fails))
+
+    async def broken(**kw):
+        return "skip: no refresh token"
+
+    monkeypatch.setattr(token_refresh, "maybe_refresh", broken)
+    monkeypatch.setattr(token_refresh, "ALERT_AFTER_FAILS", 2)
+    asyncio.run(_run_loop_briefly(interval=0.5, path="/nope",
+                                  sweep_deadline=1.0, heartbeat_every=0, on_alert=alert))
+    assert calls and calls[0] == ("skip: no refresh token", 1)
+
+
+def test_refresh_loop_stays_quiet_while_healthy(monkeypatch):
+    """#408: the alert hook must never fire on a healthy skip (token still fresh) — that is
+    the normal state ~27 sweeps out of 28 and would be pure spam."""
+    calls: list[tuple[str, int]] = []
+
+    async def alert(status, fails):
+        calls.append((status, fails))
+
+    async def healthy(**kw):
+        return "skip: 7199s left"
+
+    monkeypatch.setattr(token_refresh, "maybe_refresh", healthy)
+    asyncio.run(_run_loop_briefly(interval=0.002, path="/nope",
+                                  sweep_deadline=1.0, heartbeat_every=0, on_alert=alert))
+    assert calls == []

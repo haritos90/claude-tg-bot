@@ -2029,6 +2029,21 @@ CATALOG: dict[str, dict[str, str]] = {
         "en": "⚠️ Server login expires in {days}d — re-login on the host with the claude CLI to avoid downtime.",
         "ru": "⚠️ Логин на сервере истекает через {days}д — перелогинься на хосте через claude CLI, чтобы не было простоя.",
     },
+    # #408: pushed to the owner when the token refresher keeps failing — the login died
+    # EARLY (revoked / rotated away), which the #379 deadline warning above cannot see.
+    # Until it is fixed every turn dies with a generic "server-side error".
+    "session.login_refresh_failed": {
+        "en": "🔴 Server login is not refreshing ({status}, {fails} in a row). Turns will fail "
+              "with a \"server-side error\" until you re-login on the host "
+              "(claude setup-token) and restart the service.",
+        "ru": "🔴 Логин на сервере не обновляется ({status}, {fails} подряд). Запросы будут "
+              "падать с «ошибкой на стороне сервера», пока не перелогинишься на хосте "
+              "(claude setup-token) и не перезапустишь сервис.",
+    },
+    "session.login_refresh_recovered": {
+        "en": "🟢 Server login is refreshing again.",
+        "ru": "🟢 Логин на сервере снова обновляется.",
+    },
     "busy.queued": {
         "en": "⏳ Server busy — your turn is queued and will run as soon as a slot frees up.",
         "ru": "⏳ Сервер занят — ваш ход в очереди и начнётся, как только освободится слот.",
