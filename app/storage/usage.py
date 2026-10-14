@@ -27,7 +27,20 @@ _DEFAULT_CREDS = "~/.claude/.credentials.json"
 # Windows we surface, in the response. The endpoint reports `utilization` as a
 # PERCENT (0..100) and `resets_at` as an ISO-8601 string — both normalized below to
 # the RateLimitInfo shape the formatters expect (fraction 0..1 + epoch seconds).
-_ACCOUNT_WINDOWS = ("five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet", "overage")
+# #419: the subscription has exactly TWO limits — the ~5-hour window and the weekly one. The
+# per-model weekly windows (seven_day_opus / seven_day_sonnet) and "overage" were transitional
+# and are no longer surfaced, wherever they come from (account payload, SDK rate events, or a
+# snapshot persisted before). was:
+#   _ACCOUNT_WINDOWS = ("five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet", "overage")
+#   (#415 briefly took every window the payload reported)
+# decision-23: the two window names are the one usage-side hardcode — a window the endpoint adds
+# later stays hidden until it is listed here, preferred over showing dead transitional windows.
+ACCOUNT_WINDOWS: tuple[str, ...] = ("five_hour", "seven_day")
+
+
+def keep_window(key) -> bool:
+    """#419: True for one of the two subscription windows the bot tracks."""
+    return str(key) in ACCOUNT_WINDOWS
 
 
 def _parse_iso_epoch(s):
@@ -85,7 +98,8 @@ def normalize_account_usage(data) -> dict:
     out: dict = {}
     if not isinstance(data, dict):
         return out
-    for key in _ACCOUNT_WINDOWS:
+    # #419: only the two subscription windows (was `for key in _ACCOUNT_WINDOWS`).
+    for key in ACCOUNT_WINDOWS:
         entry = data.get(key)
         if not isinstance(entry, dict):
             continue
@@ -248,10 +262,7 @@ def _ordered_present(rate_by_type: dict):
         if key in rate_by_type and rate_by_type[key] is not None:
             seen.add(key)
             yield key, rate_by_type[key]
-    # Include any unexpected keys after the known ones.
-    for key, info in rate_by_type.items():
-        if key not in seen and info is not None:
-            yield key, info
+    # #419: nothing beyond the two subscription windows (was: any unexpected key after them).
 
 
 def footer_line(rate_by_type: dict, lang: str = "en", sep: str = " · ") -> str:
@@ -264,10 +275,9 @@ def footer_line(rate_by_type: dict, lang: str = "en", sep: str = " · ") -> str:
     keys: list[str] = []
     if rate_by_type.get("five_hour") is not None:
         keys.append("five_hour")
-    for key in ("seven_day", "seven_day_opus", "seven_day_sonnet"):
-        if rate_by_type.get(key) is not None:
-            keys.append(key)
-            break
+    # #419: the weekly window only (was: seven_day, else seven_day_opus / seven_day_sonnet).
+    if rate_by_type.get("seven_day") is not None:
+        keys.append("seven_day")
 
     parts = []
     for key in keys:

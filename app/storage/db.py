@@ -1057,7 +1057,6 @@ async def get_usage_totals_bulk(thread_ids: list[int]) -> dict[int, dict]:
             SELECT u.thread_id                       AS thread_id,
                    COALESCE(SUM(u.input_tokens), 0)  AS input,
                    COALESCE(SUM(u.output_tokens), 0) AS output,
-                   COALESCE(SUM({_units_sql_expr()}), 0) AS units,
                    COUNT(*)                          AS requests
             FROM usage u
             WHERE u.thread_id IN ({placeholders})
@@ -1067,9 +1066,8 @@ async def get_usage_totals_bulk(thread_ids: list[int]) -> dict[int, dict]:
         )
         rows = await cur.fetchall()
         await cur.close()
-    # #307: also return weighted "units" per thread (for the /sessions list stats line).
+    # #419: the weighted "units" per thread (#307) are gone — usage is tracked in tokens.
     return {int(r["thread_id"]): {"input": int(r["input"]), "output": int(r["output"]),
-                                  "units": int(r["units"]),
                                   "requests": int(r["requests"])} for r in rows}
 
 
@@ -1087,38 +1085,41 @@ WEEK_WINDOW_SEC = 7 * 86400    # 7 days — the long window
 # #293: get_user_usage_breakdown / get_user_units_breakdown consolidated into
 # get_user_breakdown(user_id, measure=...) — see the centralized family below.
 
-# #165: weighted "usage units" — a cost-aware per-turn metric that mirrors how the
-# shared subscription windows actually fill, so a user with a big WARM context (cheap
-# input but a huge cache_read re-read every turn) is no longer under-counted by the
-# raw input+output total. A unit is a cost-weighted token-equivalent, baselined on a
-# Sonnet INPUT token; the coefficients track Anthropic list-price ratios:
-#   unit = MODEL_WEIGHT * (input + OUT*output + CC*cache_creation + CR*cache_read)
-# Computed at QUERY time from each row's stored raw columns + model, so the weights are
-# tunable here with NO migration, and every turn's cost is derived only from its own
-# numbers (concurrency-safe — not a before/after delta on a shared global gauge). The
-# model is matched by substring, so a "[1m]" / dated suffix still resolves.
-USAGE_OUTPUT_MULT = 5.0          # output tokens ≈ 5× input price
-USAGE_CACHE_CREATE_MULT = 1.25   # cache write ≈ 1.25× input price
-USAGE_CACHE_READ_MULT = 0.10     # cache read ≈ 0.1× input price
-USAGE_MODEL_WEIGHT_OPUS = 5.0    # Opus ≈ 5× Sonnet input price
-USAGE_MODEL_WEIGHT_SONNET = 1.0  # baseline
-USAGE_MODEL_WEIGHT_HAIKU = 0.27  # Haiku ≈ 0.27× Sonnet input price
-USAGE_MODEL_WEIGHT_DEFAULT = 1.0  # unknown / NULL model → Sonnet-equivalent baseline
-
-
-def _units_sql_expr() -> str:
-    """SQL sub-expression turning one ``usage u`` row into weighted units (#165). The
-    numeric weights are trusted module constants formatted inline (never user input)."""
-    return (
-        "((CASE "
-        f"WHEN u.model LIKE '%opus%'   THEN {USAGE_MODEL_WEIGHT_OPUS} "
-        f"WHEN u.model LIKE '%sonnet%' THEN {USAGE_MODEL_WEIGHT_SONNET} "
-        f"WHEN u.model LIKE '%haiku%'  THEN {USAGE_MODEL_WEIGHT_HAIKU} "
-        f"ELSE {USAGE_MODEL_WEIGHT_DEFAULT} END) "
-        f"* (COALESCE(u.input_tokens,0) + {USAGE_OUTPUT_MULT}*COALESCE(u.output_tokens,0) "
-        f"+ {USAGE_CACHE_CREATE_MULT}*COALESCE(u.cache_creation,0) "
-        f"+ {USAGE_CACHE_READ_MULT}*COALESCE(u.cache_read,0)))"
-    )
+# #419: usage is tracked in TOKENS only (input + output) — the cost-weighted "usage units"
+# (#165: per-family model weights × output/cache multipliers) and their SQL expression are
+# retired. was:
+# # #165: weighted "usage units" — a cost-aware per-turn metric that mirrors how the
+# # shared subscription windows actually fill, so a user with a big WARM context (cheap
+# # input but a huge cache_read re-read every turn) is no longer under-counted by the
+# # raw input+output total. A unit is a cost-weighted token-equivalent, baselined on a
+# # Sonnet INPUT token; the coefficients track Anthropic list-price ratios:
+# #   unit = MODEL_WEIGHT * (input + OUT*output + CC*cache_creation + CR*cache_read)
+# # Computed at QUERY time from each row's stored raw columns + model, so the weights are
+# # tunable here with NO migration, and every turn's cost is derived only from its own
+# # numbers (concurrency-safe — not a before/after delta on a shared global gauge). The
+# # model is matched by substring, so a "[1m]" / dated suffix still resolves.
+# USAGE_OUTPUT_MULT = 5.0          # output tokens ≈ 5× input price
+# USAGE_CACHE_CREATE_MULT = 1.25   # cache write ≈ 1.25× input price
+# USAGE_CACHE_READ_MULT = 0.10     # cache read ≈ 0.1× input price
+# USAGE_MODEL_WEIGHT_OPUS = 5.0    # Opus ≈ 5× Sonnet input price
+# USAGE_MODEL_WEIGHT_SONNET = 1.0  # baseline
+# USAGE_MODEL_WEIGHT_HAIKU = 0.27  # Haiku ≈ 0.27× Sonnet input price
+# USAGE_MODEL_WEIGHT_DEFAULT = 1.0  # unknown / NULL model → Sonnet-equivalent baseline
+#
+#
+# def _units_sql_expr() -> str:
+#     """SQL sub-expression turning one ``usage u`` row into weighted units (#165). The
+#     numeric weights are trusted module constants formatted inline (never user input)."""
+#     return (
+#         "((CASE "
+#         f"WHEN u.model LIKE '%opus%'   THEN {USAGE_MODEL_WEIGHT_OPUS} "
+#         f"WHEN u.model LIKE '%sonnet%' THEN {USAGE_MODEL_WEIGHT_SONNET} "
+#         f"WHEN u.model LIKE '%haiku%'  THEN {USAGE_MODEL_WEIGHT_HAIKU} "
+#         f"ELSE {USAGE_MODEL_WEIGHT_DEFAULT} END) "
+#         f"* (COALESCE(u.input_tokens,0) + {USAGE_OUTPUT_MULT}*COALESCE(u.output_tokens,0) "
+#         f"+ {USAGE_CACHE_CREATE_MULT}*COALESCE(u.cache_creation,0) "
+#         f"+ {USAGE_CACHE_READ_MULT}*COALESCE(u.cache_read,0)))"
+#     )
 
 
 # #293: centralized usage-aggregation family. The raw-token and weighted-unit reads
@@ -1129,20 +1130,20 @@ def _units_sql_expr() -> str:
 # get_user_usage_breakdown, get_user_units_breakdown, get_all_users_units,
 # get_all_users_usage (and the dead get_user_usage_tokens).
 def _usage_measure_expr(measure: str) -> str:
-    """The per-``usage u`` row SQL sum sub-expression for a measure. Numeric weights
-    are trusted module constants (never user input); `measure` is a fixed literal from
-    the call sites, validated here so a typo fails loudly instead of mis-summing."""
-    if measure == "units":
-        return _units_sql_expr()
+    """The per-``usage u`` row SQL sum sub-expression for a measure. `measure` is a fixed
+    literal from the call sites, validated here so a typo fails loudly instead of
+    mis-summing. #419: "raw" (input + output tokens) is the only measure — was also
+    "units" (→ _units_sql_expr, the #165 weighted units). decision-24: tokens only, so no
+    per-model weight table has to follow model releases."""
     if measure == "raw":
         return "(COALESCE(u.input_tokens,0) + COALESCE(u.output_tokens,0))"
     raise ValueError(f"unknown usage measure: {measure!r}")
 
 
 async def get_user_usage_window(user_id: int, since: float | None = None,
-                                measure: str = "units") -> int:
-    """Total usage one user has spent across ALL their sessions, in `measure`
-    (default weighted "units" #165 — the cost-aware basis for the rolling-window caps).
+                                measure: str = "raw") -> int:
+    """Total usage one user has spent across ALL their sessions, in `measure` — input +
+    output tokens, the basis for the rolling-window caps (#419: was weighted "units", #165).
     With ``since`` (epoch seconds), counts only usage at-or-after that time. Usage rows
     carry their owner's chat_id (#309), so the sum is over ``usage.chat_id`` directly and
     survives a session delete (a deleted session's spend still counts toward the cap)."""
@@ -1166,7 +1167,7 @@ async def get_user_usage_window(user_id: int, since: float | None = None,
 
 async def get_user_breakdown(user_id: int, measure: str = "raw") -> dict:
     """Per-user usage over the trailing 5h / week plus the lifetime total and request
-    count, in `measure` ("raw" tokens or weighted "units" #165). Windows are computed
+    count, in `measure` ("raw" tokens — #419 retired the weighted units). Windows are computed
     from usage.ts, so no reset job is needed. Feeds the per-user stats card + /limits."""
     now = time.time()
     day_since = now - SHORT_WINDOW_SEC   # #264: "day" key = trailing 5h
@@ -1196,7 +1197,7 @@ async def get_user_breakdown(user_id: int, measure: str = "raw") -> dict:
 
 async def get_all_users_breakdown(measure: str = "raw") -> list[dict]:
     """#285: per-user usage aggregate for ALL DM users in ONE GROUP BY — trailing-5h /
-    week / lifetime total in `measure` ("raw" tokens or weighted "units" #165), plus the
+    week / lifetime total in `measure` ("raw" tokens — #419 retired the weighted units), plus the
     request count and last-activity ts, busiest week first. Keyed-by-uid dicts are built
     by the caller when needed. Only DM users (``chat_id > 0`` == the Telegram id) count: a
     group/supergroup has a negative ``-100…`` chat_id and is NOT a person, so it is

@@ -20,12 +20,14 @@ def test_normalize_percent_to_fraction_and_iso_to_epoch():
         "extra_usage": {"is_enabled": False},          # no utilization → dropped
     }
     out = usage.normalize_account_usage(data)
-    assert set(out) == {"five_hour", "seven_day", "seven_day_sonnet"}
+    # #419: only the two subscription windows — the per-model seven_day_sonnet is dropped.
+    assert set(out) == {"five_hour", "seven_day"}
     assert abs(out["five_hour"].utilization - 0.38) < 1e-9
     assert out["five_hour"].rate_limit_type == "five_hour"
     assert out["five_hour"].status == "allowed"        # 0.38 < 0.8
     assert isinstance(out["five_hour"].resets_at, int) and out["five_hour"].resets_at > 0
-    assert out["seven_day_sonnet"].utilization == 0.0  # 0% kept (it IS a number)
+    zero = usage.normalize_account_usage({"seven_day": {"utilization": 0.0, "resets_at": None}})
+    assert zero["seven_day"].utilization == 0.0        # 0% kept (it IS a number)
 
 
 def test_normalize_status_thresholds():

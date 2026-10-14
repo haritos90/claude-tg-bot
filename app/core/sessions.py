@@ -1466,7 +1466,8 @@ class SessionManager:
                     # wasteful (events repeat with identical data within a turn),
                     # so only do it when the snapshot actually changed.
                     rl_type = getattr(ev.rate, "rate_limit_type", None)
-                    if rl_type:
+                    # #419: only the two subscription windows (5h, weekly) are tracked.
+                    if rl_type and usage.keep_window(rl_type):
                         self.rate_by_type[str(rl_type)] = ev.rate
                         sig = self._rate_signature()
                         if sig != self._last_rate_sig:
@@ -2045,7 +2046,8 @@ class SessionManager:
                 data = json.loads(raw)
                 rebuilt: dict[str, object] = {}
                 for rl_type, entry in data.items():
-                    if not isinstance(entry, dict):
+                    # #419: drops a stale per-model window (e.g. seven_day_sonnet) saved earlier.
+                    if not isinstance(entry, dict) or not usage.keep_window(rl_type):
                         continue
                     rebuilt[str(rl_type)] = SimpleNamespace(
                         status=entry.get("status"),
@@ -2349,6 +2351,9 @@ class SessionManager:
             return False
         for key, info in data.items():
             self.rate_by_type[str(key)] = info
+        # #419: also drop any window outside the two tracked ones that an older run left behind.
+        for key in [k for k in self.rate_by_type if not usage.keep_window(k)]:
+            self.rate_by_type.pop(key, None)
         sig = self._rate_signature()
         if sig == self._last_rate_sig:
             return False

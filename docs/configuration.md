@@ -17,11 +17,72 @@ repeated here.
 |---|---|---|
 | `TELEGRAM_BOT_TOKEN` | — | BotFather token. Required. |
 | `OWNER_ID` | — | Your numeric Telegram id — the always-allowed owner. Required. |
-| `DEFAULT_MODEL` | `claude-opus-4-8` | Model for new sessions (`/model` aliases: opus / sonnet / haiku). |
+| `DEFAULT_MODEL` | `opus` | Model for new sessions: a Claude Code CLI family alias (`opus` / `sonnet` / `haiku` / …) that the CLI resolves to the newest model of that family, or a pinned id. Model versions are never hardcoded — see *Models and the CLI* below. |
 | `BASE_WORKDIR` | `./workdirs` | Root of the per-session working trees and archives. Must sit outside `/root` when per-session uids are on (the deployment uses `/var/lib/claude-tg-bot/workdirs`). |
 | `DB_PATH` | `./bot.db` | SQLite state file. |
 | `ALLOWLIST_PATH` | `./allowlist.json` | Per-user access store. |
 | `BLOCKED_PROMPT_KEYWORDS` | — | Extra prompt keywords to defuse, on top of the built-in `ultrathink` / `ultracode`. Comma- or space-separated. |
+
+## Models and the CLI
+
+No model, model version or effort level is hardcoded; the few deliberate exceptions are listed
+under *Deliberate exceptions* below. The Claude Code CLI is the source of truth:
+
+- **Models.** The CLI's model catalog (its `initialize` response) lists the family aliases
+  (`opus`, `sonnet`, `haiku`, …), the CLI's own `default`, and pinned version ids, each with the
+  concrete model it resolves to and a display name. The `/model` picker lists the aliases; a
+  session stores the alias it was given, and the CLI resolves it to the newest model of that
+  family, so a model release reaches every session with the next CLI update. A typed
+  `/model claude-…` pins an exact version (shown with 📌). A throwaway probe of the host CLI (no
+  prompt, no tokens) reads the catalog 20 s after startup and after every CLI update; it is
+  persisted, so menus are correct right after a restart. The probe's catalog is authoritative: a
+  sandboxed session's CLI sees only the credential broker's dummy token and reports a reduced list
+  (family names without versions, no pinned ids), which only fills in before the first probe.
+- **Effort.** The `/effort` picker lists the levels the CLI reports for the session's model (none
+  for a model that takes no effort). With no explicit level the CLI's per-model default applies;
+  it is read from the CLI (`get_settings`) and shown, for example, as "default (medium)". Level
+  names are translated when the i18n catalog happens to have the name, otherwise shown as the CLI
+  spells them.
+- **Context window.** Each session runs its model's native context window, as the CLI knows it —
+  1M on the current models (Opus 5.5, Sonnet 5.5, Opus 5, Fable…), 200K on Haiku 4.5. There is no
+  1M switch: the CLI offers no size choice for a model whose 1M window is native. The CLI's
+  auto-compaction keeps a long session within the window.
+- **Display.** A new session confirms with its mode glyph and the model it runs on, its version
+  and effort — `💬 Opus 5.5 · medium` — named by the CLI's display name of what the alias
+  resolves to (the CLI's `default` shows as the model it currently means).
+- **CLI updates.** Once a day at `CLI_UPDATE_AT_UTC` the bot runs the host CLI's own updater
+  (`claude update`) and re-stages the sandbox copy at `/usr/local/bin/claude`. A run missed while
+  the bot was down happens at the next start. When the binary changed, sessions move to it
+  without cutting a reply: idle clients are closed at once and reconnect (resuming the
+  conversation) on their next message; a client in the middle of a reply moves once that reply is
+  done.
+- **Migration.** On the first start with this scheme, concrete ids stored by earlier versions
+  (`claude-opus-4-8` …) are rewritten once to their family alias.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `MODEL_PICKER` | — | Comma-separated catalog values the `/model` picker may offer (e.g. `opus,sonnet,haiku`). Empty = every alias the CLI offers (minus withheld families). |
+| `CLI_UPDATE_AT_UTC` | `12:00` | Daily time (UTC, `HH:MM`) of the CLI update round described above; `off` = never. The owner can change it at runtime in Settings → Admin → CLI update, which also offers "check now". Replaces `CLI_UPDATE_INTERVAL_HOURS`; a legacy `CLI_UPDATE_INTERVAL_HOURS=0` still disables updates when this variable is unset. |
+| `THINKING_MODEL_LINE` | on | Experimental: the first line of the animated "Thinking…" indicator names the model, its version and the effort the reply runs at (`Opus 5.5 · medium`); `0` turns it off. A draft Telegram rejects with the line is retried without it. |
+| `DRAFT_HOLD_OPEN_TABLES` | off | Opt-in workaround for the Telegram iOS client, which does not draw rows added to a table it has already rendered: a table enters the streaming draft only once complete (an animated "building a table" note stands in). Off = tables stream row by row. |
+| `DRAFT_PUSH` | `all` | Telegram holds a message the user sends while a reply draft is streaming and delivers it only once the draft ends. The draft carries Telegram's own stop button; in this bot pressing it means **push**, not stop: the draft ends on the client (which lets the held message through), the reply carries on in a new draft and the message is folded into the running reply. Pressed with no message waiting (none arrives within 1 s — a held message comes 20–30 ms after the press), it stops the reply like `/stop`. The button's look and its press animation are Telegram's. `all` = every chat, `owner` = the owner's chat only, `off` = no button. |
+| `DRAFT_RELEASE` | `off` | Withdrawn experiment: while only the "Thinking…" indicator showed, the bot periodically landed and deleted a tiny message to let a held message through; every such message raised a notification (silent delivery only drops the sound). `owner` / `all` turn it back on. |
+| `DRAFT_RELEASE_SECS` | `3` | Period of that withdrawn cycle, in seconds. |
+
+### Deliberate exceptions
+
+Each item below is model-specific knowledge kept in code on purpose; everything else follows the
+CLI.
+
+| Exception | Where | Why |
+|---|---|---|
+| `max` effort is a per-user grant | `handlers._may_max_effort`, `SessionManager._effective_settings` | It is the most expensive setting against the shared subscription and a budget decision, not a model property. Without the grant `max` is hidden; a stored `max` runs one level lower in the CLI's list for that model. |
+| The Fable family is withheld from everyone | `models._HIDDEN_FAMILIES` | Offering the CLI's top tier is a per-host, per-user budget decision (meant for hosts on a Max plan) that needs its own grant, like `max`. Until that grant exists nobody, the owner included, can pick it; a stored Fable value runs as the default model. |
+| Only two account windows are tracked | `usage.ACCOUNT_WINDOWS` | The subscription has exactly two limits, the ~5-hour and the weekly window; the usage endpoint still returns transitional per-model windows that carry no data. A window added later stays hidden until listed. |
+| Pinned ids are recognised by the `claude-` prefix | `models._PINNED_PREFIX` | The catalog carries no alias/pinned flag; every concrete id it lists starts with `claude-` and no alias does. |
+
+Per-user usage caps count raw tokens (input + output) — no per-model weights, so a cap means the
+same on every model.
 
 ## Concurrency and resources
 

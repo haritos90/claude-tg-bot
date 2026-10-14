@@ -3790,13 +3790,12 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         """The /users summary lines (owner + each entry/pending), each WITH per-user
         usage (day/week/total) — shown for everyone regardless of whether limits are
         set (owner request). The token column shows the #120 ROLLING caps (day/week)."""
-        # #285: fetch every user's weighted units in ONE GROUP BY (was an N+1 per-user query).
+        # #285: fetch every user's usage in ONE GROUP BY (was an N+1 per-user query).
         # #293: get_all_users_breakdown returns a list; key it by uid for the per-user lookup.
-        # #303: also fetch RAW tokens so each user shows a units line AND a tokens line.
-        units = {}
+        # #419: tokens only — the weighted-units line (#303) is gone. was:
+        #   units = {r["uid"]: r for r in await db.get_all_users_breakdown("units")}
         tokens = {}
         with contextlib.suppress(Exception):
-            units = {r["uid"]: r for r in await db.get_all_users_breakdown("units")}
             tokens = {r["uid"]: r for r in await db.get_all_users_breakdown("raw")}
 
         def _usage_lines(uid):
@@ -3807,10 +3806,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             def _w(v):
                 return _rpad_mono(_fmt_tokens(v), 6)
             out = []
-            ub = units.get(uid)
-            if ub:
-                out.append(i18n.t("users.entry_usage", lang, day=_w(ub["day"]),
-                                  week=_w(ub["week"]), total=_w(ub["total"])))
+            # #419: was a units line first (users.entry_usage from the "units" breakdown).
             tb = tokens.get(uid)
             if tb:
                 out.append(i18n.t("users.entry_usage_tok", lang, day=_w(tb["day"]),
@@ -3954,10 +3950,11 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         tid = d.get("id")
         bd = await db.get_user_breakdown(tid) if tid is not None else \
             {"day": 0, "week": 0, "total": 0, "requests": 0}
-        # #165: the day/week/total figures on the card are WEIGHTED USAGE UNITS (the
-        # same metric the caps enforce); the request count stays from the raw breakdown.
-        ub = await db.get_user_breakdown(tid, "units") if tid is not None else \
-            {"day": 0, "week": 0, "total": 0}
+        # #419: the day/week/total figures are TOKENS, the same measure the caps enforce.
+        # was (#165, weighted units):
+        #   ub = await db.get_user_breakdown(tid, "units") if tid is not None else \
+        #       {"day": 0, "week": 0, "total": 0}
+        ub = bd
         rate = d.get("rate") or {"day": None, "week": None}
 
         def cap(v):
@@ -4726,8 +4723,9 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         # Delegated user → their own trailing-5h / trailing-7d use vs cap. #165: the
         # day/week figures and the caps are WEIGHTED USAGE UNITS (cost-aware), while the
         # request count still comes from the raw breakdown.
-        bd = await db.get_user_breakdown(uid)      # for the request count
-        ub = await db.get_user_breakdown(uid, "units")   # weighted units (#165)
+        bd = await db.get_user_breakdown(uid)      # tokens + the request count
+        # #419: was ub = await db.get_user_breakdown(uid, "units") — weighted units (#165)
+        ub = bd
         caps = allowlist.rate_of(uid, uname)
 
         def _row(label: str, used: int, cap) -> str:
@@ -4749,26 +4747,24 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             f"{i18n.t('limits.requests', lang)}: <b>{bd['requests']}</b>",
             i18n.t("limits.sessions", lang, used=scount, cap=scap_lbl),
             i18n.t("limits.rolling_note", lang),
-            i18n.t("limits.units_note", lang),
+            # #419: was i18n.t("limits.units_note", lang) — usage is in tokens now
         ]
         await reply(message, "\n".join(lines))
 
     async def _send_userstats(chat_id: int, send_kwargs: dict, lang: str) -> None:
         """#164: build + send the per-user usage dashboard as a NATIVE table (one row
-        per user). #293: shows BOTH metrics in separate columns — raw input+output
-        tokens AND cost-weighted units (the cap basis) — for the trailing 5h / week /
-        lifetime, plus requests and last-seen. Falls back to a monospace grid if
-        sendRichMessage fails. Shared by /userstats and the 📊 button on /users (#172)."""
+        per user): input+output tokens for the trailing 5h / week / lifetime, plus
+        requests and last-seen (#419: the #293 weighted-units columns are gone). Falls
+        back to a monospace grid if sendRichMessage fails. Shared by /userstats and the
+        📊 button on /users (#172)."""
         rows = await db.get_all_users_breakdown("raw")   # raw tokens, one row per DM user
         if not rows:
             with contextlib.suppress(Exception):
                 await bot.send_message(chat_id, i18n.t("userstats.empty", lang),
                                        parse_mode="HTML", **send_kwargs)
             return
-        # #293: weighted units for the same users, keyed by uid (units = the cap basis).
-        units_by_uid: dict[int, dict] = {}
-        with contextlib.suppress(Exception):
-            units_by_uid = {u["uid"]: u for u in await db.get_all_users_breakdown("units")}
+        # #419: was — weighted units for the same users (#293):
+        #   units_by_uid = {u["uid"]: u for u in await db.get_all_users_breakdown("units")}
         # uid → PLAIN-text label (the table escapes, so no HTML here). #272: show the
         # friendly name AND @username together (was: fname OR @username), and resolve
         # the OWNER from owner_prefs (the owner has no access entry → showed only an id).
@@ -4801,12 +4797,13 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 return f"{int(d // 3600)}h"
             return f"{int(d // 86400)}d"
 
-        # #293: tokens and units side by side per window (User | 5h tok | 5h un | …).
+        # #419: tokens per window (User | 5h | Wk | Tot | req | last). was (#293): a units
+        # column after each tokens column (userstats.col_5h_un / col_wk_un / col_tot_un).
         header = [
             i18n.t("userstats.col_user", lang),
-            i18n.t("userstats.col_5h_tok", lang), i18n.t("userstats.col_5h_un", lang),
-            i18n.t("userstats.col_wk_tok", lang), i18n.t("userstats.col_wk_un", lang),
-            i18n.t("userstats.col_tot_tok", lang), i18n.t("userstats.col_tot_un", lang),
+            i18n.t("userstats.col_5h_tok", lang),
+            i18n.t("userstats.col_wk_tok", lang),
+            i18n.t("userstats.col_tot_tok", lang),
             i18n.t("userstats.col_req", lang), i18n.t("userstats.col_last", lang),
         ]
         trows = [header]
@@ -4815,15 +4812,14 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             label = labels.get(uid, str(uid))
             if uid == settings.owner_id:
                 label = f"👑 {label}"
-            un = units_by_uid.get(uid, {})
             trows.append([
                 label,
-                _fmt_tokens(r["day"]), _fmt_tokens(un.get("day", 0)),
-                _fmt_tokens(r["week"]), _fmt_tokens(un.get("week", 0)),
-                _fmt_tokens(r["total"]), _fmt_tokens(un.get("total", 0)),
+                _fmt_tokens(r["day"]),
+                _fmt_tokens(r["week"]),
+                _fmt_tokens(r["total"]),
                 str(r["requests"]), _ago(r["last_ts"]),
             ])
-        aligns = ["left", "right", "right", "right", "right", "right", "right", "right", "right"]
+        aligns = ["left", "right", "right", "right", "right", "right"]
         title = f"<b>👥 {markup.escape_html(i18n.t('userstats.title', lang))}</b>"
         legend = f"<i>{markup.escape_html(i18n.t('userstats.legend', lang))}</i>"
         html = title + "\n" + legend + markup.table_to_rich_html(trows, aligns)

@@ -328,35 +328,32 @@ def test_favorite_flag_persists_and_sorts_first():
     _run(_t)
 
 
-def test_usage_units_weighting_and_breakdown():
-    """#165: weighted usage units bill model weight + output + cache, not just raw
-    input+output, and the breakdown rolls up by the user's DM chat_id."""
+def test_usage_is_tokens_only_and_breakdown():
+    """#419 (was #165's weighted units): usage and the cap basis are input + output TOKENS —
+    no model weight, no cache multipliers — and the breakdown rolls up by the user's DM
+    chat_id. The retired "units" measure fails loudly instead of mis-summing."""
+    import pytest
+
     async def _t():
         await db.init_db(tempfile.mktemp(suffix=".db"))
         uid = 5
-        key = await db.allocate_dm_session(uid, "s", "claude-opus-4-8", "/tmp", mode="code")
-        # One Opus turn: input 1000, output 100, cache_creation 200, cache_read 10000.
+        key = await db.allocate_dm_session(uid, "s", "opus", "/tmp", mode="code")
+        # One turn: input 1000, output 100, cache_creation 200, cache_read 10000.
         await db.add_usage(
             key,
             {"input_tokens": 1000, "output_tokens": 100,
              "cache_creation_input_tokens": 200, "cache_read_input_tokens": 10000},
-            0.0, model="claude-opus-4-8", context_tokens=42000,
+            0.0, model="claude-opus-5-5", context_tokens=42000,
         )
-        # #293: raw metric ignores cache + model weight: 1000 + 100 = 1100.
-        assert await db.get_user_usage_window(uid, measure="raw") == 1100
-        # Units = 5.0 * (1000 + 5*100 + 1.25*200 + 0.1*10000)
-        #       = 5.0 * (1000 + 500 + 250 + 1000) = 13750.
-        assert await db.get_user_usage_window(uid) == 13750   # default measure = units
-        # A NULL-model row weights at the default (Sonnet) baseline 1.0.
+        assert await db.get_user_usage_window(uid) == 1100          # default = tokens
         await db.add_usage(key, {"input_tokens": 10, "output_tokens": 0}, 0.0)
-        assert await db.get_user_usage_window(uid) == 13750 + 10
-        bd = await db.get_user_breakdown(uid, "units")
-        assert bd["day"] == 13760 and bd["week"] == 13760 and bd["total"] == 13760
-        # The raw breakdown over the same rows: 1100 + 10 = 1110, 2 requests.
-        rawbd = await db.get_user_breakdown(uid)   # default measure = raw
-        assert rawbd["total"] == 1110 and rawbd["requests"] == 2
-        # A different user sees none of it.
-        assert await db.get_user_usage_window(999) == 0
+        assert await db.get_user_usage_window(uid) == 1110
+        bd = await db.get_user_breakdown(uid)
+        assert bd["day"] == bd["week"] == bd["total"] == 1110 and bd["requests"] == 2
+        assert "units" not in (await db.get_usage_totals_bulk([key]))[key]
+        with pytest.raises(ValueError):
+            await db.get_user_usage_window(uid, measure="units")
+        assert await db.get_user_usage_window(999) == 0              # another user: nothing
         await db.close_db()
 
     _run(_t)

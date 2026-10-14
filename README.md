@@ -120,8 +120,8 @@ dropped before any handler runs. It is fail-closed — a missing or corrupt `all
 owner-only, never everyone.
 
 Each user has a level (`chat`, or `code` for chat plus code), an optional expiry, and optional
-rolling usage caps (a trailing 5h and a trailing 7d cap). Caps count weighted usage units, a
-cost-aware metric that mirrors how the shared subscription windows fill. Manage from Telegram
+rolling usage caps (a trailing 5h and a trailing 7d cap). Usage and caps are counted in tokens
+(input + output). Manage from Telegram
 (owner only): `/allow`, `/deny`, `/level`, `/expire`, `/limit`, `/users`. Numeric ids are
 authoritative; a `@username` grant pins to its id on the user's first message.
 

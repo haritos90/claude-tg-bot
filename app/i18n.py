@@ -1038,10 +1038,7 @@ CATALOG: dict[str, dict[str, str]] = {
         "en": "<i>Windows are rolling (trailing 5h / 7d, matching Anthropic's reset).</i>",
         "ru": "<i>Окна скользящие (последние 5ч / 7д, как сброс у Anthropic).</i>",
     },
-    "limits.units_note": {
-        "en": "<i>Usage is in weighted units (cost-aware: model, output and cache); caps are in units too.</i>",
-        "ru": "<i>Расход во взвешенных единицах (с учётом модели, вывода и кэша); лимиты тоже в единицах.</i>",
-    },
+    # #419: usage and caps are tokens (input + output); the weighted-units note is retired.
     "limits.account_header": {
         "en": "📊 <b>Account usage</b> (subscription, owner)",
         "ru": "📊 <b>Использование аккаунта</b> (подписка, владелец)",
@@ -1055,16 +1052,13 @@ CATALOG: dict[str, dict[str, str]] = {
     "userstats.col_total": {"en": "Total", "ru": "Всего"},
     "userstats.col_req": {"en": "Req", "ru": "Запр"},
     "userstats.col_last": {"en": "Last", "ru": "Актив."},
-    # #293: the table shows BOTH metrics in separate columns — raw tokens and weighted units.
+    # #419: tokens only (input + output). The #293 weighted-units columns are retired.
     "userstats.col_5h_tok": {"en": "5h tok", "ru": "5ч ток"},
-    "userstats.col_5h_un": {"en": "5h un", "ru": "5ч ед"},
     "userstats.col_wk_tok": {"en": "Wk tok", "ru": "Нед ток"},
-    "userstats.col_wk_un": {"en": "Wk un", "ru": "Нед ед"},
     "userstats.col_tot_tok": {"en": "Tot tok", "ru": "Σ ток"},
-    "userstats.col_tot_un": {"en": "Tot un", "ru": "Σ ед"},
     "userstats.legend": {
-        "en": "tok = tokens · un = cost-weighted units (the cap basis)",
-        "ru": "ток = токены · ед = взвешенные единицы (основа лимитов)",
+        "en": "tok = tokens (input + output) — the basis of the usage caps",
+        "ru": "ток = токены (ввод + вывод) — по ним считаются лимиты",
     },
     "stream.usage_line": {"en": "📊 {pct}% {kind}", "ru": "📊 {pct}% {kind}"},
     "stream.kind_day": {"en": "of 5h limit", "ru": "5-часового лимита"},
@@ -1281,17 +1275,17 @@ CATALOG: dict[str, dict[str, str]] = {
         "ru": "Нет записи в списке доступа для <code>{val}</code>.",
     },
     "limit.prompt": {
-        "en": "Send: <code>&lt;id|@user&gt; &lt;units&gt; [day|week]</code> (or <code>off</code>; /cancel).",
-        "ru": "Отправьте: <code>&lt;id|@user&gt; &lt;единицы&gt; [day|week]</code> (или <code>off</code>; /cancel).",
+        "en": "Send: <code>&lt;id|@user&gt; &lt;tokens&gt; [day|week]</code> (or <code>off</code>; /cancel).",
+        "ru": "Отправьте: <code>&lt;id|@user&gt; &lt;токены&gt; [day|week]</code> (или <code>off</code>; /cancel).",
     },
     "limit.usage": {
-        "en": "Usage: <code>/limit &lt;id|@user&gt; &lt;units&gt; [day|week] | off</code> (default: day).",
-        "ru": "Использование: <code>/limit &lt;id|@user&gt; &lt;единицы&gt; [day|week] | off</code> (по умолчанию: day).",
+        "en": "Usage: <code>/limit &lt;id|@user&gt; &lt;tokens&gt; [day|week] | off</code> (default: day).",
+        "ru": "Использование: <code>/limit &lt;id|@user&gt; &lt;токены&gt; [day|week] | off</code> (по умолчанию: day).",
     },
-    # #192: the cap is enforced in weighted usage units (#165), not raw tokens.
+    # #419: the cap is enforced in tokens (input + output); was weighted units (#165/#192).
     "limit.set": {
-        "en": "✅ <code>{val}</code> — <b>{window}</b> cap set to <b>{n}</b> units.",
-        "ru": "✅ <code>{val}</code> — лимит на <b>{window}</b>: <b>{n}</b> единиц.",
+        "en": "✅ <code>{val}</code> — <b>{window}</b> cap set to <b>{n}</b> tokens.",
+        "ru": "✅ <code>{val}</code> — лимит на <b>{window}</b>: <b>{n}</b> токенов.",
     },
     "limit.cleared": {
         "en": "✅ Rate limits cleared for <code>{val}</code>.",
@@ -1370,12 +1364,12 @@ CATALOG: dict[str, dict[str, str]] = {
 
     # -- #120 rolling rate limits + per-user effort/permissions gates ------- #
     "access.rate_day_exceeded": {
-        "en": "🔒 5-hour usage limit reached (<b>{used}/{cap}</b> units). It frees up as your last 5h of usage ages out.",
-        "ru": "🔒 5-часовой лимит исчерпан (<b>{used}/{cap}</b> ед.). Освободится по мере устаревания последних 5 часов.",
+        "en": "🔒 5-hour usage limit reached (<b>{used}/{cap}</b> tokens). It frees up as your last 5h of usage ages out.",
+        "ru": "🔒 5-часовой лимит исчерпан (<b>{used}/{cap}</b> токенов). Освободится по мере устаревания последних 5 часов.",
     },
     "access.rate_week_exceeded": {
-        "en": "🔒 Weekly usage limit reached (<b>{used}/{cap}</b> units). It frees up as your last 7 days age out.",
-        "ru": "🔒 Недельный лимит исчерпан (<b>{used}/{cap}</b> ед.). Освободится по мере устаревания последних 7 дней.",
+        "en": "🔒 Weekly usage limit reached (<b>{used}/{cap}</b> tokens). It frees up as your last 7 days age out.",
+        "ru": "🔒 Недельный лимит исчерпан (<b>{used}/{cap}</b> токенов). Освободится по мере устаревания последних 7 дней.",
     },
     "effort.max_denied": {
         "en": "🔒 The <b>max</b> effort level is restricted (it's costly on the shared subscription). Ask the owner to grant it.",
@@ -1391,16 +1385,8 @@ CATALOG: dict[str, dict[str, str]] = {
         "en": "<i>Tap a user to manage memory, limits, effort, tools, expiry, and see usage.</i>",
         "ru": "<i>Нажмите на пользователя: память, лимиты, effort, инструменты, срок доступа и статистика.</i>",
     },
-    "users.entry_usage": {
-        # #308: monospace + compact; values are NBSP-padded in handlers so the day/week/total
-        # columns line up across users. The <code> wraps the WHOLE line so the row renders as
-        # one monospace span (like the /sessions stat row). The units label (shorter than tokens)
-        # gets a trailing NBSP ( ) right after its colon so the "5h …" columns also line
-        # up vertically against the longer-label tokens line below it (else tokens shifts +1).
-        "en": "<code>↳ units:  5h {day} · wk {week} · tot {total}</code>",
-        "ru": "<code>↳ ед.:  5ч {day} · нед {week} · всего {total}</code>",
-    },
-    "users.entry_usage_tok": {  # #303: a same-format raw-tokens line below the units line
+    # #419: users.entry_usage (the weighted-units line above the tokens line) is retired.
+    "users.entry_usage_tok": {  # #303: the per-user tokens line (#308 NBSP-padded columns)
         "en": "<code>↳ tokens: 5h {day} · wk {week} · tot {total}</code>",
         "ru": "<code>↳ ток.: 5ч {day} · нед {week} · всего {total}</code>",
     },
@@ -1490,17 +1476,15 @@ CATALOG: dict[str, dict[str, str]] = {
         "en": "Send an expiry date <code>YYYY-MM-DD</code> (or <code>never</code>; /cancel).",
         "ru": "Отправьте дату окончания <code>ГГГГ-ММ-ДД</code> (или <code>never</code>; /cancel).",
     },
-    # #192: caps are compared against WEIGHTED USAGE UNITS (#165), not raw tokens, so the
-    # entry prompt must say "units" (a unit ≈ a Sonnet-input-token-equivalent; Opus + cache
-    # run ~5–25× raw tokens). #264: the short window is 5h (Anthropic's reset), not a day.
+    # #419: caps are compared against TOKENS (input + output) again — the #165/#192 weighted
+    # units are retired. #264: the short window is 5h (Anthropic's reset), not a day.
     "usercard.prompt_day": {
-        "en": "Send the 5-HOUR usage cap in <b>units</b> (e.g. <code>500k</code>, or <code>off</code>; /cancel). Caps and usage are weighted units, not raw tokens.",
-        "ru": "Отправьте 5-ЧАСОВОЙ лимит в <b>единицах</b> (напр. <code>500k</code>, или <code>off</code>; /cancel). Лимиты и расход — во взвешенных единицах, не в сырых токенах.",
+        "en": "Send the 5-HOUR usage cap in <b>tokens</b> (input + output; e.g. <code>500k</code>, or <code>off</code>; /cancel).",
+        "ru": "Отправьте 5-ЧАСОВОЙ лимит в <b>токенах</b> (ввод + вывод; напр. <code>500k</code>, или <code>off</code>; /cancel).",
     },
-    # was (#120): "Send the WEEKLY token cap (e.g. 2m, …)". Relabelled to units for #192.
     "usercard.prompt_week": {
-        "en": "Send the WEEKLY usage cap in <b>units</b> (e.g. <code>2m</code>, or <code>off</code>; /cancel). Caps and usage are weighted units, not raw tokens.",
-        "ru": "Отправьте НЕДЕЛЬНЫЙ лимит в <b>единицах</b> (напр. <code>2m</code>, или <code>off</code>; /cancel). Лимиты и расход — во взвешенных единицах, не в сырых токенах.",
+        "en": "Send the WEEKLY usage cap in <b>tokens</b> (input + output; e.g. <code>2m</code>, or <code>off</code>; /cancel).",
+        "ru": "Отправьте НЕДЕЛЬНЫЙ лимит в <b>токенах</b> (ввод + вывод; напр. <code>2m</code>, или <code>off</code>; /cancel).",
     },
     "usercard.prompt_idle": {
         "en": "Send the idle-TTL in <b>minutes</b> (e.g. <code>6</code>), <code>off</code> for ∞ (never reap), or <code>default</code> for the server default. /cancel to abort.",
