@@ -1,26 +1,9 @@
-"""Cold storage for deleted sessions (#177).
+"""Cold storage for deleted sessions.
 
-When a user deletes a DM session we no longer DESTROY its data (the old #58/#136
-path `shutil.rmtree`-d the workdir outright). Instead we MOVE everything into a
-single gzip-compressed bundle under ``BASE_WORKDIR/_archive/<owner_id>/`` so disk
-use drops (text/jsonl transcripts compress ~10×) while nothing is lost. Deleting
-the archives themselves (retention / auto-purge) is deliberately NOT wired yet —
-that's the deferred #178.
-
-Since #180/#181 every session is JAILED and uses a NESTED layout, so a session's
-footprint is ONE parent dir (plus a legacy fallback):
-
-  1. ``BASE_WORKDIR/<sid>/``  — the whole session: ``work/`` (the agent's cwd /
-     files) + ``state/`` (the jail HOME → ``~/.claude/projects``, i.e. the
-     transcript). Bundling this one dir captures everything for a jailed session.
-  2. ``~/.claude/projects/<encoded>``  — LEGACY only: a pre-#180 non-sandboxed
-     session kept its transcript on the host (cwd ``BASE_WORKDIR/<sid>``). After
-     #180 there are none; kept as a defensive fallback. Claude Code derives
-     ``<encoded>`` from the cwd by replacing every non-alphanumeric char with ``-``.
-
-``archive_session`` captures whichever exist into one bundle, then removes the live
-copies. It is best-effort and FAIL-SAFE: if writing the bundle raises, the live
-copies are left untouched (we never lose data to a half-write).
+- Deleted sessions are bundled into one gzip tarball
+- Bundles live under `BASE_WORKDIR/_archive/<owner_id>/`
+- Footprint: `BASE_WORKDIR/<sid>/` plus legacy `~/.claude/projects/<encoded>`
+- Best-effort and fail-safe: live copies stay on write error
 """
 
 from __future__ import annotations
@@ -37,46 +20,41 @@ from pathlib import Path
 
 log = logging.getLogger("archive")
 
-# Where archived bundles live, relative to BASE_WORKDIR. Leading underscore keeps
-# it out of the way of the sid-named live session dirs (sids are hex, never this).
+# Archive root, relative to `BASE_WORKDIR`.
+# - Leading underscore never collides with hex sids
 ARCHIVE_DIRNAME = "_archive"
 
 
 def encode_workdir(workdir: str | Path) -> str:
-    """Claude Code's project-dir name for a working directory: every
-    non-alphanumeric character replaced with ``-`` (so ``/var/lib/claude-tg-bot/
-    workdirs/cf8c89/work`` → ``-var-lib-claude-tg-bot-workdirs-cf8c89-work``).
-    Verified against the live deployment's project dirs.
+    """Claude Code project-dir name for a working directory.
 
-    #335: THE single shared encoder. Anything that reconstructs a transcript path
-    from a cwd MUST go through this (or the helpers below) — a divergent encoder
-    (e.g. a plain ``cwd.replace('/', '-')``) silently resolves the WRONG dir for
-    any cwd containing ``.``/``_``/other punctuation.
+    - Replaces every non-alphanumeric character with `-`
+    - Single shared encoder; never use plain `replace('/', '-')`
+    - A divergent encoder breaks cwds containing `.` or `_`
     """
     return re.sub(r"[^A-Za-z0-9]", "-", str(Path(workdir)))
 
 
 def live_transcript_dir(cwd: str | Path) -> Path:
-    """#335: the JAILED session's live transcript dir on disk for an agent ``cwd``:
-    ``<sid>/state/<encoded-cwd>``. The jail HOME (``state``) is the sibling of the
-    agent cwd (``<sid>/work``), and the project dir under it is named by
-    :func:`encode_workdir`. Used by both the ai-title reader and ``/whois``."""
+    """Live transcript dir of a jailed session for a cwd.
+
+    - Path is `<sid>/state/<encoded-cwd>`
+    """
     cwd = Path(cwd)
     return cwd.parent / "state" / encode_workdir(cwd)
 
 
 def transcript_dir(workdir: str | Path, claude_home: Path | None = None) -> Path:
-    """The ``~/.claude/projects/<encoded>`` directory holding a session's
-    transcript ``*.jsonl`` for the given working directory.
+    """Transcript project directory for a working directory.
 
-    Claude Code names the project dir after the cwd via :func:`encode_workdir`.
+    - Named via `encode_workdir`
     """
     home = claude_home or (Path.home() / ".claude")
     return home / "projects" / encode_workdir(workdir)
 
 
 def _dir_size(path: Path) -> int:
-    """Total bytes under ``path`` (best effort; 0 on any error)."""
+    """Total bytes under a path; 0 on any error."""
     total = 0
     with contextlib.suppress(OSError):
         for p in path.rglob("*"):
@@ -96,31 +74,25 @@ def archive_session(
     claude_home: Path | None = None,
     stamp: str | None = None,
 ) -> Path | None:
-    """Move a deleted session's workdir + sandbox state + transcript into a single
-    ``.tar.gz`` under ``BASE_WORKDIR/_archive/<owner_id>/`` and remove the live
-    copies. Returns the bundle path, or ``None`` if there was nothing to archive.
+    """Archive a deleted session into one tar.gz bundle.
 
-    Scope is intentionally conservative — exactly the two live dirs the old delete
-    path removed (``<sid>`` and ``<sid>.sbxstate``) PLUS the transcript dir, and
-    the transcript is only touched when its name ends with the sid (so the shared
-    ``~/.claude/projects/-root-claude-claude-tg-bot`` repo transcript can never be
-    swept up by accident). Fail-safe: if writing the bundle raises, the partial
-    bundle is removed and the live copies are LEFT IN PLACE (no data loss).
+    - Bundle goes under `BASE_WORKDIR/_archive/<owner_id>/`
+    - Returns bundle path, or `None` if nothing to archive
+    - Transcript touched only when its name ends with sid
+    - On write failure, partial bundle removed, live copies kept
     """
     base = Path(base_workdir)
-    # #181: the whole per-session dir <sid>/ (holding work/ + state/) is one bundle.
-    # was: workdir = base/sid, sbx = base/f"{sid}.sbxstate" (sibling layout, pre-#181).
+    # Whole per-session dir (`work/` plus `state/`) is one bundle.
     session_dir = base / sid
     tdir = transcript_dir(session_dir, claude_home)
 
-    # (arcname inside the bundle, live path on disk) for each piece that exists.
+    # (arcname in bundle, live path) for each existing piece.
     sources: list[tuple[str, Path]] = []
     if session_dir.is_dir():
         sources.append(("session", session_dir))
-    # Legacy/defensive: a pre-#180 host transcript for a NON-sandboxed session (cwd
-    # == base/sid). After #180 every session is jailed so its transcript lives in
-    # <sid>/state (inside the bundle above) and this rarely matches. Guard: only this
-    # session's dir (name ends with the sid), never the shared repo-root projects dir.
+    # Legacy host transcript for non-sandboxed sessions.
+    # - Only this session's dir (name ends with sid)
+    # - Never the shared repo-root projects dir
     if tdir.is_dir() and tdir.name.endswith(sid):
         sources.append(("transcript", tdir))
 
@@ -159,13 +131,13 @@ def archive_session(
             bundle.unlink()
         return None
 
-    # Sidecar meta for a future archive browser (#178) — list without un-taring.
+    # Sidecar meta lets an archive browser list without untarring.
     with contextlib.suppress(Exception):
         (arch_root / f"{sid}-{stamp}.json").write_text(
             json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8"
         )
 
-    # Bundle is safely on disk — now free the live space.
+    # Bundle is safely on disk; free live space.
     for _arc, path in sources:
         shutil.rmtree(path, ignore_errors=True)
 
@@ -182,14 +154,12 @@ def purge_expired(
     *,
     now: float | None = None,
 ) -> tuple[int, int]:
-    """Delete archived session bundles older than ``max_age_days`` (#178 retention).
+    """Delete archived bundles older than `max_age_days`.
 
-    Sweeps ``BASE_WORKDIR/_archive`` for ``*.tar.gz`` bundles whose mtime is older
-    than the cutoff, removing each bundle and its ``*.json`` sidecar. Returns
-    ``(bundles_removed, bytes_freed)``. A non-positive ``max_age_days`` means "keep
-    forever" → a no-op. Conservative + fail-soft: only ``*.tar.gz`` files under the
-    ``_archive`` tree are touched, age is by file mtime, and any per-file error is
-    swallowed so one bad file can't stall the sweep (nothing else is removed).
+    - Removes each bundle and its `*.json` sidecar
+    - Returns `(bundles_removed, bytes_freed)`
+    - Non-positive `max_age_days` keeps forever (no-op)
+    - Fail-soft; age by mtime, per-file errors swallowed
     """
     if not max_age_days or max_age_days <= 0:
         return (0, 0)
@@ -208,7 +178,7 @@ def purge_expired(
             removed += 1
         except OSError:
             continue
-        # Drop the matching sidecar meta (``<sid>-<stamp>.json``), best effort.
+        # Drop the matching sidecar meta, best effort.
         sidecar = bundle.parent / (bundle.name[: -len(".tar.gz")] + ".json")
         with contextlib.suppress(OSError):
             sidecar.unlink()

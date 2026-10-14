@@ -1,5 +1,8 @@
-"""#328: maintenance-mode gate — while the sentinel exists the bot replies a stub and drops the
-update (no handler runs → no new session/turn data), so a migration sees a frozen dataset."""
+"""Maintenance-mode gate drops updates and replies with a stub.
+
+- no handler runs, so no new session or turn data
+- a migration sees a frozen dataset
+"""
 
 import asyncio
 from types import SimpleNamespace
@@ -17,7 +20,7 @@ class _Allow:
 
 
 class _Msg:
-    """Duck-typed Message (no `.data` → treated as a message, not a callback)."""
+    """Duck-typed Message (no `.data`), treated as a message."""
 
     def __init__(self):
         self.from_user = SimpleNamespace(id=1, username="u")
@@ -40,14 +43,14 @@ def test_maintenance_drops_update_and_replies_stub(monkeypatch, tmp_path):
 
     async def scenario():
         msg = _Msg()
-        # maintenance ON → drop + stub, handler NEVER runs (no data created)
+        # maintenance on: drop and stub, handler never runs
         sentinel.write_text("")
         assert access.maintenance_active() is True
         result = await mw(handler, msg, {})
         assert result is None
         assert handled == []
         assert msg.replies and "🛠" in msg.replies[0]
-        # maintenance OFF → handler runs normally
+        # maintenance off: handler runs normally
         sentinel.unlink()
         assert access.maintenance_active() is False
         msg2 = _Msg()

@@ -1,23 +1,9 @@
-"""Liveness / connection watchdog — keeps the bot self-healing under a supervisor.
+"""Liveness watchdog that keeps the bot self-healing under systemd.
 
-The bot polls Telegram; if the network path to Telegram drops for a while the
-process can either die (then a supervisor must restart it) or, worse, stay alive
-but wedged (no supervisor restart fires on a live process). This module closes
-both gaps by reporting health to **systemd's watchdog**:
-
-* :func:`ready` sends ``READY=1`` once polling starts (for ``Type=notify``).
-* :func:`run` probes Telegram (``get_me``) on a fixed cadence and sends
-  ``WATCHDOG=1`` **only on success**. If the bot can no longer reach Telegram
-  (connection dropped, polling wedged, event loop blocked), the pings stop and
-  systemd's ``WatchdogSec`` force-restarts the unit — which, with
-  ``Restart=always`` + ``StartLimitIntervalSec=0``, retries until Telegram is
-  reachable again, with zero manual intervention. Short blips are tolerated
-  within ``WatchdogSec`` (the probe keeps succeeding between them).
-
-Everything here is a best-effort no-op when NOT run under systemd (no
-``NOTIFY_SOCKET``), so running the bot manually (or in tests) is unaffected — it
-just probes Telegram and writes an optional heartbeat file. All OS/supervisor
-coupling stays in this one small module + ``deploy/tg-bot.service``.
+- `ready` sends `READY=1` once polling starts
+- `run` probes `get_me`, pings `WATCHDOG=1` only on success
+- stopped pings let `WatchdogSec` force a restart
+- no-op without `NOTIFY_SOCKET`, so manual runs are unaffected
 """
 
 from __future__ import annotations
@@ -32,17 +18,17 @@ log = logging.getLogger("watchdog")
 
 
 def _sd_notify(state: str) -> None:
-    """Send one sd_notify datagram; no-op when not under systemd.
+    """Send one sd_notify datagram; no-op outside systemd.
 
-    Honors the abstract-namespace form (``NOTIFY_SOCKET`` starting with ``@``).
-    Never raises — a watchdog that crashes the bot would defeat its purpose.
+    - handles abstract sockets (`NOTIFY_SOCKET` starting with `@`)
+    - never raises; a crashing watchdog defeats its purpose
     """
     addr = os.environ.get("NOTIFY_SOCKET")
     if not addr:
         return
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as sock:
-            # '@'-prefixed address is an abstract socket → leading NUL byte.
+            # An `@` prefix means an abstract socket: leading NUL byte.
             target = "\0" + addr[1:] if addr.startswith("@") else addr
             sock.sendto(state.encode("utf-8"), target)
     except OSError:
@@ -50,14 +36,18 @@ def _sd_notify(state: str) -> None:
 
 
 def ready() -> None:
-    """Tell systemd the service finished starting (used with ``Type=notify``)."""
+    """Tell systemd the service finished starting.
+
+    - used with `Type=notify`
+    """
     _sd_notify("READY=1")
 
 
 def _interval_seconds() -> float:
-    """Probe cadence. Under a systemd watchdog, ping at half of ``WatchdogSec``
-    (the manual's recommendation) so a couple of misses still fit the window;
-    otherwise default to 30s."""
+    """Probe interval: half of `WatchdogSec`, else 30s.
+
+    - half leaves room for a couple of missed pings
+    """
     usec = os.environ.get("WATCHDOG_USEC", "")
     if usec.isdigit() and int(usec) > 0:
         return max(5.0, (int(usec) / 1_000_000) / 2)
@@ -65,12 +55,11 @@ def _interval_seconds() -> float:
 
 
 async def run(bot, heartbeat_file: str | None = None) -> None:
-    """Probe Telegram forever; ping systemd's watchdog on each success.
+    """Probe Telegram forever; ping systemd on each success.
 
-    Cancel the returned task on shutdown. ``bot`` is the aiogram ``Bot`` (so the
-    probe traverses the SAME session/proxy as real traffic). ``heartbeat_file``
-    (or env ``HEARTBEAT_FILE``) is touched with a unix timestamp on each success,
-    for non-systemd supervisors / debugging.
+    - cancel the returned task on shutdown
+    - `bot` is the aiogram `Bot`; probes share its session
+    - `heartbeat_file` or `HEARTBEAT_FILE` is touched with a timestamp
     """
     interval = _interval_seconds()
     hb = heartbeat_file or os.environ.get("HEARTBEAT_FILE") or None
@@ -86,10 +75,10 @@ async def run(bot, heartbeat_file: str | None = None) -> None:
             await asyncio.wait_for(bot.get_me(), timeout=timeout)
         except asyncio.CancelledError:
             raise
-        except Exception as exc:  # network/timeout/API — treat as "unreachable"
+        except Exception as exc:  # network, timeout or API: unreachable
             consecutive += 1
-            # Deliberately do NOT ping on failure: under systemd, WatchdogSec then
-            # restarts us; the restart loop self-heals once Telegram is back.
+            # Deliberately no ping on failure; systemd restarts us.
+            # - the restart loop self-heals once Telegram returns
             log.warning("watchdog: Telegram unreachable (%d in a row): %s",
                         consecutive, exc)
         else:

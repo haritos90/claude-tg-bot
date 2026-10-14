@@ -1,33 +1,8 @@
-"""Unified settings registry + resolver (#138, PART 1 — foundation).
+"""Unified settings registry and scope resolver.
 
-This module is the single source of truth for the bot's user-facing settings: WHAT
-each setting is (key, type, choices, default), WHERE it lives across the three
-storage tiers, WHO may see/edit it, and HOW to resolve its effective value.
-
-Three SCOPES, with a fixed precedence (SESSION → USER → GLOBAL → built-in default):
-
-* ``SESSION`` — this session only (``db.ThreadState`` columns + setters).
-* ``USER``    — the user's personal default for their FUTURE sessions (the NEW tier,
-  stored generically via ``db.get_user_default`` / ``db.set_user_default``).
-* ``GLOBAL``  — the deployer/owner-wide value (``config.Settings`` + allowlist owner
-  prefs); the built-in fallback when nothing else is set.
-
-``resolve(setting, ctx)`` walks SESSION → USER → GLOBAL and returns the FIRST
-non-None value with its source scope, else ``(setting.default, Scope.GLOBAL)``.
-Each setting carries per-scope adapter callables over the EXISTING storage, so there
-is ZERO data migration and the resolver itself stays generic — any per-setting
-quirk (e.g. the sandbox override inversion) lives INSIDE that setting's adapter.
-
-PART 2 builds the generic /settings renderer on top of this registry. The tools
-toggle GRID and the users-admin flows are NOT single-value settings and are
-DELIBERATELY left out of ``SETTINGS`` — they remain bespoke pages reachable from
-the settings menu (see module-level note below).
-
-NOTE for PART 2 — bespoke (non-registry) pages reachable from /settings:
-    * tools          — a multi-select toggle GRID (db.set_tools_enabled), not one value.
-    * users / admin  — per-user access level / usage limits / tool caps (allowlist),
-                       owner-only multi-record admin, not one value.
-These keep their own dedicated pages; the registry only owns single-value settings.
+- Scopes resolve SESSION, then USER, then GLOBAL
+- Per-scope adapters wrap existing storage, no migration
+- Tools grid and users admin stay bespoke pages
 """
 
 from __future__ import annotations
@@ -38,7 +13,7 @@ from typing import Any, Callable, Optional
 
 
 class Scope(enum.Enum):
-    """Storage tier of a setting value, in precedence order (SESSION wins)."""
+    """Storage tier of a setting, in precedence order."""
 
     SESSION = "session"
     USER = "user"
@@ -46,12 +21,10 @@ class Scope(enum.Enum):
 
 
 class Role(enum.IntEnum):
-    """A user's role, ordered so ``>=`` is a "min role" comparison.
+    """User role; ordering makes `>=` a minimum-role check.
 
-    GUEST < CHAT < CODE < OWNER. Used by ``view_role`` / ``edit_role`` gates: a user
-    may see/edit a setting iff their role is ``>=`` the setting's required role. The
-    OWNER-only settings (sandbox, global memory, global default model, per-user
-    admin) require ``Role.OWNER`` and are therefore HIDDEN from everyone else.
+    - GUEST < CHAT < CODE < OWNER
+    - Owner-only settings are hidden from everyone else
     """
 
     GUEST = 0
@@ -61,18 +34,12 @@ class Role(enum.IntEnum):
 
 
 class Access(enum.Enum):
-    """Owner-controlled per-option, per-user access level (#151, menu.md §4.2).
+    """Owner-set per-option access level for each user.
 
-    The ladder: *grant it → let them use it · otherwise read-only · otherwise they
-    never see it.* This LAYERS ON TOP of the structural ``view_role``/``edit_role``
-    gate (which encodes code-level / owner-only capability): a setting is VISIBLE iff
-    ``role >= view_role`` AND access != HIDDEN; EDITABLE iff ``role >= edit_role`` AND
-    access == DELEGATED.
-
-    * ``HIDDEN``    — user never sees it; rides the global value silently.
-    * ``READONLY``  — user sees it but can't change it; value is global.
-    * ``DELEGATED`` — user sees AND changes it (own default + per session); their own
-      value counts (session → user default → global), until set they ride global.
+    - Layers on top of `view_role`/`edit_role` gates
+    - `HIDDEN`: invisible, global value applies silently
+    - `READONLY`: visible but not editable
+    - `DELEGATED`: user sees and edits own values
     """
 
     HIDDEN = "hidden"
@@ -80,29 +47,27 @@ class Access(enum.Enum):
     DELEGATED = "delegated"
 
 
-# Default BASE access per option (menu.md Table 23). Absent ⇒ DELEGATED. The owner
-# can override any of these at runtime (stored in db; preloaded into Ctx.access_base)
-# and can add per-user EXCEPTIONS (allowlist; preloaded into Ctx.access_exceptions).
+# Default base access per option; absent means DELEGATED.
+# - Owner can override at runtime, stored in db
+# - Per-user exceptions come from the allowlist
 BASE_ACCESS_DEFAULTS: dict[str, Access] = {
     "model": Access.DELEGATED,
-    "effort": Access.DELEGATED,           # `max` further gated (allow_max_effort)
-    "permission_mode": Access.DELEGATED,  # #223: full-access now delegated to code users too
+    "effort": Access.DELEGATED,           # `max` is further gated
+    "permission_mode": Access.DELEGATED,  # Delegated to code users too
     "max_turns": Access.DELEGATED,
-    # #428: the 1M toggle is retired (the window is the model's own). was:
-    # "memory": Access.HIDDEN,              # big_memory: owner delegates to granted users
-    "sandbox": Access.HIDDEN,            # owner delegates
+    "sandbox": Access.HIDDEN,            # Owner delegates
     "language": Access.DELEGATED,
-    "usage_display": Access.READONLY,    # account-wide; owner delegates
+    "usage_display": Access.READONLY,    # Account-wide; owner delegates
     "tools": Access.DELEGATED,
-    "hot_cache_timer": Access.DELEGATED,  # #164: every user may toggle their note
-    "todo_card": Access.DELEGATED,        # #229: code users toggle the live task-list card
-    "auto_compact": Access.HIDDEN,        # #168: forced-on; owner delegates to disable
-    "ctx_status": Access.HIDDEN,          # #167: forced-on; owner delegates to disable
+    "hot_cache_timer": Access.DELEGATED,  # Every user may toggle their note
+    "todo_card": Access.DELEGATED,        # Code users toggle the task-list card
+    "auto_compact": Access.HIDDEN,        # Forced on; owner may disable
+    "ctx_status": Access.HIDDEN,          # Forced on; owner may disable
 }
 
 
 def _coerce_access(v) -> Optional[Access]:
-    """Map a stored string / Access to an Access (or None when unrecognized)."""
+    """Map a stored string or Access to Access, else None."""
     if isinstance(v, Access):
         return v
     try:
@@ -113,31 +78,30 @@ def _coerce_access(v) -> Optional[Access]:
 
 @dataclass
 class Ctx:
-    """The small context the adapters/resolver read.
+    """Context the adapters and resolver read.
 
-    Carries everything an adapter needs to GET/SET a value across scopes WITHOUT
-    importing handler state: the session ``state`` (a ``db.ThreadState`` or None),
-    the acting ``user_id``, the user's ``role``, plus the shared ``settings``
-    (config.Settings) and ``allowlist`` singletons. ``state`` may be None when a
-    page is opened with no session bound (USER/GLOBAL scopes still resolve).
+    - `state` may be None when no session is bound
+    - Carries user id, role, settings and allowlist
     """
 
-    state: Any = None              # db.ThreadState | None
+    state: Any = None              # `db.ThreadState` or None
     user_id: Optional[int] = None
     role: Role = Role.GUEST
-    settings: Any = None           # config.Settings | None
-    allowlist: Any = None          # allowlist.Allowlist | None
+    settings: Any = None           # `config.Settings` or None
+    allowlist: Any = None          # `Allowlist` or None
 
     def session_owner(self) -> Optional[int]:
-        """The uid that owns the bound session (DM creator == chat_id), else the
-        acting user. Used for USER-scope reads keyed on the session's owner."""
+        """UID owning the bound session, else the acting user.
+
+        - Used for USER-scope reads keyed on session owner
+        """
         st = self.state
         if st is not None:
             return getattr(st, "created_by", None) or getattr(st, "chat_id", None)
         return self.user_id
 
 
-# An adapter is ``get(ctx) -> value | None`` or ``set(ctx, value) -> None|awaitable``.
+# Getters return value or None; setters may be async.
 Getter = Callable[[Ctx], Any]
 Setter = Callable[[Ctx, Any], Any]
 
@@ -146,15 +110,9 @@ Setter = Callable[[Ctx, Any], Any]
 class Setting:
     """One single-value setting in the unified registry.
 
-    * ``key``          — stable id (the user-default kv key + callback token).
-    * ``type``         — value type (``str`` / ``int`` / ``bool``).
-    * ``choices``      — a fixed tuple of allowed values, or None (free/open value).
-    * ``default``      — the built-in fallback used when no scope has a value.
-    * ``scopes``       — which scopes this setting is stored in (subset, ordered).
-    * ``view_role`` / ``edit_role`` — min ``Role`` to SEE / EDIT (re-checked in apply).
-    * ``name_key``     — i18n row for the display label.
-    * ``value_labels`` — optional {raw_value: i18n_key_or_text} for friendly labels.
-    * ``get`` / ``set``— per-scope adapter callables over the EXISTING storage.
+    - `get`/`set` are per-scope adapters over existing storage
+    - `view_role`/`edit_role` are minimum roles, rechecked on apply
+    - `choices` None means open value
     """
 
     key: str
@@ -166,26 +124,26 @@ class Setting:
     edit_role: Role
     name_key: str
     value_labels: dict = field(default_factory=dict)
-    get: dict = field(default_factory=dict)   # dict[Scope, Getter]
-    set: dict = field(default_factory=dict)   # dict[Scope, Setter]
+    get: dict = field(default_factory=dict)   # `dict[Scope, Getter]`
+    set: dict = field(default_factory=dict)   # `dict[Scope, Setter]`
 
     def can_view(self, role: Role) -> bool:
         return role >= self.view_role
 
     def can_edit(self, role: Role) -> bool:
-        """SERVER-SIDE authorization for an edit. A button is NOT authorization —
-        every apply path MUST re-check this before mutating storage (#138)."""
+        """Server-side authorization for an edit.
+
+        - Every apply path must recheck before mutating storage
+        """
         return role >= self.edit_role
 
 
 def resolve(setting: "Setting", ctx: Ctx) -> tuple[Any, Scope]:
-    """Resolve the effective value of ``setting`` for ``ctx``.
+    """Resolve the effective value of a setting.
 
-    Walks the scopes in precedence order SESSION → USER → GLOBAL and returns the
-    FIRST scope whose getter yields a non-None value, as ``(value, source_scope)``.
-    If every scope is None (or has no adapter), returns ``(setting.default,
-    Scope.GLOBAL)``. The walk is generic: any per-setting inversion/quirk lives
-    inside that setting's adapter, not here.
+    - Walks SESSION, USER, GLOBAL; first non-None wins
+    - Returns `(value, source_scope)`; falls back to default
+    - Per-setting quirks live in adapters, not here
     """
     return resolve_from(setting, ctx, Scope.SESSION)
 
@@ -194,11 +152,10 @@ _PRECEDENCE = (Scope.SESSION, Scope.USER, Scope.GLOBAL)
 
 
 def resolve_from(setting: "Setting", ctx: Ctx, start: Scope) -> tuple[Any, Scope]:
-    """Like ``resolve`` but only considers ``start`` and the scopes BELOW it in
-    precedence (#138-fix). The full hub (SESSION tab) wants the effective value via
-    ``resolve``; the USER / GLOBAL tabs want "what THIS scope contributes, or what it
-    inherits from below" — walking from SESSION there would wrongly surface a
-    session override on the "my defaults" page. Falls back to (default, GLOBAL)."""
+    """Like `resolve`, but starts at a given scope.
+
+    - USER/GLOBAL tabs must not surface session overrides
+    """
     started = False
     for scope in _PRECEDENCE:
         if scope == start:
@@ -214,16 +171,14 @@ def resolve_from(setting: "Setting", ctx: Ctx, start: Scope) -> tuple[Any, Scope
     return setting.default, Scope.GLOBAL
 
 
-# --------------------------------------------------------------------------- #
-# Access model (#151, menu.md §4) — owner-configured, DERIVED per prompt.
-# --------------------------------------------------------------------------- #
+# Access model: owner-configured, derived per prompt.
 def effective_access(setting: "Setting", ctx: "Ctx") -> Access:
-    """The owner-configured access of ``setting`` for ctx's user (#151, menu.md §4.2).
+    """Owner-configured access of a setting for the user.
 
-    Resolution: OWNER is always DELEGATED (manages global + rules, edits own values
-    freely). Otherwise per-user EXCEPTION (``ctx.access_exceptions``) → owner's BASE
-    override (``ctx.access_base``) → the built-in default (``BASE_ACCESS_DEFAULTS``)
-    → DELEGATED. Both dicts are preloaded into the Ctx (kept sync for the hot path)."""
+    - Owner is always DELEGATED
+    - Else per-user exception, base override, default, DELEGATED
+    - Both dicts are preloaded into the context
+    """
     if ctx.role >= Role.OWNER:
         return Access.DELEGATED
     exc = getattr(ctx, "access_exceptions", None)
@@ -240,21 +195,24 @@ def effective_access(setting: "Setting", ctx: "Ctx") -> Access:
 
 
 def can_view_setting(setting: "Setting", ctx: "Ctx") -> bool:
-    """Visible iff the role passes the structural gate AND access != HIDDEN (#151)."""
+    """Visible iff role passes gate and access is not HIDDEN."""
     return setting.can_view(ctx.role) and effective_access(setting, ctx) != Access.HIDDEN
 
 
 def can_edit_setting(setting: "Setting", ctx: "Ctx") -> bool:
-    """Editable iff the role passes the structural gate AND access == DELEGATED (#151).
-    Re-checked server-side in every apply path — a button is never authorization."""
+    """Editable iff role passes gate and access is DELEGATED.
+
+    - Re-checked server-side on every apply; buttons are not authorization
+    """
     return setting.can_edit(ctx.role) and effective_access(setting, ctx) == Access.DELEGATED
 
 
 def configured_base_access(setting: "Setting", ctx: "Ctx") -> Access:
-    """The owner-CONFIGURED base access for ``setting`` (the owner's override → the
-    built-in default), independent of who is viewing — feeds the owner's access
-    editor (#151, menu.md §4.4). Distinct from ``effective_access`` (which returns
-    DELEGATED for the owner viewing their own values)."""
+    """Owner-configured base access, independent of the viewer.
+
+    - Feeds the owner's access editor
+    - Unlike `effective_access`, owner is not forced DELEGATED
+    """
     base = getattr(ctx, "access_base", None)
     if isinstance(base, dict):
         a = _coerce_access(base.get(setting.key))
@@ -264,24 +222,20 @@ def configured_base_access(setting: "Setting", ctx: "Ctx") -> Access:
 
 
 def resolve_effective(setting: "Setting", ctx: "Ctx") -> tuple[Any, Scope]:
-    """The DERIVED effective value honoring access (#151 soft-revoke, menu.md §4.6):
-    when the user is DELEGATED the value walks SESSION → USER → GLOBAL; otherwise
-    ONLY the global value counts (the user's stored session/user overrides are kept
-    but no longer counted, so lowering access falls back to global immediately)."""
+    """Effective value honoring the user's access level.
+
+    - DELEGATED walks SESSION, USER, GLOBAL; otherwise global only
+    - Stored overrides are kept but ignored when lowered
+    """
     if effective_access(setting, ctx) == Access.DELEGATED:
         return resolve(setting, ctx)
     return resolve_from(setting, ctx, Scope.GLOBAL)
 
 
-# --------------------------------------------------------------------------- #
-# USER-scope adapters (generic, shared by every registry key)
-# --------------------------------------------------------------------------- #
-# The USER tier is a synchronous READ from the per-user-default cache the handler
-# layer must keep warm, plus an ASYNC write. To keep ``resolve()`` synchronous (it
-# runs on the hot path) the USER getter reads from ``ctx`` if a preloaded
-# user-defaults dict is attached, falling back to None. PART 2 wires the preload +
-# the async set; PART 1 only needs the GETTER to participate so resolve() can walk
-# the tier. We expose a factory so each setting binds its own key.
+# ---- USER-scope adapters ----
+# - USER getter reads a preloaded user-defaults dict on `ctx`
+# - Keeps `resolve()` synchronous on the hot path
+# - A factory binds each setting's key
 def _user_get(key: str) -> Getter:
     def getter(ctx: Ctx):
         defaults = getattr(ctx, "user_defaults", None)
@@ -292,26 +246,23 @@ def _user_get(key: str) -> Getter:
     return getter
 
 
-# --------------------------------------------------------------------------- #
-# Per-setting adapters
-# --------------------------------------------------------------------------- #
+# ---- Per-setting adapters ----
 def _session_attr_get(attr: str) -> Getter:
-    """SESSION getter reading a ``db.ThreadState`` attribute (None when no state)."""
+    """SESSION getter reading a `ThreadState` attribute.
+
+    - Returns None when there is no state
+    """
     def getter(ctx: Ctx):
         return getattr(ctx.state, attr, None) if ctx.state is not None else None
 
     return getter
 
 
-# -- sandbox: the confusing one (#138) --------------------------------------- #
-# OLD effective decision (sessions.py ~213): ``settings.sandbox_code and not
-# state.no_sandbox`` — a NEGATIVE per-session override (no_sandbox) over a positive
-# global. We route it through the registry so the inversion lives in the ADAPTER and
-# resolve() stays generic:
-#   * SESSION getter: returns False when state.no_sandbox is set (an explicit
-#     override-OFF), else None (no session-level opinion → fall through).
-#   * USER getter (owner-only edit): a per-user default sandbox bool, or None.
-#   * GLOBAL getter: settings.sandbox_code (the deployer-wide value); default True.
+# ---- sandbox: inverted override ----
+# - Session `no_sandbox` is a negative override over a positive global
+# - Inversion lives in the adapter; `resolve` stays generic
+# - SESSION getter: False if `no_sandbox`, else None
+# - GLOBAL getter: `settings.sandbox_code`, default True
 def _sandbox_session_get(ctx: Ctx):
     st = ctx.state
     if st is not None and getattr(st, "no_sandbox", False):
@@ -325,7 +276,7 @@ def _sandbox_global_get(ctx: Ctx):
 
 
 def _bool_user_get(key: str) -> Getter:
-    """USER getter coercing a stored user-default to a real bool (or None)."""
+    """USER getter coercing stored default to bool or None."""
     base = _user_get(key)
 
     def getter(ctx: Ctx):
@@ -335,20 +286,18 @@ def _bool_user_get(key: str) -> Getter:
     return getter
 
 
-# --------------------------------------------------------------------------- #
-# Scope SETTERS (#138, PART 2) — write a value into one scope's storage.
-# --------------------------------------------------------------------------- #
-# Mirror the getters: a setter is ``set(ctx, value) -> awaitable`` writing to the
-# scope's backing store over the EXISTING db/config helpers (ZERO migration). They
-# import ``db`` LAZILY so this module stays import-cycle-free (db never imports it).
-# The generic apply handler RE-CHECKS ``edit_role`` before ever calling a setter
-# (the button is not authorization, AGENTS §2 / #138). A None value CLEARS the
-# scope (falls through to the next tier in resolve()).
+# ---- Scope setters ----
+# - Setter writes a value into one scope's storage
+# - `db` imported lazily to avoid an import cycle
+# - Apply handler rechecks `edit_role`; buttons are not authorization
+# - None value clears the scope
 def _session_attr_setter(db_func_name: str) -> Setter:
-    """SESSION setter calling the matching ``db.set_<x>(thread_id, value)`` async
-    helper for the bound session (no-op when no session is bound)."""
+    """SESSION setter calling the matching async `db.set_<x>` helper.
+
+    - No-op when no session is bound
+    """
     async def setter(ctx: Ctx, value):
-        from app.storage import db  # lazy: avoid an import cycle
+        from app.storage import db  # Lazy: avoids an import cycle
         st = ctx.state
         if st is None:
             return
@@ -362,9 +311,12 @@ def _session_attr_setter(db_func_name: str) -> Setter:
 
 
 def _user_setter(key: str) -> Setter:
-    """USER setter persisting the per-user default (value None CLEARS it)."""
+    """USER setter persisting the per-user default.
+
+    - Value None clears it
+    """
     async def setter(ctx: Ctx, value):
-        from app.storage import db  # lazy
+        from app.storage import db  # Lazy import
         if ctx.user_id is None:
             return
         await db.set_user_default(ctx.user_id, key, value)
@@ -373,8 +325,11 @@ def _user_setter(key: str) -> Setter:
 
 
 def _model_global_setter() -> Setter:
-    """GLOBAL model setter — mutates the live deployer default (runtime only; it
-    re-reads from .env on the next process start). Owner-gated in the apply path."""
+    """GLOBAL model setter mutating the live default.
+
+    - Runtime only; re-read from `.env` on restart
+    - Owner-gated in the apply path
+    """
     def setter(ctx: Ctx, value):
         if ctx.settings is not None and value is not None:
             ctx.settings.default_model = value
@@ -383,12 +338,14 @@ def _model_global_setter() -> Setter:
 
 
 def _sandbox_session_setter() -> Setter:
-    """SESSION sandbox setter (owner-only). The stored column is the INVERTED
-    opt-OUT (``no_sandbox``): value True (isolate) → no_sandbox False, value False
-    (raw) → no_sandbox True, value None → re-isolate (clear the opt-out). Mirrors
-    the inversion in ``_sandbox_session_get`` so resolve() stays generic."""
+    """SESSION sandbox setter, owner-only.
+
+    - Stored column is inverted opt-out `no_sandbox`
+    - True maps to False, False to True, None clears
+    - Mirrors `_sandbox_session_get` so `resolve` stays generic
+    """
     async def setter(ctx: Ctx, value):
-        from app.storage import db  # lazy
+        from app.storage import db  # Lazy import
         st = ctx.state
         thread_id = getattr(st, "thread_id", None) if st is not None else None
         if thread_id is None:
@@ -399,8 +356,10 @@ def _sandbox_session_setter() -> Setter:
 
 
 def _sandbox_global_setter() -> Setter:
-    """GLOBAL sandbox setter (owner-only) — mutates the live deployer-wide value
-    (runtime only; it re-reads SANDBOX_CODE from .env on the next start)."""
+    """GLOBAL sandbox setter, owner-only.
+
+    - Runtime only; `SANDBOX_CODE` is re-read on restart
+    """
     def setter(ctx: Ctx, value):
         if ctx.settings is not None and value is not None:
             ctx.settings.sandbox_code = bool(value)
@@ -409,10 +368,12 @@ def _sandbox_global_setter() -> Setter:
 
 
 def _language_user_setter() -> Setter:
-    """USER language setter — persists the locale to its OWN kv store
-    (db.set_user_lang, key lang:<uid>), not the generic user_default kv."""
+    """USER language setter writing to its own store.
+
+    - Uses `db.set_user_lang`, not the generic user-default store
+    """
     async def setter(ctx: Ctx, value):
-        from app.storage import db  # lazy
+        from app.storage import db  # Lazy import
         if ctx.user_id is None or value is None:
             return
         await db.set_user_lang(ctx.user_id, value)
@@ -420,15 +381,10 @@ def _language_user_setter() -> Setter:
     return setter
 
 
-# Permission modes are the SDK literals. #415: effort levels are NOT listed here any more —
-# they come from the Claude Code CLI for the session's model (app/core/models.py), rendered by
-# handlers._setting_choice_labels and enforced in handlers._ss_apply. was:
-#   # Effort choices/levels live in handlers.EFFORT_LEVELS; permission modes are the
-#   # SDK literals. Kept as literals here to avoid importing the handler layer (which
-#   # imports this module would risk a cycle) — PART 2 maps friendly labels via i18n.
-#   _EFFORT_CHOICES = ("low", "medium", "high", "xhigh", "max")
-# #223: dropped "default"/ask — auto-edits is the floor; full-access is un-gated for
-# code users (sandbox contains it). was: ("default", "acceptEdits", "plan", "bypassPermissions")
+# Permission modes are the SDK literals.
+# - Effort levels come from the CLI per model
+# - 'default'/ask dropped; auto-edits is the floor
+# - Full-access is ungated for code users; sandbox contains it
 _PERM_CHOICES = ("acceptEdits", "plan", "bypassPermissions")
 
 
@@ -436,11 +392,10 @@ SETTINGS: dict[str, Setting] = {
     "model": Setting(
         key="model",
         type=str,
-        # #411: open here — the offered set is the Claude Code CLI's own model catalog
-        # (app/core/models.py), rendered by handlers._setting_choice_labels and enforced in
-        # handlers._ss_apply. was: choices=("opus", "sonnet", "haiku"),
+        # Model choices are open here.
+        # - Offered set is the CLI's own model catalog
         choices=None,
-        default=None,  # #411: the GLOBAL scope (settings.default_model) always answers. was: "opus"
+        default=None,  # Global scope always answers
         scopes=(Scope.SESSION, Scope.USER, Scope.GLOBAL),
         view_role=Role.CHAT,
         edit_role=Role.CHAT,
@@ -462,8 +417,8 @@ SETTINGS: dict[str, Setting] = {
     "effort": Setting(
         key="effort",
         type=str,
-        choices=None,  # #415: the CLI's levels for the session's model. was: _EFFORT_CHOICES
-        default=None,  # None = SDK default (no explicit effort)
+        choices=None,  # CLI levels for the session's model
+        default=None,  # None means SDK default effort
         scopes=(Scope.SESSION, Scope.USER),
         view_role=Role.CHAT,
         edit_role=Role.CHAT,
@@ -481,9 +436,8 @@ SETTINGS: dict[str, Setting] = {
         key="permission_mode",
         type=str,
         choices=_PERM_CHOICES,
-        # was default="default" — relaxed to acceptEdits for #212: with the #119 jail
-        # as the hard containment layer, the sane baseline auto-runs in-jail work and
-        # only prompts for outbound/destructive actions (see permissions.py).
+        # Baseline `acceptEdits`: jail contains in-jail work.
+        # - Prompts only for outbound or destructive actions
         default="acceptEdits",
         scopes=(Scope.SESSION, Scope.USER),
         view_role=Role.CODE,
@@ -498,58 +452,18 @@ SETTINGS: dict[str, Setting] = {
             Scope.USER: _user_setter("permission_mode"),
         },
     ),
-    # #428 / decision-26: the 1M-context toggle is RETIRED — 1M is the native window of every
-    # current model and the CLI offers no size choice, so the row is gone from the hub and the
-    # access pages. The ThreadState.big_memory column + db setter are kept (harmless) for revert.
-    # "memory": Setting(
-    #     key="memory",  # per-session big_memory (1M context window)
-    #     type=bool,
-    #     choices=(True, False),
-    #     default=False,
-    #     scopes=(Scope.SESSION, Scope.USER),
-    #     view_role=Role.CHAT,
-    #     edit_role=Role.CHAT,
-    #     name_key="settings.row_memory",
-    #     get={
-    #         Scope.SESSION: _session_attr_get("big_memory"),
-    #         Scope.USER: _bool_user_get("memory"),
-    #     },
-    #     set={
-    #         Scope.SESSION: _session_attr_setter("set_big_memory"),
-    #         Scope.USER: _user_setter("memory"),
-    #     },
-    # ),
-    # #144: the Streaming toggle is RETIRED — native Telegram sendMessageDraft
-    # streaming is always-on (no user toggle; AGENTS §5), and /stream is gone. The
-    # registry row is removed so the /settings hub no longer renders it. The
-    # ThreadState.stream_enabled column + db setter are kept (harmless) for revert.
-    # "stream_enabled": Setting(
-    #     key="stream_enabled",
-    #     type=bool,
-    #     choices=(True, False),
-    #     default=True,
-    #     scopes=(Scope.SESSION, Scope.USER),
-    #     view_role=Role.CHAT,
-    #     edit_role=Role.CHAT,
-    #     name_key="settings.row_streaming",
-    #     get={
-    #         Scope.SESSION: _session_attr_get("stream_enabled"),
-    #         Scope.USER: _bool_user_get("stream_enabled"),
-    #     },
-    #     set={
-    #         Scope.SESSION: _session_attr_setter("set_stream_enabled"),
-    #         Scope.USER: _user_setter("stream_enabled"),
-    #     },
-    # ),
+    # Retired rows: 1M-context toggle and streaming toggle.
+    # - Native draft streaming is always on
+    # - `big_memory` and `stream_enabled` columns and setters remain
     "max_turns": Setting(
         key="max_turns",
         type=int,
-        choices=None,  # free integer (None = unlimited)
+        choices=None,  # Free integer; None means unlimited
         default=None,
         scopes=(Scope.SESSION, Scope.USER),
         view_role=Role.CODE,
         edit_role=Role.CODE,
-        name_key="settings.row_maxturns",  # #140-fix: was settings.row_model (dup "Model" row)
+        name_key="settings.row_maxturns",
         get={
             Scope.SESSION: _session_attr_get("max_turns"),
             Scope.USER: _user_get("max_turns"),
@@ -562,21 +476,21 @@ SETTINGS: dict[str, Setting] = {
     "language": Setting(
         key="language",
         type=str,
-        choices=None,  # the supported-locale set (i18n.LANGUAGES) — open here
+        choices=None,  # Supported locale set, open here
         default="en",
         scopes=(Scope.USER, Scope.GLOBAL),
         view_role=Role.GUEST,
         edit_role=Role.GUEST,
         name_key="lang.row",
         get={
-            # Language is a per-USER preference (kv lang:<uid>); the USER tier reads
-            # the preloaded user-default, GLOBAL falls back to the bot default lang.
+            # Language is per-user; USER tier reads preloaded default.
+            # - GLOBAL falls back to the bot default language
             Scope.USER: _user_get("language"),
         },
         set={
-            # Language has its OWN store (kv lang:<uid>, db.set_user_lang) so the
-            # USER setter writes there rather than the generic user_default kv; the
-            # handler still updates the locale cache + per-chat menu after the call.
+            # Language has its own store, `lang:<uid>` kv.
+            # - USER setter writes there, not generic user-default
+            # - Handler refreshes locale cache and menu after
             Scope.USER: _language_user_setter(),
         },
     ),
@@ -584,10 +498,11 @@ SETTINGS: dict[str, Setting] = {
         key="sandbox",
         type=bool,
         choices=(True, False),
-        default=True,  # sandbox ON by default (#136)
+        default=True,  # Sandbox on by default
         scopes=(Scope.SESSION, Scope.USER, Scope.GLOBAL),
-        # OWNER-ONLY + HIDDEN from non-owners: it spends/exposes the owner's ONE
-        # subscription and the jail protects the deployer's box (#138).
+        # Owner-only and hidden from non-owners.
+        # - It spends the owner's one subscription
+        # - The jail protects the deployer's box
         view_role=Role.OWNER,
         edit_role=Role.OWNER,
         name_key="settings.row_sandbox",
@@ -603,8 +518,8 @@ SETTINGS: dict[str, Setting] = {
             Scope.GLOBAL: _sandbox_global_setter(),
         },
     ),
-    # #164: post-reply warm-cache note. DELEGATED — every user may toggle it (own
-    # default + per session); the owner can still re-gate it via the access model.
+    # Post-reply warm-cache note; delegated to every user.
+    # - Owner can re-gate it via the access model
     "hot_cache_timer": Setting(
         key="hot_cache_timer",
         type=bool,
@@ -624,9 +539,9 @@ SETTINGS: dict[str, Setting] = {
             Scope.USER: _user_setter("hot_cache_timer"),
         },
     ),
-    # #229: live task-list card from the agent's TodoWrite events. Per-session + per-user
-    # delegated bool, default OFF, CODE-only (the card only renders in code mode; chat has no
-    # tools). Same SESSION+USER shape as hot_cache_timer.
+    # Live task-list card from `TodoWrite` events.
+    # - Per-session and per-user bool, default off
+    # - Code-only: chat has no tools
     "todo_card": Setting(
         key="todo_card",
         type=bool,
@@ -646,11 +561,10 @@ SETTINGS: dict[str, Setting] = {
             Scope.USER: _user_setter("todo_card"),
         },
     ),
-    # #168: SDK auto-compaction. Forced ON by default (the CLI default) but
-    # DISABLEABLE when the owner delegates it (Access). USER-scope ONLY: a per-session
-    # bool column defaults to off and would wrongly override the forced-on default,
-    # whereas the per-user kv is naturally "unset → default True". Wired in the engine
-    # via the DISABLE_AUTO_COMPACT env (verified to flip isAutoCompactEnabled).
+    # SDK auto-compaction: on by default, disableable if delegated.
+    # - USER-scope only, not per-session
+    # - A session bool defaults off, wrongly overriding forced-on
+    # - Wired via the `DISABLE_AUTO_COMPACT` env in the engine
     "auto_compact": Setting(
         key="auto_compact",
         type=bool,
@@ -664,8 +578,8 @@ SETTINGS: dict[str, Setting] = {
         get={Scope.USER: _bool_user_get("auto_compact")},
         set={Scope.USER: _user_setter("auto_compact")},
     ),
-    # #167: live context size in the working plate. Same "forced ON, disableable if
-    # delegated" pattern (USER-scope, default True, HIDDEN access).
+    # Live context size in the working plate.
+    # - Forced on, disableable if delegated; USER-scope
     "ctx_status": Setting(
         key="ctx_status",
         type=bool,
@@ -682,11 +596,9 @@ SETTINGS: dict[str, Setting] = {
 }
 
 
-# #138-fix (security defense-in-depth): enforce edit_role >= view_role for EVERY
-# setting at import time. The apply path gates on can_edit only; this invariant is
-# what makes that safe (you can't edit what you can't view). Asserting it here turns
-# a future "editable but not viewable" footgun into a loud startup failure instead
-# of a silent gate bypass.
+# Import-time check: `edit_role` must be at least `view_role`.
+# - Apply path gates on `can_edit` only
+# - Turns an editable-but-unviewable footgun into startup failure
 for _k, _s in SETTINGS.items():
     assert _s.edit_role >= _s.view_role, (
         f"settings_schema: {_k!r} has edit_role {_s.edit_role.name} < view_role "
@@ -695,53 +607,48 @@ for _k, _s in SETTINGS.items():
 
 
 def get(key: str) -> Setting:
-    """Return the registered Setting for ``key`` (raises KeyError if unknown)."""
+    """Return the registered Setting for `key`.
+
+    - Raises `KeyError` if unknown
+    """
     return SETTINGS[key]
 
 
-# Settings that ONLY apply to a CODE session (menu.md §1.7 / Table 23 "Applies to:
-# code") — they need a working directory or the agent toolset. The /settings hub
-# hides these rows on the SESSION tab when the bound session is a chat, gating on
-# the session MODE (not the user's level): a code-level user in a chat session
-# should not see Permissions / Max turns / Sandbox. (The USER/GLOBAL tabs still
-# show them as defaults for future code sessions.)
-# #215: sandbox dropped from CODE_ONLY — #180 made the jail cover chat sessions too,
-# so the hub row must show in chat as well (the /sandbox command already has no mode
-# gate). was: frozenset({"permission_mode", "max_turns", "sandbox"})
+# Settings that apply only to code sessions.
+# - They need a workdir or the agent toolset
+# - Hub hides them on the SESSION tab for chat sessions
+# - Gated on session mode, not user level
+# - USER/GLOBAL tabs still show them as future defaults
+# - `sandbox` is excluded: the jail covers chat too
 CODE_ONLY: frozenset[str] = frozenset({"permission_mode", "max_turns", "todo_card"})
 
 
 def is_code_only(key: str) -> bool:
-    """Whether ``key`` is a code-session-only setting (menu.md §1.7)."""
+    """Whether `key` applies only to code sessions."""
     return key in CODE_ONLY
 
 
-# The order settings appear on a scope page (stable, most-used first). Matches
-# menu.md §3.2 Table 10 row order. (#144: "stream_enabled" removed — retired.)
+# Order settings appear on a scope page.
+# - Stable, most-used first
 PAGE_ORDER: tuple[str, ...] = (
     "model", "effort", "permission_mode", "max_turns",
-    # #231: "sandbox" row removed from the menu — the sandbox is now MANDATORY for ALL
-    # sessions (chat AND code), always on, no per-session opt-out. The toggle existed to
-    # debug isolation vs bot bugs (#138); now that the jail is stable it's just a footgun.
-    # The `sandbox` Setting still exists (drives resolution) but is no longer surfaced.
-    # was: "memory", "sandbox", "language",
-    # #428: "memory" (the retired 1M toggle) removed too. was: "memory", "language",
+    # Sandbox row is hidden: the sandbox is always on.
+    # - The `sandbox` setting still drives resolution
     "language",
-    # #164: warm-cache note (delegated) + auto-compact + live context (forced-on,
-    # delegate-to-disable; #167/#168).
+    # Warm-cache note, auto-compact, live context rows.
+    # - Forced-on rows are disableable when delegated
     "hot_cache_timer", "auto_compact", "ctx_status",
-    # #229: live task-list card (delegated, code-only).
+    # Live task-list card row (delegated, code-only).
     "todo_card",
 )
 
 
 def role_for(is_owner: bool, level: Optional[str], may_max_effort: bool = False) -> Role:
-    """Map the bot's access primitives to a registry ``Role``.
+    """Map access primitives to a registry `Role`.
 
-    The owner is always OWNER; an allowlisted ``code`` user is CODE; everyone else
-    allowed is CHAT (the middleware already dropped non-allowed users). GUEST is
-    only used as the resolver default. ``may_max_effort`` is unused here (effort's
-    ``max`` choice is gated separately in the apply path) — kept for call symmetry.
+    - Owner is OWNER, code user is CODE, others CHAT
+    - GUEST is only the resolver default
+    - `may_max_effort` is unused; kept for call symmetry
     """
     if is_owner:
         return Role.OWNER
@@ -751,12 +658,9 @@ def role_for(is_owner: bool, level: Optional[str], may_max_effort: bool = False)
 
 
 def settings_for_scope(scope: "Scope", role: Role) -> list["Setting"]:
-    """The Settings VISIBLE to ``role`` at ``scope``, in PAGE_ORDER.
+    """Settings visible to `role` at `scope`, in page order.
 
-    A setting shows on a scope tab iff it both (a) declares that scope in its
-    ``scopes`` and (b) is viewable by the role (``view_role`` gate). This is the
-    single source for what a given user sees — the GLOBAL tab and the owner-only
-    rows (sandbox, global model) simply never pass the gate for a non-owner.
+    - Must declare the scope and pass the `view_role` gate
     """
     out: list[Setting] = []
     for key in PAGE_ORDER:
@@ -771,15 +675,16 @@ def settings_for_scope(scope: "Scope", role: Role) -> list["Setting"]:
 def make_ctx(state=None, user_id=None, role=Role.GUEST, settings=None,
              allowlist=None, user_defaults=None, access_base=None,
              access_exceptions=None) -> Ctx:
-    """Build a resolution context. ``user_defaults`` (optional) is a preloaded
-    {key: value} dict feeding the synchronous USER-scope getters. ``access_base``
-    (owner's per-option BASE overrides) and ``access_exceptions`` (this user's
-    per-option exceptions) feed the synchronous access resolver (#151)."""
+    """Build a resolution context.
+
+    - `user_defaults` preloads the synchronous USER-scope getters
+    - `access_base` and `access_exceptions` feed the access resolver
+    """
     ctx = Ctx(state=state, user_id=user_id, role=role, settings=settings,
               allowlist=allowlist)
-    # Attach the optional preloaded user-defaults for the synchronous USER getters.
+    # Attach optional preloaded user-defaults for USER getters.
     ctx.user_defaults = user_defaults if isinstance(user_defaults, dict) else {}
-    # #151: preloaded access config (owner base overrides + this user's exceptions).
+    # Attach preloaded access config: owner overrides and exceptions.
     ctx.access_base = access_base if isinstance(access_base, dict) else {}
     ctx.access_exceptions = access_exceptions if isinstance(access_exceptions, dict) else {}
     return ctx

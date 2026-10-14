@@ -1,5 +1,7 @@
-"""Tests for the allowlist middleware — drop-unknown + the #277 owner access-request
-notice (so the owner can grant someone whose numeric id they don't have)."""
+"""Tests for the allowlist middleware: drop unknown, notify owner.
+
+- owner gets an access-request notice to grant by id
+"""
 
 import asyncio
 from types import SimpleNamespace
@@ -43,14 +45,14 @@ def test_unknown_user_dropped_and_owner_notified_once():
     async def _run():
         bot = _FakeBot()
         mw = AllowlistMiddleware(_FakeAllow({OWNER}), owner_id=OWNER)
-        # An unknown user (id 2) typing → dropped (handler never runs) + owner pinged.
+        # Unknown user typing: dropped, owner pinged.
         res = await mw(_noop_handler, _msg(2, bot=bot), {})
         assert res is None                         # update dropped
         assert len(bot.sent) == 1
         chat_id, text, kw = bot.sent[0]
-        assert chat_id == OWNER and "2" in text    # the id is shown to the owner
+        assert chat_id == OWNER and "2" in text    # id shown to the owner
         assert "req:al:2" in str(kw) and "req:ac:2" in str(kw)   # one-tap grant buttons
-        # A second attempt within the window does NOT re-notify (throttled).
+        # A second attempt in the window does not re-notify.
         await mw(_noop_handler, _msg(2, bot=bot), {})
         assert len(bot.sent) == 1
     asyncio.run(_run())
@@ -70,7 +72,7 @@ def test_owner_never_notifies_self():
     async def _run():
         bot = _FakeBot()
         mw = AllowlistMiddleware(_FakeAllow(set()), owner_id=OWNER)  # owner not in fake set
-        # Even if the fake allowlist says "not allowed", the owner must not notify itself.
+        # Owner never notifies itself, even if not allowlisted.
         await mw(_noop_handler, _msg(OWNER, bot=bot), {})
         assert bot.sent == []
     asyncio.run(_run())

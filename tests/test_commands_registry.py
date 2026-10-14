@@ -1,6 +1,8 @@
-"""#435: the command registry must match the live handlers — the startup drift check
-(`assert_commands_consistent`) used to fail silently inside setup_commands, leaving every
-"/" menu stale. Running it here makes drift a test failure instead."""
+"""The command registry must match the live handlers.
+
+- the startup drift check used to fail silently
+- running it here makes drift a test failure
+"""
 
 from app import i18n
 from app.telegram import commands

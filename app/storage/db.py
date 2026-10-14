@@ -1,10 +1,9 @@
 """aiosqlite-based per-thread persistent state.
 
-A single module-level connection is opened by init_db and reused by all
-helpers. Access is serialized with an asyncio.Lock so concurrent handlers
-never interleave on the same connection. Each forum topic (thread_id, with 0
-representing the General topic) keeps its own isolated row of state plus a log
-of usage records for accounting.
+- One module-level connection shared by all helpers
+- Access serialized with an `asyncio.Lock`
+- Each forum topic keeps its own isolated state row
+- General topic uses `thread_id` 0
 """
 
 from __future__ import annotations
@@ -23,26 +22,27 @@ import aiosqlite
 
 logger = logging.getLogger("db")
 
-# Module-level connection + serialization lock. Set by init_db().
+# Module-level connection and lock, set by `init_db()`.
 _conn: aiosqlite.Connection | None = None
 _lock = None  # type: ignore[assignment]  # lazily created asyncio.Lock in init_db
 
 
-# #327 (decoupled): two ids per session. session_sid() is the INTERNAL stable workdir id (6-hex
-# sha1) naming the on-disk workdir / transcript / jail-uid / secrets — it must NEVER move (resume
-# is cwd-keyed). session_pubid() is the PUBLIC id shown in the UI: a stored ULID read from this
-# cache (backfilled by migrate_sessions_to_ulid, set on create). The filesystem stays on the 6-hex
-# id, so adding the ULID is a pure DB/display change that can't break resume.
-_SID_BY_THREAD: dict[int, str] = {}  # thread_id -> public ULID
+# Two ids per session: internal workdir id, public ULID.
+# - `session_sid()`: stable 6-hex sha1; never moves (resume is cwd-keyed)
+# - `session_pubid()`: stored ULID shown in the UI
+# - Adding the ULID is display-only; can't break resume
+_SID_BY_THREAD: dict[int, str] = {}  # thread_id to public ULID
 
-# Crockford base32 (no I, L, O, U) — the ULID alphabet.
+# Crockford base32 alphabet (no I, L, O, U).
 _CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 
 
 def new_ulid() -> str:
-    """#327: a ULID — 26-char Crockford base32, lexicographically time-sortable (48-bit ms
-    timestamp in the high bits + 80-bit randomness). Fixed length, opaque, collision-resistant;
-    no external dependency."""
+    """Generate a ULID: 26-char time-sortable Crockford base32 id.
+
+    - 48-bit ms timestamp plus 80-bit randomness
+    - No external dependency
+    """
     val = ((int(time.time() * 1000) & ((1 << 48) - 1)) << 80) | int.from_bytes(os.urandom(10), "big")
     out = bytearray(26)
     for i in range(25, -1, -1):
@@ -52,22 +52,30 @@ def new_ulid() -> str:
 
 
 def _derive_sid(thread_id: int) -> str:
-    """The LEGACY derived sid (`sha1[:6]`) — used to locate a session's OLD on-disk name during the
-    #327 migration, and as a transitional fallback for a thread not yet in the ULID cache."""
+    """Legacy derived sid (`sha1[:6]`).
+
+    - Locates a session's old on-disk name
+    - Fallback for threads not yet in the ULID cache
+    """
     return hashlib.sha1(f"sess:{thread_id}".encode()).hexdigest()[:6]
 
 
 def session_sid(thread_id: int) -> str:
-    """INTERNAL stable workdir id — the 6-hex `sha1[:6]`. Names the on-disk workdir / transcript /
-    jail-uid / secrets, which must NEVER move (resume is cwd-keyed), so it is purely derived and
-    never changes. NOT user-facing — the PUBLIC id is session_pubid() (#327)."""
+    """Internal stable workdir id: 6-hex `sha1[:6]`.
+
+    - Names workdir, transcript, jail uid, secrets
+    - Must never change; resume is cwd-keyed
+    - Not user-facing; see `session_pubid()`
+    """
     return _derive_sid(thread_id)
 
 
 def session_pubid(thread_id: int) -> str:
-    """#327: the PUBLIC session id shown in the UI — a stored ULID (opaque, fixed-length, time-
-    sortable) from the cache (backfilled by migrate_sessions_to_ulid / set on create). Falls back to
-    the 6-hex workdir id for a thread not yet backfilled."""
+    """Public session id shown in the UI.
+
+    - Stored ULID read from the cache
+    - Falls back to the 6-hex workdir id if not backfilled
+    """
     return _SID_BY_THREAD.get(thread_id) or session_sid(thread_id)
 
 
@@ -81,54 +89,55 @@ class ThreadState:
     code_session_id: str | None
     name: str | None
     permission_mode: str = "acceptEdits"
-    # Resumable chat-mode session id (persisted every chat turn). Resumed on
-    # rebuild only when big_memory is on, so important topics survive restarts.
+    # Resumable chat session id, persisted every chat turn.
+    # - Resumed on rebuild only when `big_memory` is on
     chat_session_id: str | None = None
-    # Per-topic "big memory": 1M context window in chat + durable chat session.
+    # Per-topic big memory: 1M window plus durable chat session.
     big_memory: bool = False
-    # #352: per-topic agent-driven "session memory" — short notes the model saves via the
-    # in-process `remember` tool, re-injected into the system prompt each build (size-capped
-    # in the engine). Scoped to THIS topic; cleared by /forget.
+    # Per-topic agent-saved session memory notes.
+    # - Saved via the in-process `remember` tool
+    # - Re-injected into the system prompt each build
+    # - Size-capped in the engine; cleared by /forget
     session_notes: str = ""
     created_at: float = 0.0
     created_by: int | None = None
-    # Live-streaming display preference (persisted so /stream survives restart).
+    # Live-streaming display preference, persisted across restarts.
     stream_enabled: bool = True
-    # Pro-command per-session options (#23).
+    # Per-session pro-command options.
     effort: str | None = None
     max_turns: int | None = None
     add_dirs: list[str] = field(default_factory=list)
     fork_pending: bool = False
-    # Favorite/pinned session — sorted first in /sessions so important ones are
-    # easy to find without searching.
+    # Favorite session, sorted first in /sessions.
     favorite: bool = False
-    # Owner-only per-session sandbox OPT-OUT (#104): when True, this code session's
-    # claude runs WITHOUT the bubblewrap jail even if SANDBOX_CODE is on, so the
-    # owner can compare sandboxed vs raw behaviour. Guests can never set it.
+    # Owner-only per-session sandbox opt-out.
+    # - Runs the code session's claude without the jail
+    # - Guests can never set it
     no_sandbox: bool = False
-    # #224: shell-mode overlay — a code session whose text messages route to a one-shot
-    # command in its jail instead of the model. NOT a mode change (stays "code").
+    # Shell-mode overlay: text routes to a jailed command.
+    # - Not a mode change; session stays "code"
     shell_mode: bool = False
-    # Per-session enabled tools (#129): None = the mode's full default universe
-    # (chat → web tools, code → all); a list = exactly those (``[]`` = tool-free).
+    # Per-session enabled tools.
+    # - None means the mode's full default set
+    # - A list means exactly those; `[]` is tool-free
     tools_enabled: list[str] | None = None
-    # #164: post-reply 5-min warm-cache note (delegated; user-toggleable) and SDK
-    # auto-compaction (hidden/owner-only for now). See settings_schema + TODO #164.
+    # Post-reply warm-cache note and SDK auto-compaction toggles.
+    # - Note is user-toggleable; auto-compaction owner-only
     hot_cache_timer: bool = False
     auto_compact: bool = False
-    # #229: live task-list card from the agent's TodoWrite events (delegated, code-only,
-    # default OFF). See settings_schema + streamer.update_todo_card.
+    # Live task-list card from TodoWrite events.
+    # - Code-only, default off
     todo_card: bool = False
-    # #260: True (default) = auto-adopt Claude Code's transcript ai-title as the session
-    # label; a manual /rename pins the name and clears this. See set_session_name.
+    # Auto-adopt Claude Code's transcript ai-title as session label.
+    # - A manual /rename pins the name and clears this
     name_auto: bool = True
-    # #261: epoch seconds of the last finished turn (durable last-activity); 0 = never ran.
-    # Drives the idle-rotation-to-fresh-session check on the next message.
+    # Epoch seconds of the last finished turn; 0 means never.
+    # - Drives the idle-rotation check on the next message
     last_active: float = 0.0
 
 
 def _require_conn() -> aiosqlite.Connection:
-    """Return the live connection or raise if init_db was never called."""
+    """Return the live connection or raise if uninitialized."""
     if _conn is None:
         raise RuntimeError("db not initialized: call init_db() first")
     return _conn
@@ -145,15 +154,14 @@ async def init_db(db_path: str) -> None:
     if _conn is None:
         _conn = await aiosqlite.connect(db_path)
         _conn.row_factory = aiosqlite.Row
-        # Enable WAL once: concurrent reads never block the single writer, and
-        # synchronous=NORMAL is the safe/fast pairing for WAL. Best-effort — a
-        # failure (e.g. a filesystem that can't do WAL) must not crash init.
+        # Enable WAL once: reads never block the single writer.
+        # - `synchronous=NORMAL` is the safe pairing for WAL
+        # - Best-effort; failure must not crash init
         try:
             await _conn.execute("PRAGMA journal_mode=WAL")
             await _conn.execute("PRAGMA synchronous=NORMAL")
-            # #332: wait up to 5s for a lock instead of erroring instantly, so a second
-            # writer touching the file (backup tool, stray poller, watchdog) gets a brief
-            # queue rather than an immediate "database is locked".
+            # Wait up to 5s on a lock instead of erroring.
+            # - Gives a second writer a brief queue
             await _conn.execute("PRAGMA busy_timeout=5000")
         except aiosqlite.Error:
             pass
@@ -196,8 +204,7 @@ async def init_db(db_path: str) -> None:
             )
             """
         )
-        # Per-session conversation log (feeds /recap + /history). Stores the
-        # prompt/response text the bot would otherwise never keep.
+        # Per-session conversation log feeding /recap and /history.
         await _conn.execute(
             """
             CREATE TABLE IF NOT EXISTS messages (
@@ -212,22 +219,20 @@ async def init_db(db_path: str) -> None:
         await _conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_messages_thread ON messages(thread_id, id)"
         )
-        # #285: the append-only `usage` table had NO index — every usage aggregate
-        # (session stats, /users units, rate-limit window checks) full-scanned it, and it
-        # grows forever. Index by (thread_id, ts) so per-thread + time-window scans are
-        # range scans. Also index threads.chat_id (the per-user filter/join column used by
-        # browse_threads and every per-user usage join).
+        # Index usage for range scans; the table grows forever.
+        # - Index `(thread_id, ts)` for per-thread and time-window scans
+        # - Index `threads.chat_id`, the per-user filter column
         await _conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_usage_thread_ts ON usage(thread_id, ts)"
         )
-        # #309: idx_usage_chat_ts is created LATER, in the migration block, AFTER the
-        # chat_id column is guaranteed to exist — on an existing db the column is added by
-        # an ALTER there, so an index here would hit "no such column: chat_id".
+        # Create `idx_usage_chat_ts` in the migration block.
+        # - Needs `chat_id` to exist; ALTER adds it on old dbs
         await _conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_threads_chat ON threads(chat_id)"
         )
-        # #188: recurring scheduled prompts. spec = JSON (schedules.parse_schedule); the
-        # runner loop (sessions._schedule_loop) fires due+enabled rows into their session.
+        # Recurring scheduled prompts.
+        # - `spec` is JSON from `schedules.parse_schedule`
+        # - The runner loop fires due, enabled rows into their session
         await _conn.execute(
             """
             CREATE TABLE IF NOT EXISTS schedules (
@@ -248,7 +253,7 @@ async def init_db(db_path: str) -> None:
         await _conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_schedules_due ON schedules(enabled, next_run)"
         )
-        # Append-only subscription rate-limit history (feeds the /status trend).
+        # Append-only rate-limit history feeding the /status trend.
         await _conn.execute(
             """
             CREATE TABLE IF NOT EXISTS rate_history (
@@ -260,10 +265,9 @@ async def init_db(db_path: str) -> None:
             )
             """
         )
-        # #221: per-session host-uid registry — maps each session's sid to a UNIQUE
-        # unprivileged host uid for its sandbox. The engine prefers the deterministic
-        # hash uid but probes to a free one on collision and records it here, so two
-        # sessions never share a uid (which would break per-session FS isolation).
+        # Per-session host-uid registry mapping sid to a unique uid.
+        # - Engine prefers the hash uid, probes on collision
+        # - Prevents two sessions sharing a uid (breaks FS isolation)
         await _conn.execute(
             """
             CREATE TABLE IF NOT EXISTS session_uid (
@@ -272,7 +276,7 @@ async def init_db(db_path: str) -> None:
             )
             """
         )
-        # Migrate threads: add any columns introduced after the first release.
+        # Add columns introduced after the first release.
         cur = await _conn.execute("PRAGMA table_info(threads)")
         columns = await cur.fetchall()
         await cur.close()
@@ -281,7 +285,7 @@ async def init_db(db_path: str) -> None:
             await _conn.execute(
                 "ALTER TABLE threads ADD COLUMN permission_mode TEXT DEFAULT 'acceptEdits'"
             )
-        # #327: stored PUBLIC session id (a ULID); backfilled by migrate_sessions_to_ulid.
+        # Stored public session id (ULID), backfilled at startup.
         if "sid" not in existing:
             await _conn.execute("ALTER TABLE threads ADD COLUMN sid TEXT")
             await _conn.execute(
@@ -293,7 +297,7 @@ async def init_db(db_path: str) -> None:
             await _conn.execute(
                 "ALTER TABLE threads ADD COLUMN big_memory INTEGER DEFAULT 0"
             )
-        if "session_notes" not in existing:  # #352
+        if "session_notes" not in existing:
             await _conn.execute("ALTER TABLE threads ADD COLUMN session_notes TEXT")
         if "created_by" not in existing:
             await _conn.execute("ALTER TABLE threads ADD COLUMN created_by INTEGER")
@@ -301,8 +305,7 @@ async def init_db(db_path: str) -> None:
             await _conn.execute(
                 "ALTER TABLE threads ADD COLUMN stream_enabled INTEGER DEFAULT 1"
             )
-        # Pro-command per-session options (#23): reasoning effort, agentic turn
-        # cap, extra code dirs (JSON list), and a one-shot "fork on next turn" flag.
+        # Per-session pro options: effort, turn cap, extra dirs, fork flag.
         if "effort" not in existing:
             await _conn.execute("ALTER TABLE threads ADD COLUMN effort TEXT")
         if "max_turns" not in existing:
@@ -321,16 +324,16 @@ async def init_db(db_path: str) -> None:
             await _conn.execute(
                 "ALTER TABLE threads ADD COLUMN no_sandbox INTEGER DEFAULT 0"
             )
-        # #224: shell-mode overlay for code sessions (routes text → jailed command).
+        # Shell-mode overlay for code sessions.
         if "shell_mode" not in existing:
             await _conn.execute(
                 "ALTER TABLE threads ADD COLUMN shell_mode INTEGER DEFAULT 0"
             )
-        # Per-session enabled-tools list (#129): JSON array, or NULL = mode default
-        # (chat → web tools, code → all). Distinct from [] which means tool-free.
+        # Per-session enabled-tools JSON array.
+        # - NULL means mode default; `[]` means tool-free
         if "tools_enabled" not in existing:
             await _conn.execute("ALTER TABLE threads ADD COLUMN tools_enabled TEXT")
-        # #164: warm-cache note toggle + SDK auto-compaction toggle (per session).
+        # Warm-cache note toggle and SDK auto-compaction toggle.
         if "hot_cache_timer" not in existing:
             await _conn.execute(
                 "ALTER TABLE threads ADD COLUMN hot_cache_timer INTEGER DEFAULT 0"
@@ -339,29 +342,26 @@ async def init_db(db_path: str) -> None:
             await _conn.execute(
                 "ALTER TABLE threads ADD COLUMN auto_compact INTEGER DEFAULT 0"
             )
-        # #229: per-session live task-list card toggle.
+        # Per-session live task-list card toggle.
         if "todo_card" not in existing:
             await _conn.execute(
                 "ALTER TABLE threads ADD COLUMN todo_card INTEGER DEFAULT 0"
             )
-        # #260: auto-naming flag. 1 (default) = adopt Claude Code's own ai-title from
-        # the transcript as the session label; a manual /rename pins the name and
-        # flips this to 0 so the auto-namer stops touching it.
+        # Auto-naming flag; 1 adopts Claude Code's ai-title as label.
+        # - A manual /rename sets it to 0
         if "name_auto" not in existing:
             await _conn.execute(
                 "ALTER TABLE threads ADD COLUMN name_auto INTEGER DEFAULT 1"
             )
-        # #261: wall-clock (epoch seconds) of the last finished turn. Read on the next
-        # message to decide an idle-rotation to a fresh session; durable across restart
-        # (unlike the in-memory monotonic last_activity the reaper uses). 0 = never ran.
+        # Wall-clock epoch seconds of the last finished turn.
+        # - Durable across restart, unlike in-memory monotonic activity
+        # - 0 means never ran
         if "last_active" not in existing:
             await _conn.execute(
                 "ALTER TABLE threads ADD COLUMN last_active REAL DEFAULT 0"
             )
-        # #165: the per-turn MODEL and the live CONTEXT size are needed to compute the
-        # weighted "usage units" metric (a cost-aware proxy for the official windows;
-        # see get_user_usage_window). Older rows have NULL model / 0 context — they
-        # simply weight as the default-model baseline with no context term.
+        # Per-turn model and live context size stored with usage.
+        # - Older rows have NULL model and 0 context
         cur = await _conn.execute("PRAGMA table_info(usage)")
         ucols = {col["name"] for col in await cur.fetchall()}
         await cur.close()
@@ -371,10 +371,10 @@ async def init_db(db_path: str) -> None:
             await _conn.execute(
                 "ALTER TABLE usage ADD COLUMN context_tokens INTEGER DEFAULT 0"
             )
-        # #309: usage is now owned by chat_id (the DM user / group), not just the thread, so
-        # per-user totals + rolling-limit windows survive a session delete. Backfill existing
-        # rows from their thread; a row whose thread is already gone stays NULL (unrecoverable
-        # — it was already excluded from per-user totals by the old threads join).
+        # Usage is owned by `chat_id`, not just the thread.
+        # - Totals and limit windows survive a session delete
+        # - Existing rows backfilled from their thread
+        # - Rows whose thread is gone stay NULL
         if "chat_id" not in ucols:
             await _conn.execute("ALTER TABLE usage ADD COLUMN chat_id INTEGER")
             await _conn.execute(
@@ -382,15 +382,14 @@ async def init_db(db_path: str) -> None:
                 "(SELECT th.chat_id FROM threads th WHERE th.thread_id = usage.thread_id) "
                 "WHERE chat_id IS NULL"
             )
-        # #309: index AFTER the column is guaranteed present (the ALTER above runs only on an
-        # old db; on a fresh db chat_id comes from CREATE TABLE usage). Idempotent either way.
+        # Create the index after `chat_id` is guaranteed present.
+        # - Idempotent; fresh dbs get the column from CREATE TABLE
         await _conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_usage_chat_ts ON usage(chat_id, ts)"
         )
-        # #278: the legacy permission_mode 'default' (pre-#212 = prompt for EVERY tool,
-        # incl. file edits) is no longer a selectable mode — the #212 baseline is
-        # 'acceptEdits' (the #119 jail is the containment layer). Migrate stale rows so a
-        # code session auto-accepts file creation/edits instead of prompting.
+        # Migrate legacy permission_mode 'default' to 'acceptEdits'.
+        # - 'default' is no longer selectable
+        # - The jail is the containment layer
         await _conn.execute(
             "UPDATE threads SET permission_mode = 'acceptEdits' "
             "WHERE permission_mode = 'default' OR permission_mode IS NULL"
@@ -399,7 +398,10 @@ async def init_db(db_path: str) -> None:
 
 
 def _parse_dirs(raw) -> list[str]:
-    """Parse the add_dirs JSON column to a list[str]; [] on missing/garbled."""
+    """Parse the `add_dirs` JSON column into a list.
+
+    - Returns [] on missing or garbled
+    """
     if not raw:
         return []
     try:
@@ -410,9 +412,12 @@ def _parse_dirs(raw) -> list[str]:
 
 
 def _parse_tools_enabled(raw):
-    """Parse the tools_enabled JSON column to list[str] or None (#129). NULL → None
-    (= the mode's full default tool set); a JSON list → that list (``[]`` = tool-free).
-    A garbled value degrades to None (default) rather than silently disabling tools."""
+    """Parse the `tools_enabled` JSON column.
+
+    - NULL gives None (the mode's default tool set)
+    - A list is used as-is; `[]` means tool-free
+    - Garbled value degrades to None
+    """
     if raw is None:
         return None
     try:
@@ -423,7 +428,7 @@ def _parse_tools_enabled(raw):
 
 
 async def get_thread(thread_id: int) -> ThreadState | None:
-    """Return the stored state for a thread, or None if it does not exist."""
+    """Stored state for a thread, or None if absent."""
     conn = _require_conn()
     async with _lock:
         cur = await conn.execute(
@@ -462,7 +467,7 @@ async def get_thread(thread_id: int) -> ThreadState | None:
         permission_mode=row["permission_mode"],
         chat_session_id=row["chat_session_id"],
         big_memory=bool(row["big_memory"]),
-        session_notes=row["session_notes"] or "",  # #352
+        session_notes=row["session_notes"] or "",
         created_at=float(row["created_at"] or 0),
         created_by=row["created_by"],
         stream_enabled=bool(row["stream_enabled"]),
@@ -485,14 +490,14 @@ async def get_thread(thread_id: int) -> ThreadState | None:
 async def ensure_thread(
     thread_id: int, chat_id: int, default_model: str, default_cwd: str
 ) -> ThreadState:
-    """Insert the thread with mode='chat' if absent, then return its state."""
+    """Insert the thread as chat if absent; return its state."""
     existing = await get_thread(thread_id)
     if existing is not None:
         return existing
 
     conn = _require_conn()
     async with _lock:
-        # Guard against a race where another coroutine inserted meanwhile.
+        # Guard against a coroutine inserting the row meanwhile.
         await conn.execute(
             """
             INSERT OR IGNORE INTO threads
@@ -503,9 +508,9 @@ async def ensure_thread(
         )
         await conn.commit()
 
-    # Read back the authoritative row (handles the race cleanly).
+    # Read back the authoritative row (handles the race).
     state = await get_thread(thread_id)
-    assert state is not None  # just inserted (or pre-existing)
+    assert state is not None  # just inserted or pre-existing
     return state
 
 
@@ -519,10 +524,11 @@ async def set_mode(thread_id: int, mode: str) -> None:
 
 
 async def switch_mode(thread_id: int, new_mode: str) -> None:
-    """Change a session's TYPE and CARRY its conversation across the switch (#133):
-    copy the resumable session id from the OLD mode's column into the NEW mode's, so
-    chat↔code continue one conversation. Both modes now run in the per-session workdir
-    (engine), so the transcript is findable from either. No-op if already new_mode."""
+    """Change a session's type, carrying its conversation across.
+
+    - Copies the resumable session id into the new mode's column
+    - No-op if already `new_mode`
+    """
     st = await get_thread(thread_id)
     if st is None or st.mode == new_mode:
         return
@@ -534,7 +540,7 @@ async def switch_mode(thread_id: int, new_mode: str) -> None:
             "UPDATE threads SET mode = ? WHERE thread_id = ?", (new_mode, thread_id)
         )
         if src_id:
-            # target_col is a fixed literal (not user input) — safe to interpolate.
+            # `target_col` is a fixed literal, so interpolation is safe.
             await conn.execute(
                 f"UPDATE threads SET {target_col} = ? WHERE thread_id = ?",
                 (src_id, thread_id),
@@ -552,12 +558,11 @@ async def set_model(thread_id: int, model: str) -> None:
 
 
 async def set_session_name(thread_id: int, name: str, *, manual: bool = True) -> None:
-    """Rename a session (the human label shown in /sessions).
+    """Rename a session (the label shown in /sessions).
 
-    #260: ``manual=True`` (the /rename path) PINS the name and turns auto-naming OFF
-    (``name_auto = 0``). ``manual=False`` is the auto-namer (Claude Code's transcript
-    ai-title) and only writes WHILE still in auto mode — a no-op once the user has
-    pinned a name, so a manual label is never clobbered."""
+    - `manual=True` pins the name and disables auto-naming
+    - `manual=False` writes only while still in auto mode
+    """
     conn = _require_conn()
     async with _lock:
         if manual:
@@ -583,8 +588,10 @@ async def set_cwd(thread_id: int, cwd: str) -> None:
 
 
 async def set_last_active(thread_id: int, ts: float) -> None:
-    """#261: stamp the wall-clock (epoch) time of the last finished turn — read on the
-    next message to decide an idle-rotation. Durable across restart."""
+    """Stamp the epoch time of the last finished turn.
+
+    - Read on the next message for idle rotation
+    """
     conn = _require_conn()
     async with _lock:
         await conn.execute(
@@ -594,9 +601,10 @@ async def set_last_active(thread_id: int, ts: float) -> None:
 
 
 async def get_user_last_active(user_id: int) -> float:
-    """#329: the USER's overall last-active epoch time (across ALL their sessions). Idle rotation
-    keys off the user's inactivity gap, NOT any single session's age — so a month-old session is
-    fine to continue, and only a >window gap since the user's last activity starts a fresh one."""
+    """Return the user's last-active epoch time across all sessions.
+
+    - Idle rotation keys off the user's gap, not session age
+    """
     conn = _require_conn()
     async with _lock:
         cur = await conn.execute("SELECT value FROM kv WHERE key = ?", (f"ula:{user_id}",))
@@ -609,8 +617,11 @@ async def get_user_last_active(user_id: int) -> float:
 
 
 async def set_user_last_active(user_id: int, ts: float) -> None:
-    """#329: record the user's overall last-active time — any message OR an explicit session
-    switch counts (a switch must KEEP the chosen session, never idle-rotate it away)."""
+    """Record the user's overall last-active time.
+
+    - Messages and explicit session switches both count
+    - A switch must keep the chosen session
+    """
     conn = _require_conn()
     async with _lock:
         await conn.execute(
@@ -622,12 +633,12 @@ async def set_user_last_active(user_id: int, ts: float) -> None:
 
 
 async def rotate_session_for_idle(thread_id: int) -> None:
-    """#261: start a FRESH conversation on the same session after a long idle gap —
-    NULL the code + chat session ids so the next turn runs with no resumed context.
+    """Start a fresh conversation on the same session.
 
-    Unlike reset_thread, this KEEPS the message log (recap/history) and never touches
-    mode/model/cwd or usage; the old transcript stays on disk (resumable). The point is
-    only to stop stale context from being re-ingested, not to wipe the session."""
+    - NULLs code and chat session ids
+    - Keeps message log, mode, model, cwd, usage
+    - Old transcript stays on disk
+    """
     conn = _require_conn()
     async with _lock:
         await conn.execute(
@@ -639,7 +650,7 @@ async def rotate_session_for_idle(thread_id: int) -> None:
 
 
 async def set_stream_enabled(thread_id: int, on: bool) -> None:
-    """Persist the per-session live-streaming preference (/stream)."""
+    """Persist the per-session live-streaming preference."""
     conn = _require_conn()
     async with _lock:
         await conn.execute(
@@ -650,7 +661,7 @@ async def set_stream_enabled(thread_id: int, on: bool) -> None:
 
 
 async def set_hot_cache_timer(thread_id: int, on: bool) -> None:
-    """Persist the per-session warm-cache post-reply note toggle (#164)."""
+    """Persist the per-session warm-cache post-reply note toggle."""
     conn = _require_conn()
     async with _lock:
         await conn.execute(
@@ -660,7 +671,7 @@ async def set_hot_cache_timer(thread_id: int, on: bool) -> None:
 
 
 async def set_todo_card(thread_id: int, on: bool) -> None:
-    """Persist the per-session live task-list card toggle (#229)."""
+    """Persist the per-session live task-list card toggle."""
     conn = _require_conn()
     async with _lock:
         await conn.execute(
@@ -669,7 +680,7 @@ async def set_todo_card(thread_id: int, on: bool) -> None:
         )
 
 
-# ---------------------------------------------------------- schedules (#188)
+# ---- schedules ----
 
 async def add_schedule(thread_id: int, chat_id: int, owner_uid: int, spec_json: str,
                        prompt: str, next_run: float, created_at: float) -> int:
@@ -686,7 +697,7 @@ async def add_schedule(thread_id: int, chat_id: int, owner_uid: int, spec_json: 
 
 
 async def list_schedules(owner_uid: int) -> list[dict]:
-    """All schedules owned by ``owner_uid``, oldest first."""
+    """All schedules owned by `owner_uid`, oldest first."""
     conn = _require_conn()
     async with _lock:
         cur = await conn.execute(
@@ -698,7 +709,7 @@ async def list_schedules(owner_uid: int) -> list[dict]:
 
 
 async def count_schedules(owner_uid: int) -> int:
-    """How many schedules ``owner_uid`` has (for the per-user cap)."""
+    """Count schedules owned by `owner_uid` (for the per-user cap)."""
     conn = _require_conn()
     async with _lock:
         cur = await conn.execute(
@@ -720,7 +731,7 @@ async def get_schedule(schedule_id: int) -> dict | None:
 
 
 async def due_schedules(now: float) -> list[dict]:
-    """Enabled schedules whose next_run has passed (the runner's work list)."""
+    """Enabled schedules whose `next_run` has passed."""
     conn = _require_conn()
     async with _lock:
         cur = await conn.execute(
@@ -733,7 +744,7 @@ async def due_schedules(now: float) -> list[dict]:
 
 
 async def set_schedule_enabled(schedule_id: int, on: bool) -> None:
-    """Pause/resume a schedule."""
+    """Pause or resume a schedule."""
     conn = _require_conn()
     async with _lock:
         await conn.execute(
@@ -744,7 +755,7 @@ async def set_schedule_enabled(schedule_id: int, on: bool) -> None:
 
 async def update_schedule_run(schedule_id: int, next_run: float, last_run: float,
                               last_status: str) -> None:
-    """Record a fire: advance next_run and stamp the last run + status."""
+    """Record a fire: advance `next_run`, stamp last run and status."""
     conn = _require_conn()
     async with _lock:
         await conn.execute(
@@ -759,11 +770,11 @@ async def delete_schedule(schedule_id: int) -> None:
     conn = _require_conn()
     async with _lock:
         await conn.execute("DELETE FROM schedules WHERE id = ?", (schedule_id,))
-        await conn.commit()  # #257: dropped a duplicate second commit() here
+        await conn.commit()
 
 
 async def set_auto_compact(thread_id: int, on: bool) -> None:
-    """Persist the per-session SDK auto-compaction toggle (#164, hidden for now)."""
+    """Persist the per-session SDK auto-compaction toggle."""
     conn = _require_conn()
     async with _lock:
         await conn.execute(
@@ -774,7 +785,7 @@ async def set_auto_compact(thread_id: int, on: bool) -> None:
 
 
 async def set_no_sandbox(thread_id: int, on: bool) -> None:
-    """Persist the owner-only per-session sandbox opt-out (#104)."""
+    """Persist the owner-only per-session sandbox opt-out."""
     conn = _require_conn()
     async with _lock:
         await conn.execute(
@@ -785,7 +796,7 @@ async def set_no_sandbox(thread_id: int, on: bool) -> None:
 
 
 async def set_shell_mode(thread_id: int, on: bool) -> None:
-    """Persist the per-session shell-mode overlay toggle (#224)."""
+    """Persist the per-session shell-mode overlay toggle."""
     conn = _require_conn()
     async with _lock:
         await conn.execute(
@@ -796,8 +807,11 @@ async def set_shell_mode(thread_id: int, on: bool) -> None:
 
 
 async def set_tools_enabled(thread_id: int, tools: list[str] | None) -> None:
-    """Persist the per-session enabled-tools list (#129). None → NULL (mode default);
-    a list is stored as JSON (``[]`` = tool-free)."""
+    """Persist the per-session enabled-tools list.
+
+    - None stores NULL (mode default)
+    - A list is stored as JSON; `[]` is tool-free
+    """
     conn = _require_conn()
     raw = None if tools is None else json.dumps([str(t) for t in tools])
     async with _lock:
@@ -808,7 +822,7 @@ async def set_tools_enabled(thread_id: int, tools: list[str] | None) -> None:
 
 
 async def set_favorite(thread_id: int, on: bool) -> None:
-    """Pin/unpin a session as a favorite (sorted first in /sessions)."""
+    """Pin or unpin a session as a favorite (sorted first)."""
     conn = _require_conn()
     async with _lock:
         await conn.execute(
@@ -819,7 +833,7 @@ async def set_favorite(thread_id: int, on: bool) -> None:
 
 
 async def set_effort(thread_id: int, effort: str | None) -> None:
-    """Persist the reasoning-effort level (#23); None clears it (SDK default)."""
+    """Persist the reasoning-effort level; None clears it."""
     conn = _require_conn()
     async with _lock:
         await conn.execute(
@@ -829,7 +843,7 @@ async def set_effort(thread_id: int, effort: str | None) -> None:
 
 
 async def set_max_turns(thread_id: int, n: int | None) -> None:
-    """Persist the agentic turn cap (#23); None clears it (unlimited)."""
+    """Persist the agentic turn cap; None means unlimited."""
     conn = _require_conn()
     async with _lock:
         await conn.execute(
@@ -839,7 +853,7 @@ async def set_max_turns(thread_id: int, n: int | None) -> None:
 
 
 async def set_add_dirs(thread_id: int, dirs: list[str]) -> None:
-    """Persist the extra code working dirs (#23) as a JSON list."""
+    """Persist the extra code working dirs as a JSON list."""
     conn = _require_conn()
     async with _lock:
         await conn.execute(
@@ -850,7 +864,7 @@ async def set_add_dirs(thread_id: int, dirs: list[str]) -> None:
 
 
 async def set_fork_pending(thread_id: int, on: bool) -> None:
-    """Set/clear the one-shot 'fork on next turn' flag (#23)."""
+    """Set or clear the one-shot fork-on-next-turn flag."""
     conn = _require_conn()
     async with _lock:
         await conn.execute(
@@ -882,7 +896,7 @@ async def set_chat_session(thread_id: int, session_id: str | None) -> None:
 
 
 async def set_big_memory(thread_id: int, on: bool) -> None:
-    """Toggle the per-topic big-memory flag (1M chat window + durable session)."""
+    """Toggle the per-topic big-memory flag (1M window, durable session)."""
     conn = _require_conn()
     async with _lock:
         await conn.execute(
@@ -893,9 +907,11 @@ async def set_big_memory(thread_id: int, on: bool) -> None:
 
 
 async def set_session_notes(thread_id: int, notes: str) -> None:
-    """#352: replace the per-topic session-memory blob. Both the agent's `remember` tool
-    (via the engine's on_remember hook) and /forget write here; the engine caps size before
-    this is called, so the value is stored verbatim."""
+    """Replace the per-topic session-memory blob.
+
+    - Written by the `remember` tool and /forget
+    - Engine caps size beforehand; stored verbatim
+    """
     conn = _require_conn()
     async with _lock:
         await conn.execute(
@@ -916,7 +932,7 @@ async def set_permission_mode(thread_id: int, mode: str) -> None:
 
 
 async def get_kv(key: str, default: str | None = None) -> str | None:
-    """Return the stored value for a key, or default if absent."""
+    """Stored value for a key, or default if absent."""
     conn = _require_conn()
     async with _lock:
         cur = await conn.execute("SELECT value FROM kv WHERE key = ?", (key,))
@@ -940,8 +956,10 @@ async def set_kv(key: str, value: str) -> None:
 
 
 async def reset_thread(thread_id: int) -> None:
-    """Clear the code + chat session ids (drop context); keep mode/model/cwd,
-    the big_memory flag and usage intact."""
+    """Clear code and chat session ids (drop context).
+
+    - Keeps mode, model, cwd, `big_memory` and usage
+    """
     conn = _require_conn()
     async with _lock:
         await conn.execute(
@@ -949,7 +967,7 @@ async def reset_thread(thread_id: int) -> None:
             "WHERE thread_id = ?",
             (thread_id,),
         )
-        # /reset drops the conversation, so the recap/history log goes too.
+        # /reset drops the conversation, so the recap log goes too.
         await conn.execute("DELETE FROM messages WHERE thread_id = ?", (thread_id,))
         await conn.commit()
 
@@ -958,10 +976,11 @@ async def add_usage(
     thread_id: int, usage: dict | None, cost_usd: float | None,
     model: str | None = None, context_tokens: int = 0,
 ) -> None:
-    """Append one usage record. Missing keys default to 0. ``model`` and
-    ``context_tokens`` (#165) are stored alongside the raw token counts so the
-    weighted ``usage_units`` metric can be computed at query time from each turn's
-    own data (concurrency-safe — no shared global gauge)."""
+    """Append one usage record; missing keys default to 0.
+
+    - Stores `model` and `context_tokens` with raw counts
+    - Metrics are computed per turn at query time
+    """
     usage = usage or {}
 
     def _int(key: str) -> int:
@@ -971,10 +990,9 @@ async def add_usage(
         except (TypeError, ValueError):
             return 0
 
-    # These key names match the Anthropic API `usage` object, which the SDK
-    # passes through unchanged: ResultMessage.usage = data["usage"] (verified in
-    # claude_agent_sdk/_internal/message_parser.py). Keep them in sync with that
-    # schema — wrong names would make every total silently read 0.
+    # Key names match the Anthropic API `usage` object.
+    # - The SDK passes it through unchanged
+    # - Wrong names would make every total silently read 0
     input_tokens = _int("input_tokens")
     output_tokens = _int("output_tokens")
     cache_read = _int("cache_read_input_tokens")
@@ -997,7 +1015,7 @@ async def add_usage(
             """,
             (
                 thread_id,
-                thread_id,   # #309: resolve + store the owning chat_id so the row outlives the thread
+                thread_id,   # owning `chat_id` outlives the thread
                 time.time(),
                 input_tokens,
                 output_tokens,
@@ -1012,7 +1030,10 @@ async def add_usage(
 
 
 async def get_usage_totals(thread_id: int) -> dict:
-    """Aggregate usage for a thread: {input, output, cache_read, cache_creation, cost, requests}."""
+    """Aggregate usage for a thread.
+
+    - Returns {input, output, cache_read, cache_creation, cost, requests}
+    """
     conn = _require_conn()
     async with _lock:
         cur = await conn.execute(
@@ -1043,9 +1064,11 @@ async def get_usage_totals(thread_id: int) -> dict:
 
 
 async def get_usage_totals_bulk(thread_ids: list[int]) -> dict[int, dict]:
-    """#285: per-thread {input, output, requests} for MANY threads in ONE query — replaces
-    the N+1 `get_usage_totals` loop in the /sessions render (one GROUP BY instead of N
-    full scans). Threads with no usage are absent from the result (caller defaults to 0)."""
+    """Per-thread usage totals for many threads in one query.
+
+    - Returns {input, output, requests} per thread
+    - Threads without usage are absent; caller defaults to 0
+    """
     ids = [int(t) for t in thread_ids]
     if not ids:
         return {}
@@ -1066,75 +1089,29 @@ async def get_usage_totals_bulk(thread_ids: list[int]) -> dict[int, dict]:
         )
         rows = await cur.fetchall()
         await cur.close()
-    # #419: the weighted "units" per thread (#307) are gone — usage is tracked in tokens.
     return {int(r["thread_id"]): {"input": int(r["input"]), "output": int(r["output"]),
                                   "requests": int(r["requests"])} for r in rows}
 
 
-# #293: get_user_usage_tokens removed — dead since #165 (the raw-token scalar limit
-# basis was superseded by weighted units; see get_user_usage_window(measure="units")).
-
-# #264: per-user rolling-cap windows. The SHORT window now tracks Anthropic's real
-# ~5-hour subscription reset (was a 24h "daily" window — too coarse to distribute the
-# shared budget fairly across users); the long window stays 7 days. The breakdown dict
-# keys are still "day"/"week" for back-compat, but "day" now means the trailing 5 HOURS.
-SHORT_WINDOW_SEC = 5 * 3600    # 5h — Anthropic's short reset window (was 86400 = 24h)
-WEEK_WINDOW_SEC = 7 * 86400    # 7 days — the long window
+# Rolling-cap windows: short is 5h, long is 7 days.
+# - Breakdown keys stay "day"/"week"; "day" means trailing 5 hours
+SHORT_WINDOW_SEC = 5 * 3600    # 5h: Anthropic's short reset window
+WEEK_WINDOW_SEC = 7 * 86400    # 7 days, the long window
 
 
-# #293: get_user_usage_breakdown / get_user_units_breakdown consolidated into
-# get_user_breakdown(user_id, measure=...) — see the centralized family below.
-
-# #419: usage is tracked in TOKENS only (input + output) — the cost-weighted "usage units"
-# (#165: per-family model weights × output/cache multipliers) and their SQL expression are
-# retired. was:
-# # #165: weighted "usage units" — a cost-aware per-turn metric that mirrors how the
-# # shared subscription windows actually fill, so a user with a big WARM context (cheap
-# # input but a huge cache_read re-read every turn) is no longer under-counted by the
-# # raw input+output total. A unit is a cost-weighted token-equivalent, baselined on a
-# # Sonnet INPUT token; the coefficients track Anthropic list-price ratios:
-# #   unit = MODEL_WEIGHT * (input + OUT*output + CC*cache_creation + CR*cache_read)
-# # Computed at QUERY time from each row's stored raw columns + model, so the weights are
-# # tunable here with NO migration, and every turn's cost is derived only from its own
-# # numbers (concurrency-safe — not a before/after delta on a shared global gauge). The
-# # model is matched by substring, so a "[1m]" / dated suffix still resolves.
-# USAGE_OUTPUT_MULT = 5.0          # output tokens ≈ 5× input price
-# USAGE_CACHE_CREATE_MULT = 1.25   # cache write ≈ 1.25× input price
-# USAGE_CACHE_READ_MULT = 0.10     # cache read ≈ 0.1× input price
-# USAGE_MODEL_WEIGHT_OPUS = 5.0    # Opus ≈ 5× Sonnet input price
-# USAGE_MODEL_WEIGHT_SONNET = 1.0  # baseline
-# USAGE_MODEL_WEIGHT_HAIKU = 0.27  # Haiku ≈ 0.27× Sonnet input price
-# USAGE_MODEL_WEIGHT_DEFAULT = 1.0  # unknown / NULL model → Sonnet-equivalent baseline
-#
-#
-# def _units_sql_expr() -> str:
-#     """SQL sub-expression turning one ``usage u`` row into weighted units (#165). The
-#     numeric weights are trusted module constants formatted inline (never user input)."""
-#     return (
-#         "((CASE "
-#         f"WHEN u.model LIKE '%opus%'   THEN {USAGE_MODEL_WEIGHT_OPUS} "
-#         f"WHEN u.model LIKE '%sonnet%' THEN {USAGE_MODEL_WEIGHT_SONNET} "
-#         f"WHEN u.model LIKE '%haiku%'  THEN {USAGE_MODEL_WEIGHT_HAIKU} "
-#         f"ELSE {USAGE_MODEL_WEIGHT_DEFAULT} END) "
-#         f"* (COALESCE(u.input_tokens,0) + {USAGE_OUTPUT_MULT}*COALESCE(u.output_tokens,0) "
-#         f"+ {USAGE_CACHE_CREATE_MULT}*COALESCE(u.cache_creation,0) "
-#         f"+ {USAGE_CACHE_READ_MULT}*COALESCE(u.cache_read,0)))"
-#     )
+# Usage is tokens only: input plus output.
 
 
-# #293: centralized usage-aggregation family. The raw-token and weighted-unit reads
-# used to be parallel twin functions doing the same query with a different summed
-# expression; now ONE measure parameter selects the expression and the rest (windows,
-# scope, grouping) is shared. `measure="raw"` = input+output tokens; `measure="units"`
-# = cost-weighted units (#165). Consolidates the former get_user_usage_units,
-# get_user_usage_breakdown, get_user_units_breakdown, get_all_users_units,
-# get_all_users_usage (and the dead get_user_usage_tokens).
+# Centralized usage-aggregation family.
+# - One `measure` parameter selects the summed expression
+# - Windows, scope and grouping are shared
+# - `measure="raw"` is input plus output tokens
 def _usage_measure_expr(measure: str) -> str:
-    """The per-``usage u`` row SQL sum sub-expression for a measure. `measure` is a fixed
-    literal from the call sites, validated here so a typo fails loudly instead of
-    mis-summing. #419: "raw" (input + output tokens) is the only measure — was also
-    "units" (→ _units_sql_expr, the #165 weighted units). decision-24: tokens only, so no
-    per-model weight table has to follow model releases."""
+    """SQL sum sub-expression per `usage u` row for a measure.
+
+    - `measure` is validated so a typo fails loudly
+    - Only "raw" (input plus output tokens) exists
+    """
     if measure == "raw":
         return "(COALESCE(u.input_tokens,0) + COALESCE(u.output_tokens,0))"
     raise ValueError(f"unknown usage measure: {measure!r}")
@@ -1142,16 +1119,17 @@ def _usage_measure_expr(measure: str) -> str:
 
 async def get_user_usage_window(user_id: int, since: float | None = None,
                                 measure: str = "raw") -> int:
-    """Total usage one user has spent across ALL their sessions, in `measure` — input +
-    output tokens, the basis for the rolling-window caps (#419: was weighted "units", #165).
-    With ``since`` (epoch seconds), counts only usage at-or-after that time. Usage rows
-    carry their owner's chat_id (#309), so the sum is over ``usage.chat_id`` directly and
-    survives a session delete (a deleted session's spend still counts toward the cap)."""
+    """Total tokens a user spent across all sessions.
+
+    - Input plus output tokens; basis for rolling-window caps
+    - `since` (epoch seconds) counts only usage at or after it
+    - Summed by `usage.chat_id`; survives session deletes
+    """
     expr = _usage_measure_expr(measure)
     conn = _require_conn()
     query = (
         f"SELECT COALESCE(SUM({expr}), 0) AS v "
-        "FROM usage u "                 # #309: by usage.chat_id, not a threads join
+        "FROM usage u "                 # by `usage.chat_id`, not a join
         "WHERE u.chat_id = ?"
     )
     params: list = [user_id]
@@ -1166,11 +1144,13 @@ async def get_user_usage_window(user_id: int, since: float | None = None,
 
 
 async def get_user_breakdown(user_id: int, measure: str = "raw") -> dict:
-    """Per-user usage over the trailing 5h / week plus the lifetime total and request
-    count, in `measure` ("raw" tokens — #419 retired the weighted units). Windows are computed
-    from usage.ts, so no reset job is needed. Feeds the per-user stats card + /limits."""
+    """Per-user usage over trailing 5h and week, plus lifetime.
+
+    - Includes request count; windows computed from `usage.ts`
+    - Needs no reset job
+    """
     now = time.time()
-    day_since = now - SHORT_WINDOW_SEC   # #264: "day" key = trailing 5h
+    day_since = now - SHORT_WINDOW_SEC   # "day" key is trailing 5h
     week_since = now - WEEK_WINDOW_SEC
     expr = _usage_measure_expr(measure)
     conn = _require_conn()
@@ -1181,7 +1161,7 @@ async def get_user_breakdown(user_id: int, measure: str = "raw") -> dict:
             f"COALESCE(SUM(CASE WHEN u.ts >= ? THEN {expr} ELSE 0 END), 0) AS week, "
             f"COALESCE(SUM({expr}), 0) AS total, "
             f"COUNT(*) AS requests "
-            "FROM usage u "                       # #309: by usage.chat_id, not a threads join
+            "FROM usage u "                       # by `usage.chat_id`, not a join
             "WHERE u.chat_id = ?",
             (day_since, week_since, user_id),
         )
@@ -1196,12 +1176,12 @@ async def get_user_breakdown(user_id: int, measure: str = "raw") -> dict:
 
 
 async def get_all_users_breakdown(measure: str = "raw") -> list[dict]:
-    """#285: per-user usage aggregate for ALL DM users in ONE GROUP BY — trailing-5h /
-    week / lifetime total in `measure` ("raw" tokens — #419 retired the weighted units), plus the
-    request count and last-activity ts, busiest week first. Keyed-by-uid dicts are built
-    by the caller when needed. Only DM users (``chat_id > 0`` == the Telegram id) count: a
-    group/supergroup has a negative ``-100…`` chat_id and is NOT a person, so it is
-    excluded (it would otherwise show up as a phantom 'user' — #164 follow-up)."""
+    """Per-user usage aggregate for all DM users, one query.
+
+    - 5h, week, lifetime tokens, requests, last-activity ts
+    - Busiest week first
+    - Only DM users (`chat_id > 0`); groups excluded
+    """
     now = time.time()
     day_since = now - SHORT_WINDOW_SEC
     week_since = now - WEEK_WINDOW_SEC
@@ -1214,10 +1194,10 @@ async def get_all_users_breakdown(measure: str = "raw") -> list[dict]:
             f"COALESCE(SUM(CASE WHEN u.ts >= ? THEN {expr} ELSE 0 END), 0) AS week, "
             f"COALESCE(SUM({expr}), 0) AS total, "
             f"COUNT(*) AS requests, COALESCE(MAX(u.ts), 0) AS last_ts "
-            # #309: group by usage.chat_id (no threads join) so a deleted session's owner
-            # still appears with their full lifetime totals.
+            # Group by `usage.chat_id`, no `threads` join.
+            # - A deleted session's owner keeps lifetime totals
             "FROM usage u "
-            "WHERE u.chat_id > 0 "          # DM users only; groups (chat_id<0) are not people
+            "WHERE u.chat_id > 0 "          # DM users only; groups excluded
             "GROUP BY u.chat_id ORDER BY week DESC, total DESC",
             (day_since, week_since),
         )
@@ -1236,14 +1216,12 @@ async def get_all_users_breakdown(measure: str = "raw") -> list[dict]:
     ]
 
 
-# --------------------------------------------------------------------------- #
-# Conversation log (feeds /recap + /history)
-# --------------------------------------------------------------------------- #
+# ---- Conversation log (feeds /recap and /history) ----
 async def log_message(thread_id: int, role: str, text: str) -> None:
-    """Append one conversation turn (role = 'user' | 'assistant') for a thread.
+    """Append one conversation turn for a thread.
 
-    Best-effort: empty text is skipped. Stored verbatim so /history exports and
-    /recap can replay the exact exchange the bot would otherwise never keep.
+    - Role is 'user' or 'assistant'; empty text skipped
+    - Stored verbatim for /history and /recap
     """
     if not text or not text.strip():
         return
@@ -1257,8 +1235,10 @@ async def log_message(thread_id: int, role: str, text: str) -> None:
 
 
 async def get_recent_messages(thread_id: int, limit: int = 200) -> list[dict]:
-    """Return up to `limit` most recent messages for a thread, oldest-first:
-    [{ts, role, text}, …]. Empty list when nothing is logged."""
+    """Return recent messages for a thread, oldest-first.
+
+    - Each item is `{ts, role, text}`; empty if none
+    """
     conn = _require_conn()
     async with _lock:
         cur = await conn.execute(
@@ -1271,12 +1251,12 @@ async def get_recent_messages(thread_id: int, limit: int = 200) -> list[dict]:
     return [{"ts": r["ts"], "role": r["role"], "text": r["text"]} for r in rows]
 
 
-# --------------------------------------------------------------------------- #
-# Subscription rate-limit history (feeds the /status trend)
-# --------------------------------------------------------------------------- #
+# ---- Rate-limit history (feeds /status trend) ----
 async def append_rate_history(rate_type: str, utilization, status: str) -> None:
-    """Append one rate-limit datapoint; trims to the most recent 500 rows so the
-    table can't grow unbounded. utilization may be None (the CLI often omits it)."""
+    """Append one rate-limit datapoint, trimming to 500 rows.
+
+    - utilization may be None (CLI often omits it)
+    """
     conn = _require_conn()
     util = float(utilization) if isinstance(utilization, (int, float)) else None
     async with _lock:
@@ -1293,7 +1273,7 @@ async def append_rate_history(rate_type: str, utilization, status: str) -> None:
 
 
 async def get_rate_history(rate_type: str, limit: int = 12) -> list[dict]:
-    """Return up to `limit` most recent datapoints for a window, oldest-first."""
+    """Return recent datapoints for a window, oldest-first."""
     conn = _require_conn()
     async with _lock:
         cur = await conn.execute(
@@ -1325,10 +1305,10 @@ async def set_created_by(thread_id: int, user_id: int) -> None:
 async def browse_threads(
     chat_id: int, keyword: str | None = None, limit: int = 8, offset: int = 0
 ) -> tuple[list[dict], int]:
-    """Return (page_rows, total) of a chat's sessions, most-recently-active first.
+    """Return (page_rows, total) of a chat's sessions, newest-active first.
 
-    chat_id selects the surface: the supergroup id lists its topics; a user id
-    lists that user's DM sessions. An optional keyword does a simple name search.
+    - Supergroup id lists topics; user id lists DM sessions
+    - Optional keyword does a simple name search
     """
     conn = _require_conn()
     where = "chat_id = ?"
@@ -1346,12 +1326,10 @@ async def browse_threads(
             "SELECT thread_id, name, mode, created_at, created_by, "
             "COALESCE(favorite, 0) AS favorite, COALESCE(name_auto, 1) AS name_auto "
             f"FROM threads WHERE {where} "
-            # #364: order by most-recent ACTIVITY, not creation time, so writing in an
-            # existing session floats it back to the top. last_active is stamped at each
-            # turn end (sessions.set_last_active); a fresh/never-completed session has
-            # last_active=0, so max(last_active, created_at) falls back to created_at and
-            # it still sorts sensibly. SQLite scalar max() over like epoch-seconds floats.
-            # was: "ORDER BY favorite DESC, created_at DESC LIMIT ? OFFSET ?"  (#364)
+            # Order by most recent activity, not creation time.
+            # - `last_active` is stamped at each turn end
+            # - Never-run sessions have 0, so `max()` falls back to `created_at`
+            # - Favorites sort first
             "ORDER BY favorite DESC, "
             "max(COALESCE(last_active, 0), COALESCE(created_at, 0)) DESC "
             "LIMIT ? OFFSET ?",
@@ -1367,10 +1345,8 @@ async def browse_threads(
             "created_at": r["created_at"],
             "created_by": r["created_by"],
             "favorite": bool(r["favorite"]),
-            # #334: surface name_auto so the empty-session GC's "spare manually-renamed"
-            # guard (handlers `_gc_untitled_empties`) actually sees it — it was SELECTed
-            # (COALESCE above) but dropped from the page dict, so the guard's
-            # `.get("name_auto", True)` always defaulted True and never fired.
+            # Surface `name_auto` so the empty-session GC guard sees it.
+            # - The guard spares manually renamed sessions
             "name_auto": bool(r["name_auto"]),
         }
         for r in rows
@@ -1381,13 +1357,11 @@ async def browse_threads(
 async def allocate_dm_session(
     user_id: int, name: str, default_model: str, base_workdir: str, mode: str = "chat"
 ) -> int:
-    """Create a new DM session (a negative key, chat_id = user_id); return its key.
+    """Create a new DM session; return its key.
 
-    DM sessions use negative keys from a global counter so they never collide with
-    supergroup topic ids (>= 0) or with another user's sessions. Each session gets
-    its OWN code working directory, base_workdir/<key>, so code-mode work in one
-    session never touches another's files (per-session isolation by id). The mode
-    (chat/code) is fixed at creation — a session is one OR the other for its life.
+    - Keys are negative, from a global counter
+    - Each session gets its own working directory
+    - Mode (chat/code) is fixed at creation
     """
     conn = _require_conn()
     async with _lock:
@@ -1401,12 +1375,12 @@ async def allocate_dm_session(
             (str(seq),),
         )
         key = -seq
-        # #332: name the workdir by the PUBLIC ULID — same id shown in the UI, collision-safe
-        # (80-bit), and the on-disk dir == sid == session_pubid. The legacy 6-hex session_sid
-        # is migration-only now. was: cwd = base / session_sid(key) / "work".
-        # #181: nested layout — the session cwd is <ulid>/work (state is the sibling).
+        # Workdir is named by the public ULID.
+        # - On-disk dir equals sid equals `session_pubid`
+        # - Nested layout: cwd is `<ulid>/work`, state is the sibling
+        # - Legacy 6-hex `session_sid` is migration-only
         pubid = new_ulid()
-        _SID_BY_THREAD[key] = pubid  # so session_pubid(key) resolves while building the path
+        _SID_BY_THREAD[key] = pubid  # so `session_pubid(key)` resolves for path
         cwd = str(Path(base_workdir) / pubid / "work")
         session_mode = "code" if mode == "code" else "chat"
         await conn.execute(
@@ -1422,8 +1396,10 @@ async def allocate_dm_session(
 
 
 async def dm_user_ids() -> list[int]:
-    """#413: every user that owns at least one DM session (a negative ``thread_id`` keyed by
-    the owner's positive ``chat_id`` — the same scope ``browse_threads(uid)`` lists)."""
+    """Every user owning at least one DM session.
+
+    - DM sessions: negative `thread_id`, positive owner `chat_id`
+    """
     conn = _require_conn()
     async with _lock:
         cur = await conn.execute(
@@ -1434,7 +1410,7 @@ async def dm_user_ids() -> list[int]:
 
 
 async def get_dm_current(user_id: int) -> int | None:
-    """Return the user's current DM session key, or None if unset."""
+    """Return the user's current DM session key, or None."""
     raw = await get_kv(f"dm_current:{user_id}")
     try:
         return int(raw) if raw is not None else None
@@ -1447,22 +1423,20 @@ async def set_dm_current(user_id: int, key: int) -> None:
     await set_kv(f"dm_current:{user_id}", str(key))
 
 
-# --------------------------------------------------------------------------- #
-# Per-USER default settings (#138)
-# --------------------------------------------------------------------------- #
-# The USER scope of the unified settings registry (settings_schema.py): a user's
-# personal default for a setting, applied to their FUTURE sessions when the session
-# itself has no explicit (SESSION-scope) value. Stored generically in `kv` under
-# ``user_default:{uid}:{key}`` as a JSON-encoded value, so no schema migration is
-# needed and any new registry key works without a column. Precedence is enforced by
-# settings_schema.resolve(): SESSION → USER → GLOBAL → built-in default.
+# ---- Per-user default settings ----
+# - User scope of the settings registry
+# - Applies to future sessions lacking an explicit session value
+# - Stored in `kv` as `user_default:{uid}:{key}` JSON
+# - Precedence: session, user, global, built-in default (`resolve()`)
 def _user_default_key(uid: int, key: str) -> str:
     return f"user_default:{uid}:{key}"
 
 
 async def get_user_default(uid: int, key: str):
-    """Return this user's personal default for ``key`` (the USER scope), or None if
-    unset. Stored JSON-encoded in `kv`; a garbled value degrades to None (unset)."""
+    """Return the user's personal default for a key, or None.
+
+    - Stored JSON-encoded in `kv`; garbled degrades to None
+    """
     raw = await get_kv(_user_default_key(uid, key))
     if raw is None:
         return None
@@ -1473,9 +1447,11 @@ async def get_user_default(uid: int, key: str):
 
 
 async def set_user_default(uid: int, key: str, value) -> None:
-    """Set (value JSON-encoded) or clear (value is None → delete the row) this
-    user's personal default for ``key``. Clearing makes the USER scope fall through
-    to GLOBAL/default in resolve()."""
+    """Set or clear a user's personal default for a key.
+
+    - Value JSON-encoded; None deletes the row
+    - Clearing falls through to global/default in `resolve()`
+    """
     kvkey = _user_default_key(uid, key)
     if value is None:
         conn = _require_conn()
@@ -1490,18 +1466,13 @@ _MODEL_ALIAS_MIGRATION_KV = "model_alias_migrated"
 
 
 async def migrate_model_ids_to_aliases(family_of) -> int:
-    """#411: ONE-TIME move of every stored CONCRETE model id onto its CLI family alias.
+    """One-time move of stored model ids onto family aliases.
 
-    Before #411 the /model picker stored concrete ids (``claude-opus-4-8``), so every stored
-    value was really "the current Opus" frozen at the pick. ``family_of`` maps such an id to
-    its family alias (``models.family_alias``: ``claude-opus-4-8`` → ``opus``, None for an id it
-    can't place). Session rows (``threads.model``) and per-user defaults (kv
-    ``user_default:<uid>:model``) are rewritten to the alias, which the Claude Code CLI resolves
-    to the newest model of the family — so later releases reach them with no further migration.
-
-    Runs ONCE (kv ``model_alias_migrated``): after it, a concrete id can only come from a
-    deliberate ``/model claude-…`` pin, which must survive restarts. Usage rows keep their
-    historical model (accounting history, not configuration). Returns the rows rewritten."""
+    - Rewrites `threads.model` and per-user default model values
+    - The CLI resolves an alias to the family's newest model
+    - Runs once (kv `model_alias_migrated`); later pins survive
+    - Usage rows keep historical model; returns rows rewritten
+    """
     if await get_kv(_MODEL_ALIAS_MIGRATION_KV):
         return 0
 
@@ -1542,17 +1513,17 @@ async def migrate_model_ids_to_aliases(family_of) -> int:
     return changed
 
 
-# --------------------------------------------------------------------------- #
-# Owner-configured per-option ACCESS overrides (#151, menu.md §4)
-# --------------------------------------------------------------------------- #
-# The owner may override an option's BASE access (Hidden / Read-only / Delegated)
-# away from its built-in default (settings_schema.BASE_ACCESS_DEFAULTS). Stored as a
-# single JSON blob in `kv` (key 'access_base') so any registry key works with no
-# schema change. Effective access is DERIVED per prompt (settings_schema), so a
-# change applies from the user's very next prompt — nothing per-user is cached here.
+# ---- Owner per-option access overrides ----
+# - Overrides an option's base access from its built-in default
+# - Levels: Hidden, Read-only, Delegated
+# - Stored as one JSON blob in `kv` key 'access_base'
+# - Effective access derived per prompt; nothing cached per-user
 async def get_access_overrides() -> dict:
-    """Return the owner's per-option base-access overrides {option: level_str}, or
-    {} when none set. A garbled blob degrades to {} (fall back to built-in defaults)."""
+    """Return the owner's per-option base-access overrides.
+
+    - `{option: level_str}`, or `{}` when none set
+    - Garbled blob degrades to `{}` (built-in defaults)
+    """
     raw = await get_kv("access_base")
     if raw is None:
         return {}
@@ -1564,7 +1535,7 @@ async def get_access_overrides() -> dict:
 
 
 async def set_access_override(option: str, level: str | None) -> None:
-    """Set (or clear, ``level=None``) the owner's base-access override for one option."""
+    """Set or clear the owner's base-access override for an option."""
     cur = await get_access_overrides()
     if level is None:
         cur.pop(option, None)
@@ -1574,11 +1545,10 @@ async def set_access_override(option: str, level: str | None) -> None:
 
 
 async def get_user_lang(user_id: int) -> str | None:
-    """Return the user's chosen interface locale, or None if never set.
+    """Return the user's chosen interface locale, or None.
 
-    Stored in `kv` (key 'lang:<user_id>') like the DM-current pointer. None means
-    "no explicit choice yet" — the caller auto-detects from the Telegram client
-    language and may persist that as the default.
+    - Stored in `kv` as 'lang:<user_id>'
+    - None means no explicit choice; caller may auto-detect
     """
     return await get_kv(f"lang:{user_id}")
 
@@ -1589,18 +1559,13 @@ async def set_user_lang(user_id: int, lang: str) -> None:
 
 
 async def delete_dm_session(user_id: int, key: int) -> bool:
-    """Delete a DM session (and its message + schedule rows). Returns True if a row
-    was removed. NOTE (#309): the session's ``usage`` rows are deliberately KEPT — a
-    user's recorded token spend must outlive deleting the session (it still feeds their
-    lifetime totals + rolling-limit windows, keyed by chat_id).
+    """Delete a DM session and its message and schedule rows.
 
-    Scoped to (thread_id == key AND chat_id == user_id) so a user can only ever
-    delete their OWN row. DM rows are owned by a real, positive user id, whereas a
-    shared supergroup topic / General row is keyed by the supergroup's (negative)
-    chat id — so the chat_id scope alone already prevents this path from dropping a
-    shared row. We deliberately do NOT refuse key >= 0: an anomalous DM row minted
-    outside allocate_dm_session (e.g. a legacy key 0) must still be deletable by its
-    owner. The caller closes any live session and removes the workdir.
+    - Returns True if a row was removed
+    - `usage` rows are kept so spend still counts toward caps
+    - Scoped to (`thread_id`, `chat_id`): only the owner's row
+    - Anomalous legacy keys (e.g. 0) stay deletable by owner
+    - Caller closes the live session and removes the workdir
     """
     if user_id <= 0:
         return False
@@ -1612,36 +1577,30 @@ async def delete_dm_session(user_id: int, key: int) -> bool:
         )
         removed = cur.rowcount or 0
         await cur.close()
-        # #309: usage rows are NO LONGER deleted with the session — a user's per-session
-        # token spend must survive deleting that session, so it still counts toward their
-        # lifetime totals + rolling-limit windows (else deleting sessions silently shrinks
-        # recorded spend and dodges the caps). Usage is keyed by chat_id and aggregated
-        # without the threads join, so the orphaned rows still attribute to the right user.
-        # was (removed for #309):
-        # await conn.execute("DELETE FROM usage WHERE thread_id = ?", (key,))
+        # Usage rows are kept when the session is deleted.
+        # - Spend must still count toward lifetime totals and caps
+        # - Rows are keyed by `chat_id`, aggregated without a join
         await conn.execute("DELETE FROM messages WHERE thread_id = ?", (key,))
-        # #332: the session_uid registry is keyed by the on-disk dir name = the ULID (re-keyed
-        # by migrate_workdirs_to_ulid). was: session_sid(key) — the legacy 6-hex.
-        await conn.execute("DELETE FROM session_uid WHERE sid = ?", (session_pubid(key),))  # #221/#332
-        # #254: cascade to schedules too — otherwise an orphaned schedule keeps firing and
-        # _fire_schedule → handle_text → ensure_thread silently resurrects the deleted thread.
+        # `session_uid` registry is keyed by the on-disk dir name (ULID).
+        await conn.execute("DELETE FROM session_uid WHERE sid = ?", (session_pubid(key),))
+        # Cascade to schedules too.
+        # - An orphaned schedule would resurrect the deleted thread
         await conn.execute("DELETE FROM schedules WHERE thread_id = ?", (key,))
         await conn.commit()
     return removed > 0
 
 
 async def claim_session_uid(sid: str, preferred: int, lo: int, hi: int) -> int:
-    """Return a STABLE, collision-free host uid for ``sid`` (#221). ``hi`` is exclusive.
+    """Return a stable, collision-free host uid for `sid`.
 
-    First call: record ``preferred`` (the deterministic hash uid) if free, else
-    linear-probe ``[lo, hi)`` for the next unused uid and record THAT — so two sessions
-    whose hashes collide get DISTINCT uids. Later calls return the recorded uid, so the
-    on-disk chown stays valid across rebuilds. ``_lock`` serialises the probe and the
-    UNIQUE(uid) constraint is the backstop that makes an already-taken slot fail.
+    - First call records `preferred`, else probes `[lo, hi)`
+    - Later calls return the recorded uid
+    - `hi` is exclusive; UNIQUE(uid) is the backstop
+    - `_lock` serialises the probe
     """
     conn = _require_conn()
     span = max(1, hi - lo)
-    start = lo + ((preferred - lo) % span)            # clamp preferred into [lo, hi)
+    start = lo + ((preferred - lo) % span)            # clamp `preferred` into range
     async with _lock:
         cur = await conn.execute("SELECT uid FROM session_uid WHERE sid = ?", (sid,))
         row = await cur.fetchone()
@@ -1657,15 +1616,14 @@ async def claim_session_uid(sid: str, preferred: int, lo: int, hi: int) -> int:
                 await conn.commit()
                 return cand
             except sqlite3.IntegrityError:
-                continue                              # uid taken by another sid → next slot
-        # Space exhausted (>> any realistic session count): fall back to the bare hash
-        # rather than fail the session. Collisions are possible again only in this case.
+                continue                              # taken by another sid: next slot
+        # Space exhausted: fall back to the bare hash.
+        # - Collisions become possible again only here
         return start
 
 
 async def release_session_uid(sid: str) -> None:
-    """Free a session's reserved uid (#221) so the uid space can be reused. No-op if
-    absent. Called when a session is permanently deleted."""
+    """Free a session's reserved uid; no-op if absent."""
     conn = _require_conn()
     async with _lock:
         await conn.execute("DELETE FROM session_uid WHERE sid = ?", (sid,))
@@ -1673,34 +1631,27 @@ async def release_session_uid(sid: str) -> None:
 
 
 def _uid_collisions(uid_by_sid: dict[str, int]) -> dict[int, list[str]]:
-    """Group sids by their host uid; return only the NON-ROOT uids shared by MORE THAN
-    ONE sid (a genuine per-session isolation break). Pure + testable; the disk scan
-    below feeds it.
+    """Return non-root uids shared by more than one sid.
 
-    #231: uid 0 (root) is EXCLUDED — root ownership is the ROUTINE pre-launch / no-jail
-    default, not a runtime collision, so it must not raise an owner alert. A workdir stays
-    root-owned until a CODE session first runs and the launcher chowns it to its claimed
-    per-session uid; chat sessions (no jail) and sandbox-off sessions stay root-owned for
-    good. None of those is the birthday-collision this doctor exists to catch — two
-    sessions whose uid hash maps to the SAME ASSIGNED non-root uid. A jailed session runs
-    as a distinct non-root uid and cannot read another's root-owned 0700 dir anyway, so
-    shared root ownership is not an isolation break. (Counting it fired a benign warning on
-    every restart for chat sessions that can never self-heal.)
-    # was: every shared uid (incl. uid 0) was reported — replaced for #231."""
+    - Pure; the disk scan feeds it
+    - uid 0 excluded: root ownership is the routine pre-launch default
+    - Only a shared assigned non-root uid is an isolation break
+    """
     by_uid: dict[int, list[str]] = {}
     for sid, uid in uid_by_sid.items():
         if uid == 0:
-            continue                      # root = unassigned / no-jail default, not a collision
+            continue                      # root means unassigned, not a collision
         by_uid.setdefault(uid, []).append(sid)
     return {uid: sorted(sids) for uid, sids in by_uid.items() if len(sids) > 1}
 
 
 def sandbox_uid_collisions(base_workdir: str) -> dict[int, list[str]]:
-    """#221 doctor: scan on-disk session workdirs and return ``{uid: [sids]}`` for any
-    host uid that owns more than one session's ``<sid>/work`` — the real isolation break.
-    Empty dict = clean. With the uid registry this should always be empty; it surfaces a
-    PRE-#221 collision not yet healed (it heals when the affected sessions next run and
-    get re-chowned to their registry uid). Sync (filesystem stat); never raises."""
+    """Scan session workdirs for host uids owning multiple sessions.
+
+    - Returns `{uid: [sids]}`; empty means clean
+    - Sync filesystem stat; never raises
+    - Heals when affected sessions next run
+    """
     uid_by_sid: dict[str, int] = {}
     try:
         for child in Path(base_workdir).iterdir():
@@ -1709,15 +1660,18 @@ def sandbox_uid_collisions(base_workdir: str) -> dict[int, list[str]]:
             try:
                 uid_by_sid[child.name] = os.stat(child / "work").st_uid
             except OSError:
-                continue                      # no work dir yet / unreadable → skip
+                continue                      # no work dir yet or unreadable: skip
     except OSError:
         return {}
     return _uid_collisions(uid_by_sid)
 
 
 async def load_sid_cache() -> None:
-    """#327: populate the thread_id -> ULID cache from the DB at startup (after the migration has
-    backfilled `sid`). session_sid() reads this cache on the hot path."""
+    """Populate the thread_id to ULID cache from the DB.
+
+    - Run at startup after the `sid` backfill
+    - `session_sid()` reads this cache on the hot path
+    """
     conn = _require_conn()
     async with _lock:
         cur = await conn.execute("SELECT thread_id, sid FROM threads WHERE sid IS NOT NULL")
@@ -1729,12 +1683,14 @@ async def load_sid_cache() -> None:
 
 
 async def migrate_sessions_to_ulid(base_workdir: str) -> int:
-    """#327 (decoupled): backfill a stored PUBLIC ULID for every session that lacks one. DB-ONLY —
-    the workdir / transcript / jail-uid stay on the stable 6-hex session_sid(), so the filesystem is
-    NEVER touched and `resume` can't break. Idempotent (rows that already have a sid are skipped),
-    safe to run every startup. ``base_workdir`` is unused now (kept for the call signature — no dirs
-    are moved). Returns the count backfilled."""
-    _ = base_workdir  # decoupled migration is DB-only; no directories are moved
+    """Backfill a stored public ULID for sessions lacking one.
+
+    - DB-only; filesystem never touched, so resume can't break
+    - Idempotent, safe every startup
+    - `base_workdir` is unused (signature only)
+    - Returns the count backfilled
+    """
+    _ = base_workdir  # DB-only; no directories are moved
     conn = _require_conn()
     backfilled = 0
     async with _lock:
@@ -1755,22 +1711,12 @@ async def migrate_sessions_to_ulid(base_workdir: str) -> int:
 
 
 async def migrate_workdirs_to_ulid(base_workdir: str) -> int:
-    """#332: rename each per-session workdir from the legacy 6-hex ``session_sid`` to the
-    PUBLIC ULID, so the on-disk name matches the id shown in the UI and is collision-safe
-    (80-bit) instead of the old 24-bit hash. For every session whose dir is still the 6-hex:
+    """Rename per-session workdirs from 6-hex sid to ULID.
 
-      * rename ``base/<6hex>`` -> ``base/<ulid>``;
-      * re-encode the nested transcript dir ``<ulid>/state/<old-encoded-cwd>`` ->
-        ``<ulid>/state/<new-encoded-cwd>`` — claude keys ``resume`` by the cwd-encoded path,
-        so this MUST follow the rename or resume breaks (the #327/#140 trap);
-      * re-key the ``session_uid`` registry row (keyed by the on-disk dir name) 6hex -> ulid,
-        so the per-session host uid stays stable across the rename;
-      * realign the stored ``cwd`` to the new ULID path.
-
-    Idempotent (a session already on its ULID dir is skipped, incl. ones born ULID-named) and
-    per-row fail-safe: an OSError on one dir is logged and skipped WITHOUT touching its cwd, so
-    that session still runs off its old dir and the next startup retries. Must run AFTER the
-    ULID backfill (every thread needs its `sid`). Returns the number of sessions migrated.
+    - Re-encodes the transcript dir so resume survives
+    - Re-keys the `session_uid` row; realigns stored `cwd`
+    - Idempotent; per-row fail-safe, retried next startup
+    - Must run after the ULID backfill; returns count
     """
     conn = _require_conn()
     base = Path(base_workdir)
@@ -1785,8 +1731,8 @@ async def migrate_workdirs_to_ulid(base_workdir: str) -> int:
             cwd = row["cwd"]
             if not ulid:
                 continue
-            # Already on the ULID dir (cwd's parent dir == the ULID) — skip. Covers sessions
-            # born ULID-named and a re-run after a prior migration.
+            # Already on the ULID dir: skip.
+            # - Covers ULID-born sessions and re-runs
             if cwd and os.path.basename(os.path.dirname(os.path.normpath(cwd))) == ulid:
                 continue
             legacy = _derive_sid(tid)            # the old 6-hex on-disk name
@@ -1796,10 +1742,9 @@ async def migrate_workdirs_to_ulid(base_workdir: str) -> int:
             try:
                 if old.is_dir() and not new.exists():
                     os.rename(old, new)
-                    # Re-encode the nested transcript dir so `resume` survives the rename.
-                    # #335: this regex MUST stay in sync with archive.encode_workdir (the
-                    # shared cwd→project-dir encoder the runtime readers use); leaf db.py
-                    # keeps its own copy rather than import archive for one migration line.
+                    # Re-encode the transcript dir so `resume` survives the rename.
+                    # - Regex must stay in sync with `archive.encode_workdir`
+                    # - `db.py` keeps its own copy to stay a leaf
                     old_enc = re.sub(r"[^A-Za-z0-9]", "-", str(old / "work"))
                     new_enc = re.sub(r"[^A-Za-z0-9]", "-", str(new / "work"))
                     state = new / "state"
@@ -1807,9 +1752,9 @@ async def migrate_workdirs_to_ulid(base_workdir: str) -> int:
                         os.rename(state / old_enc, state / new_enc)
                     logger.info("migrate_workdirs_to_ulid: thread %s %s -> %s", tid, old, new)
                 elif old.is_dir() and new.is_dir():
-                    # #338: both exist — keep the ULID dir, realign cwd. Remove the orphaned
-                    # legacy dir ONLY if it is empty (os.rmdir fails on a non-empty dir → a
-                    # legacy dir still holding files is LEFT IN PLACE, never silently deleted).
+                    # Both dirs exist: keep the ULID dir, realign cwd.
+                    # - Remove the legacy dir only if empty
+                    # - A non-empty legacy dir is left in place (`os.rmdir` fails)
                     try:
                         os.rmdir(old)
                         logger.info(
@@ -1820,8 +1765,8 @@ async def migrate_workdirs_to_ulid(base_workdir: str) -> int:
                             "migrate_workdirs_to_ulid: both %s and %s exist for thread %s; "
                             "kept new dir, legacy dir not empty — left in place, cwd realigned",
                             old, new, tid)
-                # else: no live dir yet (lazy) or new-only — just realign cwd + uid below.
-                # Re-key the uid registry (keyed by the on-disk dir name) so the uid is stable.
+                # No live dir yet: just realign cwd and uid.
+                # - Re-key the uid registry so the uid stays stable
                 await conn.execute("UPDATE session_uid SET sid = ? WHERE sid = ?", (ulid, legacy))
                 if cwd != new_cwd:
                     await conn.execute(
@@ -1837,30 +1782,14 @@ async def migrate_workdirs_to_ulid(base_workdir: str) -> int:
 
 
 async def migrate_workdirs_to_sid(base_workdir: str) -> int:
-    """One-time, idempotent rename of per-session workdirs from the raw numeric
-    thread_id to the stable PUBLIC sid (#140).
+    """Retired migration renaming workdirs from thread_id to sid.
 
-    Historically a session's working directory was ``base_workdir/<thread_id>``
-    (and its sandbox state ``base_workdir/<thread_id>.sbxstate``). #140 names them
-    by ``session_sid(thread_id)`` instead so on-disk names match the id shown in
-    /sessions and never leak the internal numbering. For every thread row we:
-
-      * compute old = base_workdir/<thread_id>, new = base_workdir/<sid>;
-      * if old != new and old exists and new does NOT, os.rename(old, new) and,
-        if present, rename "old.sbxstate" -> "new.sbxstate";
-      * UPDATE the row's cwd column to the new ABSOLUTE path.
-
-    Rows already migrated (cwd basename already == sid) are skipped, so this is
-    safe to run on every startup. Returns the number of rows migrated; never
-    raises for an individual row (logs and continues) so a single bad dir can't
-    block the rest.
+    - Returns early to avoid clobbering the nested layout
+    - Renamed the `.sbxstate` sidecar and updated stored `cwd`
     """
-    # #181: RETIRED — return early so the legacy #140 rename can't CLOBBER the new
-    # nested layout (<sid>/work). Its skip-check keys on basename==sid, but the new
-    # cwd basename is "work", so re-running it would strip "/work" off every startup.
-    # This deployment is long-migrated and the nested move was done by hand (no new
-    # migration tooling, per the owner). Original body kept below (unreachable) for
-    # history per the audit convention.
+    # Retired: return early to protect the nested layout.
+    # - Old skip-check keys on basename==sid, but cwd basename is "work"
+    # - Re-running would strip "/work" on every startup
     return 0
     conn = _require_conn()
     base = Path(base_workdir)
@@ -1873,7 +1802,7 @@ async def migrate_workdirs_to_sid(base_workdir: str) -> int:
             thread_id = int(row["thread_id"])
             sid = session_sid(thread_id)
             cur_cwd = row["cwd"]
-            # Already on the new scheme (the stored cwd ends in the sid) — skip.
+            # Already on the new scheme (cwd ends in sid): skip.
             if cur_cwd and os.path.basename(os.path.normpath(cur_cwd)) == sid:
                 continue
             old = base / str(thread_id)
@@ -1881,8 +1810,8 @@ async def migrate_workdirs_to_sid(base_workdir: str) -> int:
             if old == new:
                 continue
             try:
-                # Rename the dir (+ its .sbxstate sidecar) if it still lives at the
-                # OLD numeric name and the sid name is free.
+                # Rename dir and sidecar if still at old name.
+                # - Only when the sid name is free
                 if old.exists() and not new.exists():
                     os.rename(old, new)
                     old_sbx = Path(f"{old}.sbxstate")
@@ -1893,8 +1822,8 @@ async def migrate_workdirs_to_sid(base_workdir: str) -> int:
                         "Migrated workdir for thread %s: %s -> %s", thread_id, old, new
                     )
                 elif old.exists() and new.exists():
-                    # Both present (e.g. a half-finished prior run) — don't clobber
-                    # the new dir; the cwd realignment below settles it.
+                    # Both present: don't clobber the new dir.
+                    # - The cwd realignment below settles it
                     logger.warning(
                         "Workdir migration: both %s and %s exist for thread %s; "
                         "kept new dir, realigned cwd only",
@@ -1902,13 +1831,10 @@ async def migrate_workdirs_to_sid(base_workdir: str) -> int:
                         new,
                         thread_id,
                     )
-                # In EVERY case the canonical dir is now the sid path, so realign the
-                # stored cwd whenever it still differs. #140-fix: this UPDATE must
-                # also bump `migrated` so the guarded commit below isn't skipped — the
-                # realign-only branches previously updated cwd but left migrated=0, so
-                # `if migrated: commit()` dropped the change and it re-ran forever.
-                # Also covers a crash BETWEEN a prior rename and its commit (old gone,
-                # new exists, cwd still stale) and a never-started session (no dir yet).
+                # Always realign stored cwd to the sid path.
+                # - The UPDATE must bump `migrated` so the commit isn't skipped
+                # - Covers a crash between rename and commit
+                # - Covers a never-started session (no dir yet)
                 if cur_cwd != str(new):
                     await conn.execute(
                         "UPDATE threads SET cwd = ? WHERE thread_id = ?",

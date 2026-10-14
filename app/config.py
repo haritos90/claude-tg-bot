@@ -1,8 +1,8 @@
-"""Application configuration loaded from a .env file in the current working directory.
+"""Application settings loaded from a .env file.
 
-Exposes a typed Settings dataclass and load_settings(), which validates required
-environment variables and warns (without raising) when ANTHROPIC_API_KEY is set,
-since that would force paid API billing instead of the Pro/Max subscription.
+- Typed `Settings` dataclass built by `load_settings()`
+- Warns, never raises, if ANTHROPIC_API_KEY is set
+- That key would force paid API billing
 """
 
 from __future__ import annotations
@@ -15,22 +15,23 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-# Default model used when DEFAULT_MODEL is not provided in the environment: the Claude Code
-# CLI's own "default" alias — the model Claude Code recommends for the account, resolved by
-# the CLI (app/core/models.py). No model family or version is named in code; a deployment
-# that wants a family pins it in .env (e.g. DEFAULT_MODEL=opus).
-# was: DEFAULT_MODEL = "claude-opus-4-8" — replaced for #411.
+# Default model: the CLI's own "default" alias.
+# - Resolved by the CLI; no model family named in code
+# - Pin a family in .env, e.g. DEFAULT_MODEL=opus
 DEFAULT_MODEL = "default"
 # Default base directory for per-thread working directories.
 DEFAULT_BASE_WORKDIR = "./workdirs"
-# Default SQLite database path for persisted per-thread state and usage.
+# Default SQLite path for per-thread state and usage.
 DEFAULT_DB_PATH = "./bot.db"
 # Default path to the JSON allowlist file.
 DEFAULT_ALLOWLIST_PATH = "./allowlist.json"
 
 
 def _mem_total_mb() -> int:
-    """Total RAM in MiB from /proc/meminfo (best effort; 2048 if unknown)."""
+    """Total RAM in MiB from /proc/meminfo.
+
+    - Returns 2048 if unknown
+    """
     try:
         with open("/proc/meminfo") as f:
             for line in f:
@@ -51,135 +52,114 @@ class Settings:
     base_workdir: Path
     db_path: Path
     allowlist_path: Path
-    # Per-code-session sandbox (#104). ON by default (#136) — when on, each code
-    # session's `claude` runs in a bubblewrap jail: unprivileged uid, confined to
-    # its workdir, credential injected read-only. See deploy/sandbox-claude.sh.
-    # was `= False` (opt-in) — flipped to default-on for #136 so a code session
-    # can only write inside its own workdir (the agent was creating files outside
-    # it, e.g. an imagined /Users/<name> home, when running un-jailed as root).
+    # Per-code-session sandbox, on by default.
+    # - Runs `claude` in a bubblewrap jail
+    # - Unprivileged uid, confined to its workdir
+    # - Un-jailed runs wrote files outside the workdir
+    # - See deploy/sandbox-claude.sh
     sandbox_code: bool = True
-    sandbox_uid: int = 65534          # the unprivileged uid/gid the jail drops to (INSIDE the jail)
-    sandbox_allow_exec: bool = True   # True = perm "7" (exec ok); False = "6" (noexec workdir)
-    # Per-session unprivileged HOST uid (sandbox escape hardening). OFF by default. When
-    # on, each jail is run (via setpriv + an unprivileged userns) as a DISTINCT non-root
-    # host uid derived from the session id, and its workdir is chowned to that uid (0700).
-    # So a userns/kernel escape lands as an unprivileged user (not host root), and even
-    # then cannot read another session's files (owned by a different uid). Needs
-    # unprivileged user namespaces (kernel.unprivileged_userns_clone=1) + setpriv.
+    sandbox_uid: int = 65534          # unprivileged uid/gid inside the jail
+    sandbox_allow_exec: bool = True   # True allows exec; False noexec
+    # Per-session unprivileged host uid; off by default.
+    # - Jail runs as a distinct non-root uid via setpriv
+    # - Workdir is chowned to that uid (0700)
+    # - An escape cannot read other sessions' files
+    # - Needs unprivileged userns and setpriv
     sandbox_per_session_uid: bool = False
-    sandbox_uid_base: int = 700000    # host uid range base; per-session uid = base + (sid % range)
+    sandbox_uid_base: int = 700000    # host uid: base plus offset
     sandbox_uid_range: int = 60000
-    # Credential broker (#119b). OFF by default. When on (+ sandbox on), the jailed
-    # `claude` gets only a DUMMY token + ANTHROPIC_BASE_URL pointing at a host-side
-    # broker (deploy/cred-broker.py) that injects the REAL OAuth bearer and forwards
-    # to api.anthropic.com — so the subscription token is never inside the jail.
+    # Credential broker, off by default.
+    # - Jail gets a dummy token and a broker base URL
+    # - Host broker injects the real OAuth bearer
+    # - Subscription token never enters the jail
     cred_broker: bool = False
     cred_broker_port: int = 8789
-    # Egress allowlist (#119c). OFF by default. When on (+ sandbox on), the jail's
-    # network egress is hard-blocked to loopback only by a cgroup-scoped iptables rule
-    # (deploy/egress-setup.sh): `claude` reaches Anthropic via the broker and the agent's
-    # tools reach an ALLOWLISTED set of dev hosts via the CONNECT proxy (deploy/
-    # egress-proxy.py); every other destination is dropped. Recommended WITH cred_broker.
+    # Egress allowlist, off by default.
+    # - Jail egress blocked to loopback by cgroup-scoped iptables
+    # - Anthropic via broker; dev hosts via CONNECT proxy
+    # - Other destinations are dropped
+    # - Recommended together with `cred_broker`
     sandbox_egress: bool = False
     egress_proxy_port: int = 8790
-    egress_allow_hosts: str = ""      # extra CONNECT-allowlisted hosts (beyond the proxy defaults)
-    # Per-jail DoS limits (#119e). 0 / "" = unset (no limit). Applied via the manual
-    # cgroup leaf the launcher joins (memory.max / cpu.max / pids.max). seccomp loads a
-    # denylist BPF (deploy/make-seccomp.py) into the jail when on (x86_64 only).
-    sandbox_mem_mb: int = 0           # memory.max in MB (0 = unlimited)
-    sandbox_cpu_percent: int = 0      # cpu.max as % of ONE core (100 = 1 core; 0 = unlimited)
-    sandbox_pids_max: int = 0         # pids.max (0 = unlimited)
+    egress_allow_hosts: str = ""      # extra CONNECT-allowlisted hosts
+    # Per-jail DoS limits; 0 or empty = unset.
+    # - Applied through the cgroup leaf the launcher joins
+    # - seccomp loads a denylist BPF when on (x86_64 only)
+    sandbox_mem_mb: int = 0           # memory.max in MB
+    sandbox_cpu_percent: int = 0      # cpu.max, percent of one core
+    sandbox_pids_max: int = 0         # pids.max
     sandbox_seccomp: bool = False
-    sandbox_seccomp_path: str = ""    # derived: where bot.main writes the compiled BPF blob
-    # Per-user session limit (read-only to the user; owner-managed). This is the GLOBAL
-    # default; a per-user override lives in allowlist.json. 0 = unlimited.
+    sandbox_seccomp_path: str = ""    # bot.main writes the compiled BPF here
+    # Global per-user session limit; 0 = unlimited.
+    # - Per-user override lives in allowlist.json
     max_sessions_default: int = 500
-    # Concurrency / RAM management (#179). Defaults derived from the box's RAM + CPU
-    # at load (see load_settings) so a small VPS self-limits. Each LIVE `claude`
-    # client is a persistent subprocess (~400–600 MB RSS); without caps, N first-time
-    # users = N processes pinned until restart → OOM on a small box. The idle reaper
-    # frees them (history persists on disk; `resume` rebuilds on the next message).
-    max_live_clients: int = 4      # max simultaneously-LIVE claude clients (idle+busy)
-    idle_ttl_sec: int = 360        # reap a client idle longer than this — 6 min = the ~5-min warm
-                                   # prompt-cache window + ~1 min buffer (no caching gain past it)
-    # #274: a persistent jailed SHELL survives the client reap (it's ~3 MB vs ~500 MB for the
-    # claude client, and holds the user's cd/env + any running command) on its OWN, far longer
-    # TTL so the user can step away, discuss results with the bot, and come back to a live shell.
-    # 0 = keep until session delete/reset. Default 24h.
-    shell_ttl_sec: int = 86400     # 24h
-    # #261: rotate a quiet session to a FRESH context after this long with no activity, so the
-    # next message starts clean instead of re-ingesting stale history (context drift). The old
-    # transcript + workdir are kept on disk. 0 = never auto-rotate. Per-user override → idle_reset_min.
-    idle_reset_sec: int = 2700     # 45 min (was 1800 / 30 min — #359)
-    # #412: how often the bot runs the host CLI's own updater (`claude update`) and re-stages
-    # the jail copy, so new models (taken from the CLI, #411) arrive with no bot change.
-    # was (#412, an interval in hours — replaced for #423 by a daily run at a fixed UTC time):
-    #   cli_update_hours: int = 24
-    # #423: run that update once a day at this UTC time ("HH:MM"; "off" = never), then move the
-    # clients onto the new binary without cutting a reply (idle ones at once, busy ones after
-    # their turn). The owner can change it at runtime from /settings → Admin (persisted in kv
-    # `cli_update_at`, which overrides this startup default).
+    # Concurrency and RAM caps; defaults derive from the box.
+    # - Each live `claude` client uses ~400-600 MB RSS
+    # - Idle reaper frees them; `resume` rebuilds on demand
+    max_live_clients: int = 4      # max simultaneously live clients
+    idle_ttl_sec: int = 360        # reap clients idle past this
+                                   # Six minutes = 5-minute warm cache plus buffer
+                                   # - No caching gain past it
+    # Detached jailed shell survives the client reap.
+    # - ~3 MB versus ~500 MB for the client
+    # - Keeps cd/env and any running command
+    # - Own longer TTL; 0 = until delete or reset
+    shell_ttl_sec: int = 86400     # 24 hours
+    # Rotate a quiet session to a fresh context.
+    # - Avoids re-ingesting stale history (context drift)
+    # - Old transcript and workdir stay on disk
+    # - 0 = never; per-user override `idle_reset_min`
+    idle_reset_sec: int = 2700     # 45 minutes
+    # Run `claude update` daily at this UTC time.
+    # - Format HH:MM; "off" = never
+    # - Idle clients move at once, busy ones after their turn
+    # - Owner can override at runtime via kv `cli_update_at`
     cli_update_at: str = "12:00"
-    max_concurrent_turns: int = 4  # cap on SIMULTANEOUS active turns (the generation spike)
-    min_free_mb: int = 400         # below this MemAvailable, evict idle clients before a turn
-    # Extra prompt keyword triggers to neutralize, ON TOP of the built-in defaults
-    # (engine.DEFAULT_KEYWORD_TRIGGERS = ultrathink, ultracode). Loaded from
-    # BLOCKED_PROMPT_KEYWORDS (comma/space-separated). Each word is made inert in
-    # user prompts so it can't trigger a hidden CLI behaviour — see the README and
-    # engine.defuse_triggers. Empty by default (the defaults still apply).
+    max_concurrent_turns: int = 4  # cap on simultaneous active turns
+    min_free_mb: int = 400         # evict idle clients below this MemAvailable
+    # Extra prompt keyword triggers to neutralize.
+    # - Added on top of the built-in defaults
+    # - Loaded from BLOCKED_PROMPT_KEYWORDS (comma/space-separated)
+    # - Each word is made inert in user prompts
+    # - Empty by default; defaults still apply
     extra_blocked_keywords: list[str] = field(default_factory=list)
-    # #178: archive retention (days). Deleted-session bundles under
-    # BASE_WORKDIR/_archive are auto-purged when older than this; 0 = keep forever
-    # ("never"). Default 6 months. The owner can change it at runtime from
-    # /settings → Admin (persisted in kv `archive_retention_days`, which overrides
-    # this startup default).
+    # Archive retention in days; 0 = keep forever.
+    # - Older bundles under `_archive` are auto-purged
+    # - Default 6 months
+    # - Owner override persists in kv `archive_retention_days`
     archive_retention_days: int = 180
-    # #363: local speech-to-text for Telegram voice notes. OFF by default — needs the
-    # OPTIONAL ffmpeg (system binary) + faster-whisper (pip; see requirements/voice.txt)
-    # deps. When on, a voice note is decoded with ffmpeg and transcribed on-device by
-    # faster-whisper in the HOST process (audio never enters the jail, never leaves the
-    # box), then routed like a typed turn. Recognition need not be perfect — the agent
-    # tolerates errors like typos — so a small/fast model (default "base") is enough.
+    # Local speech-to-text for voice notes; off by default.
+    # - Needs optional ffmpeg and faster-whisper
+    # - Transcribed on host; audio never enters the jail
+    # - Small model suffices; agent tolerates recognition errors
     voice_transcription: bool = False
-    voice_model: str = "base"     # faster-whisper size (tiny/base/small/...) or a local model path
-    voice_lang: str = ""          # "" = autodetect; force a language with e.g. "ru" / "en"
-    voice_max_seconds: int = 300  # reject longer notes (protects the CPU box); 0 = no limit
-    voice_model_path: str = ""    # model cache dir; "" = a "models" dir beside BASE_WORKDIR
-    # #434: MAX (max.ru) messenger transport. OFF unless MAX_BOT_TOKEN is set. The same
-    # handlers serve both platforms behind a routing Bot session (app/max); MAX users live in
-    # their own id namespace (app.max.ids), so sessions/users never overlap with Telegram and
-    # the owner's MAX account is an ordinary allowlisted user — admin stays on Telegram.
+    voice_model: str = "base"     # model size or local path
+    voice_lang: str = ""          # empty autodetects; else force a language
+    voice_max_seconds: int = 300  # max note seconds, 0 unlimited
+    voice_model_path: str = ""    # model cache dir; empty = default
+    # MAX (max.ru) transport; off unless MAX_BOT_TOKEN set.
+    # - Same handlers serve both platforms via a routing session
+    # - MAX users have their own id namespace
+    # - Owner is an ordinary MAX user; admin stays on Telegram
     max_bot_token: str = ""
     max_api_base: str = "https://platform-api2.max.ru"
-    max_ca_bundle: str = ""       # "" = bundled deploy/certs/russian_trusted_root_ca.pem; "system" = OS store only
+    max_ca_bundle: str = ""       # bundled CA, or "system" store
 
 
 def load_settings() -> Settings:
-    """Read configuration from a .env file in the CWD and return Settings.
+    """Read .env from the CWD and return Settings.
 
-    Required environment variables:
-        TELEGRAM_BOT_TOKEN -- Telegram Bot API token.
-        OWNER_ID           -- integer Telegram user id allowed to use the bot.
-
-    Optional environment variables:
-        DEFAULT_MODEL  -- model alias or id (default "default" — the CLI's recommended model).
-        BASE_WORKDIR   -- base directory for per-thread cwds (default "./workdirs").
-        DB_PATH        -- SQLite database path (default "./bot.db").
-        ALLOWLIST_PATH -- JSON allowlist file path (default "./allowlist.json").
-
-    Side effects:
-        - Creates base_workdir if it does not exist.
-        - Prints a WARNING to stderr if ANTHROPIC_API_KEY is set (does not raise).
-
-    Raises:
-        ValueError: if a required variable is missing or OWNER_ID is not an int.
+    - Required: TELEGRAM_BOT_TOKEN and integer OWNER_ID
+    - Optional: DEFAULT_MODEL, BASE_WORKDIR, DB_PATH, ALLOWLIST_PATH
+    - Creates base_workdir; warns on stderr if API key set
+    - Raises ValueError for a missing variable or non-int OWNER_ID
     """
-    # Load variables from a .env file in the current working directory, if present.
-    # Existing process environment values take precedence over the file.
+    # Load .env from the CWD if present.
+    # - Existing environment values take precedence
     load_dotenv(override=False)
 
-    # Warn (do not raise) if an API key is present: it would force paid API billing
-    # instead of using the logged-in subscription credentials of the claude CLI.
+    # Warn, don't raise, if an API key exists.
+    # - It would force paid billing over subscription
     if os.environ.get("ANTHROPIC_API_KEY"):
         print(
             "WARNING: ANTHROPIC_API_KEY is set. This will force PAID API billing "
@@ -209,10 +189,9 @@ def load_settings() -> Settings:
         ) from exc
 
     default_model = os.environ.get("DEFAULT_MODEL", DEFAULT_MODEL).strip() or DEFAULT_MODEL
-    # Resolve to an ABSOLUTE path (#136): the per-session cwd is derived from this
-    # and passed to the sandbox launcher (which binds it + derives SBX_STATE from
-    # it). A relative base made SBX_STATE relative-to-the-jail-cwd and broke
-    # session-state persistence. was: Path(os.environ.get(...) or DEFAULT)
+    # Resolve base workdir to an absolute path.
+    # - Sandbox launcher derives SBX_STATE from it
+    # - A relative path broke session-state persistence
     base_workdir = Path(
         os.environ.get("BASE_WORKDIR", DEFAULT_BASE_WORKDIR).strip() or DEFAULT_BASE_WORKDIR
     ).resolve()
@@ -224,7 +203,7 @@ def load_settings() -> Settings:
         or DEFAULT_ALLOWLIST_PATH
     )
 
-    # Ensure the base working directory exists (parents included).
+    # Ensure the base working directory exists.
     base_workdir.mkdir(parents=True, exist_ok=True)
 
     def _flag(name: str, default: bool) -> bool:
@@ -233,30 +212,24 @@ def load_settings() -> Settings:
             return default
         return raw.strip().lower() in ("1", "true", "yes", "on")
 
-    sandbox_code = _flag("SANDBOX_CODE", True)  # #136: default-on (was False)
+    sandbox_code = _flag("SANDBOX_CODE", True)
     try:
         sandbox_uid = int(os.environ.get("SANDBOX_UID", "65534").strip() or "65534")
     except ValueError:
         sandbox_uid = 65534
     sandbox_allow_exec = _flag("SANDBOX_EXEC", True)
-    # #312: full isolation is the DEFAULT posture now (was opt-in / off by default).
-    # The broker, the loopback-only egress block, the seccomp denylist and the per-session
-    # non-root uid all default ON; a host that can't support a layer opts OUT via its env
-    # flag (=0). On this deployment `.env` already sets all four to 1, so the default flip
-    # is a runtime no-op here — it only hardens a fresh deploy that ships no overrides.
-    # was (opt-in, off by default — pre-#312):
-    #   cred_broker = _flag("CRED_BROKER", False)                        # #119b
-    #   sandbox_egress = _flag("SANDBOX_EGRESS", False)                  # #119c
-    #   sandbox_seccomp = _flag("SANDBOX_SECCOMP", False)                # #119e
-    #   sandbox_per_session_uid = _flag("SANDBOX_PER_SESSION_UID", False)
-    cred_broker = _flag("CRED_BROKER", True)             # #312: default-on (needs the host broker sidecar)
-    sandbox_egress = _flag("SANDBOX_EGRESS", True)       # #312: default-on (needs egress-setup.sh + iptables/cgroup)
-    sandbox_seccomp = _flag("SANDBOX_SECCOMP", True)     # #312: default-on (needs the generated seccomp profile)
-    sandbox_per_session_uid = _flag("SANDBOX_PER_SESSION_UID", True)  # #312: default-on (needs userns + BASE_WORKDIR outside /root)
+    # Full isolation is on by default.
+    # - Broker, egress block, seccomp, per-session uid default on
+    # - Hosts lacking a layer opt out via env flag (=0)
+    cred_broker = _flag("CRED_BROKER", True)             # needs the host broker sidecar
+    sandbox_egress = _flag("SANDBOX_EGRESS", True)       # needs egress-setup.sh, iptables, cgroup
+    sandbox_seccomp = _flag("SANDBOX_SECCOMP", True)     # needs the generated seccomp profile
+    sandbox_per_session_uid = _flag("SANDBOX_PER_SESSION_UID", True)  # needs userns; BASE_WORKDIR outside /root
     egress_allow_hosts = (os.environ.get("EGRESS_ALLOW_HOSTS", "") or "").strip()
 
-    # Concurrency / RAM caps (#179). Derive sane defaults from the box: reserve
-    # ~900 MB for the OS + bot + buffers, budget ~550 MB per live claude client.
+    # Derive concurrency and RAM caps from the box.
+    # - Reserve ~900 MB for OS, bot, buffers
+    # - Budget ~550 MB per live client
     def _int(name: str, default: int) -> int:
         raw = os.environ.get(name)
         if raw is None or not raw.strip():
@@ -271,54 +244,54 @@ def load_settings() -> Settings:
     _default_live = max(2, (_total_mb - 900) // 550)
     _default_turns = max(1, min(_default_live, _cpus * 2))
     max_live_clients = max(1, _int("MAX_LIVE_CLIENTS", _default_live))
-    idle_ttl_sec = max(60, _int("IDLE_TTL_SEC", 360))  # #179: 6-min default = warm-cache (5m) + 1m
-                                                       # buffer (per-user override → #182)
-    idle_reset_sec = max(0, _int("IDLE_RESET_SEC", 2700))  # #261: 45-min idle → fresh session (was 1800)
-                                                           # (0 = off; per-user override → idle_reset_min)
-    # was: cli_update_hours = max(0, _int("CLI_UPDATE_INTERVAL_HOURS", 24))  # #412 — replaced for #423
-    # #423: daily CLI update time, UTC ("off" = never). A legacy CLI_UPDATE_INTERVAL_HOURS=0
-    # (the old "never") still disables it when CLI_UPDATE_AT_UTC is not set.
+    idle_ttl_sec = max(60, _int("IDLE_TTL_SEC", 360))  # 6 min default
+                                                       # Warm cache (5 min) plus 1 min buffer
+    idle_reset_sec = max(0, _int("IDLE_RESET_SEC", 2700))  # 45-min idle rotates to fresh session
+                                                           # 0 = off; per-user override `idle_reset_min`
+    # Daily CLI update time, UTC; "off" = never.
+    # - Legacy CLI_UPDATE_INTERVAL_HOURS=0 still disables it
+    # - Applies only when CLI_UPDATE_AT_UTC is unset
     cli_update_at = (os.environ.get("CLI_UPDATE_AT_UTC") or "").strip()
     if not cli_update_at:
         cli_update_at = ("off" if os.environ.get("CLI_UPDATE_INTERVAL_HOURS", "").strip() == "0"
                          else "12:00")
-    shell_ttl_sec = max(0, _int("SHELL_TTL_SEC", 86400))   # #274: detached-shell TTL (0 = until delete)
+    shell_ttl_sec = max(0, _int("SHELL_TTL_SEC", 86400))   # detached-shell TTL; 0 = until delete
     max_concurrent_turns = max(1, _int("MAX_CONCURRENT_TURNS", _default_turns))
     min_free_mb = max(0, _int("MIN_FREE_MB", 400))
-    cred_broker_port = max(1, _int("CRED_BROKER_PORT", 8789))  # #119b
-    egress_proxy_port = max(1, _int("EGRESS_PROXY_PORT", 8790))  # #119c
-    sandbox_mem_mb = max(0, _int("SANDBOX_MEM_MB", 0))           # #119e (0 = unlimited)
-    sandbox_cpu_percent = max(0, _int("SANDBOX_CPU_PERCENT", 0))  # #119e (100 = one core)
-    sandbox_pids_max = max(0, _int("SANDBOX_PIDS_MAX", 0))        # #119e (0 = unlimited)
+    cred_broker_port = max(1, _int("CRED_BROKER_PORT", 8789))
+    egress_proxy_port = max(1, _int("EGRESS_PROXY_PORT", 8790))
+    sandbox_mem_mb = max(0, _int("SANDBOX_MEM_MB", 0))           # 0 = unlimited
+    sandbox_cpu_percent = max(0, _int("SANDBOX_CPU_PERCENT", 0))  # 100 = one core
+    sandbox_pids_max = max(0, _int("SANDBOX_PIDS_MAX", 0))        # 0 = unlimited
     sandbox_uid_base = max(1000, _int("SANDBOX_UID_BASE", 700000))
     sandbox_uid_range = max(1, _int("SANDBOX_UID_RANGE", 60000))
-    max_sessions_default = max(0, _int("MAX_SESSIONS_PER_USER", 500))  # 0 = unlimited; #268: 10→500
-                                                                       # (per-session disk is tiny —
-                                                                       # just the transcript, ~KB–~1MB)
-    # #119e: where bot.main writes the compiled seccomp BPF blob (under BASE_WORKDIR so
-    # it is on a writable path the engine can point bwrap's --seccomp fd at). Set only
-    # when seccomp is on; the actual file is generated by bot.main at startup.
+    max_sessions_default = max(0, _int("MAX_SESSIONS_PER_USER", 500))  # 0 = unlimited
+                                                                       # Per-session disk is tiny (~1 MB transcript)
+    # Where bot.main writes the seccomp BPF blob.
+    # - Under BASE_WORKDIR so bwrap's --seccomp fd can read it
+    # - Set only when seccomp is on
     sandbox_seccomp_path = str(base_workdir / ".sbx-seccomp.bpf") if sandbox_seccomp else ""
-    # #178: archive retention in days (0 = keep forever). The startup default; the
-    # owner can override it at runtime via /settings → Admin (kv archive_retention_days).
+    # Archive retention in days; 0 = keep forever.
+    # - Startup default; owner overrides at runtime (kv `archive_retention_days`)
     archive_retention_days = max(0, _int("ARCHIVE_RETENTION_DAYS", 180))
 
-    # #363: voice-note transcription (optional feature; deps in requirements/voice.txt).
-    # voice_lang "" = autodetect; VOICE_MODEL default "base" (VOICE_MODEL can pick tiny =
-    # faster / small = better, or a local path); VOICE_MAX_SECONDS default 300 (0 = off).
+    # Voice-note transcription; optional deps in requirements/voice.txt.
+    # - Language empty = autodetect
+    # - Model default "base"; tiny faster, small better
+    # - Max seconds default 300; 0 = off
     voice_transcription = _flag("VOICE_TRANSCRIPTION", False)
     voice_model = (os.environ.get("VOICE_MODEL", "") or "").strip() or "base"
     voice_lang = (os.environ.get("VOICE_LANG", "") or "").strip()
     voice_max_seconds = max(0, _int("VOICE_MAX_SECONDS", 300))
     voice_model_path = (os.environ.get("VOICE_MODEL_PATH", "") or "").strip()
 
-    # #434: MAX transport — token empty = off. Never logged.
+    # MAX transport; empty token = off, never logged.
     max_bot_token = (os.environ.get("MAX_BOT_TOKEN", "") or "").strip()
     max_api_base = (os.environ.get("MAX_API_BASE", "") or "").strip() or "https://platform-api2.max.ru"
     max_ca_bundle = (os.environ.get("MAX_CA_BUNDLE", "") or "").strip()
 
-    # Extra keyword triggers to neutralize in prompts (on top of the engine
-    # defaults). Comma- or whitespace-separated; blanks dropped.
+    # Extra keyword triggers to neutralize in prompts.
+    # - On top of engine defaults; blanks dropped
     raw_keywords = os.environ.get("BLOCKED_PROMPT_KEYWORDS", "") or ""
     extra_blocked_keywords = [w for w in re.split(r"[,\s]+", raw_keywords.strip()) if w]
 
@@ -350,7 +323,7 @@ def load_settings() -> Settings:
         idle_ttl_sec=idle_ttl_sec,
         shell_ttl_sec=shell_ttl_sec,
         idle_reset_sec=idle_reset_sec,
-        cli_update_at=cli_update_at,  # #423 (was: cli_update_hours=cli_update_hours, #412)
+        cli_update_at=cli_update_at,
         max_concurrent_turns=max_concurrent_turns,
         min_free_mb=min_free_mb,
         archive_retention_days=archive_retention_days,

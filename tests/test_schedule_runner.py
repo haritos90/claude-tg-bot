@@ -1,8 +1,9 @@
-"""Unit tests for the #188 schedule RUNNER gates in sessions._fire_schedule:
-orphan guard (#254), allowlist re-check (#255), the no-swap memory deferral, and the
-db cascade-delete of schedules on session delete (#254).
+"""Unit tests for the schedule runner gates in `sessions._fire_schedule`.
 
-Async tests wrap asyncio.run (no pytest-asyncio), matching the suite convention.
+- orphan guard and allowlist re-check
+- no-swap memory deferral
+- db cascade-delete of schedules on session delete
+- async tests wrap `asyncio.run`, no pytest-asyncio
 """
 import asyncio
 import json
@@ -29,7 +30,7 @@ def _mgr(allowlist=None, min_free_mb=400):
         bot=SimpleNamespace(send_message=_noop), settings=settings,
         gate=SimpleNamespace(), allowlist=allowlist,
     )
-    sm._fired = []  # record handle_text dispatches
+    sm._fired = []  # record `handle_text` dispatches
     async def _fake_handle_text(chat_id, thread_id, prompt):
         sm._fired.append((chat_id, thread_id, prompt))
         return 0
@@ -42,7 +43,10 @@ async def _noop(*a, **kw):
 
 
 async def _seed(spec, *, with_thread=True, owner_uid=42, past=True):
-    """Fresh in-memory db with one schedule (next_run already due if past)."""
+    """Fresh in-memory db with one schedule.
+
+    - next_run is already due if in the past
+    """
     await db.init_db(":memory:")
     if with_thread:
         await db.ensure_thread(7, 100, "claude-opus-4-8", "/tmp")
@@ -75,9 +79,9 @@ def test_low_memory_defers_without_advancing():
         sm._mem_available_mb = staticmethod(lambda: 50)  # below floor, stays below
         row = (await db.due_schedules(time.time()))[0]
         await sm._fire_schedule(row)
-        assert sm._fired == []                        # NOT dispatched
+        assert sm._fired == []                        # not dispatched
         sched = await db.get_schedule(sid)
-        assert sched["next_run"] == old_next          # next_run UNTOUCHED → retried next sweep
+        assert sched["next_run"] == old_next          # next_run untouched; retried next sweep
         assert sched["enabled"] == 1                  # still active
         await db.close_db()
     asyncio.run(run())
@@ -90,7 +94,7 @@ def test_orphan_thread_disables_schedule():
         sm._mem_available_mb = staticmethod(lambda: 1 << 20)
         row = (await db.due_schedules(time.time()))[0]
         await sm._fire_schedule(row)
-        assert sm._fired == []                        # did NOT resurrect the thread
+        assert sm._fired == []                        # did not resurrect the thread
         sched = await db.get_schedule(sid)
         assert sched["enabled"] == 0
         assert sched["last_status"] == "orphaned"
@@ -116,13 +120,13 @@ def test_revoked_owner_disables_schedule():
 def test_delete_dm_session_cascades_to_schedules():
     async def run():
         await db.init_db(":memory:")
-        # delete_dm_session scopes to (thread_id == key AND chat_id == user_id).
+        # `delete_dm_session` scopes to thread_id == key and chat_id == user_id.
         await db.ensure_thread(55, 55, "claude-opus-4-8", "/tmp")
         now = time.time()
         sid = await db.add_schedule(55, 55, 55, json.dumps(
             {"kind": "interval", "seconds": 3600}), "p", now + 10, now)
         assert await db.get_schedule(sid) is not None
         assert await db.delete_dm_session(55, 55) is True
-        assert await db.get_schedule(sid) is None     # cascade removed it (#254)
+        assert await db.get_schedule(sid) is None     # cascade removed it
         await db.close_db()
     asyncio.run(run())

@@ -1,33 +1,25 @@
-"""Identity namespace and id registries for the MAX transport (#434).
+"""Identity namespace and id registries for the MAX transport.
 
-Every store in the bot (sessions, allowlist, usage, kv per-user keys, the i18n cache, the
-owner check) keys users by one bare integer, and a DM's chat id doubles as the user id.
-MAX user ids are small positive integers like Telegram's, so a MAX user is mapped to an
-INTERNAL id ``MAX_ID_OFFSET + max_user_id`` before it enters the dispatcher. Telegram user
-ids are far below the offset (they fit in 52 bits but are ~1e10 today), so the two spaces
-never meet: a MAX user can never collide with, or be mistaken for, a Telegram user — in
-particular never for the owner. Sessions and users are therefore completely separate per
-platform by construction; the owner's MAX account is an ordinary allowlisted user.
-
-MAX message ids are opaque strings (``mid.…``) while aiogram wants an int ``message_id``;
-``MidRegistry`` hands out process-local ints. ``FileRegistry`` does the same for incoming
-attachment URLs behind a ``max:<n>`` file_id, so ``bot.download()`` works unchanged.
+- MAX users map to internal id `MAX_ID_OFFSET + max_user_id`
+- Telegram ids sit far below the offset
+- `MidRegistry` maps string mids to process-local ints
+- `FileRegistry` maps attachment URLs to `max:<n>` file ids
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-MAX_ID_OFFSET = 1_000_000_000_000  # 1e12: above any Telegram id, far below 2**52
+MAX_ID_OFFSET = 1_000_000_000_000  # above Telegram ids, below 2**52
 
 
 def to_internal(max_id: int) -> int:
-    """MAX user/chat id → the internal id used everywhere inside the bot."""
+    """MAX user/chat id to the internal bot id."""
     return MAX_ID_OFFSET + int(max_id)
 
 
 def is_internal_max(uid) -> bool:
-    """True when an internal id (user or DM chat) belongs to the MAX namespace."""
+    """True if an internal id belongs to the MAX namespace."""
     try:
         return int(uid) >= MAX_ID_OFFSET
     except (TypeError, ValueError):
@@ -35,17 +27,16 @@ def is_internal_max(uid) -> bool:
 
 
 def to_max(uid: int) -> int:
-    """Internal id → the MAX user id it was mapped from."""
+    """Internal id back to the MAX user id."""
     return int(uid) - MAX_ID_OFFSET
 
 
 class MidRegistry:
-    """Bidirectional map between MAX string message ids and process-local ints.
+    """Bidirectional map between MAX string message ids and local ints.
 
-    Ints are only meaningful for this process (a restart forgets them) — that matches how
-    the bot already treats Telegram message ids it keeps in memory. The reverse lookup is
-    what edits/deletes need; a callback carries its message's mid, so a button on a message
-    sent before a restart still resolves."""
+    - Ints are meaningful only within this process
+    - Reverse lookup serves edits and deletes
+    """
 
     def __init__(self) -> None:
         self._by_mid: dict[str, int] = {}
@@ -79,7 +70,10 @@ class RemoteFile:
 
 
 class FileRegistry:
-    """``max:<n>`` file ids for incoming attachment URLs (bounded; oldest dropped)."""
+    """`max:<n>` file ids for incoming attachment URLs.
+
+    - Bounded; oldest dropped
+    """
 
     def __init__(self, cap: int = 2048) -> None:
         self._files: dict[str, RemoteFile] = {}
@@ -104,7 +98,7 @@ class FileRegistry:
 
     @staticmethod
     def path_of(file_id: str) -> str:
-        """The ``file_path`` handed to aiogram; ``RoutingSession.stream_content`` spots it."""
+        """The `file_path` handed to aiogram, spotted by `RoutingSession.stream_content`."""
         return "max/" + file_id.split(":", 1)[1]
 
     def by_path(self, path: str) -> RemoteFile | None:

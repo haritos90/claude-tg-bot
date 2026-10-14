@@ -14,12 +14,6 @@ Using AI coding tools is welcome. There are two rules:
 - Point your tool at [`AGENTS.md`](AGENTS.md), the agent context file with the always-on rules and
   a reference index (most agent tools pick it up automatically).
 
-## Editing existing code
-
-When you change or remove existing logic, don't delete it outright — comment the old version out next
-to the new code with a short reference to the task it changed for (e.g. `# was: <old> — replaced for
- #NNN`), so changes stay auditable and easy to revert. Full deletion is reserved for cleanups.
-
 ## Language: English everywhere
 
 The repository is English only.

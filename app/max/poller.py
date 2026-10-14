@@ -1,19 +1,10 @@
-"""MAX long-poller → synthetic aiogram updates (#434).
+"""MAX long-poller producing synthetic aiogram updates.
 
-``GET /updates`` (long poll, 30 s window) is the delivery method here: the bot has no public
-HTTPS endpoint, and one poller per token is the same rule as on Telegram. Each MAX update is
-rewritten as the aiogram ``Update`` it corresponds to and fed to the shared ``Dispatcher`` with
-the routing bot, so the allowlist/language middlewares and every handler see an ordinary
-private-chat update:
-
-* ``message_created`` in a dialog → ``message`` (text; an image → ``photo``, a file →
-  ``document``, an audio → ``voice`` so transcription applies; several images → one message
-  per image sharing a ``media_group_id``, which the album debounce merges into one turn).
-* ``message_callback`` → ``callback_query`` (id ``max:<callback_id>``, ``data`` = payload).
-* ``bot_started`` (the user pressed Start) → a ``/start`` text message.
-
-Group chats and channels are ignored: like the Telegram side, DM is the only live surface. The
-poll marker is persisted in kv ``max_marker`` so a restart does not replay delivered updates.
+- `GET /updates` long poll, 30 s window
+- Each update becomes an aiogram `Update` for the `Dispatcher`
+- Several images become one message each, sharing a `media_group_id`
+- Groups and channels are ignored; DM only
+- Poll marker persists in kv `max_marker`
 """
 
 from __future__ import annotations
@@ -47,7 +38,7 @@ class MaxPoller:
         self._update_seq = int(time.time())
         self._tasks: set[asyncio.Task] = set()
 
-    # ------------------------------------------------------------------ loop
+    # ---- loop ----
     async def run(self) -> None:
         marker: int | None = None
         with contextlib.suppress(Exception):
@@ -91,7 +82,7 @@ class MaxPoller:
         except Exception:
             logger.exception("MAX: unhandled error while processing an update")
 
-    # ------------------------------------------------------------------ conversion
+    # ---- conversion ----
     def _next_update_id(self) -> int:
         self._update_seq += 1
         return self._update_seq
@@ -119,7 +110,10 @@ class MaxPoller:
                 "chat": chat, "from": sender}
 
     def to_updates(self, upd: dict) -> list[dict]:
-        """One MAX update → zero or more aiogram ``Update`` dicts (pure; unit-tested)."""
+        """One MAX update to zero or more aiogram `Update` dicts.
+
+        - Pure function
+        """
         kind = upd.get("update_type")
         if kind == "message_created":
             return self._from_message_created(upd)
@@ -186,7 +180,7 @@ class MaxPoller:
         elif text:
             m["text"] = text
         elif not extra:
-            return []                                    # sticker/contact/video only: nothing to do
+            return []                                    # sticker/contact/video only: ignore
         return [{"update_id": self._next_update_id(), "message": m}]
 
     def _from_callback(self, upd: dict) -> list[dict]:

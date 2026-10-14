@@ -1,17 +1,10 @@
-"""Thin async client for the MAX Platform API (#434).
+"""Thin async client for the MAX Platform API.
 
-Base URL ``https://platform-api2.max.ru`` (the ``platform-api.max.ru`` host is retired);
-the token travels in the ``Authorization`` header (query-string tokens are no longer
-accepted). The API host is signed by the Russian Trusted Root CA (Ministry of Digital
-Development), which no stock OS trust store carries, so the client verifies TLS against a
-context holding the system store PLUS the bundled ``deploy/certs/russian_trusted_root_ca.pem``
-— scoped to this client only, never installed system-wide.
-
-Only the methods the bridge needs are wrapped. Media uploads follow the documented
-three-step flow (``POST /uploads?type=…`` → multipart ``data`` upload → attach by token) and
-``send_message`` retries the documented ``attachment.not.ready`` race with backoff. The
-platform allows ~30 requests/s; a small pacing lock keeps bursts (one reply split into parts,
-a batch of photos) under it.
+- Base URL `https://platform-api2.max.ru`; token in `Authorization`
+- TLS trusts system store plus bundled Russian root
+- The extra root is scoped to this client
+- Uploads: `POST /uploads`, multipart data, attach by token
+- `send_message` retries `attachment.not.ready`; pacing stays under ~30 rps
 """
 
 from __future__ import annotations
@@ -35,12 +28,12 @@ TEXT_LIMIT = 4000          # NewMessageBody.text maxLength
 BUTTON_TEXT_LIMIT = 128    # Button.text maxLength
 CALLBACK_PAYLOAD_LIMIT = 1024
 COMMANDS_LIMIT = 32        # BotCommandsPatch.commands maxItems
-_MIN_INTERVAL = 1 / 25     # stay under the 30 rps platform limit
+_MIN_INTERVAL = 1 / 25     # stay under 30 rps limit
 _NOT_READY_DELAYS = (0.5, 1.0, 2.0, 4.0)
 
 
 class MaxApiError(Exception):
-    """A non-2xx reply from the platform (``code`` is the platform's error code)."""
+    """A non-2xx platform reply; `code` is the platform's error code."""
 
     def __init__(self, status: int, code: str, message: str, method: str = ""):
         super().__init__(f"{method} -> {status} {code}: {message}".strip())
@@ -50,9 +43,10 @@ class MaxApiError(Exception):
 
 
 def ssl_context(ca_bundle: str | Path | None) -> ssl.SSLContext | bool:
-    """System trust store + the bundled Russian root (``None``/"" = bundled default). The
-    string ``"system"`` returns the plain default (True → aiohttp's default context), for a
-    host that already trusts the root system-wide."""
+    """System trust store plus the bundled Russian root.
+
+    - `"system"` returns the plain default context
+    """
     if ca_bundle == "system":
         return True
     ctx = ssl.create_default_context()
@@ -75,7 +69,7 @@ class MaxApi:
         self._pace = asyncio.Lock()
         self._last = 0.0
 
-    # ------------------------------------------------------------------ plumbing
+    # ---- plumbing ----
     async def session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession(
@@ -97,8 +91,11 @@ class MaxApi:
 
     async def request(self, method: str, path: str, *, params: dict | None = None,
                       json: Any = None, timeout: float | None = None) -> Any:
-        """One API call → decoded JSON (``{}`` for an empty body). 429 is retried a few
-        times; any other non-2xx raises ``MaxApiError``. The token never reaches a log."""
+        """One API call returning decoded JSON (`{}` if empty).
+
+        - 429 is retried a few times
+        - Other non-2xx raise `MaxApiError`; the token is never logged
+        """
         sess = await self.session()
         url = self.base + path
         headers = {"Authorization": self._token}
@@ -129,7 +126,7 @@ class MaxApi:
                 return data
         raise MaxApiError(429, "too.many.requests", "rate limited", f"{method} {path}")
 
-    # ------------------------------------------------------------------ methods
+    # ---- methods ----
     async def get_me(self) -> dict:
         return await self.request("GET", "/me")
 
@@ -144,13 +141,15 @@ class MaxApi:
             params["marker"] = marker
         if types:
             params["types"] = ",".join(types)
-        # The HTTP timeout must outlive the server-side long-poll window.
+        # The HTTP timeout must outlive the server long-poll window.
         return await self.request("GET", "/updates", params=params, timeout=timeout + 15)
 
     async def send_message(self, *, user_id: int | None = None, chat_id: int | None = None,
                            body: dict, disable_link_preview: bool | None = None) -> dict:
-        """``POST /messages`` → the created ``Message`` dict. Retries the documented
-        ``attachment.not.ready`` race (media still processing after upload)."""
+        """`POST /messages` returning the created `Message` dict.
+
+        - Retries the `attachment.not.ready` race
+        """
         params = {"user_id": user_id, "chat_id": chat_id,
                   "disable_link_preview": disable_link_preview}
         for delay in (*_NOT_READY_DELAYS, None):
@@ -183,7 +182,7 @@ class MaxApi:
         await self.request("POST", f"/chats/{chat_id}/actions", json={"action": action})
 
     async def upload(self, kind: str, data: bytes, filename: str) -> str:
-        """Upload ``data`` as ``kind`` (image|video|audio|file) → the attachment token."""
+        """Upload `data` as `kind` and return the attachment token."""
         endpoint = await self.request("POST", "/uploads", params={"type": kind})
         url = endpoint["url"]
         sess = await self.session()
@@ -196,7 +195,7 @@ class MaxApi:
             if resp.status >= 400:
                 raise MaxApiError(resp.status, "upload.failed",
                                   raw[:200].decode("utf-8", "replace"), f"upload {kind}")
-        if endpoint.get("token"):            # video / audio: token comes with the URL
+        if endpoint.get("token"):            # video/audio: token comes with URL
             return endpoint["token"]
         try:
             import json as _json
@@ -204,19 +203,19 @@ class MaxApi:
         except Exception as exc:
             raise MaxApiError(500, "upload.badreply", raw[:200].decode("utf-8", "replace"),
                               f"upload {kind}") from exc
-        if kind == "image":                  # {"photos": {"<id>": {"token": "…"}}}
+        if kind == "image":                  # photos: id to token mapping
             photos = info.get("photos") or {}
             for entry in photos.values():
                 if isinstance(entry, dict) and entry.get("token"):
                     return entry["token"]
             raise MaxApiError(500, "upload.notoken", str(info)[:200], "upload image")
-        token = info.get("token")            # file: {"fileId": …, "token": "…"}
+        token = info.get("token")            # file: fileId and token
         if not token:
             raise MaxApiError(500, "upload.notoken", str(info)[:200], f"upload {kind}")
         return token
 
     async def download(self, url: str, chunk_size: int = 65536):
-        """Stream an attachment URL's bytes (same TLS context as the API)."""
+        """Stream an attachment URL's bytes with the same TLS context."""
         sess = await self.session()
         async with sess.get(url) as resp:
             resp.raise_for_status()

@@ -1,17 +1,9 @@
-"""Live-updating Telegram message with a typewriter write-head.
+"""Live-updating Telegram message streamed for one model turn.
 
-A Streamer owns one placeholder message in a topic and reveals the model's reply
-in it like a write-head "typing" across the message: text the model has produced
-is held in a buffer, and a frame loop reveals it a chunk of characters at a time
-while sliding a rotating braille caret to the new frontier. When the reveal
-catches up to what the model has produced (or before the first token), the caret
-just spins in place. Telegram caps single-message edits to ~1/second, so we
-cannot truly animate per-character — each frame reveals a controlled number of
-buffered characters instead, which still reads as writing.
-
-The final flush renders the complete text (no caret), splitting long output into
-chunks or a .md document. Tool-status lines are shown above the streamed text.
-Every Telegram call is wrapped so a transient error never crashes the run.
+- Final flush splits long output into chunks or .md
+- Every Telegram call is wrapped; errors never crash
+- Tool-status lines appear above the streamed text
+- Edits cap near one per second
 """
 
 from __future__ import annotations
@@ -33,26 +25,22 @@ from aiogram.types import (
 
 from app import i18n
 from app.telegram import markup
-from app.telegram import table_image  # #243: wide (>20-col) tables → PNG; also the #162 PNG-table revert path
-from app.telegram import svg_image  # #295: chat <svg> diagrams → PNG (rasterized via cairosvg)
+from app.telegram import table_image  # wide tables rendered as PNG
+from app.telegram import svg_image  # chat svg diagrams rasterized via cairosvg
 from app.telegram.rich_message import EditRichMessage, SendRichMessage, SendRichMessageDraft
 
 logger = logging.getLogger("streamer")
 
-# Links in model output should stay inline — never expand into a web-page preview
-# card (the owner asked for this; previews are noisy and can look like an
-# attachment). Passed to every text send/edit.
+# Keep links inline; never expand into previews.
+# - Passed to every text send and edit
 _NO_PREVIEW = LinkPreviewOptions(is_disabled=True)
 
-# The caret/write-head animation is retired: DM streams via native Telegram drafts
-# (Telegram owns the typewriter and any custom trailing glyph just flickers), and
-# the dormant group write-head reveals text caret-free. Only the reveal-pacing
-# presets below survive (they pace the write-head's per-edit reveal).
+# Caret animation retired; Telegram drafts own the typewriter.
+# - Only the reveal-pacing presets below survive
 
-# Speed presets: (frame_interval seconds, base_step chars revealed per frame).
-# Telegram caps single-message edits to ~1/sec, so frame_interval can't go much
-# below that without tripping 429s — the caret rotation rate is bounded by it.
-# "normal" targets ~16 chars/sec (reading pace) with a lively ~1.2 Hz caret.
+# Speed presets: (frame_interval seconds, base_step chars).
+# - Edits cap near one per second; faster trips 429
+# - normal targets about 16 chars/sec
 CARET_SPEEDS: dict[str, tuple[float, int]] = {
     "calm":   (1.0, 8),
     "normal": (0.85, 14),
@@ -60,90 +48,71 @@ CARET_SPEEDS: dict[str, tuple[float, int]] = {
 }
 _DEFAULT_SPEED = "normal"
 
-# Clear a reveal backlog (model far ahead of the reveal) within ~this many frames.
+# Clear a reveal backlog within about this many frames.
 _CATCHUP = 5
 
-# ---------------------------------------------------------------- native drafts
-# Native message-draft streaming (private chats / DM only — Telegram rejects
-# drafts in supergroups with TEXTDRAFT_PEER_INVALID). Unlike edit_message_text,
-# which Telegram throttles to ~1 edit/sec, sendMessageDraft is purpose-built for
-# live generation: the client smoothly animates the text between updates, so we
-# get genuine streaming instead of the once-a-second write-head. The draft is
-# ephemeral (≈30s preview); finish() sends the real, persisted message at the end.
-#
-# draft_id must be NON-ZERO; reusing one id means each update animates in place.
-# was (#238): _DRAFT_ID = 1 — a SINGLE global id shared by every DM turn. Turns are serial
-#   per chat, but the previous turn's draft is an ephemeral ~30s preview, so a NEW turn that
-#   reused id 1 animated FROM that leftover draft — a cross-turn collision that compounded
-#   into lag/stutter on rapid successive turns (e.g. repeated /test). Replaced by a UNIQUE
-#   per-Streamer id so each turn's draft is independent.
+# ---- native drafts ----
+# - Private chats only; supergroups reject with TEXTDRAFT_PEER_INVALID
+# - Drafts are not throttled like edits to 1/sec
+# - Draft is an ephemeral preview; finish() sends the real message
+# - draft_id must be non-zero; reusing it animates in place
 _DRAFT_ID_SEQ = 0
 
 
 def _next_draft_id() -> int:
-    """#238: a unique non-zero draft id per Streamer (process-monotonic; wraps within int32,
-    skips 0). Each turn gets its own draft so it never animates from a prior turn's leftover."""
+    """Unique non-zero draft id per Streamer.
+
+    - Process-monotonic; wraps within int32, skips 0
+    - Keeps a turn from animating a prior draft
+    """
     global _DRAFT_ID_SEQ
     _DRAFT_ID_SEQ = (_DRAFT_ID_SEQ + 1) % 2_000_000_000
     return _DRAFT_ID_SEQ + 1
-# Sustainable draft cadence (≈5/sec). Measured against the live API: short bursts
-# up to ~25/sec pass, but sustained sending below ~110ms/update trips a 3-second
-# RetryAfter penalty (which reads as stutter). At ~5/sec the client still has
-# plenty of keyframes to animate the appended characters letter-by-letter.
+# Sustainable draft cadence, about 5 per second.
+# - Sustained sends under 110ms trip a 3s RetryAfter
+# - Short bursts up to 25/sec pass
 _DRAFT_INTERVAL = 0.2
-# #242: a draft is an ephemeral ~30s preview. If the content doesn't change for that long
-# (a long tool run holding one phase, or a mid-reply pause) the draft — and the <tg-thinking>
-# indicator — would expire. Re-send the current draft if nothing changed for this many seconds
-# (< 30s) to keep it alive until content resumes.
-# #416: was 20.0 — but the Telegram iOS client drops a draft ~20 s after its LAST update (its
-# local typing-draft store expires entries at 20 s, independent of the 30 s the Bot API
-# documents), so a keepalive at 20 s arrived just too late: the draft vanished and came back
-# as a NEW bubble that re-revealed from the start. 12 s leaves room for network latency.
+# Re-send an unchanged draft after this many seconds.
+# - Drafts expire; iOS drops them about 20s after last update
+# - 12s leaves room for network latency
 _DRAFT_KEEPALIVE_SECS = 12.0
-# #418: Bot API rich-message limit — at most 50 media attachments in one rich message.
+# Rich message limit: at most 50 media attachments.
 _RICH_MEDIA_MAX = 50
-# Optional console cursor appended at the typing frontier. Default OFF (""):
-# Telegram's native draft animation owns the frontier and largely absorbs a
-# trailing glyph — a rotating one just flickers and vanishes, and even a steady
-# block is barely visible — so a custom caret adds little here. Telegram draws its
-# own streaming indicator. Set e.g. "▌" to force a console cursor back on.
+# Optional console cursor at the typing frontier; default off.
+# - Telegram's draft animation absorbs a trailing glyph
+# - Set a steady block like ▌ to enable
 _DRAFT_CURSOR = ""
-# #239: the documented draft-ONLY "Thinking…" placeholder (RichBlockThinking, the custom
-# <tg-thinking> tag). Shown via sendRichMessageDraft until the first real content replaces
-# it (same draft_id animates). It is DRAFT-ONLY and must NEVER appear in the final
-# sendRichMessage — finish() uses {"markdown": full_text}, so it can't leak. Custom emoji
-# from t.me/addemoji/AIActions are optional. (Was: an empty plain draft showing Telegram's
-# own native "Thinking…" — replaced for #239 to follow the documented rich block.)
-# #294: localized — `_thinking_placeholder_html(lang)` builds the static placeholder and
-# the rotating gerunds come from i18n (stream.thinking_words). Was an English-only literal:
-#   _THINKING_HTML = "<tg-thinking>Thinking…</tg-thinking>"
-# #240: Claude-Code-style "thinking" gerunds, rotated in the <tg-thinking> block before the
-# first content arrives so the placeholder ANIMATES (instead of a static "Thinking…"). Each
-# is shown for _THINKING_ROTATE_SECS; dedup on the rendered html means ~1 draft update per
-# rotation (flood-safe). Whimsical on purpose — these are the Claude Code spinner words.
+# Draft-only thinking placeholder using the thinking tag.
+# - Shown until first real content replaces it
+# - Never appears in the final rich message
+# - Thinking words rotate so the placeholder animates
+# - Each word shown for _THINKING_ROTATE_SECS
 _THINKING_ROTATE_SECS = 4.0
 
-# #323: custom (premium/animated) emoji for the <tg-thinking> indicator. A bot may send custom
-# emoji only if its OWNER has Telegram Premium (detected live from the owner's messages via
-# set_owner_premium) OR the bot bought a Fragment username; ALL viewers see them animated, no
-# premium needed on their side. So _emoji() substitutes a custom emoji for the plain unicode
-# ONLY when the owner is premium AND an id is configured for that icon — else the unicode (the
-# <tg-emoji> fallback, shown everywhere). Ids come from THINKING_EMOJI_IDS ("think:<id>,
-# search:<id>"); empty by default → unicode, no behaviour change. Spec: docs/rich-message-spec.md.
+# Custom animated emoji for the thinking indicator.
+# - Bot may send them only if owner has Premium
+# - Needs a Premium owner and a configured id
+# - Otherwise the unicode fallback is shown
+# - Ids come from THINKING_EMOJI_IDS; empty means unicode
 _OWNER_PREMIUM: bool = False
 _CUSTOM_EMOJI_IDS: dict[str, str] = {}
 
 
 def set_owner_premium(value: bool) -> None:
-    """#323: record whether the bot OWNER has Telegram Premium (read from the owner's
-    `from_user.is_premium` on their messages) — gates custom-emoji substitution (see _emoji)."""
+    """Record whether the bot owner has Telegram Premium.
+
+    - Gates custom-emoji substitution
+    """
     global _OWNER_PREMIUM
     _OWNER_PREMIUM = bool(value)
 
 
 def configure_custom_emoji(raw: str | None) -> None:
-    """#323: set the icon→custom_emoji_id map from a "role:id,role:id" string (roles: think,
-    search). Empty / unparseable → custom emoji disabled (plain unicode)."""
+    """Set the icon-to-custom-emoji map from a string.
+
+    - Format: role:id pairs; roles think, search
+    - Empty or unparseable disables custom emoji
+    """
     global _CUSTOM_EMOJI_IDS
     out: dict[str, str] = {}
     for part in (raw or "").split(","):
@@ -155,54 +124,44 @@ def configure_custom_emoji(raw: str | None) -> None:
     _CUSTOM_EMOJI_IDS = out
 
 
-# Read the configured ids at import (startup); owner premium is set live per-message.
+# Read configured ids at import; owner premium is live.
 configure_custom_emoji(os.environ.get("THINKING_EMOJI_IDS", ""))
 
-# #416: draft table streaming mode. Default: row-by-row (markup.clip_partial_table, #237), as
-# before. DRAFT_HOLD_OPEN_TABLES=1 opts into the iOS workaround — a table enters the draft only
-# once COMPLETE (markup.hold_open_table), because the Telegram iOS client never draws rows added
-# to a table it has already rendered (empty rows until the chat is reopened).
+# Draft table streaming mode; default is row-by-row.
+# - DRAFT_HOLD_OPEN_TABLES=1 holds tables until complete
+# - Works around iOS never drawing rows added later
 _HOLD_OPEN_TABLES = os.environ.get("DRAFT_HOLD_OPEN_TABLES", "").strip().lower() in (
     "1", "true", "yes", "on")
 
 
 def _thinking_placeholder_html(lang: str = "en") -> str:
-    """#294: the static <tg-thinking> placeholder in the user's language."""
+    """Static thinking placeholder in the user's language."""
     return f"<tg-thinking>{i18n.t('stream.thinking', lang)}…</tg-thinking>"
 
 
-# #422 (EXPERIMENTAL): the first line of the <tg-thinking> indicator names the model, its
-# version and the effort the turn runs at ("Opus 5.5 · medium"); the indicator text follows on
-# the second line (`<br>` — rich HTML collapses a bare newline). THINKING_MODEL_LINE=0 turns it
-# off. To remove it entirely: drop this flag, Streamer.model_line and Streamer._thinking_html
-# (its three callers then wrap `inner` in <tg-thinking> as before — the `was:` lines there),
-# and the model_line assignment in SessionManager._run_one.
+# Experimental first line of the indicator names model and effort.
+# - Second line follows via br; bare newline collapses
+# - THINKING_MODEL_LINE=0 turns it off
 _THINKING_MODEL_LINE = os.environ.get("THINKING_MODEL_LINE", "1").strip().lower() not in (
     "0", "false", "no", "off")
 
-# #430 (EXPERIMENTAL): Telegram holds a message the user sends while a reply draft streams and
-# delivers it only once a real message lands in the chat (observed on iOS — rich-message-spec.md).
-# While the draft shows ONLY the <tg-thinking> indicator (tool / search / thinking phases, the long
-# waits) the streamer, every DRAFT_RELEASE_SECS, lands a tiny silent message, deletes it and puts
-# the indicator back, so a held message reaches the bot mid-turn and goes into the running CLI
-# turn (#417). Never while answer text streams. DRAFT_RELEASE: "owner" (default while it is being
-# tested) | "all" | "off". Rollback: DRAFT_RELEASE=off, or drop these flags, draft_release_period,
-# Streamer.draft_release_secs and _release_held_messages / _drop_release_msg with their callers.
-# #431: WITHDRAWN — every placeholder raised a notification (disable_notification only drops the
-# sound), so the cycle is off by default; the draft push button (DRAFT_PUSH) replaces it.
-# was: os.environ.get("DRAFT_RELEASE", "owner")
+# Experimental: release held user messages during draft streaming.
+# - Telegram delivers them once a real message lands
+# - Cycle runs only during thinking-only phases
+# - DRAFT_RELEASE values: owner, all, off
+# - Default off: placeholders notified the user
 _DRAFT_RELEASE_SCOPE = os.environ.get("DRAFT_RELEASE", "off").strip().lower()
-# Period: 3 s (was 15 — the first, untested guess); one cycle takes ~1.3 s itself.
+# Period of 3 seconds; one cycle takes about 1.3s.
 try:
     _DRAFT_RELEASE_SECS = max(0.0, float(os.environ.get("DRAFT_RELEASE_SECS", "3")))
 except ValueError:
     _DRAFT_RELEASE_SECS = 3.0
-# How long the placeholder stays before it is deleted (long enough for the client to let go).
+# How long the placeholder stays before deletion.
 _DRAFT_RELEASE_HOLD_SECS = 1.0
 
 
 def draft_release_period(chat_id: int, owner_id: int | None) -> float:
-    """#430: the thinking-phase release-cycle period for a chat, in seconds; 0 = off."""
+    """Thinking-phase release-cycle period in seconds; 0 disables."""
     if _DRAFT_RELEASE_SCOPE in ("", "0", "off", "no", "false") or _DRAFT_RELEASE_SECS <= 0:
         return 0.0
     if _DRAFT_RELEASE_SCOPE != "all" and chat_id != owner_id:
@@ -210,37 +169,32 @@ def draft_release_period(chat_id: int, owner_id: int | None) -> float:
     return _DRAFT_RELEASE_SECS
 
 
-# #431 (EXPERIMENTAL): the draft's own button (sendRichMessageDraft can_stop, Bot API 10.3) used as
-# PUSH, not stop. Telegram holds a message the user sends while a draft streams; pressing the button
-# ends the draft on the client, which lets that message through — no bot message, no notification.
-# The bot receives `stopped_message_generation` and, instead of stopping, carries on in a NEW
-# draft id (Streamer.on_push), so the message reaches the running turn (#417). The button is drawn
-# by Telegram (its look cannot be changed). DRAFT_PUSH: "all" (default — released to every user
-# after the owner's test) | "owner" | "off". Rollback: DRAFT_PUSH=off, or drop this flag,
-# draft_push_enabled, Streamer.push_button / _draft_extra / on_push and
-# SessionManager.on_generation_stopped with the bot.py middleware.
-# was: os.environ.get("DRAFT_PUSH", "owner")  — owner only while it was being tested
+# Experimental: the draft's own button used as push.
+# - Pressing it ends the draft, releasing held messages
+# - Bot continues in a new draft id
+# - Button look is drawn by Telegram
+# - DRAFT_PUSH values: all (default), owner, off
 _DRAFT_PUSH_SCOPE = os.environ.get("DRAFT_PUSH", "all").strip().lower()
 
 
 def draft_push_enabled(chat_id: int, owner_id: int | None) -> bool:
-    """#431: whether this chat's drafts carry the push button."""
+    """Whether this chat's drafts carry the push button."""
     if _DRAFT_PUSH_SCOPE in ("", "0", "off", "no", "false"):
         return False
     return _DRAFT_PUSH_SCOPE == "all" or chat_id == owner_id
-# #240c: extended-thinking (reasoning) shown in the <tg-thinking> block. Keep only the
-# tail (the block is a compact live indicator, not a transcript) and retain a little more
-# than is shown so the frontier animates smoothly as deltas arrive.
+# Extended-thinking text shown in the thinking block.
+# - Keep only the tail, a compact live indicator
+# - Retain slightly more than shown for smooth animation
 _REASONING_MAX = 4000        # cap retained reasoning text
-_REASONING_DRAFT_TAIL = 600  # how much of the tail to show in the block
+_REASONING_DRAFT_TAIL = 600  # tail length shown in block
 
 
 def _thinking_label(elapsed: float, lang: str = "en", searching: bool = False) -> str:
-    """#240/#294/#319: pick the localized gerund for the animated <tg-thinking> placeholder by
-    elapsed time. Two rotation subsets: the generic `stream.thinking_words`, or — while a web
-    search/fetch is in flight (`searching`) — the search-themed `stream.searching_words`, so the
-    thinking tag keeps ANIMATING (a fixed phase string is static — only a CHANGING draft
-    animates) and the words read as info-gathering."""
+    """Pick a localized thinking word by elapsed time.
+
+    - Generic words, or search-themed words while searching
+    - Changing text keeps the thinking tag animating
+    """
     key = "stream.searching_words" if searching else "stream.thinking_words"
     words = [w for w in i18n.t(key, lang).split(",") if w]
     if not words:
@@ -248,11 +202,9 @@ def _thinking_label(elapsed: float, lang: str = "en", searching: bool = False) -
     return words[int(elapsed // _THINKING_ROTATE_SECS) % len(words)]
 
 
-# #240b: map an agent TOOL call to a short live phase shown in the <tg-thinking> block while
-# the tool runs ("what the agent is doing now"). Plain text + a leading unicode emoji (free,
-# renders everywhere — bots can't use premium custom emoji); the caller HTML-escapes it.
-# #294: tool → (emoji, i18n verb key). Emoji stays in code (renders everywhere); the verb
-# is localized so the phase label follows the user's language.
+# Map a tool call to a short live phase.
+# - Leading unicode emoji renders everywhere
+# - Verb is localized; caller HTML-escapes the label
 _TOOL_PHASES = {
     "Read": ("📖", "stream.verb_reading"), "Write": ("✏️", "stream.verb_writing"),
     "Edit": ("✏️", "stream.verb_editing"), "MultiEdit": ("✏️", "stream.verb_editing"),
@@ -264,9 +216,11 @@ _TOOL_PHASES = {
 
 
 def tool_phase_label(tool_name: str, tool_input: dict | None, lang: str = "en") -> str:
-    """#240b/#294: a short, localized 'doing X' phase for a tool call, e.g.
-    '⚙️ Running pytest -q…' / '📖 Reading sessions.py…'. Plain text (HTML-escaped by the
-    streamer before send); emoji is fixed, the verb comes from i18n in the user's language."""
+    """Short localized phase label for a tool call.
+
+    - Plain text, HTML-escaped before send
+    - Emoji is fixed; the verb is localized
+    """
     inp = tool_input or {}
     if tool_name == "Bash":
         cmd = (inp.get("command") or "").strip().splitlines()[0:1]
@@ -290,14 +244,14 @@ def tool_phase_label(tool_name: str, tool_input: dict | None, lang: str = "en") 
 
 
 def sources_card_markdown(sources: list, lang: str = "en", done: bool = False) -> str:
-    """#318/#319: render the live web-research card body. `sources` is a list of (kind, value):
-    kind 'search' (a WebSearch query) or 'fetch' (a WebFetch URL). While the turn runs `done`
-    is False → the in-progress "Searching…" header; at finish it flips to the "Sources" header.
-    Each resource is a markdown LIST item on its OWN line — a single '\\n' collapses to a space
-    in Telegram's rich markdown (the #318 bug: everything ran together), so the header is a
-    separate block ('\\n\\n') and each item is a '- ' list row. Values are inline code (a fetch
-    URL has its scheme + trailing slash trimmed) so markdown in a URL/query can't mangle it.
-    Pure — the streamer sends/edits the rendered body."""
+    """Render the live web-research card body.
+
+    - sources: (kind, value) pairs; kind search or fetch
+    - done switches the header from Searching to Sources
+    - Header is its own block; each item a list row
+    - Values are inline code; fetch URLs are trimmed
+    - Pure; the streamer sends the rendered body
+    """
     header = i18n.t("stream.sources_title" if done else "stream.searching", lang)
     items = []
     for kind, value in sources:
@@ -315,29 +269,24 @@ def sources_card_markdown(sources: list, lang: str = "en", done: bool = False) -
     return header + "\n\n" + "\n".join(items) if items else header
 
 
-# A DM draft can't carry an inline button (send_message_draft has no reply_markup),
-# so the ⏹ Stop affordance lives on a SEPARATE control message. To avoid flicker on
-# quick replies, it's posted only once a turn has been running this long, and it's
-# removed when the turn ends. (#49)
+# Drafts can't carry inline buttons, so Stop is separate.
+# - Posted only after the turn runs a while
+# - Removed when the turn ends
 _CONTROL_DELAY = 3.0
 
-# The ⏹ Stop control message used to animate a braille spinner here (#94). The
-# animation was removed at the owner's request: capped at ~1 edit/sec it updated
-# too slowly to read as motion and just flickered. The control is now a STATIC
-# label + Stop button (see _delayed_control).
+# Stop control is a static label plus button.
 
 
 def resolve_speed(name: str | None) -> tuple[float, int]:
-    """Return (frame_interval, base_step) for a speed preset name."""
+    """Return (frame_interval, base_step) for a speed preset."""
     return CARET_SPEEDS.get(name or "", CARET_SPEEDS[_DEFAULT_SPEED])
 
 
 class Streamer:
-    """A single self-editing Telegram message for one streamed turn.
+    """One self-editing Telegram message for a streamed turn.
 
-    thread_id is the real topic key; None (or 0) means the General topic and is
-    rendered without a message_thread_id. We accept None for "General"; callers
-    in this project pass None when the thread key is 0.
+    - thread_id None or 0 means the General topic
+    - General topic is sent without message_thread_id
     """
 
     def __init__(
@@ -354,80 +303,77 @@ class Streamer:
     ) -> None:
         self.bot = bot
         self.chat_id = chat_id
-        # #172: whether to post the separate ⏹ Stop control message mid-stream. The
-        # /test demo turns this OFF — a new message arriving mid-draft makes some
-        # clients re-render the draft from the top (looks like it "regenerates").
+        # Whether to post the separate Stop control mid-stream.
+        # - A new message mid-draft makes some clients re-render
+        # - The /test demo turns this off
         self.controllable = bool(controllable)
-        # #164: an extra line shown under "Working…" in the Stop-control plate —
-        # the user's own limit (≥50%) or, for the owner, the account usage.
+        # Extra line under Working in the Stop plate.
+        # - User's own limit (50%+), or owner account usage
         self.working_note = working_note or ""
-        # Normalise the General topic (0) to None so _kwargs() omits the field.
+        # Normalise the General topic (0) to None.
         self.thread_id = thread_id if thread_id else None
         d_interval, d_step = CARET_SPEEDS[_DEFAULT_SPEED]
         self.frame_interval = frame_interval or d_interval
         self.base_step = base_step or d_step
-        # Native draft streaming is only valid in a private chat (chat_id > 0);
-        # guard here so a stray call in a group can never try (and fail) drafts.
-        # start() probes once and falls back to the write-head if drafts error.
+        # Native drafts need a private chat (chat_id > 0).
+        # - start() probes once, falls back to write-head
         self.use_drafts = bool(use_drafts) and chat_id > 0
-        # #229: message id of the live task-list card (a SEPARATE bubble from the answer,
-        # edited in place across the turn). None until the first TodoWrite event.
+        # Message id of the live task-list card.
+        # - Separate bubble edited in place; None until first TodoWrite
         self._todo_msg_id: int | None = None
-        # #318 (experimental): live "Sources" card — a SEPARATE bubble listing the web
-        # resources (WebFetch URLs + WebSearch queries) the agent pulled this turn, edited
-        # in place as they accumulate. Persists across segment breaks (like _todo_msg_id;
-        # _begin_next_segment does not touch it). None until the first web tool of the turn.
+        # Experimental live Sources card, a separate bubble.
+        # - Lists web fetch URLs and search queries
+        # - Edited in place; persists across segment breaks
+        # - None until the first web tool
         self._sources_msg_id: int | None = None
         self._web_sources: list[tuple[str, str]] = []
         self._web_sources_seen: set[tuple[str, str]] = set()
-        # #240c: accumulated extended-thinking (reasoning) text, shown (tail) in the
-        # <tg-thinking> draft block until real answer content starts. Capped to the tail.
+        # Accumulated extended-thinking text, shown as a tail.
+        # - Cleared once real answer content starts
         self._reasoning: str = ""
-        # Whether finish() isolates each fenced code block into its OWN message
-        # (default — easy mobile copy); owner-toggleable via /codesplit. Off →
-        # code stays inline in the reply.
+        # Whether finish() isolates each code block into a message.
+        # - Default on for easy copying; toggled via /codesplit
+        # - Off keeps code inline in the reply
         self._split_code_messages = bool(split_code_messages)
-        # Drafts stream at a fixed, flood-safe cadence; Telegram animates the newly
-        # appended characters between updates (the native letter-by-letter effect).
+        # Drafts stream at a fixed, flood-safe cadence.
+        # - Telegram animates newly appended characters between updates
         self._draft_interval = _DRAFT_INTERVAL
-        # #238: unique draft id for THIS turn (no cross-turn animation collision), and a
-        # flood backoff: while >0 and in the future, skip draft frames (set on RetryAfter)
-        # instead of dropping to the grid fallback.
+        # Unique draft id for this turn.
+        # - Flood backoff deadline: skip draft frames until it passes
+        # - Set on RetryAfter
         self._draft_id = _next_draft_id()
         self._draft_retry_after: float = 0.0
-        # #240b: the current live "phase" shown in the <tg-thinking> block while the agent
-        # works (set from tool events). None → the placeholder rotates a gerund instead.
+        # Current live phase shown in the thinking block.
+        # - Set from tool events; None rotates a gerund
         self._phase: str | None = None
-        # #319: True while a web search/fetch is in flight — the placeholder then rotates the
-        # search-themed gerund subset (animated) instead of a static "Searching the web" phase.
+        # True while a web search or fetch is in flight.
+        # - Placeholder then rotates search-themed gerunds
         self._searching: bool = False
-        # #323: set if a custom-emoji draft send fails this turn → fall back to plain unicode for
-        # the rest of the turn, so a rejected custom emoji can never blank the thinking tag.
+        # Set when custom emoji fails; use plain unicode afterwards.
+        # - Prevents a rejected emoji blanking the thinking tag
         self._custom_emoji_failed: bool = False
-        # #422 (experimental): plain-text first line of the <tg-thinking> indicator (model +
-        # version + effort), set by the session worker before start(); "" = no line.
+        # Plain-text model line of the thinking indicator.
+        # - Set by the session worker before start()
         self.model_line: str = ""
-        # #430 (experimental): thinking-phase release-cycle period (0 = off; set by the session
-        # worker), when the last cycle ran, and a placeholder message not yet deleted.
+        # Release-cycle period (0 off), last run, undeleted placeholder.
         self.draft_release_secs: float = 0.0
         self._last_release: float = 0.0
         self._release_msg_id: int | None = None
-        # #431 (experimental): whether drafts carry the push button (set by the session worker).
+        # Whether drafts carry the push button.
         self.push_button: bool = False
 
         self.message_id: int | None = None
         self._start_time: float = 0.0
         self._last_edit: float = 0.0
 
-        # Typewriter state: _full is everything the model has produced so far
-        # (the buffer); _shown is how many of its characters we have revealed (the
-        # write-head position). The frame loop advances _shown toward len(_full).
+        # Typewriter state: _full is the buffer, _shown the write-head.
+        # - Frame loop advances _shown toward len(_full)
         self._full: str = ""
         self._shown: int = 0
-        self._rendered_text: str = ""       # what is currently shown (for dedupe)
-        # #291: memoize the per-frame wide-table substitution so an unchanged body
-        # (keepalive re-send / throttled tick that didn't advance) skips re-parsing
-        # the whole table structure. (cache_key_body, substituted_body).
+        self._rendered_text: str = ""       # currently shown text, for dedupe
+        # Memoize per-frame wide-table substitution by body.
+        # - Unchanged body skips re-parsing table structure
+        # - Tuple: (cache_key_body, substituted_body)
         self._wide_cache: tuple[str, str] | None = None
 
         # Whether a turn is actively streaming.
@@ -435,14 +381,14 @@ class Streamer:
 
         self._lock = asyncio.Lock()
         self._typing_task: asyncio.Task | None = None
-        # Drives the typewriter reveal + caret rotation for the whole turn.
+        # Drives the reveal for the whole turn.
         self._anim_task: asyncio.Task | None = None
-        # ⏹ Stop control message (separate from the draft): id + the delayed-poster.
+        # Stop control message id and its delayed poster.
         self._control_id: int | None = None
         self._control_task: asyncio.Task | None = None
         self._closed = False
 
-    # ------------------------------------------------------------------ utils
+    # ---- utils ----
 
     def _kwargs(self) -> dict[str, Any]:
         """Common send kwargs; include message_thread_id only for real topics."""
@@ -451,34 +397,31 @@ class Streamer:
         return {}
 
     def _render_chunks(self, body: str) -> list[str]:
-        """Produce independently-balanced HTML chunks for the model text.
+        """Produce independently balanced HTML chunks for the model text.
 
-        CRITICAL: we split the RAW body on text boundaries FIRST, then run
-        md_to_html on each chunk separately. Rendering before splitting would
-        let split_message cut inside a <pre>/<code>/<b> tag, producing
-        unbalanced HTML that Telegram rejects (and _safe() would then silently
-        drop). Splitting raw text means every rendered chunk is self-contained.
+        - Split raw text first, then render each chunk
+        - Rendering first could cut inside an HTML tag
         """
         body = body.strip()
         if not body:
             return ["…"]
         rendered: list[str] = []
         for raw in markup.split_markdown(body, limit=markup.SAFE_LIMIT):
-            # render_within_limit guarantees each HTML piece fits Telegram's hard
-            # 4096 ceiling (md_to_html escaping can expand a raw chunk past it).
+            # render_within_limit keeps each piece under Telegram's 4096 cap.
+            # - HTML escaping can expand a raw chunk
             for html in markup.render_within_limit(raw):
-                # #387 (AC5): parity with _render_message_chunks — a hard-cut inside a long
-                # single-line fence can leave a lone fence that renders to a blank <pre></pre>; skip it.
+                # Drop a lone fence that renders to blank pre.
+                # - A hard cut in a long single-line fence causes it
                 if markup.is_empty_render(html):
                     continue
                 rendered.append(html)
         return rendered or ["…"]
 
     def _render_message_chunks(self, body: str) -> list[str]:
-        """Like _render_chunks, but ISOLATES each fenced code block into its own
-        message so a snippet is trivially copyable (long-press → Copy) even on
-        clients with no per-block copy button. Prose between blocks is its own
-        message; an oversized segment is still size-split (fences repaired).
+        """Like _render_chunks, but isolates each fenced code block.
+
+        - Keeps snippets copyable via long-press
+        - Oversized segments are still size-split
         """
         body = body.strip()
         if not body:
@@ -486,22 +429,21 @@ class Streamer:
         out: list[str] = []
         for seg in markup.segment_blocks(body):
             for raw in markup.split_markdown(seg, limit=markup.SAFE_LIMIT):
-                # Guarantee every rendered chunk fits Telegram's hard 4096 ceiling
-                # (raw sizing + HTML escaping can otherwise overflow + drop it).
+                # Ensure every rendered chunk fits the 4096 limit.
+                # - Raw sizing plus escaping can otherwise overflow
                 for html in markup.render_within_limit(raw):
-                    # Hard-cutting a single over-long line inside a fence can yield
-                    # a lone fence that renders to an empty <pre></pre> box; drop it.
+                    # Drop a lone fence rendering to an empty pre box.
+                    # - Hard-cutting an over-long fenced line causes it
                     if markup.is_empty_render(html):
                         continue
                     out.append(html)
         return out or ["…"]
 
     async def _safe(self, coro_factory) -> Any:
-        """Run a Telegram coroutine, swallowing transient/no-op errors.
+        """Run a Telegram coroutine, swallowing transient errors.
 
-        On TelegramRetryAfter we honour the server-provided delay once and
-        retry a single time; any further failure is swallowed so the stream
-        keeps running.
+        - RetryAfter: honour the delay and retry once
+        - Any further failure is swallowed
         """
         try:
             return await coro_factory()
@@ -514,13 +456,13 @@ class Streamer:
             except Exception:
                 return None
         except TelegramBadRequest:
-            # "message is not modified", "message to edit not found", etc.
+            # Benign errors: message not modified, edit target not found.
             return None
         except Exception:
-            # Network blips and other transient errors must not crash the turn.
+            # Transient network errors must not crash the turn.
             return None
 
-    # --------------------------------------------------------------- typing
+    # ---- typing ----
 
     async def _send_typing(self) -> None:
         await self._safe(
@@ -534,7 +476,7 @@ class Streamer:
         try:
             while not self._closed:
                 await self._send_typing()
-                # Telegram keeps the typing indicator for ~5s.
+                # Telegram keeps the typing indicator about 5 seconds.
                 await asyncio.sleep(4.0)
         except asyncio.CancelledError:
             return
@@ -546,15 +488,13 @@ class Streamer:
             self._typing_task.cancel()
             self._typing_task = None
 
-    # --------------------------------------------------------------- animation
+    # ---- animation ----
 
     async def _animate_loop(self) -> None:
         """Frame loop that drives the live stream.
 
-        update() only fills the buffer; this loop owns every send/edit. Each frame
-        _tick() pushes the latest text — a draft update (DM) or a write-head edit
-        (group). Re-checks the finalize flags UNDER the lock so it can never fire
-        after finish() has finalized the message.
+        - update() only fills the buffer; this loop sends
+        - Rechecks finalize flags under the lock
         """
         interval = self._draft_interval if self.use_drafts else self.frame_interval
         try:
@@ -572,45 +512,45 @@ class Streamer:
             return
 
     async def _tick(self) -> None:
-        """One frame: advance the reveal toward the buffer, then repaint."""
+        """One frame: advance the reveal, then repaint."""
         if self.use_drafts:
-            # The client animates the text growth for us, so we do not meter the
-            # reveal — push the whole frontier and let Telegram do the typewriter.
+            # Push the whole frontier; Telegram animates the typewriter.
             self._shown = len(self._full)
             await self._render_draft()
             return
         target = len(self._full)
         if self._shown < target:
             remaining = target - self._shown
-            # Reveal at least _BASE_STEP chars (so it reads as writing), more when
-            # a backlog builds so the reveal never lags the model by much.
-            step = max(self.base_step, -(-remaining // _CATCHUP))  # ceil division
+            # Reveal at least _BASE_STEP chars per frame.
+            # - More when a backlog builds
+            step = max(self.base_step, -(-remaining // _CATCHUP))  # ceiling division
             self._shown = min(target, self._shown + step)
-        # else: caught up — the caret spins in place (no new characters revealed).
         await self._render_frame()
 
     def _emoji(self, uni: str, role: str) -> str:
-        """#323: a custom (animated) emoji for `role` (think/search) when the bot OWNER has
-        Telegram Premium AND an id is configured AND custom emoji haven't failed this turn;
-        otherwise the plain unicode (works for everyone — viewers never need premium). The
-        unicode is the <tg-emoji> fallback, shown where a custom emoji can't render."""
+        """Custom emoji for a role when available, else unicode.
+
+        - Needs Premium owner, configured id, no failure this turn
+        - Unicode is the fallback everyone sees
+        """
         if self._custom_emoji_failed or not _OWNER_PREMIUM:
             return uni
         cid = _CUSTOM_EMOJI_IDS.get(role)
         return f'<tg-emoji emoji-id="{cid}">{uni}</tg-emoji>' if cid else uni
 
     def set_phase(self, label: str | None) -> None:
-        """#240b: set the live phase shown in the <tg-thinking> placeholder (e.g. from a
-        tool event). Synchronous + cheap; the animation loop picks it up on the next tick.
-        Cleared automatically once real content streams."""
+        """Set the live phase shown in the thinking placeholder.
+
+        - Cheap and synchronous; cleared once content streams
+        """
         self._phase = label or None
 
     def set_tool_phase(self, tool_name: str, tool_input: dict | None) -> None:
-        """#294/#319: set the live tool phase, localized to this chat's language. A web
-        search/fetch flips on "searching" MODE — the placeholder then rotates the search-themed
-        gerund subset so the <tg-thinking> tag keeps ANIMATING (a fixed phase string is static);
-        every other tool stores a fixed label (e.g. "📖 Reading sessions.py") naming the
-        file/command. The Sources card (a separate message) carries WHAT is being looked at."""
+        """Set the live tool phase in the chat's language.
+
+        - Web search or fetch enables searching mode
+        - Other tools store a fixed file or command label
+        """
         if tool_name in ("WebSearch", "WebFetch"):
             self._searching = True
             self._phase = None
@@ -619,49 +559,55 @@ class Streamer:
             self._phase = tool_phase_label(tool_name, tool_input, i18n.cached_lang(self.chat_id))
 
     def add_reasoning(self, delta: str) -> None:
-        """#240c: append a chunk of the model's extended-thinking (reasoning) text. Its tail
-        is shown in the <tg-thinking> draft block until real answer content starts (then it
-        is cleared). Resuming reasoning also drops any stale tool phase so the live block
-        reflects the current activity. Synchronous + cheap; the draft loop renders it."""
+        """Append extended-thinking text for the thinking draft block.
+
+        - Tail shown until answer content starts
+        - Resuming reasoning drops any stale tool phase
+        """
         if not delta:
             return
         self._reasoning = (self._reasoning + delta)[-_REASONING_MAX:]
         self._phase = None
-        self._searching = False  # #319: reasoning resumed — leave search-mode rotation
+        self._searching = False  # reasoning resumed; leave search mode
 
     def _thinking_html(self, inner: str) -> str:
-        """#422 (experimental): wrap the indicator text (already HTML) in <tg-thinking>, led by
-        the model line when one is set and THINKING_MODEL_LINE is on."""
+        """Wrap indicator HTML in thinking tag, with model line.
+
+        - Model line shown when set and enabled
+        """
         if _THINKING_MODEL_LINE and self.model_line:
             return (f"<tg-thinking>{markup.escape_html(self.model_line)}<br>{inner}"
                     "</tg-thinking>")
         return f"<tg-thinking>{inner}</tg-thinking>"
 
     def _draft_extra(self) -> dict[str, Any]:
-        """#431: extra sendRichMessageDraft fields — the push button when enabled."""
+        """Extra draft fields: the push button when enabled."""
         return {"can_stop": True} if self.push_button else {}
 
     def on_push(self, draft_id: int) -> bool:
-        """#431 (experimental): the user pressed the draft's button. The client has ended this
-        draft (and lets a held message through); carry on in a new draft id — the old one takes no
-        further drafts — re-sent on the next frame. Returns True when it was this draft."""
+        """Handle the user pressing the draft's button.
+
+        - Client ended the draft; continue under a new id
+        - Returns True when it was this draft
+        """
         if not self.use_drafts or self._closed or draft_id != self._draft_id:
             return False
         self._draft_id = _next_draft_id()
-        self._rendered_text = ""   # force the next frame to re-send under the new id
+        self._rendered_text = ""   # force next frame to re-send
         self._last_edit = 0.0
         logger.info("chat %s: draft push (draft %s → %s)", self.chat_id, draft_id, self._draft_id)
         return True
 
     async def _release_held_messages(self, html: str) -> bool:
-        """#430 (experimental): land a tiny silent message, delete it, put the thinking
-        indicator back — Telegram then delivers a message the user sent while the draft was
-        streaming, so it reaches the running turn. Caller holds the lock. Returns True when the
-        cycle ran (the indicator is re-sent here or by the next frame)."""
+        """Release held user messages via a silent placeholder cycle.
+
+        - Lands tiny message, deletes it, restores indicator
+        - Caller holds the lock
+        - Returns True when the cycle ran
+        """
         self._last_release = time.monotonic()
         lang = i18n.cached_lang(self.chat_id)
-        # Plain text that reads like the indicator (model line + "💭 Thinking…"), so the swap is
-        # as quiet as possible.
+        # Plain text mimicking the indicator keeps the swap quiet.
         text = f"💭 {i18n.t('stream.thinking', lang)}…"
         if _THINKING_MODEL_LINE and self.model_line:
             text = f"{self.model_line}\n{text}"
@@ -681,64 +627,39 @@ class Streamer:
             self._rendered_text = html
             self._last_edit = time.monotonic()
         except Exception:
-            self._rendered_text = ""  # the next frame re-sends the indicator
+            self._rendered_text = ""  # next frame re-sends the indicator
         return True
 
     async def _drop_release_msg(self) -> None:
-        """#430: delete the release placeholder if one is still up (idempotent)."""
+        """Delete the release placeholder if still up."""
         mid, self._release_msg_id = self._release_msg_id, None
         if mid is not None:
             with contextlib.suppress(Exception):
                 await self.bot.delete_message(self.chat_id, mid)
 
     def _thinking_placeholder(self) -> str:
-        """#294/#422: the static "Thinking…" placeholder (with the model line when set)."""
+        """Static Thinking placeholder, with the model line when set."""
         return self._thinking_html(
             f"{markup.escape_html(i18n.t('stream.thinking', i18n.cached_lang(self.chat_id)))}…")
 
     async def _render_draft(self) -> None:
-        """Push the current text as a native message draft (DM streaming).
+        """Push the current text as a native message draft.
 
-        Telegram animates the characters APPENDED between two drafts that share a
-        draft_id — that is the real letter-by-letter typewriter, and it is far
-        smoother than the ~1/sec write-head. We rely on it instead of metering the
-        reveal ourselves, and by default we add NO trailing cursor (_DRAFT_CURSOR
-        is ""): Telegram owns the frontier and absorbs a custom glyph, so it just
-        adds noise. _DRAFT_CURSOR can be set to a steady block to force one back on.
-
-        We stream ONLY the model's text here — NOT the tool-status block. The
-        status lines grow and change as tools run, which would break the clean
-        growing-prefix relationship between drafts and make Telegram snap the whole
-        message in chunks instead of animating the new characters. (Status still
-        appears in the final message via finish().) Drafts cap at 4096 chars, so
-        for long output we render the frontier chunk (the tail). No real message is
-        touched here — finish() posts the persisted message once the turn ends.
+        - Appended text between same-id drafts animates letter-by-letter
+        - Only model text is streamed, not tool status
+        - Status changes would break the growing-prefix animation
+        - Drafts cap at 4096 chars; long output shows the tail
+        - No cursor by default; finish() posts the real message
         """
-        # Streaming-table history (see the TODO ledger):
-        #   #172 — stream the reply as raw markdown via sendRichMessageDraft (already
-        #          formatted as it generates); finish() (#176) posts the whole reply as ONE
-        #          {"markdown"} rich message — SAME renderer as the draft.
-        #   #226 — bug: a table mid-stream shows only its first row, then the full table
-        #          snaps in at finish. Two fixes tried and REJECTED on-device:
-        #            was (attempt 1): render the table frontier as a <pre> grid via
-        #              markup.md_to_html (re-did #162's wide-table wrapping).
-        #            was (attempt 2):
-        #              draft_md = (markup.placeholder_tables(frontier)
-        #                          if markup.contains_table(frontier) else frontier)
-        #              # → replaced the table with a placeholder line (hid it while streaming).
-        #   #237 — live fix below: the draft and finish() share the {"markdown"} renderer, so
-        #          a COMPLETE table renders identically; clip_partial_table() drops the
-        #          in-progress trailing row so each draft frame is a VALID prefix and the
-        #          native table grows row-by-row with no snap. CONFIRMED working on-device
-        #          2026-06-19 — tables stream header→row→row, no empty-snap. (Spec:
-        #          rich-message-spec.md; re-verify via the /verify-rich-draft command.)
-        # #238: under a flood backoff, skip this frame (a RetryAfter set the deadline). The
-        # next tick resumes once it passes; finish() always sends the correct final message.
+        # Row-by-row table streaming via clip_partial_table.
+        # - Draft and finish() share the markdown renderer
+        # - Dropping the in-progress row keeps each frame valid
+        # - Under flood backoff, skip the frame; finish() is correct
         if self._draft_retry_after and time.monotonic() < self._draft_retry_after:
             return
-        # #416: opt-in (DRAFT_HOLD_OPEN_TABLES) — hold a still-open trailing table out of the
-        # frame (markup.hold_open_table); an animated <tg-thinking> "building a table" note with
-        # the row count stands in for it. Default stays the #237 row-by-row clip below.
+        # Opt-in: hold a still-open trailing table out of frames.
+        # - An animated building-table note with row count stands in
+        # - Default is the row-by-row clip below
         table_note = ""
         if not _HOLD_OPEN_TABLES:
             body = markup.clip_partial_table(self._full[: self._shown]).strip()
@@ -748,12 +669,12 @@ class Streamer:
             if pending_rows is not None:
                 table_note = i18n.t("stream.table_building", i18n.cached_lang(self.chat_id),
                                     rows=pending_rows)
-        # #256: a >20-col table can't render as a native rich DRAFT (cap is 20). Swap each wide
-        # table for the same localized note _commit uses, so the draft matches the final bubble
-        # (the table goes as a PNG only at finish()). Cheap no-op when nothing is wide.
+        # Wide tables can't render as native drafts (cap 20 columns).
+        # - Swap each for the same note final commit uses
+        # - The PNG goes only at finish()
         if "|" in body:
-            # #291: reuse the last substitution when this frame's body is identical to the
-            # previous one (keepalive / throttled re-send) — skip the table re-parse.
+            # Reuse the last substitution when the body is identical.
+            # - Skips the table re-parse on keepalive or throttled re-send
             if self._wide_cache is not None and self._wide_cache[0] == body:
                 body = self._wide_cache[1]
             else:
@@ -761,58 +682,55 @@ class Streamer:
                 body, _wide = markup.extract_wide_tables(body)
                 body = self._wide_table_notes(body, _wide)
                 self._wide_cache = (_in, body)
-        # #295: while an <svg> diagram streams, hide it from the draft (raw XML would otherwise
-        # animate). Complete ones become the note; an unclosed one at the frontier is cut.
+        # Hide svg diagrams from the draft while streaming.
+        # - Complete ones become the note; unclosed tail is cut
         if "<svg" in body.lower():
             body, _svgs = markup.extract_svgs(body)
             body = self._svg_notes(body, _svgs)
             body = self._hide_unclosed_svg(body)
-        # #344: while a ```location block streams, hide its raw JSON from the draft (show the
-        # note instead). Complete ones become the note; an unclosed one at the frontier is cut.
+        # Hide location block JSON from the draft while streaming.
+        # - Complete ones become the note; unclosed tail is cut
         _low = body.lower()
         if "```location" in _low or "```geo" in _low:
             body, _locs = markup.extract_locations(body)
-            # #418: the pin streams as the SAME inline map block the final message carries.
-            # was: body = self._location_notes(body, _locs)
+            # Pin streams as the same inline map block as final.
             body = self._location_maps(body, _locs)
             body = self._hide_unclosed_location(body)
         if not body:
-            # Animate the <tg-thinking> placeholder. Priority (most → least specific):
-            #   #240c: live REASONING (extended-thinking) text — show its tail, "unfurling";
-            #   #240b: a live tool PHASE ("⚙️ Running pytest…") when no reasoning is streaming;
-            #   #240a: otherwise a rotating Claude-Code-style gerund (Thinking… → Pondering…).
-            # Dedup on the rendered html → ~1 draft update per change.
+            # Animate the thinking placeholder; priority, most to least specific.
+            # - Live reasoning text tail, unfurling
+            # - Live tool phase when no reasoning streams
+            # - Otherwise a rotating thinking gerund
+            # - Dedup on rendered html: one draft update per change
             if table_note:
-                # #416: the reply opens with a table that is still being written.
+                # The reply opens with a table still being written.
                 inner = markup.escape_html(table_note)
             elif self._reasoning:
                 inner = self._emoji("💭", "think") + " " + markup.escape_html(
                     self._reasoning[-_REASONING_DRAFT_TAIL:])
             elif self._searching:
-                # #319: a web search/fetch is running — rotate the search-themed gerund subset
-                # (🔎) so the tag ANIMATES while reading as info-gathering, instead of a static
-                # "Searching the web" phase (a fixed string doesn't animate).
-                # #323: the 🔎 is a custom animated emoji when the owner has Premium, else unicode.
+                # Web search in flight: rotate search-themed gerunds.
+                # - Keeps the tag animating; a fixed string doesn't
+                # - Search icon is a custom emoji for Premium owners
                 lang = i18n.cached_lang(self.chat_id)
                 inner = (self._emoji("🔎", "search")
                          + f" {_thinking_label(time.monotonic() - self._start_time, lang, searching=True)}…")
             elif self._phase:
                 inner = markup.escape_html(self._phase)
             else:
-                lang = i18n.cached_lang(self.chat_id)   # #294: localized gerund
+                lang = i18n.cached_lang(self.chat_id)   # localized gerund
                 inner = (self._emoji("💭", "think")
                          + f" {_thinking_label(time.monotonic() - self._start_time, lang)}…")
-            # #422: was: html = f"<tg-thinking>{inner}</tg-thinking>"
             html = self._thinking_html(inner)
-            # #430 (experimental): let a message the user typed meanwhile through — only in this
-            # thinking-only phase, never while answer text streams.
+            # Let user messages through, only in thinking-only phase.
+            # - Never while answer text streams
             if (self.draft_release_secs > 0 and not table_note
                     and time.monotonic() - max(self._start_time, self._last_release)
                     >= self.draft_release_secs):
                 if await self._release_held_messages(html):
                     return
-            # #242: skip only if unchanged AND sent recently; otherwise re-send to keep the
-            # ephemeral ~30s draft alive (a static phase during a long tool would else expire).
+            # Skip only if unchanged and recently sent.
+            # - Otherwise re-send to keep the ~30s draft alive
             if html == self._rendered_text and (time.monotonic() - self._last_edit) < _DRAFT_KEEPALIVE_SECS:
                 return
             try:
@@ -827,42 +745,33 @@ class Streamer:
             except TelegramRetryAfter as exc:
                 self._draft_retry_after = time.monotonic() + float(getattr(exc, "retry_after", 1) or 1)
             except Exception as exc:
-                # #323: a draft can fail if a custom emoji is rejected (owner lost premium, a bad
-                # id, or drafts don't accept custom emoji) — fall back to plain unicode for the
-                # rest of the turn so the indicator keeps showing (unicode always works).
+                # Custom emoji draft failure falls back to plain unicode.
+                # - Causes: lost Premium, bad id, or unsupported in drafts
+                # - Unicode always works
                 if _OWNER_PREMIUM and _CUSTOM_EMOJI_IDS:
                     self._custom_emoji_failed = True
-                # #422: likewise drop the experimental model line for the rest of the turn.
+                # Likewise drop the experimental model line for the turn.
                 if isinstance(exc, TelegramBadRequest):
                     self.model_line = ""
             return
-        self._phase = None  # #240b: real content is streaming — drop any live tool phase
-        self._searching = False  # #319: and any search-mode rotation
-        self._reasoning = ""  # #240c: answer started — clear reasoning (a later segment refills)
-        # #172: stream the RAW markdown via sendRichMessageDraft, so the draft is
-        # ALREADY FORMATTED as it generates (Durov's GIF) instead of plain text that
-        # snaps to rich at the end. Split raw first so a fence cut at the tail stays
-        # balanced; stream the FRONTIER (tail) chunk so a long stream tracks the
-        # frontier (Telegram animates same-draft_id updates). On any failure (e.g. a
-        # partial-markdown parse hiccup) we fall back to a plain HTML draft for that
-        # frame so streaming never goes dark; the final finish() message is always
-        # correct on every client.
-        # #241: drafts are RICH messages → use the 32768 limit, not the classic 3900. For a
-        # normal reply the whole growing text is one chunk (streams in full); only a >32768
-        # reply splits and we track the tail frontier.
-        # #353: demote ATX headings (## ..) to **bold** so the rich draft stays in ONE font
-        # (a heading BLOCK renders in Telegram's distinct heading typeface — "jumping fonts").
-        # Same transform as the final commit → the draft stays consistent with the final bubble.
+        self._phase = None  # real content streaming: drop tool phase
+        self._searching = False  # and search-mode rotation
+        self._reasoning = ""  # answer started: clear reasoning
+        # Stream raw markdown via rich draft so it's formatted live.
+        # - Split raw first so a tail fence stays balanced
+        # - Stream the frontier chunk; rich limit is 32768
+        # - Demote ATX headings to bold: one font, matches final
+        # - On failure, fall back to a plain HTML draft
         body = markup.demote_headings(body)
         raw_chunks = markup.split_markdown(body, limit=markup.RICH_LIMIT)
         frontier = raw_chunks[-1] if raw_chunks else body
         if table_note:
-            # #416: a table is being written below the text so far — keep the draft visibly
-            # alive (the row count changes, so the block animates) until the table is complete.
-            # #422: no model line here — the reply's text already streams above this note.
+            # Table being written below text: keep draft visibly alive.
+            # - Row count changes so the block animates
+            # - No model line; the reply text streams above
             frontier = f"{frontier}\n\n<tg-thinking>{markup.escape_html(table_note)}</tg-thinking>"
-        # #242: re-send an unchanged frontier before the ~30s draft expiry (e.g. a mid-reply
-        # pause) so the streamed text doesn't vanish; otherwise skip (dedup).
+        # Re-send an unchanged frontier before the draft expires.
+        # - Prevents streamed text vanishing during a mid-reply pause
         if frontier == self._rendered_text and (time.monotonic() - self._last_edit) < _DRAFT_KEEPALIVE_SECS:
             return
         try:
@@ -875,14 +784,14 @@ class Streamer:
                 )
             )
         except TelegramRetryAfter as exc:
-            # #238: flood — back off and SKIP this frame. Do NOT drop to the md_to_html/<pre>
-            # grid fallback (that degraded the table to a wrapped grid + added a retry sleep on
-            # rapid /test runs). The next tick resumes after the backoff; finish() is correct.
+            # Flood: back off and skip this frame.
+            # - Don't drop to the pre-grid fallback; it degrades tables
+            # - Next tick resumes; finish() is correct
             self._draft_retry_after = time.monotonic() + float(getattr(exc, "retry_after", 1) or 1)
             return
         except Exception:
-            # A genuine (non-flood) rich-draft failure — last-resort plain draft so streaming
-            # isn't dark. Rare on a rich-capable DM client; the final finish() is always correct.
+            # Genuine rich-draft failure: last-resort plain draft.
+            # - Rare on rich-capable clients; finish() is always correct
             chunk = markup.md_to_html(frontier) or "…"
             await self._safe(
                 lambda: self.bot.send_message_draft(
@@ -894,11 +803,10 @@ class Streamer:
         self._last_edit = time.monotonic()
 
     async def _render_frame(self) -> None:
-        """Paint full[:shown] into the placeholder (the write-head).
+        """Paint the revealed prefix into the placeholder.
 
-        Caret-free: the write-head just reveals progressively more text per edit.
-        No-op when the rendered result equals what is already on screen. (Only the
-        dormant non-DM/group path uses this; DM streams via native drafts.)
+        - No-op when output equals what is shown
+        - Used only by the non-DM write-head path
         """
         if self.message_id is None:
             return
@@ -922,17 +830,14 @@ class Streamer:
             self._anim_task.cancel()
             self._anim_task = None
 
-    # ------------------------------------------------------------- stop control
+    # ---- stop control ----
 
     async def _delayed_control(self) -> None:
-        """After a short delay, post a separate STATIC ⏹ Stop message (DM only).
+        """Post a separate static Stop message after a delay.
 
-        Skipped if the turn already finished — so a quick reply never flickers a
-        Stop button. The button's callback is `stop:<thread_id>`, handled in
-        handlers and routed to SessionManager.stop (graceful interrupt). The
-        message is a fixed label + button (no animation — the old braille spinner
-        was removed because at ~1 edit/sec it just flickered); it is deleted by
-        _remove_control()/cancel() when the turn ends.
+        - DM only; skipped if the turn already finished
+        - Callback stop:<thread_id> routes to SessionManager.stop
+        - Deleted when the turn ends
         """
         try:
             await asyncio.sleep(_CONTROL_DELAY)
@@ -964,10 +869,9 @@ class Streamer:
         cid = getattr(msg, "message_id", None)
         if cid is None:
             return
-        # Register the id immediately so _remove_control()/cancel() can delete it,
-        # then re-check the turn didn't end while we were posting — otherwise a turn
-        # that finished during the send would leave an orphaned control message
-        # (#94 audit). Deleting an already-gone message is a harmless no-op.
+        # Register the id immediately so cleanup can delete it.
+        # - re-check the turn didn't end during the send
+        # - otherwise an orphaned control message remains
         self._control_id = cid
         async with self._lock:
             if self._closed or not self._streaming:
@@ -975,8 +879,8 @@ class Streamer:
                 with contextlib.suppress(Exception):
                     await self.bot.delete_message(self.chat_id, cid)
                 return
-        # Static control: no animation loop — the message stands (unedited) until
-        # _remove_control()/cancel() deletes it when the turn ends.
+        # Static control message: no animation loop.
+        # - stands unedited until the turn ends
 
     async def _remove_control(self) -> None:
         """Delete the Stop control message (idempotent)."""
@@ -990,18 +894,17 @@ class Streamer:
                 await self.bot.delete_message(self.chat_id, cid)
 
     def cancel(self) -> None:
-        """Stop the background tasks without finalizing the message.
+        """Stop background tasks without finalizing the message.
 
-        Used on the cancel path (reset/shutdown) where finish() never runs: the
-        worker is cancelled mid-turn, so we tear down the typing + animation loops
-        to avoid orphaned tasks. The partially-revealed text stays on screen.
+        - For cancel paths where finish() never runs
+        - Partially revealed text stays on screen
         """
         self._closed = True
         self._streaming = False
         self._stop_typing()
         self._stop_anim()
-        # Tear down the Stop control message too (fire-and-forget: cancel() is sync
-        # and runs on the worker's cancel path, so we can't await here).
+        # Tear down the Stop control message too.
+        # - fire-and-forget: cancel() is sync, cannot await
         if self._control_task is not None:
             self._control_task.cancel()
             self._control_task = None
@@ -1010,22 +913,19 @@ class Streamer:
             self._control_id = None
             with contextlib.suppress(Exception):
                 asyncio.create_task(self.bot.delete_message(self.chat_id, cid))
-        # #430: and a release placeholder still up (same fire-and-forget teardown).
+        # Also tear down any release placeholder still up.
         if self._release_msg_id is not None:
             mid, self._release_msg_id = self._release_msg_id, None
             with contextlib.suppress(Exception):
                 asyncio.create_task(self.bot.delete_message(self.chat_id, mid))
 
-    # ----------------------------------------------------------------- API
+    # ---- API ----
 
     async def start(self, placeholder: str | None = None) -> None:
-        """Begin the live stream and start the animation (and typing) loops.
+        """Begin the live stream and start animation loops.
 
-        Draft mode (DM): show Telegram's native "Thinking…" placeholder by sending
-        an empty draft — no real message yet — and stream via sendMessageDraft. If
-        the draft probe fails (unsupported client / not a private chat), we fall
-        back to the edit-based write-head for this turn. Write-head mode: send a
-        real placeholder message and run the typing indicator alongside the reveal.
+        - DM uses drafts; falls back to edit-based write-head
+        - Write-head mode sends a real placeholder message
         """
         async with self._lock:
             self._start_time = time.monotonic()
@@ -1036,23 +936,16 @@ class Streamer:
             self._closed = False
 
             if self.use_drafts:
-                # #239: probe with the documented <tg-thinking> placeholder block (draft-only).
-                # It shows an animated "Thinking…" until the first real content replaces it.
-                # ONLY a definitive BadRequest (drafts genuinely unsupported here, e.g. not a
-                # private chat) drops us to the write-head. A transient error (RetryAfter /
-                # network blip) keeps drafts ON — the animation loop just retries — so a brief
-                # throttle never silently reverts a DM to the chunky 1/sec write-head.
-                # was: await self.bot.send_message_draft(chat_id=…, draft_id=…, text="")
-                #      — an empty plain draft (Telegram's own native "Thinking…"); #239.
-                # #422: two attempts — a draft rejected while it carries the experimental model
-                # line is retried once without it, so the line can never cost a turn its drafts.
+                # Probe with the <tg-thinking> placeholder block (draft-only).
+                # - shows animated Thinking until first real content
+                # - only a definitive BadRequest drops to the write-head
+                # - transient errors keep drafts on; the loop retries
+                # - two attempts: retry without the experimental model line
                 for _attempt in range(2):
                     try:
                         await self.bot(
                             SendRichMessageDraft(
                                 chat_id=self.chat_id, draft_id=self._draft_id, **self._draft_extra(),
-                                # #422: was: rich_message={"html": _thinking_placeholder_html(
-                                #     i18n.cached_lang(self.chat_id))},
                                 rich_message={"html": self._thinking_placeholder()},
                             )
                         )
@@ -1079,26 +972,24 @@ class Streamer:
                 )
                 if msg is not None:
                     self.message_id = getattr(msg, "message_id", None)
-                # The draft itself signals activity, so typing only runs here.
+                # The draft signals activity, so typing runs only here.
                 if self._typing_task is None:
                     self._typing_task = asyncio.create_task(self._typing_loop())
 
             if self._anim_task is None:
                 self._anim_task = asyncio.create_task(self._animate_loop())
 
-            # DM: a draft can't carry a Stop button, so schedule a separate
-            # control message (posted only if the turn outlasts _CONTROL_DELAY).
-            # #172: skipped for the /test demo (controllable=False) so a mid-draft
-            # message arrival can't make the client re-render the draft from the top.
+            # DM drafts can't carry a Stop button.
+            # - schedule a separate control message after _CONTROL_DELAY
+            # - skipped when not controllable: a mid-draft message re-renders the draft
             if self.use_drafts and self.controllable and self._control_task is None:
                 self._control_task = asyncio.create_task(self._delayed_control())
 
     async def update(self, full_text: str) -> None:
-        """Buffer the latest full text for the animator to reveal.
+        """Buffer the latest full text for the animator.
 
-        We never edit here — the frame loop owns every edit — so a big token
-        burst lands in the buffer and is revealed progressively rather than
-        dumped in one chunky jump. Keep the longest snapshot seen.
+        - Never edits here; the frame loop owns edits
+        - Keeps the longest snapshot seen
         """
         async with self._lock:
             if len(full_text) >= len(self._full):
@@ -1106,16 +997,14 @@ class Streamer:
 
     async def finish(self, full_text: str, footer: str = "", notify: bool = True,
                      reply_markup=None) -> None:
-        """Final flush for the turn: stop the loops and commit the persisted text.
+        """Final flush: stop loops and commit the persisted text.
 
-        notify controls whether the FIRST committed message pings the user — True
-        for the final answer (it is ready), False for an intermediate segment.
-        reply_markup (#227b) attaches an inline keyboard to the committed rich message
-        (used by the interactive-shell keypad).
+        - notify: True for final answer, False for intermediate segments
+        - reply_markup attaches an inline keyboard to the message
         """
         async with self._lock:
-            # Reveal everything and stop the loops so neither can fire after we
-            # finalize (the animator also re-checks these flags under the lock).
+            # Reveal everything and stop both loops before finalizing.
+            # - the animator also re-checks these flags under the lock
             self._streaming = False
             self._full = full_text
             self._shown = len(full_text)
@@ -1124,19 +1013,16 @@ class Streamer:
             self._closed = True
             await self._commit(full_text, footer, notify, reply_markup=reply_markup)
             self._last_edit = time.monotonic()
-        # Outside the lock: tear down the Stop control message for this turn.
+        # Outside the lock: tear down this turn's Stop control.
         await self._remove_control()
-        await self._drop_release_msg()  # #430: never leave a release placeholder behind
-        # #321: web-search Sources card disabled (see add_web_source) — finalize call commented.
-        # was (#319): await self.finalize_sources()
+        await self._drop_release_msg()  # never leave release placeholder behind
+        # Web-search Sources card is disabled; finalize call omitted.
 
     async def segment_break(self) -> None:
-        """Commit the current segment as its own message and reset for the next.
+        """Commit the current segment and reset for the next.
 
-        Used in code mode between tool calls: each burst of model text becomes a
-        separate, visible message (silent — it is intermediate) instead of silently
-        updating the previous one. Streaming stays live, so the next segment starts
-        a fresh draft / placeholder. No-op when nothing has been produced yet.
+        - Code mode: each text burst becomes its own message
+        - Silent; streaming stays live; no-op when empty
         """
         async with self._lock:
             text = self._full.strip()
@@ -1146,15 +1032,12 @@ class Streamer:
             await self._begin_next_segment()
 
     async def flush_segment(self, text: str) -> None:
-        """Commit a caller-provided PREFIX as its own message(s) and reset for the
-        next segment, keeping the stream live.
+        """Commit a caller-provided prefix as its own message.
 
-        Like segment_break, but commits the given text instead of the whole
-        buffer. Used for live code-block splitting (#93): when a fenced block has
-        fully closed mid-stream, sessions hands us the prose+block prefix so the
-        snippet is posted (and copyable) immediately while the tail keeps
-        streaming. No-op for blank text. The caller resets its own running text to
-        the remainder and update()s us with it.
+        - Like segment_break, but commits only the given text
+        - Used to post closed code blocks mid-stream
+        - No-op for blank text
+        - Caller resets its running text to the remainder
         """
         async with self._lock:
             if not text or not text.strip():
@@ -1163,23 +1046,22 @@ class Streamer:
             await self._begin_next_segment()
 
     async def _begin_next_segment(self) -> None:
-        """Reset the buffer + draft/placeholder so the next segment is a brand-new
-        message. Caller holds the lock. Shared by segment_break and flush_segment.
+        """Reset buffer and draft so the next segment is fresh.
+
+        - Caller holds the lock
+        - Shared by segment_break and flush_segment
         """
         self._full = ""
         self._shown = 0
         self._rendered_text = ""
         self.message_id = None
         if self.use_drafts:
-            # #239: reset the draft to the <tg-thinking> placeholder for the next segment;
-            # the committed message stands permanently above it.
-            # was: await self.bot.send_message_draft(chat_id=…, draft_id=…, text="")  (#239)
+            # Reset the draft to the placeholder for the next segment.
+            # - the committed message stands permanently above it
             with contextlib.suppress(Exception):
                 await self.bot(
                     SendRichMessageDraft(
                         chat_id=self.chat_id, draft_id=self._draft_id, **self._draft_extra(),
-                        # #422: was: rich_message={"html": _thinking_placeholder_html(
-                        #     i18n.cached_lang(self.chat_id))},
                         rich_message={"html": self._thinking_placeholder()},
                     )
                 )
@@ -1197,13 +1079,14 @@ class Streamer:
                 self.message_id = getattr(msg, "message_id", None)
 
     def _build_sendables(self, full_text: str, render_fn) -> list:
-        """Split the final answer into ordered sendables — ``('text', html)`` chunks and
-        ``('rich', RichTable)`` native tables (#164). EVERY markdown table is sent as a
-        NATIVE Telegram table (even in a code-containing reply, #172) — so a code reply
-        still gets a proper classic code block in its text chunks AND a native table;
-        _send_rich falls back to a <pre> grid only if that API call fails."""
+        """Split the final answer into ordered sendables.
+
+        - Text HTML chunks and native rich tables
+        - Every markdown table is sent as a native table
+        - Falls back to a pre grid if the call fails
+        """
         out: list = []
-        # #164: route every table through the native rich-table path.
+        # Route every table through the native rich-table path.
         for item in markup.split_rich_tables(full_text):
             if isinstance(item, markup.RichTable):
                 out.append(("rich", item))
@@ -1213,27 +1096,11 @@ class Streamer:
                     out.append(("text", chunk))
         return out
 
-        # # was (#162) — wide tables as PNG images / narrow as <pre> grids. Replaced
-        # # for #164 (native Telegram tables); kept commented for quick revert.
-        # out: list = []
-        # for item in markup.split_image_tables(full_text):
-        #     if isinstance(item, markup.TableImage):
-        #         try:
-        #             out.append(("photo", table_image.render_table_png(item.rows)))
-        #             continue
-        #         except Exception:
-        #             esc = [[markup.escape_html(c) for c in r] for r in item.rows]
-        #             out.append(("text", markup._render_table_pre(esc)))
-        #             continue
-        #     for chunk in render_fn(item):
-        #         if chunk and not markup.is_empty_render(chunk):
-        #             out.append(("text", chunk))
-        # return out
-
     async def _send_rich(self, table, silent: bool) -> None:
-        """Send one markdown table as a NATIVE Telegram table via Bot API 10.1
-        sendRichMessage (#164). The method is new, so on ANY failure we fall back to
-        the old monospace <pre> grid — a table is never lost, just less pretty."""
+        """Send one markdown table as a native Telegram table.
+
+        - Uses sendRichMessage; any failure falls back to a pre grid
+        """
         html = markup.table_to_rich_html(table.rows, table.aligns)
         try:
             await self.bot(
@@ -1247,7 +1114,7 @@ class Streamer:
             return
         except Exception:
             logger.warning("sendRichMessage failed; falling back to <pre> grid", exc_info=True)
-        # Fallback: the legacy monospace grid (cells emphasis-stripped + escaped).
+        # Fallback: legacy monospace grid (cells stripped and escaped).
         esc = [[markup.escape_html(markup._strip_cell_emphasis(c)) for c in r] for r in table.rows]
         await self._safe(
             lambda: self.bot.send_message(
@@ -1261,11 +1128,13 @@ class Streamer:
         )
 
     def _wide_table_notes(self, rich_text: str, wide_tables: list) -> str:
-        """Replace each ``WIDE_TABLE_TOKEN`` left by ``markup.extract_wide_tables`` with the
-        localized ``stream.wide_table`` note (the table itself is sent separately as a PNG).
-        Shared by the final commit (#243) and the draft path (#256) so a streaming wide table
-        shows the SAME note it will have in the final bubble, instead of being sent verbatim as
-        an over-cap native draft that the client may reject. No-op when nothing is wide."""
+        """Replace wide-table tokens with the localized note.
+
+        - The table itself is sent separately as a PNG
+        - Shared by final commit and draft path
+        - Avoids sending an over-cap native draft
+        - No-op when nothing is wide
+        """
         if not wide_tables:
             return rich_text
         lang = i18n.cached_lang(self.chat_id)
@@ -1277,10 +1146,11 @@ class Streamer:
         return out
 
     def _svg_notes(self, rich_text: str, svgs: list) -> str:
-        """#295: replace each ``markup.SVG_TOKEN`` (left by ``markup.extract_svgs``) with the
-        localized ``stream.svg_image`` note; the diagram itself is sent separately as a PNG.
-        Shared by the final commit and the draft path so the streamed body matches the final
-        bubble instead of dumping raw <svg> XML. No-op when there are no SVGs."""
+        """Replace svg tokens with the localized image note.
+
+        - The diagram is sent separately as a PNG
+        - Shared by final commit and draft path
+        """
         if not svgs:
             return rich_text
         lang = i18n.cached_lang(self.chat_id)
@@ -1292,9 +1162,11 @@ class Streamer:
         return out
 
     def _hide_unclosed_svg(self, body: str) -> str:
-        """#295: in a streaming draft, an <svg> that hasn't closed yet would show as raw XML.
-        Cut from the still-open ``<svg`` (or its opening ```fence) to the end and leave the
-        transient 'rendering…' note, so the draft never animates a wall of markup."""
+        """Hide an unclosed svg from a streaming draft.
+
+        - Cut from the open svg to the end
+        - Leaves a transient rendering note
+        """
         low = body.lower()
         cut = low.rfind("<svg")
         if cut == -1 or "</svg>" in low[cut:]:
@@ -1305,13 +1177,15 @@ class Streamer:
         return (body[:pos].rstrip() + "\n" + note).strip()
 
     async def _send_svg_image(self, svg: str) -> None:
-        """#295: rasterize one <svg> diagram to PNG and send it as a photo. On any render
-        failure, fall back to sending the raw .svg as a document so nothing is lost. Always a
-        silent intermediate (it follows the already-sent reply bubble)."""
+        """Rasterize one svg diagram to PNG and send it.
+
+        - On render failure, sends the raw .svg document
+        - Always a silent intermediate message
+        """
         try:
             png = await asyncio.to_thread(svg_image.render_svg_png, svg)
         except Exception:
-            logger.warning("#295 svg render failed; sending raw .svg document", exc_info=True)
+            logger.warning("svg render failed; sending raw .svg document", exc_info=True)
             with contextlib.suppress(Exception):
                 await self.bot.send_document(
                     chat_id=self.chat_id,
@@ -1328,26 +1202,27 @@ class Streamer:
         )
 
     def _location_notes(self, rich_text: str, locations: list) -> str:
-        """#344: replace each ``markup.LOCATION_TOKEN`` (left by ``markup.extract_locations``)
-        with the localized ``stream.location`` note; the pin itself is sent separately as a native
-        map message. Shared by the final commit and the draft path so the streamed body matches the
-        final bubble instead of showing raw JSON. No-op when there are no locations."""
+        """Replace location tokens with the localized note.
+
+        - The pin is sent separately as a native map
+        - Shared by final commit and draft path
+        """
         if not locations:
             return rich_text
         lang = i18n.cached_lang(self.chat_id)
         note = i18n.t("stream.location", lang)
-        # #354: replace EACH LOCATION_TOKEN with the note, driven off the ACTUAL tokens present
-        # (note.join) rather than range(len(locations)). Token and location counts are equal by
-        # construction (extract_locations emits one token per location); joining on the real
-        # tokens can never drop a trailing part or index past the split if they ever diverged.
-        # was: parts=split; out=parts[0]; for idx in range(len(locations)): out+=note+(parts[idx+1] if idx+1<len(parts) else "")
+        # Replace each LOCATION_TOKEN present with the note.
+        # - token and location counts match by construction
+        # - joining on real tokens never drops a trailing part
         return note.join(rich_text.split(markup.LOCATION_TOKEN))
 
     @staticmethod
     def _map_block(loc: dict) -> str:
-        """#418: one map pin as a NATIVE rich map block (RichBlockMap, ``<tg-map>``), inline in
-        the reply — the same block in the draft and the final message, so the pin never jumps
-        out into a separate message. Title/address (a venue) become the caption."""
+        """One map pin as a native rich map block.
+
+        - Same block in draft and final message
+        - Title and address become the caption
+        """
         lat, lon = float(loc["lat"]), float(loc["lon"])
         block = f'<tg-map lat="{lat:.6f}" long="{lon:.6f}" zoom="15"/>'
         cap = " — ".join(markup.escape_html(str(loc[k])) for k in ("title", "address")
@@ -1357,8 +1232,7 @@ class Streamer:
         return f"\n\n{block}\n\n"
 
     def _location_maps(self, rich_text: str, locations: list) -> str:
-        """#418: replace each ``LOCATION_TOKEN`` with its inline rich map block (was: a note in
-        the text + a separate sendLocation/sendVenue message, #344/#373)."""
+        """Replace each location token with its inline map block."""
         if not locations:
             return rich_text
         parts = rich_text.split(markup.LOCATION_TOKEN)
@@ -1368,25 +1242,28 @@ class Streamer:
         return out
 
     def _hide_unclosed_location(self, body: str) -> str:
-        """#344: in a streaming draft, a ```location fence that hasn't closed yet would show as raw
-        JSON. Cut from the still-open fence to the end and leave the note, so the draft never
-        animates the coordinates before the pin is ready. Complete blocks are already gone (turned
-        into the note by ``extract_locations`` + ``_location_notes``), so this only trims the tail."""
+        """Hide an unclosed location fence from a streaming draft.
+
+        - Cut from the open fence; leave the note
+        - Complete blocks are already replaced earlier
+        """
         low = body.lower()
         cut = max(low.rfind("```location"), low.rfind("```geo"))
-        if cut == -1 or "```" in body[cut + 3:]:  # no open fence, or it already closed → leave it
+        if cut == -1 or "```" in body[cut + 3:]:  # no open fence, or already closed
             return body
         note = i18n.t("stream.location", i18n.cached_lang(self.chat_id))
         return (body[:cut].rstrip() + "\n" + note).strip()
 
     async def _send_location(self, loc: dict) -> None:
-        """#344: deliver one extracted ```location block as a real Telegram map message — a
-        sendVenue card when it names a place (title+address both present), else a plain sendLocation
-        pin. Always a silent intermediate (it follows the already-sent reply bubble)."""
+        """Deliver one location block as a real Telegram map.
+
+        - Venue card when title and address exist, else a pin
+        - Always a silent intermediate message
+        """
         lat, lon = loc["lat"], loc["lon"]
-        # #347: try the venue card first; if Telegram rejects it (e.g. an over-long title/address
-        # 400) _safe returns None — fall through to a plain pin so valid coordinates always drop a
-        # marker instead of vanishing. was: a bare if/else with no venue fallback.
+        # Try the venue card first, then a plain pin.
+        # - _safe returns None when Telegram rejects (e.g. long title)
+        # - valid coordinates must always drop a marker
         if loc.get("title") and loc.get("address"):
             if await self._safe(
                 lambda: self.bot.send_venue(
@@ -1396,8 +1273,7 @@ class Streamer:
                 )
             ):
                 return
-        # #387: log a lost pin — unlike _send_svg_image/_send_wide_table_image, a location that
-        # fails BOTH the venue and the plain-pin send otherwise vanishes with no trace.
+        # Log a lost pin; otherwise it vanishes without trace.
         if await self._safe(
             lambda: self.bot.send_location(
                 chat_id=self.chat_id, latitude=lat, longitude=lon,
@@ -1408,17 +1284,19 @@ class Streamer:
                            lat, lon)
 
     async def _send_wide_table_image(self, table) -> None:
-        """#243: send one wide (>20-column) table as its own PNG photo — a native rich table
-        caps at 20 columns. If PNG rendering is unavailable (e.g. the table-image font is not
-        installed), fall back to a monospace <pre> grid so the data is never lost. Always a
-        silent intermediate (it follows the already-sent reply bubble)."""
+        """Send one wide (over 20 columns) table as a PNG.
+
+        - Native rich tables cap at 20 columns
+        - Falls back to a pre grid without the table font
+        - Always a silent intermediate message
+        """
         try:
             esc = [[markup._strip_cell_emphasis(c) for c in r] for r in table.rows]
-            # #285: PIL raster is synchronous CPU — run it off the event loop so a wide-table
-            # reply doesn't freeze every other user's stream for tens-to-hundreds of ms.
+            # PIL raster is synchronous CPU; run it off the loop.
+            # - else a wide-table reply freezes other users' streams
             png = await asyncio.to_thread(table_image.render_table_png, esc)
         except Exception:
-            logger.warning("#243 wide-table PNG render failed; <pre> grid fallback", exc_info=True)
+            logger.warning("wide-table PNG render failed; <pre> grid fallback", exc_info=True)
             grid = [[markup.escape_html(markup._strip_cell_emphasis(c)) for c in r] for r in table.rows]
             await self._safe(
                 lambda: self.bot.send_message(
@@ -1441,19 +1319,17 @@ class Streamer:
         )
 
     async def update_todo_card(self, todos: list, lang: str = "en") -> None:
-        """#229: render/refresh the live task-list card from the agent's TodoWrite ``todos``.
-        It is a SEPARATE rich message (NOT on the draft typewriter path) sent on the first
-        TodoWrite event of the turn and EDITED IN PLACE on later ones — one card per turn
-        (a fresh Streamer per turn resets ``_todo_msg_id``). Best-effort: a send/edit failure
-        is swallowed so it never breaks the answer. A native rich markdown body, so clients
-        that don't style it still show a readable glyph list."""
+        """Render or refresh the live task-list card.
+
+        - Separate rich message, edited in place; one per turn
+        - Best-effort: send or edit failures are swallowed
+        """
         total, done, open_, body = markup.summarize_todos(todos)
         if total == 0:
             return
         header = i18n.t("todo.card_header", lang, n=total, done=done, open=open_)
-        # #339: header → body needs a markdown HARD break ("  \n") too; a bare "\n" is a
-        # soft break (space) in the rich {"markdown"} field, which glued the header onto the
-        # first task. was: f"{header}\n{body}"
+        # Header-to-body needs a markdown hard break (two spaces, newline).
+        # - a bare newline is a soft break in rich markdown
         rich = {"markdown": f"{header}  \n{body}"}
         try:
             if self._todo_msg_id is None:
@@ -1475,18 +1351,18 @@ class Streamer:
                     )
                 )
         except Exception:
-            # Edits fail if the content is unchanged ("message is not modified") or the
-            # card was deleted — neither should disturb the turn.
-            logger.debug("#229 todo card update failed", exc_info=True)
+            # Edit failures (unchanged, deleted card) must not disturb the turn.
+            logger.debug("todo card update failed", exc_info=True)
 
-    # #321: CURRENTLY DISABLED — the web-search Sources card is off (its call sites in
-    # sessions.py + finish() are commented; search feedback is the animated 🔎 thinking tag
-    # alone). add_web_source / finalize_sources / sources_card_markdown are kept intact for revert.
+    # Web-search Sources card is currently disabled.
+    # - its call sites in sessions.py and finish() are commented
+    # - helper functions kept intact
     async def add_web_source(self, kind: str, value: str, lang: str = "en") -> None:
-        """#318 (experimental): collect a web source (kind 'search'=query | 'fetch'=url) and
-        (re)render the live Sources card — a SEPARATE rich message sent on the first web tool
-        of the turn and EDITED IN PLACE as more arrive (mirrors update_todo_card). Dedups,
-        caps at 15, best-effort (a send/edit failure never disturbs the answer)."""
+        """Collect a web source and re-render the Sources card.
+
+        - Separate rich message, edited in place as sources arrive
+        - Dedups and caps at 15; best-effort
+        """
         value = (value or "").strip()
         if not value:
             return
@@ -1516,12 +1392,14 @@ class Streamer:
                     )
                 )
         except Exception:
-            logger.debug("#318 sources card update failed", exc_info=True)
+            logger.debug("sources card update failed", exc_info=True)
 
     async def finalize_sources(self) -> None:
-        """#319: at turn end, flip the live research card from the in-progress "Searching…"
-        header to the final "Sources" header (the resource list itself is unchanged). No-op if
-        no web tool ran this turn. Best-effort — never disturbs the finished answer."""
+        """Flip the research card header from Searching to Sources.
+
+        - No-op if no web tool ran
+        - Best-effort; never disturbs the finished answer
+        """
         if self._sources_msg_id is None or not self._web_sources:
             return
         lang = i18n.cached_lang(self.chat_id)
@@ -1537,24 +1415,19 @@ class Streamer:
 
     async def _commit_rich_markdown(self, full_text: str, footer: str, silent: bool,
                                     reply_markup=None) -> bool:
-        """#169/#172: post the ENTIRE reply as ONE native rich message (the markdown
-        field): Telegram renders headings / lists / tables / quotes natively, with NO
-        splitting. Returns True on success; False (→ classic fallback) on any error.
+        """Post the entire reply as one native rich message.
 
-        #172/#174: in a rich message a ```fence``` renders as plain MONOSPACE (no
-        language label, no copy) — RichBlockPreformatted is accepted by the API but not
-        styled by the current client. Code is sent through this path anyway, keeping one
-        consistent rich message instead of splitting; when the client styles
-        RichBlockPreformatted, code renders as a full code block with NO change here.
-        (The split-by-segment alternative lives in _commit_mixed.)"""
-        # #353: demote ATX headings to **bold** so the persisted rich reply stays in ONE font
-        # (matches the draft; decoration like a leading emoji is left to the model).
-        md = markup.demote_headings(full_text).strip() or "…"  # was: full_text.strip()
+        - Returns True on success; False falls back to classic
+        - Fenced code renders as plain monospace in rich messages
+        - Split-by-segment alternative lives in _commit_mixed
+        """
+        # Demote ATX headings to bold: one font in the reply.
+        # - matches the draft; emoji decoration left to the model
+        md = markup.demote_headings(full_text).strip() or "…"
         if footer:
-            # Italicize each footer line separately — markdown italic can't span a
-            # newline, and the usage footer is 2 lines (5h / 7d) (#169). #339: join the
-            # lines with a HARD break ("  \n"); a bare "\n" is a soft break (space) in the
-            # rich {"markdown"} field, which collapsed the 2 footer lines onto one.
+            # Italicize each footer line separately.
+            # - markdown italic can't span a newline
+            # - join with a hard break, not a bare newline
             foot = "  \n".join(f"_{ln}_" for ln in footer.splitlines() if ln.strip())
             md = f"{md}\n\n{foot}"
         try:
@@ -1568,10 +1441,10 @@ class Streamer:
                 )
             )
         except Exception:
-            logger.warning("#169 sendRichMessage(markdown) failed; legacy fallback", exc_info=True)
+            logger.warning("sendRichMessage(markdown) failed; legacy fallback", exc_info=True)
             return False
-        # The rich message is a fresh bubble, so clear the streaming write-head
-        # placeholder if there was one (DM drafts have none — they self-expire).
+        # Rich message is a fresh bubble: clear the write-head placeholder.
+        # - DM drafts have none; they self-expire
         if self.message_id is not None:
             with contextlib.suppress(Exception):
                 await self.bot.delete_message(self.chat_id, self.message_id)
@@ -1582,13 +1455,13 @@ class Streamer:
     async def _commit_rich_embedded(self, rich_text: str, locations: list, svgs: list,
                                     wide_tables: list, footer: str, silent: bool,
                                     reply_markup=None) -> bool:
-        """#418: post a reply that carries out-of-band blocks as ONE rich message: each map pin
-        becomes an inline ``<tg-map>`` block, each ``<svg>`` diagram and each wide (>20-column)
-        table a PNG photo embedded at its token via ``InputRichMessage.media`` (uploaded with the
-        send — aiogram turns the nested InputFile into a multipart ``attach://`` part). A diagram
-        that fails to render is embedded as its .svg document; a table that fails, as a text
-        grid. Returns False (→ the #374 interleave fallback) when the rich send fails or the
-        reply carries more media than one rich message may hold."""
+        """Post a reply with out-of-band blocks as one rich message.
+
+        - Map pins become inline map blocks
+        - Diagrams and wide tables embed as PNG media
+        - Failed diagram embeds as .svg; failed table as text grid
+        - Returns False when the send fails or media exceeds limit
+        """
         loc_q, svg_q, tbl_q = list(locations), list(svgs), list(wide_tables)
         if len(svg_q) + len(tbl_q) > _RICH_MEDIA_MAX:
             return False
@@ -1613,7 +1486,7 @@ class Streamer:
                     png = await asyncio.to_thread(svg_image.render_svg_png, svg)
                     out.append(_attach("photo", png, "diagram.png"))
                 except Exception:
-                    logger.warning("#418 svg render failed; embedding the raw .svg", exc_info=True)
+                    logger.warning("svg render failed; embedding the raw .svg", exc_info=True)
                     out.append(_attach("document", svg.encode("utf-8"), "diagram.svg"))
             elif seg == markup.WIDE_TABLE_TOKEN and tbl_q:
                 tbl = tbl_q.pop(0)
@@ -1622,7 +1495,7 @@ class Streamer:
                     png = await asyncio.to_thread(table_image.render_table_png, rows)
                     out.append(_attach("photo", png, "table.png"))
                 except Exception:
-                    logger.warning("#418 wide-table render failed; embedding a text grid",
+                    logger.warning("wide-table render failed; embedding a text grid",
                                    exc_info=True)
                     grid = markup._render_table_pre(
                         [[markup._strip_cell_emphasis(c) for c in r] for r in tbl.rows])
@@ -1645,7 +1518,7 @@ class Streamer:
                 )
             )
         except Exception:
-            logger.warning("#418 embedded rich send failed; interleave fallback", exc_info=True)
+            logger.warning("embedded rich send failed; interleave fallback", exc_info=True)
             return False
         if self.message_id is not None:
             with contextlib.suppress(Exception):
@@ -1657,43 +1530,32 @@ class Streamer:
     async def _commit_rich_interleaved(self, rich_text: str, locations: list, svgs: list,
                                        wide_tables: list, footer: str, silent_first: bool,
                                        reply_markup=None) -> None:
-        """#373/#374: deliver a reply that carries OUT-OF-BAND blocks — map pins (#344), ``<svg>``
-        diagrams (#295), and wide (>20-col) tables (#243) — by INTERLEAVING them: SPLIT the rich
-        body at each block's token and send its native message (a sendLocation/sendVenue pin, or a
-        PNG photo) RIGHT WHERE it sat, in document order, instead of leaving a placeholder note and
-        batching every attachment at the very end (detached from the prose that introduces it — the
-        #373 screenshot bug for pins, generalized here to diagrams + wide tables).
+        """Deliver out-of-band blocks interleaved at their document positions.
 
-        Send order is text, block, text, block, …, text. An EMPTY text run (back-to-back blocks)
-        sends no bubble, so several blocks in a row arrive as consecutive cards under the line that
-        lists them. The footer rides the LAST non-empty text bubble (its own message if the reply
-        ends on a block); the keypad (#247) rides that same bubble. Each rich bubble falls back to
-        classic HTML if its send fails (like ``_commit_mixed``) so a reply is never lost. Always
-        delivers — no False/fallback return (unlike ``_commit_rich_markdown``).
-
-        #373 was pins-only (``rich_text.split(LOCATION_TOKEN)``); #374 walks EVERY attachment token
-        via ``markup.split_on_attachment_tokens`` and dispatches by token type. Each extractor emits
-        one token per item in document order, so the per-type queues drain front-to-back in step."""
-        # Ordered queues; each list is already in document order (its extractor ran left→right).
+        - Splits rich body at each token; sends block in place
+        - Empty text runs send no bubble
+        - Footer and keypad ride the last non-empty text bubble
+        - Each bubble falls back to classic HTML; always delivers
+        """
+        # Ordered queues, each in document order.
         loc_q, svg_q, tbl_q = list(locations), list(svgs), list(wide_tables)
-        # split() KEEPS the tokens: even indices are prose, odd indices are one *_TOKEN sentinel.
+        # split() keeps tokens: even indices prose, odd indices sentinels.
         parts = markup.split_on_attachment_tokens(rich_text)
-        # #387 (AC2): a token can sit INSIDE a fenced code block (e.g. an <svg> shown among other
-        # content in a ```html block, or a wide table inside a fence); splitting there cuts the
-        # fence and leaves each prose run with unbalanced backticks. Repair the runs so each renders
-        # on its own (a reply with no token-in-a-fence is returned unchanged).
+        # A token inside a fenced block splits the fence.
+        # - repair prose runs so each has balanced backticks
+        # - a reply without such tokens is returned unchanged
         parts = markup.repair_fences_across_tokens(parts)
-        # Segments are fresh messages → drop the streaming write-head placeholder
-        # (DM drafts have none; they self-expire), mirroring _commit_mixed.
+        # Segments are fresh messages: drop the write-head placeholder.
+        # - DM drafts have none; they self-expire
         if self.message_id is not None:
             with contextlib.suppress(Exception):
                 await self.bot.delete_message(self.chat_id, self.message_id)
             self.message_id = None
-        # Last non-empty PROSE run (even index) → the footer + keypad ride it.
+        # Last non-empty prose run carries the footer and keypad.
         last_text_idx = max((i for i, p in enumerate(parts) if i % 2 == 0 and p.strip()), default=-1)
         first = True
         for idx, seg in enumerate(parts):
-            if idx % 2:  # odd → an attachment token; drop its native message at this exact spot
+            if idx % 2:  # odd index: attachment token; send its native message here
                 if seg == markup.LOCATION_TOKEN and loc_q:
                     await self._send_location(loc_q.pop(0))
                 elif seg == markup.SVG_TOKEN and svg_q:
@@ -1702,10 +1564,10 @@ class Streamer:
                     await self._send_wide_table_image(tbl_q.pop(0))
                 continue
             if not seg.strip():
-                continue  # empty prose run (leading token / back-to-back blocks) → no bubble
+                continue  # empty prose run: no bubble
             silent = silent_first if first else True
             first = False
-            md = markup.demote_headings(seg).strip()  # #353: one font
+            md = markup.demote_headings(seg).strip()  # one font
             if footer and idx == last_text_idx:
                 foot = "  \n".join(f"_{ln}_" for ln in footer.splitlines() if ln.strip())
                 md = f"{md}\n\n{foot}"
@@ -1718,24 +1580,12 @@ class Streamer:
                     )
                 )
             except Exception:
-                # #381/#383: the single rich send failed — most often the prose run exceeds the
-                # message limit (RICH_LIMIT=32768). Split it and send each piece as HTML. #383:
-                # size the pieces by RENDERED HTML, not raw markdown — md_to_html escaping can
-                # expand a <=SAFE_LIMIT raw chunk past Telegram's 4096 ceiling, and that send
-                # would 400 and be silently dropped by _safe (the very data-loss #381 set out to
-                # fix). render_within_limit re-splits + hard-cuts so every emitted HTML piece is
-                # <= HARD_LIMIT — the same guard the non-interleaved paths use (see line ~387).
-                # The keypad rides the LAST piece; only the first keeps this segment's notify.
-                # was — replaced for #381, re-sized for #383 (split RAW then md_to_html each — a
-                # dense chunk could still render past 4096 and be dropped by _safe):
-                #   pieces = markup.split_markdown(md) or [md]
-                #   for pi, piece in enumerate(pieces):
-                #       p_kb = kb if pi == len(pieces) - 1 else None
-                #       p_silent = silent if pi == 0 else True
-                #       piece_html = markup.md_to_html(piece)
-                #       await self._safe(lambda h=piece_html ...: self.bot.send_message(text=h, ...))
-                # #387 (AC5): skip blank <pre></pre> renders (a hard-cut inside a fence), keeping at
-                # least one carrier so the keypad on the last piece still rides a real bubble.
+                # Single rich send failed, usually prose exceeding the message limit.
+                # - split and send each piece as HTML
+                # - size pieces by rendered HTML; escaping inflates raw chunks
+                # - render_within_limit keeps every piece within HARD_LIMIT
+                # - keypad rides last piece; only first keeps notify
+                # - skip blank <pre></pre> pieces, keep one carrier
                 htmls = [h for raw in (markup.split_markdown(md) or [md])
                          for h in markup.render_within_limit(raw)
                          if not markup.is_empty_render(h)] or ["…"]
@@ -1752,11 +1602,9 @@ class Streamer:
                     if sent is None:
                         logger.warning("interleave fallback: dropped a %d-char HTML piece "
                                        "(send failed after render_within_limit)", len(piece_html))
-        # Reply is nothing but attachments (no text carried the footer/keypad) → send a trailing
-        # bubble so neither is dropped. #387: the keypad (reply_markup) rides it too — the footer-
-        # only branch previously omitted reply_markup, silently dropping the keypad on an all-
-        # attachment reply. A keypad with no footer uses an invisible carrier (Telegram rejects
-        # empty text). was: `if footer and last_text_idx == -1:` (text-only, no reply_markup).
+        # Attachment-only reply: send a trailing bubble for footer and keypad.
+        # - Telegram rejects empty text
+        # - a keypad without footer uses an invisible carrier
         if last_text_idx == -1 and (footer or reply_markup):
             foot_html = f"<i>{markup.escape_html(footer)}</i>" if footer else "\u2063"
             sent = await self._safe(
@@ -1767,14 +1615,10 @@ class Streamer:
                     **self._kwargs(),
                 )
             )
-            # #387 (AC4): the invisible U+2063 keypad carrier is unverified against Telegram's
-            # empty-text check; if a keypad-only send is rejected, retry once with a visible
-            # known-good carrier so the keypad is never silently lost, then log if even that fails
-            # (parity with _send_location / the interleave fallback, which now warn on a drop).
-            # #392: scope the "\u2026" carrier swap to the keypad-only case (no footer). It only addresses
-            # Telegram rejecting U+2063 as empty; with a footer the first send already carried visible
-            # text, so a failure is network/other and retrying with "\u2026" would drop the footer without
-            # fixing the cause. was: `if sent is None and reply_markup is not None:`
+            # Keypad-only send: retry with a visible carrier if rejected.
+            # - invisible U+2063 is unverified against the empty-text check
+            # - with a footer, failure is not emptiness; skip retry
+            # - log if even the retry fails
             if sent is None and reply_markup is not None and not footer:
                 sent = await self._safe(
                     lambda: self.bot.send_message(
@@ -1790,16 +1634,17 @@ class Streamer:
         self._rendered_text = rich_text
 
     async def _commit_mixed(self, full_text: str, footer: str, silent_first: bool) -> None:
-        """#176: a reply that contains code → split by code block. Non-code segments
-        (prose, tables, lists, headings) go as RICH messages (consistent font + native
-        tables); each code block goes CLASSIC (a real code block with language + copy).
-        The footer rides the last segment (or its own message if that segment is code).
-        Each rich piece falls back to classic HTML if its send fails."""
+        """Split a reply containing code by code block.
+
+        - Prose and tables go as rich messages
+        - Code blocks go classic, with language and copy
+        - Footer rides the last segment; rich falls back to HTML
+        """
         segs = [(k, s) for (k, s) in markup.split_code_blocks(full_text) if s.strip()]
         if not segs:
             segs = [("text", "…")]
-        # Segments are fresh messages → drop the streaming write-head placeholder
-        # (DM drafts have none; they self-expire).
+        # Segments are fresh messages: drop the write-head placeholder.
+        # - DM drafts have none; they self-expire
         if self.message_id is not None:
             with contextlib.suppress(Exception):
                 await self.bot.delete_message(self.chat_id, self.message_id)
@@ -1818,7 +1663,7 @@ class Streamer:
                     )
                 )
             else:
-                md = markup.demote_headings(seg).strip()  # #353: one font (was: seg.strip())
+                md = markup.demote_headings(seg).strip()  # one font
                 if want_footer:
                     foot = "  \n".join(f"_{ln}_" for ln in footer.splitlines() if ln.strip())
                     md = f"{md}\n\n{foot}"
@@ -1831,8 +1676,7 @@ class Streamer:
                         )
                     )
                 except Exception:
-                    # was md_to_html(seg) — dropped the usage footer on rich-send
-                    # fallback (the footer lives on md, not seg); render md. #342
+                    # Render md, not seg, so the fallback keeps the footer.
                     seg_html = markup.md_to_html(md)
                     await self._safe(
                         lambda h=seg_html, s=silent: self.bot.send_message(
@@ -1841,7 +1685,7 @@ class Streamer:
                             **self._kwargs(),
                         )
                     )
-            if want_footer:   # last segment was code → footer on its own line
+            if want_footer:   # after code, footer goes on its own line
                 await self._safe(
                     lambda: self.bot.send_message(
                         chat_id=self.chat_id,
@@ -1853,49 +1697,32 @@ class Streamer:
         self._rendered_text = full_text
 
     async def _commit(self, full_text: str, footer: str, notify: bool, reply_markup=None) -> None:
-        """Render full_text and post it as permanent message(s). Caller holds the
-        lock and owns the streaming flags. Links never preview; only the FIRST
-        message may ping (notify), the rest are silent.
+        """Render full_text and post it as permanent messages.
 
-        #169: the whole reply now goes as ONE rich-markdown message (see
-        _commit_rich_markdown); the chunk/split/table-bubble logic below is the
-        FALLBACK only. Very long → a .md document instead.
+        - Caller holds the lock and owns streaming flags
+        - Links never preview; only the first message pings
+        - Whole reply is one rich message; chunking is the fallback
+        - Very long replies become a .md document
         """
         silent_first = not notify
         footer_line = f"\n\n<i>{markup.escape_html(footer)}</i>" if footer else ""
 
-        # #176: send the WHOLE reply as ONE rich message, code included. In rich a
-        # ```fence``` renders as plain MONOSPACE (no language / copy — RichBlockPreformatted
-        # is accepted but not styled by the current client, #174); a single consistent
-        # rich message is used rather than SPLITTING a code reply into rich+classic
-        # bubbles, and when Telegram styles code this needs no change. The split-by-
-        # segment path (_commit_mixed / markup.split_code_blocks) is kept, un-called, to
-        # flip back if the trade-off is revisited.
-        #
-        # #243: a native rich table caps at 20 columns. Pull each WIDER table out of the body,
-        # leave a note where it was, send the rich markdown, then send each wide table as a PNG
-        # image (rich tables ≤20 cols stream/render natively as before).
-        # #295: pull out <svg> diagrams first (they're sent as images), then wide tables.
-        # #344: also pull out ```location map pins (sent as native sendLocation/sendVenue); each
-        # extractor leaves a localized note in the body and is additive — order is independent.
+        # Send the whole reply as ONE rich message, code included.
+        # - rich renders fences as plain monospace
+        # - native rich tables cap at 20 columns
+        # - svg diagrams, wide tables, location pins are extracted first
+        # - each extractor leaves a localized note; order is independent
         loc_text, locations = markup.extract_locations(full_text)
         svg_text, svgs = markup.extract_svgs(loc_text)
         rich_text, wide_tables = markup.extract_wide_tables(svg_text)
-        # #374: any out-of-band block — a map pin (#344), an <svg> diagram (#295), or a wide
-        # (>20-col) table (#243) — is INTERLEAVED: the bubble is SPLIT at the block's spot and its
-        # native message (a pin / a PNG photo) is sent THERE, in document order, instead of a
-        # placeholder note + every attachment batched at the end (detached from the text — the #373
-        # screenshot bug for pins, generalized here to diagrams + tables). The raw *_TOKEN sentinels
-        # must survive into _commit_rich_interleaved, so the note-substitution helpers are NOT
-        # applied here (was #243/#295/#344: _wide_table_notes + _svg_notes + _location_notes ran on
-        # rich_text before the send). They still run on the DRAFT path so the streamed body shows
-        # notes. The interleaver always delivers (per-segment rich→HTML fallback) — no classic fallback.
+        # Out-of-band blocks are interleaved: split the bubble at each spot.
+        # - pins, svg diagrams, wide tables send native messages in order
+        # - raw *_TOKEN sentinels must survive into the interleaver
+        # - so note-substitution helpers are not applied here
+        # - the draft path still applies them
         if locations or svgs or wide_tables:
-            # #418: ONE rich message — maps as native map blocks, diagrams and wide tables as
-            # photos embedded at their spot (InputRichMessage.media) — so the draft is replaced
-            # in place instead of splitting into several bubbles. The #374 interleave (split the
-            # reply around each attachment) stays as the fallback if that send fails.
-            # A session without rich blocks (MAX) interleaves straight away.
+            # One rich message with embedded blocks; interleave is the fallback.
+            # - A session without rich blocks (MAX) interleaves straight away
             embeds = getattr(self.bot.session, "embeds_rich_media", None)
             if (embeds is None or embeds(self.chat_id)) and await self._commit_rich_embedded(
                     rich_text, locations, svgs, wide_tables, footer, silent_first,
@@ -1906,23 +1733,17 @@ class Streamer:
                 reply_markup=reply_markup,
             )
             return
-        # No out-of-band blocks → the reply is one plain rich bubble (rich_text carries no tokens).
+        # No out-of-band blocks: one plain rich bubble, no tokens.
         if await self._commit_rich_markdown(rich_text, footer, silent_first, reply_markup=reply_markup):
             return
-        # # was (#176): split a code reply → rich prose/tables + classic code block:
-        # if markup.has_code_block(full_text):
-        #     await self._commit_mixed(full_text, footer, silent_first)
-        #     return
 
-        # #374: the two fallbacks below run ONLY when the reply has NO out-of-band block (the
-        # interleave branch returns for any pin/diagram/table) AND the rich send failed — so
-        # locations/svgs/wide_tables are all empty here and the note/pin handling is inert. It is
-        # kept (was #346, when the rich path could fall through with pins pending) as a defensive
-        # no-op: loc_noted == loc_text == full_text, and the trailing pin loop iterates nothing.
+        # Fallbacks run only when no blocks and rich send failed.
+        # - so locations, svgs, wide tables are empty here
+        # - note and pin handling is a defensive no-op
         loc_noted = self._location_notes(loc_text, locations)
 
-        # Very long output (fallback): deliver as a document so we do not spam chunks.
-        if markup.should_send_as_file(loc_noted):  # was: should_send_as_file(full_text) — #346
+        # Very long output (fallback): deliver as a document.
+        if markup.should_send_as_file(loc_noted):
             note_chunk = self._render_chunks(
                 i18n.t("stream.too_long", i18n.cached_lang(self.chat_id))
             )[0]
@@ -1936,13 +1757,13 @@ class Streamer:
                         link_preview_options=_NO_PREVIEW,
                     )
                 )
-            document = markup.as_document(loc_noted, "response.md")  # was: full_text — #346
+            document = markup.as_document(loc_noted, "response.md")
             await self._safe(
                 lambda: self.bot.send_document(
                     chat_id=self.chat_id,
                     document=document,
                     disable_notification=silent_first,
-                    reply_markup=reply_markup,  # #247: keep the shell keypad on fallback
+                    reply_markup=reply_markup,  # keep the shell keypad on fallback
                     **self._kwargs(),
                 )
             )
@@ -1958,27 +1779,19 @@ class Streamer:
                     )
                 )
             self._rendered_text = note_chunk
-            for loc in locations:  # #346: deliver the pins on the document fallback too
+            for loc in locations:  # also deliver pins on document fallback
                 await self._send_location(loc)
             return
 
-        # ---- legacy fallback (pre-#169): md_to_html chunks + native-table bubbles +
-        #      char-limit splitting. Kept (not deleted) so a sendRichMessage failure
-        #      never loses a reply, and for a quick revert. ----
-        # #162: build ordered sendables — HTML text chunks + wide-table photos. A table
-        # too wide for a phone can't be a clean <pre> grid (it wraps / runs off the
-        # bubble) and Telegram has no native table, so it is drawn as a PNG and sent as
-        # its own photo; narrow tables stay <pre> grids inside the text chunks. Per the
-        # /codesplit toggle the text path isolates fenced code blocks (default — easy
-        # mobile copy) or size-splits inline; empty code boxes are dropped, and one "…"
-        # chunk is kept so an empty turn still shows something.
-        # Fallback only (a NO-code reply whose rich send failed): classic md_to_html
-        # chunks + native-table bubbles. Code-containing replies never reach here —
-        # they are handled by _commit_mixed (rich prose/tables + classic code).
+        # Legacy fallback: classic HTML chunks plus native-table bubbles.
+        # - a failed rich send never loses a reply
+        # - code isolation follows the /codesplit toggle
+        # - one ellipsis chunk keeps an empty turn visible
         render_fn = self._render_message_chunks if self._split_code_messages else self._render_chunks
-        sendables = self._build_sendables(loc_noted, render_fn) or [("text", "…")]  # was: full_text — #346
+        sendables = self._build_sendables(loc_noted, render_fn) or [("text", "…")]
 
-        # Append the footer to the last TEXT sendable when it fits, else send it alone.
+        # Footer joins the last text sendable if it fits.
+        # - otherwise it is sent alone
         footer_as_message = bool(footer_line)
         if footer_line:
             for idx in range(len(sendables) - 1, -1, -1):
@@ -1988,17 +1801,17 @@ class Streamer:
                     footer_as_message = False
                     break
 
-        # Send in order. The FIRST text sendable replaces the streaming placeholder
-        # (write-head/group); photos and the rest are sent fresh. Only the first send
-        # may ping the user; the rest are silent intermediates.
+        # Send in order; first text sendable replaces the placeholder.
+        # - photos and the rest are sent fresh
+        # - only the first send may ping the user
         placeholder_used = False
         first_send = True
-        kb_pending = reply_markup  # #247: attach the keypad to the first text message
+        kb_pending = reply_markup  # keypad goes on the first text message
         for kind, payload in sendables:
             silent = silent_first if first_send else True
             if kind == "rich":
-                # #164: a native Telegram table — its own bubble (like the old photo),
-                # so it does not consume the streaming placeholder.
+                # A native Telegram table gets its own bubble.
+                # - it does not consume the streaming placeholder
                 await self._send_rich(payload, silent)
             elif kind == "photo":
                 await self._safe(
@@ -2010,7 +1823,7 @@ class Streamer:
                     )
                 )
             elif self.message_id is not None and not placeholder_used:
-                kb, kb_pending = kb_pending, None  # #247: first text gets the keypad
+                kb, kb_pending = kb_pending, None  # first text gets the keypad
                 await self._safe(
                     lambda t=payload, k=kb: self.bot.edit_message_text(
                         text=t,
@@ -2024,7 +1837,7 @@ class Streamer:
                 self._rendered_text = payload
                 placeholder_used = True
             else:
-                kb, kb_pending = kb_pending, None  # #247: first text gets the keypad
+                kb, kb_pending = kb_pending, None  # first text gets the keypad
                 await self._safe(
                     lambda t=payload, s=silent, k=kb: self.bot.send_message(
                         chat_id=self.chat_id,
@@ -2039,8 +1852,8 @@ class Streamer:
                 self._rendered_text = payload
             first_send = False
 
-        # A group placeholder left unconsumed (a photo-only answer) → don't orphan its
-        # "typing…" text; replace it with a thin marker.
+        # Unconsumed group placeholder (photo-only answer): replace it with a marker.
+        # - avoids orphaning its typing text
         if self.message_id is not None and not placeholder_used:
             await self._safe(
                 lambda: self.bot.edit_message_text(
@@ -2064,7 +1877,7 @@ class Streamer:
                 )
             )
 
-        # #346: deliver the ```location pins on the legacy fallback path as well (the rich path
-        # returns earlier, so this runs only when that path was not taken — pins are sent once).
+        # Deliver location pins on the legacy fallback path too.
+        # - the rich path returns earlier, so pins are sent once
         for loc in locations:
             await self._send_location(loc)

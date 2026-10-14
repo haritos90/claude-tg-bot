@@ -1,12 +1,8 @@
-"""Engine layer: wraps ClaudeSDKClient for a single thread/session.
+"""Engine layer wrapping one SDK client per session.
 
-This is the ONLY module that imports the Agent SDK. It normalizes the raw SDK
-message stream into a flat sequence of EngineEvent objects that the Telegram
-layer (sessions.py / streamer.py) can consume without any SDK knowledge.
-
-Subscription auth: we never set ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN — the
-spawned `claude` CLI uses the logged-in Pro/Max subscription credentials when
-no API key is present. We therefore strip those vars from the child env.
+- only module that imports the Agent SDK
+- normalizes SDK messages into `EngineEvent` objects
+- API-key env vars are stripped; subscription auth only
 """
 
 import os
@@ -25,21 +21,20 @@ from claude_agent_sdk import (
     ResultMessage,
     StreamEvent,
     RateLimitEvent,
-    SystemMessage,  # #411: the init message names the concrete model an alias resolved to
+    SystemMessage,  # init message names the resolved model
     TextBlock,
     ToolUseBlock,
     tool,
     create_sdk_mcp_server,
 )
 
-from app import DEPLOY_DIR  # repo-root deploy/ scripts (#302: modules live in the package now)
-from app.core import models  # #411: model catalog reported by the CLI
+from app import DEPLOY_DIR
+from app.core import models  # model catalog reported by the CLI
 
 logger = logging.getLogger(__name__)
 
-# #137: signatures used to classify a failed-startup / failed-turn from the CLI's
-# real stderr (captured via the ClaudeAgentOptions.stderr callback). Conservative
-# phrasing only, so we never mis-flag an unrelated error.
+# Signatures classifying a failed startup or turn from CLI stderr.
+# - conservative phrasing, to avoid mis-flagging unrelated errors
 _RESUME_LOST_RE = re.compile(r"No conversation found with session ID", re.I)
 _LIMIT_RE = re.compile(
     r"usage limit|rate.?limit|reached your (usage )?limit|"
@@ -49,10 +44,10 @@ _LIMIT_RE = re.compile(
 
 
 def _classify_stderr(text: str) -> str | None:
-    """Map captured CLI stderr to a known failure class, or None if unrecognized.
+    """Map captured CLI stderr to a failure class, or None.
 
-    'resume_lost' -> a stale --resume id (recoverable: retry without resume).
-    'rate_limit'  -> the subscription window is exhausted (NOT recoverable here).
+    - `resume_lost`: stale resume id, retry without it
+    - `rate_limit`: subscription window exhausted, not recoverable
     """
     if not text:
         return None
@@ -63,15 +58,11 @@ def _classify_stderr(text: str) -> str | None:
     return None
 
 
-# #343: bound how long a turn may wait for the model's FIRST streamed message before we stop
-# waiting and surface a clear "service unavailable" error. When the Anthropic service is
-# overloaded/erroring (5xx/529) the CLI retries the request INTERNALLY with backoff and emits
-# NO message for minutes, so the user just sees an endless "thinking…" animation (reported:
-# 2–5 min before any error finally appeared). A healthy turn — even with a huge context or
-# extended thinking — yields its first event within seconds, so a long initial gap means the
-# service is down/overloaded, not slow. Only the time-to-FIRST-token is bounded: once the
-# model is streaming we never time it out, because a legitimate long tool call / build
-# produces no events for minutes. Tunable via env; 0 disables the watchdog.
+# Bound the wait for the model's first streamed message.
+# - overloaded service: CLI retries silently for minutes
+# - healthy turns emit a first event within seconds
+# - only time-to-first-token is bounded; long tool calls are fine
+# - tunable via env; 0 disables
 try:
     _FIRST_TOKEN_TIMEOUT_SEC = float(
         os.environ.get("MODEL_FIRST_TOKEN_TIMEOUT_SEC", "60") or "60"
@@ -79,16 +70,11 @@ try:
 except ValueError:
     _FIRST_TOKEN_TIMEOUT_SEC = 60.0
 
-# #358: a thinking_delta IS a StreamEvent, so the first-token watchdog above disarms the moment
-# extended-thinking starts streaming. But the streamer keeps the <tg-thinking> draft alive with a
-# ~20s keepalive, so if the upstream then goes SILENT after reasoning — no answer text, no tool
-# call, no ResultMessage — the unbounded wait below hangs and "Thinking…" animates FOREVER (the
-# reported stuck-thinking bug; a draft cannot be force-cleared via the Bot API — it only self-
-# expires ~30s after the LAST draft send, which the keepalive keeps pushing back). So ALSO bound
-# each inter-event wait while the turn is still in the THINKING phase (progressed, but no ANSWER
-# content yet). NOT applied once real answer content / a tool call / a result has started — a long
-# legitimate tool call or build emits nothing for minutes. Generous (active thinking emits deltas
-# sub-second, so a multi-minute gap means a wedge). Tunable via env; 0 disables it.
+# Bound inter-event waits while a turn is still thinking.
+# - the thinking keepalive would otherwise hide a silent upstream
+# - a draft only self-expires after the last send
+# - not applied once answer content, tool call, or result starts
+# - tunable via env; 0 disables
 try:
     _STALL_TIMEOUT_SEC = float(
         os.environ.get("MODEL_STALL_TIMEOUT_SEC", "180") or "180"
@@ -96,36 +82,17 @@ try:
 except ValueError:
     _STALL_TIMEOUT_SEC = 180.0
 
-# #417: how long, after a result in a run that injected follow-up messages, to wait for the CLI
-# to say whether it folded them in (idle) or is starting a turn for them. The decision comes in
-# well under a second; the bound only keeps a silent CLI from holding the reply back.
+# Wait bound for the CLI to report follow-ups folded in.
+# - decision normally arrives in under a second
+# - stops a silent CLI holding the reply back
 _SETTLE_TIMEOUT_SEC = 15.0
 
 
-# #428 / decision-26: the 1M window is NATIVE on every current model (the CLI's own model
-# catalog marks Opus 5.5, Opus 5 / 4.8 / 4.7, Sonnet 5.5 / 5 and Fable `native_1m`), so the
-# [1m] suffix below is a no-op for them and the family list was model knowledge in code. The
-# CLI offers no context-size choice for them, so the 1M toggle is retired: every session runs
-# the model's own window. was (#134 → #411 / decision-22, kept for history):
-#   # request the 1M window via the [1m] model-id SUFFIX, NOT the `betas` param (ignored under
-#   # the OAuth subscription); Opus + [1m] worked, Sonnet + [1m] needed usage credits, Haiku has
-#   # no 1M — so [1m] went only to the families in env BIG_MEMORY_1M_MODELS (default "opus").
-#   _ONE_M_SUFFIX = "[1m]"
-#   _ONE_M_MODELS = tuple(s.strip().lower()
-#                         for s in os.environ.get("BIG_MEMORY_1M_MODELS", "opus").split(",")
-#                         if s.strip())
-#   def _one_m_model(model: str) -> str:
-#       m = model or ""
-#       if not m or _ONE_M_SUFFIX in m: return m
-#       if any(tag in m.lower() for tag in _ONE_M_MODELS): return m + _ONE_M_SUFFIX
-#       resolved = models.resolve(m) or ""   # #411: a family-less alias ("default")
-#       if resolved != m and any(tag in resolved.lower() for tag in _ONE_M_MODELS):
-#           return resolved + _ONE_M_SUFFIX
-#       return m
+# The 1M context window is native on current models.
+# - no context-size choice; every session uses the model's window
 
-# Short, friendly system prompt for chat mode. Chat now ships the read-only web
-# research tools (see _build_options), so the prompt tells the model it CAN browse
-# — otherwise it falls back to "I have no internet access" out of habit.
+# System prompt for chat mode.
+# - chat ships read-only web tools, so say it can browse
 CHAT_SYSTEM_PROMPT = (
     "You are a friendly, helpful assistant. Answer clearly and to the point. "
     "Use Markdown formatting when it helps. "
@@ -137,12 +104,10 @@ CHAT_SYSTEM_PROMPT = (
     "execution. If the user wants to run commands, execute code, or read/write files, "
     "tell them this session can be upgraded to a code session with the /code command — "
     "do NOT attempt those actions yourself. "
-    # #299: chat is tool-free, so it CANNOT build a document file — a PDF/Word/Excel/PowerPoint
-    # is a binary that needs code execution (openpyxl/reportlab/python-docx), which only a code
-    # session has (it also has the outbox that delivers generated files). Keep THIS part
-    # level-AGNOSTIC: HOW the user reaches a code session depends on their access level, and the
-    # per-session note (_session_state_note) branches on it — own /code vs ask the owner to grant
-    # code access. So here we only state the limitation + the no-fake-attachment rule.
+    # Chat is tool-free and cannot build binary documents.
+    # - PDF, Word, Excel need code execution; only code has it
+    # - stay level-agnostic: access path differs per user
+    # - the per-session note covers how to reach code
     "If the user asks you to PRODUCE a downloadable document — a PDF, Word (.docx), Excel "
     "(.xlsx), PowerPoint (.pptx), CSV, or any other generated file — you cannot build it in a "
     "chat session; only a code session can. Briefly say what you would generate and that it "
@@ -150,76 +115,17 @@ CHAT_SYSTEM_PROMPT = (
     "attachment), then follow the per-session instructions below for HOW this particular user "
     "reaches a code session. Never paste the file's raw bytes or claim to attach a file here — "
     "chat cannot create files. "
-    # was (#43/#51) — Telegram couldn't render math, so the prompt forced plain Unicode and
-    # banned $…$. #297: Bot API 10.1 renders math NATIVELY — verified live against the API
-    # (and on-device): $…$ → an inline `mathematical_expression`, $$…$$ → a block one; \(…\),
-    # \[…\] and an HTML <math> are NOT parsed (they arrive as literal text). Replies stream +
-    # persist as {"markdown"} (#176), so LaTeX passes straight through to a real rendered
-    # formula; the classic-HTML FALLBACK still degrades it to Unicode via markup._latex_to_unicode.
-    # Replaced:
-    # "Your replies are shown in a Telegram chat, which CANNOT render LaTeX or math "
-    # "markup — never use $...$, $$...$$, \\(...\\), \\[...\\], or backslash commands "
-    # "like \\frac or \\text. Write math in plain Unicode instead "
-    # "(e.g. ×, ÷, ≈, ≤, ≥, ², ₂, √, π, ½, →, ∞). "
-    # #306: math guidance DEDUPED — it was here AND in agent_context.md's Rendering section
-    # (which both modes already carry), so chat received it twice. The shared doc's math note
-    # was enriched (LaTeX commands + "Unicode for simple symbols") and this copy removed. Kept
-    # commented for revert. was (#297):
-    # "Telegram renders LaTeX math natively. Write a real formula in LaTeX: wrap an INLINE "
-    # "formula in single dollar signs ($E=mc^2$) and a DISPLAY/block formula in double dollar "
-    # "signs ($$\\int_0^1 x^2\\,dx = \\tfrac13$$), with standard LaTeX inside (\\frac, \\sqrt, "
-    # "\\sum, \\int, ^, _, Greek letters, etc.). Only these two forms render — do NOT use \\(…\\) "
-    # "or \\[…\\] (Telegram shows those as raw text). Write a literal dollar sign as \\$ so it is "
-    # "not read as math. Simple inline symbols in prose can still be plain Unicode (×, ≈, ≤, π, "
-    # "→); reach for $…$ when it is an actual formula. "
-    # #295: chat has no code execution, but the bot rasterizes inline SVG to an image, so the
-    # model CAN produce a real picture for diagram-shaped requests. #296: this SVG path is ALSO
-    # how we cover graph/flow diagrams (the Mermaid use-case) without a JS/headless renderer —
-    # the model both writes AND lays out the SVG, so steer it toward clean, non-overlapping
-    # layouts and enumerate the graph diagram types so it reaches for a drawing, not prose.
-    # was (#295) — replaced by the strengthened prompt below for #296:
-    # "When the user asks for a diagram, schematic, chart, floor plan, cutting/assembly plan, "
-    # "or any simple drawing, output it as a single self-contained SVG in a fenced ```svg code "
-    # "block — the bot renders that SVG to an image and sends it as a picture. Keep the SVG "
-    # "self-contained (inline attributes/styles, no external references or scripts), give it a "
-    # "width/height or viewBox, and label key parts and dimensions. Prefer drawing it over "
-    # "describing it in words. You cannot generate photographic images — use SVG for diagrams."
-    # #305: the SVG/diagram capability + diagram-type list + node-and-arrow layout guidance
-    # MOVED to agent_context.md's Rendering section so CODE mode gets it too — the streamer
-    # rasterizes a ```svg block to a PNG identically in BOTH modes, but only chat was ever told
-    # (code gets the claude_code preset + agent_context.md, not this chat prompt). Chat still
-    # receives this via BOT_CONTEXT_NOTE (the shared doc appended to both modes), so nothing is
-    # lost here. Kept commented for revert. was (#295/#296):
-    # "When the user asks for a diagram, schematic, chart, flowchart, sequence / state / ER / "
-    # "class diagram, org chart, mind map, tree, network graph, Gantt chart, floor plan, "
-    # "cutting/assembly plan, or any drawing, output it as a single self-contained SVG in a "
-    # "fenced ```svg code block — the bot renders that SVG to an image and sends it as a picture. "
-    # "Keep the SVG self-contained (inline attributes/styles, no external references, fonts, or "
-    # "scripts) and set a viewBox sized to the content. For node-and-arrow diagrams, lay it out "
-    # "cleanly: pick ONE flow direction (top-to-bottom or left-to-right), give boxes consistent "
-    # "sizes with inner padding, space the nodes so nothing overlaps or is clipped, connect them "
-    # "with straight or right-angled arrows that end in a <marker> arrowhead, and label both the "
-    # "nodes and the edges. Use a simple, readable palette and legible font sizes. Prefer drawing "
-    # "it over describing it in words. You cannot generate photographic images — use SVG for any "
-    # "diagram."
+    # Chat prompt formatting notes.
+    # - math renders natively, so LaTeX passes through
+    # - SVG and diagram guidance lives in the shared agent context
+    # - math guidance lives only in the shared doc
 )
 
-# #269: the table-format note (#243), the outbox file-delivery instructions (#187), and the
-# per-session isolation/privacy note (#205/#208) were all FOLDED INTO the agent_context.md
-# project document (loaded below) — so the agent's self-description lives in editable docs
-# instead of hardcoded prompt strings. #306: that doc was SPLIT into a SHARED CORE
-# (agent_context.md — what the bot is, modes, sessions, history, commands, rendering; appended
-# to BOTH modes) and a CODE-ONLY ADDENDUM (code_addendum.md — shell mode, file delivery,
-# sandbox/privacy, /secret; appended to CODE mode only), so chat no longer carries ~1k tokens
-# of code-only content it can't use on every turn.
-#
-# #265/#269: tell the agent WHAT it is — a Telegram-bot frontend — and what it (and the
-# user) can do, so it guides the user to the right mode/command instead of refusing or
-# hallucinating. The text is maintained as PROJECT DOCUMENTS (agent_context.md +
-# code_addendum.md) and loaded from there, so the bot's self-description can be edited without
-# touching code (a restart picks up doc edits). The shared core is appended to BOTH prompts;
-# the code addendum to the code prompt only. Short built-in fallbacks keep the bot working if a
-# file is ever missing.
+# Agent self-description lives in editable project documents, not code.
+# - shared core `agent_context.md` goes to both modes
+# - code-only `code_addendum.md` goes to code mode only
+# - a restart picks up doc edits
+# - short built-in fallbacks cover missing files
 _AGENT_CONTEXT_FILE = Path(__file__).resolve().parent / "agent_context.md"
 _BOT_CONTEXT_FALLBACK = (
     "\n\n## About you (this bot)\n"
@@ -232,10 +138,10 @@ _BOT_CONTEXT_FALLBACK = (
 
 
 def _load_bot_context() -> str:
-    """Load the agent self-description from agent_context.md (#269), prefixed with the blank
-    lines that separate it from the preceding prompt section. Falls back to a short built-in
-    string if the file is missing/unreadable, so a bad deploy never strips the agent's
-    self-awareness entirely."""
+    """Load the agent self-description, with leading blank-line separator.
+
+    - falls back to a built-in string if file unreadable
+    """
     try:
         text = _AGENT_CONTEXT_FILE.read_text(encoding="utf-8").strip()
     except OSError:
@@ -245,10 +151,9 @@ def _load_bot_context() -> str:
 
 BOT_CONTEXT_NOTE = _load_bot_context()
 
-# #306: the CODE-ONLY half of the self-description (shell mode, file delivery, sandbox/privacy,
-# /secret). Appended to the CODE system prompt ONLY — a chat session can't use any of it, so
-# keeping it out of the chat prompt saves ~1k tokens per chat turn. Same load-from-doc +
-# fallback pattern as the shared core above.
+# Code-only half of the self-description.
+# - appended to the code prompt only, saving chat tokens
+# - same load-from-doc and fallback pattern
 _AGENT_CODE_ADDENDUM_FILE = Path(__file__).resolve().parent / "code_addendum.md"
 _CODE_ADDENDUM_FALLBACK = (
     "\n\n## Code session capabilities\n"
@@ -260,8 +165,10 @@ _CODE_ADDENDUM_FALLBACK = (
 
 
 def _load_code_addendum() -> str:
-    """#306: load the code-only addendum (code_addendum.md), appended to the CODE prompt only.
-    Falls back to a short built-in string if the file is missing/unreadable."""
+    """Load the code-only prompt addendum for code sessions.
+
+    - falls back to a built-in string if file unreadable
+    """
     try:
         text = _AGENT_CODE_ADDENDUM_FILE.read_text(encoding="utf-8").strip()
     except OSError:
@@ -271,10 +178,9 @@ def _load_code_addendum() -> str:
 
 CODE_ADDENDUM_NOTE = _load_code_addendum()
 
-# The full universe of tools the model may CALL in code mode (the `tools`
-# option). Availability != auto-permission: dangerous tools here are NOT in
-# allowed_tools, so the CLI's permission rules evaluate to "ask" and our
-# can_use_tool gate (permissions.py) is invoked for each one.
+# Universe of tools the model may call in code mode.
+# - availability is not auto-permission
+# - tools not in `allowed_tools` go through the `can_use_tool` gate
 CODE_TOOLS = [
     "Read",
     "Glob",
@@ -291,12 +197,9 @@ CODE_TOOLS = [
     "WebSearch",
 ]
 
-# Read-only / non-destructive tools that are auto-allowed WITHOUT a prompt
-# (passed as allowed_tools). MUST stay in sync with permissions.SAFE_TOOLS so
-# the gate is the single source of truth for what is auto-allowed. Everything
-# else in CODE_TOOLS falls through to the can_use_tool approval gate. Critically,
-# the dangerous tools (Bash/Write/Edit/MultiEdit/NotebookEdit/WebFetch/WebSearch)
-# are deliberately NOT listed here.
+# Read-only tools auto-allowed without a prompt.
+# - must stay in sync with `permissions.SAFE_TOOLS`
+# - dangerous tools are deliberately absent and hit the approval gate
 CODE_AUTO_ALLOW_TOOLS = [
     "Read",
     "Glob",
@@ -306,51 +209,44 @@ CODE_AUTO_ALLOW_TOOLS = [
     "TodoWrite",
 ]
 
-# The chat-mode tool universe: the READ-ONLY web research tools (chat has no cwd,
-# so no Bash/file tools). These make chat behave like the Claude apps. The Tools
-# settings page (#129) toggles which of these are enabled per session; the default
-# (tools_enabled=None) is "all of them on".
+# Chat-mode tool universe: read-only web research tools.
+# - chat has no cwd, so no Bash or file tools
+# - default (`tools_enabled=None`) enables all of them
 CHAT_TOOLS = [
     "WebSearch",
     "WebFetch",
 ]
 
 
-# --- #352: agent-driven per-topic "session memory" -----------------------------
-# A single in-process tool (`remember`) the model can call to persist short notes for
-# ITS OWN topic — the durable-note companion of the workdir ./CLAUDE.md (#314) for a long
-# or complex session: the agent decides what is worth remembering across it.
-# #362: gated to CODE sessions owned by a CODE-LEVEL user (see ClaudeSession._session_memory_on)
-# — chat is short-form Q&A with no use for durable per-topic notes, and a user demoted
-# code→chat must not keep the capability on a leftover code session. was (#352): the tool +
-# notes were attached in BOTH modes for everyone. Notes are stored on the ThreadState (scoped
-# to one topic), size-capped, and re-injected into the system prompt each build. The tool is
-# served over the SDK stdio CONTROL channel (see the SDK's _handle_sdk_mcp_request), so it
-# works identically inside the bubblewrap jail — it needs no fs/net and only ever writes to
-# THIS session's notes (no cross-topic bleed, the #2 isolation invariant).
-SESSION_NOTES_CAP = 16384  # 16 KB — mirrors the workdir-CLAUDE.md cap (#314)
+# Session memory: an in-process `remember` tool for per-topic notes.
+# - code sessions of code-level users only
+# - notes are size-capped, topic-scoped, re-injected each build
+# - served over the SDK control channel; works in the jail
+# - only writes this session's notes
+SESSION_NOTES_CAP = 16384  # 16 KB, same as workdir CLAUDE.md cap
 MEMORY_SERVER_NAME = "memory"
-MEMORY_TOOL = f"mcp__{MEMORY_SERVER_NAME}__remember"  # SDK-namespaced name the model/allowlist see
+MEMORY_TOOL = f"mcp__{MEMORY_SERVER_NAME}__remember"  # name the model and allowlist see
 
 
 def _apply_session_note(prior: str, note: str, replace: bool,
                         cap: int = SESSION_NOTES_CAP) -> str:
-    """Compute the new session-memory blob from the current `prior` notes and an incoming
-    `note`: append (default) or REPLACE the whole set, then trim the OLDEST whole lines so
-    the result never exceeds `cap` bytes. Pure (no I/O), so the size / append / replace
-    policy is unit-testable on its own. An empty `note` is a no-op that returns the
-    trimmed prior."""
+    """Compute new session notes from prior notes and a note.
+
+    - append by default, or replace the whole set
+    - trims oldest whole lines to fit `cap` bytes
+    - pure function; empty note returns trimmed prior
+    """
     prior = (prior or "").strip()
     note = (note or "").strip()
     if not note:
         return prior
     blob = note if replace else (f"{prior}\n{note}" if prior else note)
-    # #355: measure / slice on UTF-8 BYTES — the documented unit — not code points. was:
-    # len(blob) / blob[-cap:], which let a Cyrillic/CJK/emoji note reach ~2-4x the byte cap.
+    # Measure and slice on UTF-8 bytes, the documented unit.
+    # - code points would let multibyte notes exceed the cap
     encoded = blob.encode("utf-8")
     if len(encoded) > cap:
-        # Keep the most RECENT content; drop the partial leading line after the cut. The cut can
-        # land mid-multibyte-char, so decode(errors="ignore") drops any stray leading bytes.
+        # Keep the most recent content, dropping the partial leading line.
+        # - cut may split a multibyte char; `errors="ignore"` drops strays
         encoded = encoded[-cap:]
         nl = encoded.find(b"\n")
         if nl != -1:
@@ -359,25 +255,16 @@ def _apply_session_note(prior: str, note: str, replace: bool,
     return blob
 
 
-# Prompt keyword triggers the bundled CLI honours on the user's MESSAGE TEXT (not
-# just the interactive REPL), so they fire on the SDK path too: "ultrathink"
-# escalates reasoning effort for the turn (ultrathink_effort), and "ultracode" opts
-# the turn into multi-agent Workflow orchestration. Either lets a user silently
-# bypass the bot's per-user effort gate and burn the owner's ONE shared
-# subscription, so we DEFUSE them in the prompt by SPLITTING the word with a space:
-# that breaks the CLI's \bword\b match WITHOUT blocking or removing the message — it
-# still goes through, the keyword is just inert. Effort is controlled
-# only via /effort (gated); Workflows are ALSO disabled outright in the child env
-# (CLAUDE_CODE_DISABLE_WORKFLOWS) — belt and suspenders.
-#
-# These are the built-in DEFAULTS — not hardcoded inline. A deployer can neutralize
-# MORE keywords (without touching code) via the BLOCKED_PROMPT_KEYWORDS env var
-# (config.extra_blocked_keywords), which is appended to this list. See the README.
+# Prompt keywords the CLI honours on message text.
+# - "ultrathink" raises effort; "ultracode" starts multi-agent Workflows
+# - either bypasses the per-user effort gate on the shared subscription
+# - defused by splitting the word with a space
+# - extras via `BLOCKED_PROMPT_KEYWORDS` env
+# - Workflows are also disabled in the child env
 DEFAULT_KEYWORD_TRIGGERS: tuple[str, ...] = ("ultrathink", "ultracode")
 
 def build_trigger_re(keywords):
-    """Compile a case-insensitive word-boundary alternation over `keywords`, or
-    return None when the list is empty (nothing to defuse)."""
+    """Compile a case-insensitive word-boundary regex over `keywords`, or None."""
     parts = [re.escape(k.strip()) for k in (keywords or []) if k and str(k).strip()]
     if not parts:
         return None
@@ -385,10 +272,11 @@ def build_trigger_re(keywords):
 
 
 def defuse_triggers(text: str, trigger_re) -> str:
-    """Split each matched trigger word with a space so the bundled CLI can't act on
-    it (see DEFAULT_KEYWORD_TRIGGERS). Non-destructive — the message still goes
-    through and the word stays readable; it just no longer matches the CLI's
-    whole-word keyword. No-op without a regex or text."""
+    """Split matched trigger words with a space to defuse them.
+
+    - message still goes through and stays readable
+    - no-op without a regex or text
+    """
     if not trigger_re or not text:
         return text
 
@@ -402,20 +290,12 @@ def defuse_triggers(text: str, trigger_re) -> str:
 
 @dataclass
 class EngineEvent:
-    """A single normalized event emitted while running a turn.
+    """One normalized event emitted while running a turn.
 
-    kind is one of:
-      text_delta  -> .text holds the incremental delta
-      thinking_delta -> .text holds an extended-thinking (reasoning) delta (#240c);
-                     NOT part of the answer — for the live <tg-thinking> indicator only
-      text_full   -> .text holds the full accumulated assistant text so far
-      tool        -> .tool_name / .tool_input describe a requested tool call
-      status      -> .text holds a human-readable status line
-      result      -> terminal event with .usage / .cost / .session_id / .text
-      rate_limit  -> .rate holds a RateLimitInfo object
-      error       -> .text holds a readable (English) error message; .error_key
-                     is a stable l10n key and .error_detail an optional argument,
-                     so the consumer can render the message in the user's locale.
+    - `text_delta`: `.text` is the incremental delta
+    - `thinking_delta`: reasoning delta, live indicator only
+    - `text_full`, `tool`, `status`, `result`, `rate_limit`, `error`
+    - `error`: English `.text`, stable `.error_key`, optional `.error_detail`
     """
 
     kind: str
@@ -428,16 +308,14 @@ class EngineEvent:
     rate: object | None = None
     error_key: str | None = None
     error_detail: str | None = None
-    # #137: True when this error means the subscription window is exhausted, so the
-    # consumer can flip the usage display to "limited" instead of leaving a stale
-    # "OK" (the rate EVENTS keep saying allowed even after the account limit hits).
+    # True when the error means the subscription window is exhausted.
+    # - rate events keep saying allowed even after the limit hits
     limit_hit: bool = False
 
 
-# Map the SDK's AssistantMessage.error enum values to readable messages. These
-# are the English fallbacks; the localized text lives in the i18n table under the
-# matching "err.<type>" key (see _error_key), rendered by the consumer where the
-# user's locale is known. Keep this engine module free of the i18n user cache.
+# English fallback messages for SDK error types.
+# - localized text lives in i18n under `err.<type>`
+# - keeps this module free of the i18n user cache
 _ERROR_MESSAGES = {
     "authentication_failed": (
         "Authentication error. Check your subscription login "
@@ -450,7 +328,7 @@ _ERROR_MESSAGES = {
     "unknown": "Unknown model error.",
 }
 
-# The l10n key for each known error type (consumed via i18n.t downstream).
+# l10n key for each known error type.
 _ERROR_KEYS = {
     "authentication_failed": "err.authentication_failed",
     "billing_error": "err.billing_error",
@@ -462,34 +340,29 @@ _ERROR_KEYS = {
 
 
 def _error_message(error: object) -> str:
-    """Translate an AssistantMessage.error value into a readable string."""
+    """Translate an AssistantMessage error value into readable text."""
     key = str(error) if error is not None else "unknown"
     return _ERROR_MESSAGES.get(key, f"Model error: {key}")
 
 
 def _error_key(error: object) -> str:
-    """The stable l10n key for an AssistantMessage.error value (for the consumer
-    to localize). Unmapped types fall back to a generic 'model error' key whose
-    text carries the raw type as {detail}."""
+    """Return the stable l10n key for an error value.
+
+    - unmapped types fall back to a generic model-error key
+    """
     key = str(error) if error is not None else "unknown"
     return _ERROR_KEYS.get(key, "err.model_error")
 
 
-# #361: a model REFUSAL is delivered in-band as an AssistantMessage with
-# error == "invalid_request" AND stop_reason == "refusal" — it is NOT a malformed
-# request. The bare "invalid_request" text ("Invalid request to the model.") mislabels
-# it as a client bug, so we relabel refusals to a distinct message, and a CYBER-safeguard
-# refusal (the API's stop_details.category == "cyber") to its own. The SDK's
-# AssistantMessage exposes error + stop_reason + content but NOT stop_details, so the
-# cyber category is read off the synthetic explanation text (lowercased substring). The
-# markers cover the current wording ("...flagged this message for a cybersecurity topic",
-# "cyber-related safeguards"); a future rewording simply falls back to the generic
-# refusal message — never to the old "invalid request" mislabel.
+# A model refusal arrives as `invalid_request` with `stop_reason` refusal.
+# - relabel it, since it is not a malformed request
+# - SDK omits `stop_details`, so cyber is read from explanation text
+# - reworded text falls back to the generic refusal message
 _CYBER_REFUSAL_MARKERS = ("cybersecurity", "cyber-related", "cyber safeguard", "cyber-safety")
 
-# English fallbacks for a refusal (see _refine_error). Kept separate from _ERROR_MESSAGES
-# (keyed by the SDK error enum) — a refusal is a stop_reason, not an error type. The
-# localized text lives under err.cyber_refusal / err.model_refusal.
+# English fallbacks for refusals, separate from error-enum messages.
+# - a refusal is a `stop_reason`, not an error type
+# - localized under `err.cyber_refusal` and `err.model_refusal`
 _REFUSAL_MESSAGES = {
     "cyber": (
         "The model declined this turn under its cybersecurity safeguards — a safety "
@@ -504,8 +377,10 @@ _REFUSAL_MESSAGES = {
 
 
 def _assistant_text(msg: object) -> str:
-    """The concatenated text of an AssistantMessage's TextBlocks. For a refusal this is
-    the synthetic explanation the API returns in place of an answer."""
+    """Return the concatenated text of an AssistantMessage's text blocks.
+
+    - for a refusal, this is the API's explanation
+    """
     parts = []
     for block in getattr(msg, "content", None) or []:
         text = getattr(block, "text", None)
@@ -515,11 +390,11 @@ def _assistant_text(msg: object) -> str:
 
 
 def _refine_error(msg: object) -> tuple[str, str]:
-    """(error_key, english_text) for an errored AssistantMessage. A model REFUSAL
-    (stop_reason == "refusal", surfaced by the API as invalid_request) is relabeled from
-    the generic "invalid request" to a distinct refusal message — a cyber-specific one
-    when the safeguard explanation names a cybersecurity topic (#361). Every other error
-    keeps its existing enum-based mapping."""
+    """Return (error_key, english_text) for an errored message.
+
+    - model refusals get a distinct message, not invalid request
+    - cyber-related refusals get a cyber-specific message
+    """
     error = getattr(msg, "error", None)
     if str(error) == "invalid_request" and getattr(msg, "stop_reason", None) == "refusal":
         if any(m in _assistant_text(msg).lower() for m in _CYBER_REFUSAL_MARKERS):
@@ -528,38 +403,36 @@ def _refine_error(msg: object) -> tuple[str, str]:
     return _error_key(error), _error_message(error)
 
 
-# #227a: unique marker a persistent-shell command emits when it finishes, carrying its exit
-# code, so the host can detect command completion + rc on the PTY (output before it is clean).
+# Marker emitted when a persistent-shell command finishes.
+# - carries the exit code so the host can detect completion
 _SHELL_SENTINEL = "__SBX_SH_DONE__"
-# Terminal control noise an interactive PTY program emits (CSI sequences incl. bracketed-paste
-# \x1b[?2004h/l and cursor moves; OSC title strings; TWO-char ESC escapes like ESC 7 / ESC 8 =
-# save/restore-cursor, ESC =, ESC c; and lone CR/BEL/BS). Stripped so output is clean text.
-# (Was: only \x1b[…CSI and \x1b]…OSC — it left the bare `7`/`8` of ESC 7 / ESC 8 visible, #227.)
+# Terminal control noise stripped from interactive PTY output.
+# - CSI, OSC, two-char ESC escapes, lone CR, BEL, BS
 _TERM_NOISE_RE = re.compile(
-    r"\x1b\[[0-9;?]*[ -/]*[@-~]"          # CSI ... final
-    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"  # OSC ... BEL|ST
-    r"|\x1b[ -/]*[0-~]"                     # ESC (intermediate)* final — ESC 7/8/=/c/(B/#8/...
+    r"\x1b\[[0-9;?]*[ -/]*[@-~]"          # CSI sequence
+    r"|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)"  # OSC string
+    r"|\x1b[ -/]*[0-~]"                     # ESC sequence
     r"|[\r\x07\x08]"                        # CR, BEL, backspace
 )
 
-# #246b: a full-screen / alt-screen TUI (an arrow-key picker like `gh auth login`) REDRAWS
-# the whole screen on every keystroke, so the raw PTY stream piles up many full snapshots that
-# _clean would otherwise concatenate into a garbled wall. When the program switched to the
-# ALTERNATE screen (ESC[?1049h), keep only the LATEST frame — the text after the last
-# screen-clear / cursor-home / alt-screen toggle. GATED on the alt-screen marker so ordinary
-# multi-line output (and a bare `clear`, which uses ESC[2J but not ?1049h) is never touched.
+# Alt-screen TUIs redraw the whole screen on each keystroke.
+# - keep only the latest frame after the last clear
+# - gated on the alt-screen marker
+# - bare `clear` and ordinary output are untouched
 _ALT_SCREEN_RE = re.compile(r"\x1b\[\?1049[hl]")
 _FRAME_SPLIT_RE = re.compile(
-    r"\x1b\[[0-3]?J"                  # erase display (J / 0J / 1J / 2J / 3J)
-    r"|\x1b\[\?1049[hl]"             # alternate-screen enter / exit
-    r"|\x1b\[(?:H|0?;?0?[Hf]|1;1[Hf])"  # cursor home (top-left)
+    r"\x1b\[[0-3]?J"                  # erase display
+    r"|\x1b\[\?1049[hl]"             # alternate-screen enter or exit
+    r"|\x1b\[(?:H|0?;?0?[Hf]|1;1[Hf])"  # cursor home
 )
 
 
 def _latest_frame(text: str) -> str:
-    """#246b: collapse a full-redraw alt-screen TUI to its latest frame. No-op unless the
-    alternate screen was entered (ESC[?1049h). Returns the last frame that has visible text
-    after noise-stripping (so an empty trailing clear doesn't blank the output)."""
+    """Collapse a full-redraw alt-screen TUI to its latest frame.
+
+    - no-op unless the alternate screen was entered
+    - returns the last frame with visible text
+    """
     if not _ALT_SCREEN_RE.search(text):
         return text
     parts = _FRAME_SPLIT_RE.split(text)
@@ -570,14 +443,12 @@ def _latest_frame(text: str) -> str:
 
 
 class PersistentShell:
-    """#227a: a long-lived login `bash` held on a PTY INSIDE the session's #119 jail. `cd`/env
-    persist across run() calls (it is one shell). The bwrap process owns the jail; we own the
-    PTY master on the host and drive the shell line-by-line.
+    """A long-lived login bash on a PTY inside the jail.
 
-    Non-interactive at this stage: run() sends the command followed by a sentinel-printf and
-    reads the master until the sentinel (carrying the exit code). A command that blocks on input
-    never reaches the printf, so run() times out and sends Ctrl-C to recover (true line-
-    interactivity is #227b; #245 already refuses known-interactive commands fast)."""
+    - `cd` and env persist across `run()` calls
+    - `run()` sends the command plus a sentinel printf
+    - the host owns the PTY master and drives the shell
+    """
 
     def __init__(self, proc, master_fd: int) -> None:
         self.proc = proc
@@ -603,21 +474,20 @@ class PersistentShell:
         return b"".join(chunks)
 
     async def _init(self) -> None:
-        # Quiet the shell so run() output is clean: no input echo, no prompt.
+        # Quiet the shell: no input echo, no prompt.
         os.write(self.master, b"stty -echo 2>/dev/null; export PS1='' PS2=''\n")
         await asyncio.sleep(0.3)
-        self._read_available()  # drain the login banner + the echo of this line
+        self._read_available()  # drain login banner and echo
         self._inited = True
 
     async def _drive(self, write: bytes, settle: float, timeout: float) -> tuple[int | None, str, str]:
-        """Write `write` to the PTY, then read the master until one of:
-          - the sentinel appears        -> ("done", rc, clean output)
-          - output stalls for `settle`s after producing SOME output -> ("awaiting", None, …)
-            (the command likely paused for interactive input — #227b)
-          - the hard `timeout` elapses  -> ("timeout", 124, …) and Ctrl-C is sent to recover
-        A SILENT command (no output yet) is NOT flagged awaiting — it keeps running to the
-        sentinel/timeout, so a quiet `sleep`/compile isn't mistaken for an input prompt.
-        Returns (rc_or_None, output, status)."""
+        """Write to the PTY, then read until a stop condition.
+
+        - sentinel seen: ("done", rc, clean output)
+        - output stalls after some output: ("awaiting", None, ...)
+        - hard timeout: ("timeout", 124, ...) and Ctrl-C is sent
+        - silent commands are never flagged awaiting; returns (rc_or_None, output, status)
+        """
         if write:
             os.write(self.master, write)
         buf = b""
@@ -626,73 +496,75 @@ class PersistentShell:
         last_out = loop.time()
         seen_output = False
         marker = (_SHELL_SENTINEL + ":").encode()
-        idle_polls = 0  # #251: consecutive polls with no new output (drives backoff below)
+        idle_polls = 0  # consecutive polls without new output
         while True:
             d = self._read_available()
             if d:
                 buf += d
                 last_out = loop.time()
                 seen_output = True
-                idle_polls = 0  # #251: output flowing → poll fast again
+                idle_polls = 0  # output flowing, poll fast again
                 if marker in buf:
                     rc, out = self._parse(buf)
                     return (rc, out, "done")
             if not self.alive():
-                # #227c: the shell process died (e.g. close() killed it to break a hang) —
-                # return promptly instead of polling a dead PTY until the deadline.
+                # Return promptly if the shell process died.
                 return (self.proc.returncode or 137, self._clean(buf), "done")
             now = loop.time()
             if now > deadline:
                 with contextlib.suppress(OSError):
-                    os.write(self.master, b"\x03")  # Ctrl-C to try to recover the shell
+                    os.write(self.master, b"\x03")  # Ctrl-C to try to recover
                 return (124, self._clean(buf) + f"\n(timed out after {int(timeout)}s)", "timeout")
             if seen_output and (now - last_out) > settle:
                 return (None, self._clean(buf), "awaiting")
-            # #251: adaptive backoff — a quiet long-running command (compile, `sleep 300`) must
-            # not spin the event loop at 25 Hz for minutes. Poll fast (~40 ms) while output flows
-            # and for the first ~1 s of silence, then 0.2 s, then 0.5 s; any new output resets to
-            # fast. settle (>=1.5 s) and the deadline are still caught within one slow poll.
-            # was: await asyncio.sleep(0.04)  # replaced for #251
+            # Adaptive poll backoff for quiet long-running commands.
+            # - fast while output flows and first second of silence
+            # - then slower steps, reset by any new output
+            # - settle and deadline are caught within one slow poll
             idle_polls += 1
             delay = 0.5 if idle_polls > 50 else 0.2 if idle_polls > 25 else 0.04
             await asyncio.sleep(delay)
 
     async def run(self, command: str, settle: float = 3.0, timeout: float = 60.0):
-        """Run one command. Returns (rc_or_None, output, status) — see _drive."""
+        """Run one command; returns (rc_or_None, output, status)."""
         async with self._lock:
             if not self.alive():
                 return (137, "(shell exited)", "done")
             if not self._inited:
                 await self._init()
-            self._read_available()  # drop anything stale before this command
-            # ONE input line: cmd, then the sentinel-printf. Must be one line (not two) so an
-            # interactive `read` inside cmd blocks for the USER's next line, not the printf.
+            self._read_available()  # drop stale output before this command
+            # Send command and sentinel printf as one input line.
+            # - so an interactive `read` blocks for the user's next line
             line = f"{command}; printf '\\n{_SHELL_SENTINEL}:%d\\n' \"$?\"\n"
             return await self._drive(line.encode("utf-8"), settle, timeout)
 
     async def send_input(self, text: str, settle: float = 1.5, timeout: float = 60.0):
-        """#227b: send a line of INPUT (text + Enter) to the program currently awaiting it (no
-        sentinel-printf — the pending one from the original command fires when it exits)."""
+        """Send a line of input to the awaiting program.
+
+        - no new sentinel; the original one fires on exit
+        """
         return await self.send_raw((text + "\n").encode("utf-8"), settle, timeout)
 
     async def send_raw(self, data: bytes, settle: float = 1.5, timeout: float = 60.0):
-        """#227b: write RAW bytes to the PTY (key sequences — arrows, Enter, Tab, Ctrl-C),
-        no appended newline. Returns (rc_or_None, output, status)."""
+        """Write raw bytes (key sequences) to the PTY.
+
+        - no newline appended; returns (rc_or_None, output, status)
+        """
         async with self._lock:
             if not self.alive():
                 return (137, "(shell exited)", "done")
-            # #279: drop output the program emitted while we were NOT reading (e.g. a fresh
-            # prompt printed while shell mode was toggled off / the agent answered a message),
-            # so the read after THIS input captures the program's RESPONSE — not a stale prompt
-            # that would make the forwarded keystroke look ignored. `run()` drains the same way.
+            # Drop output emitted while we were not reading.
+            # - so the read captures the response, not a stale prompt
             self._read_available()
             return await self._drive(data, settle, timeout)
 
     async def peek(self, settle: float = 0.4) -> tuple[int | None, str, str]:
-        """#279: read whatever the program has printed since we last read — WITHOUT sending
-        any input — and report it. Used on /shell re-attach to surface output the program
-        emitted while detached (e.g. it advanced to a new prompt). Quick: a short settle, no
-        wait for a sentinel. Returns (None, output, "awaiting") — empty output if nothing new."""
+        """Read pending program output without sending any input.
+
+        - used on `/shell` re-attach to show output from while detached
+        - short settle, no sentinel wait
+        - returns (None, output, "awaiting"); output empty if nothing new
+        """
         async with self._lock:
             if not self.alive():
                 return (137, "(shell exited)", "done")
@@ -700,10 +572,11 @@ class PersistentShell:
             return (None, self._clean(self._read_available()), "awaiting")
 
     async def interrupt(self) -> str:
-        """#227c/#246: send Ctrl-C to the shell. The jailed bash now has a CONTROLLING TTY
-        (see _start_shell), so the 0x03 byte is a REAL SIGINT to the foreground process group
-        — a hung foreground command (e.g. a polling `gh auth login`) is actually interrupted,
-        not just fed an input byte. Returns whatever drained afterwards."""
+        """Send Ctrl-C to the shell as a real SIGINT.
+
+        - the jailed bash has a controlling TTY
+        - returns whatever drained afterwards
+        """
         async with self._lock:
             with contextlib.suppress(OSError):
                 os.write(self.master, b"\x03")
@@ -712,7 +585,7 @@ class PersistentShell:
 
     @staticmethod
     def _clean(buf: bytes) -> str:
-        text = _latest_frame(buf.decode("utf-8", "replace"))  # #246b: collapse alt-screen redraws
+        text = _latest_frame(buf.decode("utf-8", "replace"))  # collapse alt-screen redraws
         return _TERM_NOISE_RE.sub("", text).strip("\n")
 
     def _parse(self, buf: bytes) -> tuple[int, str]:
@@ -724,16 +597,13 @@ class PersistentShell:
             if m:
                 rc = int(m.group(1))
             text = text[:idx]
-        return (rc, _TERM_NOISE_RE.sub("", _latest_frame(text)).strip("\n"))  # #246b
+        return (rc, _TERM_NOISE_RE.sub("", _latest_frame(text)).strip("\n"))
 
     async def close(self) -> None:
-        # #249: self.proc is the launcher, which exec-chains (setpriv→) into `bwrap
-        # --unshare-pid` (deploy/sandbox-claude.sh) — same PID, so proc.kill() SIGKILLs
-        # bwrap, which is PID 1 of the jail's PID namespace. The kernel then SIGKILLs
-        # EVERY process in that namespace, including a setsid-DETACHED background process
-        # (a server/build the shell started) that escaped the process group. So this
-        # single kill reaps the whole jail — no separate cgroup/process-group sweep is
-        # needed. (Verified empirically: a setsid'd bg process dies with the namespace.)
+        # `self.proc` is the launcher, which exec-chains into bwrap.
+        # - same PID, so `proc.kill()` SIGKILLs bwrap
+        # - bwrap is PID 1 of the jail's PID namespace
+        # - the kernel kills the whole namespace, even setsid-detached processes
         with contextlib.suppress(Exception):
             if self.alive():
                 self.proc.kill()
@@ -746,8 +616,7 @@ class PersistentShell:
 class ClaudeSession:
     """One SDK session bound to a single Telegram thread.
 
-    The same instance is reused across queued prompts in a thread so the prompt
-    cache and conversation context (via resume session_id) are preserved.
+    - reused across queued prompts to keep cache and context
     """
 
     def __init__(
@@ -786,120 +655,106 @@ class ClaudeSession:
         on_remember=None,
     ) -> None:
         self.mode = mode
-        # #276: the session OWNER's access level ("chat" | "code" | None=unknown). Drives the
-        # dynamic "this session right now" note so the model knows whether the user can /code.
+        # Session owner's access level: chat, code, or None.
+        # - drives the dynamic session note about `/code`
         self.user_level = user_level
         self.model = model
-        # #411: the concrete model id the CLI resolved ``model`` (usually a family alias such
-        # as "opus") to, read from the init message of the current client. None until known.
+        # Concrete model id the CLI resolved the alias to.
+        # - read from the init message; None until known
         self.resolved_model: str | None = None
-        # #411: the effort the CLI applies to this session (get_settings) — the explicit level,
-        # or the model's default when none is set; None when the model takes none / unknown.
+        # Effort the CLI applies: explicit level or model default.
+        # - None when the model takes none or unknown
         self.applied_effort: str | None = None
         self.cwd = cwd
         self.can_use_tool = can_use_tool
         self.permission_mode = permission_mode
-        # Big memory: opt-in 1M context window for CHAT mode (code mode already
-        # runs with the 1M beta). Set per topic via /memory.
-        # #428: unused since the 1M toggle was retired (the window is the model's own); kept so
-        # callers and the commented #134 branches below still read.
+        # Unused since the 1M toggle was retired.
+        # - kept so callers still read
         self.big_memory = big_memory
-        # Per-session ENABLED TOOLS (the Tools settings page, #129). None = the mode's
-        # full default universe (chat → CHAT_TOOLS web research tools; code →
-        # CODE_TOOLS); a list = exactly those, intersected with the universe in
-        # _resolve_tools. Supersedes the earlier web_search bool — chat is web-capable
-        # by default (relaxes the old "chat is tool-free" rule #24) and the page can
-        # turn any tool off; code mode's dangerous tools still hit the approval gate.
+        # Per-session enabled tools.
+        # - None means the mode's full default universe
+        # - a list is intersected with the universe in `_resolve_tools`
+        # - dangerous code tools still hit the approval gate
         self.tools_enabled = list(tools_enabled) if tools_enabled is not None else None
-        # Per-USER tool cap (owner-set, #131): the tools this session's OWNER is
-        # allowed to use at all. None = uncapped. _resolve_tools intersects the
-        # session's enabled set with this, so the owner can restrict a shared user's
-        # tools regardless of what that user toggles per session.
+        # Per-user tool cap set by the owner.
+        # - None means uncapped
+        # - `_resolve_tools` intersects it with the session's enabled set
         self.tool_cap = list(tool_cap) if tool_cap is not None else None
-        # Per-user GLOBAL MEMORY (owner-granted opt-out of isolation): when on, this
-        # session INJECTS the owner's ~/.claude/CLAUDE.md (+ memory) CONTENT into the
-        # system prompt (_global_memory_block), keeping setting_sources=[] so
-        # settings.json (permissions/env) is NEVER loaded (#130). Relaxes the
-        # per-session isolation invariant for that user only; OFF by default.
+        # Per-user global memory, owner-granted and off by default.
+        # - injects owner's CLAUDE.md content into the system prompt
+        # - `setting_sources=[]` stays, so `settings.json` is never loaded
+        # - relaxes isolation for that user only
         self.global_memory = bool(global_memory)
-        # #352: per-topic agent-driven "session memory". `session_notes` is the current
-        # saved blob (injected each build via _session_notes_block); `on_remember` is an
-        # async hook the `remember` tool calls to PERSIST the updated blob (sessions.py
-        # wires it to db.set_session_notes for this thread). The in-process MCP server is
-        # built lazily and cached, so the same instance is reused across rebuilds.
+        # Per-topic session memory state.
+        # - `session_notes` is injected each build
+        # - `on_remember` persists the updated blob
+        # - MCP server is built lazily and cached
         self.session_notes = (session_notes or "").strip()
         self._on_remember = on_remember
         self._memory_server_cache = None
-        # Prompt keyword triggers to neutralize: the built-in DEFAULT_KEYWORD_TRIGGERS
-        # plus any deployer extras (BLOCKED_PROMPT_KEYWORDS). Compiled once per session.
+        # Prompt keyword triggers to neutralize.
+        # - defaults plus deployer extras, compiled once per session
         self._trigger_re = build_trigger_re(
             list(DEFAULT_KEYWORD_TRIGGERS) + list(extra_blocked_keywords or [])
         )
-        # Pro-command per-session options (#23): reasoning effort, agentic turn
-        # cap, extra code dirs, and a one-shot fork (resume → branch a new id).
+        # Per-session options: effort, turn cap, extra dirs, one-shot fork.
         self.effort = effort
         self.max_turns = max_turns
         self.add_dirs = list(add_dirs) if add_dirs else []
         self.fork = bool(fork)
-        # Per-code-session sandbox (#104): when on, code mode launches the CLI via
-        # the bubblewrap wrapper (deploy/sandbox-claude.sh) — unprivileged uid,
-        # workdir-confined, subscription credential injected read-only.
+        # Per-session sandbox: code mode launches the CLI via bubblewrap.
+        # - unprivileged uid, workdir-confined
+        # - credential injected read-only
         self.sandbox = bool(sandbox)
         self.sandbox_uid = int(sandbox_uid)
         self.sandbox_allow_exec = bool(sandbox_allow_exec)
-        # #119b: when set, the jail gets a DUMMY token + ANTHROPIC_BASE_URL=this, so the
-        # real OAuth token never enters the jail (the host broker injects it). None = off.
+        # When set, jail gets a dummy token.
+        # - the real OAuth token never enters the jail
+        # - None means off
         self.cred_broker_url = cred_broker_url
-        # #119c/#119e: egress allowlist + per-jail DoS limits. egress → the launcher joins
-        # the firewalled cgroup + routes tools via the CONNECT proxy; the limit strings
-        # (already formatted for memory.max / cpu.max / pids.max) populate the cgroup leaf;
-        # seccomp_path is the compiled denylist BPF bound via bwrap --seccomp. All optional.
+        # Egress allowlist and per-jail DoS limits.
+        # - egress joins the firewalled cgroup and uses the CONNECT proxy
+        # - limit strings are preformatted for cgroup files
+        # - `seccomp_path` is the compiled denylist; all optional
         self.egress = bool(egress)
         self.egress_proxy_url = egress_proxy_url
         self.sbx_mem_max = sbx_mem_max
         self.sbx_cpu_max = sbx_cpu_max
         self.sbx_pids_max = int(sbx_pids_max or 0)
         self.seccomp_path = seccomp_path
-        # Per-session unprivileged HOST uid: each jail runs (via setpriv) as a distinct
-        # non-root uid derived from the session id, so an escape is unprivileged AND can't
-        # read other sessions' (differently-owned) files. Applies to ALL modes.
+        # Per-session unprivileged host uid, derived from the session id.
+        # - an escape is unprivileged and can't read other sessions' files
+        # - applies to all modes
         self.per_session_uid = bool(per_session_uid)
         self.uid_base = int(uid_base)
         self.uid_range = max(1, int(uid_range))
-        # #221: the registry-assigned host uid (claimed lazily in _ensure_client, then
-        # cached here). None until claimed; _enable_sandbox falls back to the bare hash.
+        # Registry-assigned host uid, claimed lazily and cached.
+        # - None until claimed; falls back to the bare hash
         self.host_uid: int | None = None
-        # #168: SDK auto-compaction (ON by default = the CLI default). When False,
-        # _build_env sets DISABLE_AUTO_COMPACT=1 (forwarded through the sandbox).
+        # SDK auto-compaction, on by default.
+        # - when False, `DISABLE_AUTO_COMPACT=1` is set, forwarded via sandbox
         self.auto_compact = bool(auto_compact)
-        # session_id is updated from each ResultMessage and passed back as
-        # options.resume so a freshly-built client continues the prior session.
+        # Updated from each result; passed back as `options.resume`.
+        # - a fresh client continues the prior session
         self.session_id: str | None = resume_session_id
         self.client: ClaudeSDKClient | None = None
-        # #227a: the session's persistent jailed shell (lazily started by shell_run); held so
-        # cd/env persist across messages and torn down with the session (aclose).
+        # The session's persistent jailed shell, started lazily.
+        # - held so cd and env persist
+        # - torn down with the session
         self._shell: "PersistentShell | None" = None
-        # #137: rolling buffer of the child CLI's stderr (filled by _on_stderr, wired
-        # via ClaudeAgentOptions.stderr). The SDK only pipes the child's stderr when
-        # this callback is set — otherwise a non-zero exit raised a ProcessError whose
-        # detail was the literal "Check stderr output for details", and the REAL line
-        # (e.g. "No conversation found with session ID …", or a limit message) leaked
-        # to the bot's own stderr/log instead of reaching the user.
+        # Rolling buffer of child CLI stderr.
+        # - SDK pipes stderr only when this callback is set
+        # - else errors show only "Check stderr output for details"
         self._stderr_lines: list[str] = []
-        # Set by interrupt() so run() can tell a deliberate /stop apart from a
-        # real failure: when interrupting, any exception out of receive_response()
-        # is an expected end, not an error to surface. Reset at the start of run().
+        # Set by interrupt() to tell /stop from a failure.
+        # - exceptions from receive_response() are then expected
+        # - reset at start of run()
         self._interrupted = False
-        # #417: follow-up messages go INTO the running CLI session (inject) instead of a
-        # bot-side queue — the CLI folds one sent mid-turn in at the next tool-call boundary,
-        # or runs it as the very next turn when the current one ends first. `_turn_active`:
-        # a run() is between its query and its result. `_injected`: messages handed to the
-        # CLI that the bot has not yet seen it settle (cleared when the CLI reports idle).
-        # `_states_seen`: this client streams session_state_changed (CLI + env support it),
-        # the signal that tells "consumed mid-turn" (idle right after the result) apart from
-        # "a follow-up turn is starting". `_stash`: messages read past a result while telling
-        # those apart, replayed by the next run(); `followup_pending`: a follow-up turn has
-        # started and the caller should run(None) to render it.
+        # Follow-ups are injected into the running CLI session.
+        # - CLI folds them in at the next tool boundary
+        # - or runs them as the very next turn
+        # - `_stash` holds messages read past a result
+        # - `followup_pending`: caller should run(None) to render it
         self._turn_active = False
         self._injected = 0
         self._states_seen = False
@@ -907,63 +762,62 @@ class ClaudeSession:
         self.followup_pending = False
 
     def _on_stderr(self, line: str) -> None:
-        """SDK stderr callback (#137). Append-only, no I/O / await — it runs on the
-        SDK's reader-task loop. Keep only the last ~50 lines (the tail carries the
-        actual error)."""
+        """SDK stderr callback; keeps the last ~50 lines.
+
+        - append-only, no I/O or await (runs on reader task)
+        """
         self._stderr_lines.append(line)
         del self._stderr_lines[:-50]
 
     def _stderr_text(self) -> str:
-        """The captured CLI stderr tail (#137), for surfacing the real error."""
+        """Return the captured CLI stderr tail."""
         return "\n".join(self._stderr_lines[-8:]).strip()
 
     def _build_env(self) -> dict[str, str]:
-        """Copy the current env, strip API-key vars (force subscription auth), and
-        disable the harness Workflows feature.
+        """Copy env, strip API-key vars, and disable Workflows.
 
-        CLAUDE_CODE_DISABLE_WORKFLOWS=1 turns off multi-agent orchestration and its
-        "ultracode" prompt-keyword trigger at the source: the bundled CLI otherwise
-        lets ANY user opt a turn into multi-agent Workflow orchestration just by
-        typing "ultracode" — a token bomb on the owner's ONE shared subscription.
-        The bot is an Agent-SDK frontend and never wants that tool. (The keyword is
-        also defused in the prompt itself; see defuse_triggers.)"""
+        - `CLAUDE_CODE_DISABLE_WORKFLOWS=1` stops the "ultracode" keyword trigger
+        - otherwise any user could burn the shared subscription
+        - keyword is also defused in the prompt
+        """
         env = dict(os.environ)
         env.pop("ANTHROPIC_API_KEY", None)
         env.pop("ANTHROPIC_AUTH_TOKEN", None)
         env["CLAUDE_CODE_DISABLE_WORKFLOWS"] = "1"
-        # #417: have the CLI stream its session state (running / idle) to us — how a turn
-        # with injected follow-ups tells "folded in" from "a follow-up turn is starting".
+        # Ask the CLI to stream its session state.
         env["CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS"] = "1"
-        # #168: disable the CLI's auto-compaction when the (effective) toggle is off.
-        # Verified: this flips ContextUsageResponse.isAutoCompactEnabled to False.
+        # Disable CLI auto-compaction when the toggle is off.
         if not self.auto_compact:
             env["DISABLE_AUTO_COMPACT"] = "1"
         return env
 
     def _sandbox_launcher(self) -> str:
-        """Absolute path to the committed bubblewrap launcher (deploy/)."""
-        # was: Path(__file__).resolve().parent / "deploy" / "sandbox-claude.sh" — #302:
-        # engine moved to app/core/, so deploy/ is at the repo root, not a sibling dir.
+        """Return the absolute path to the bubblewrap launcher."""
+        # Launcher lives in repo-root deploy/, not beside engine.
         return str(DEPLOY_DIR / "sandbox-claude.sh")
 
     def _hash_uid(self) -> int:
-        """The deterministic per-session host uid from the sid — the PREFERRED value the
-        #221 registry hands out (and remaps only on collision). uid_base + sid % range."""
+        """Return the deterministic per-session host uid from the sid.
+
+        - preferred value; the registry remaps only on collision
+        - `uid_base + sid % range`
+        """
         sid = Path(self.cwd).parent.name
         try:
-            n = int(sid, 16)            # legacy 6-hex sid → int directly
+            n = int(sid, 16)            # legacy 6-hex sid as int
         except ValueError:
-            # #327: a ULID (Crockford base32) or other non-hex sid → byte-sum. This is only the
-            # PREFERRED uid; the stored session_uid row (re-keyed by the migration) is
-            # authoritative at launch, so a migrated session keeps its existing uid regardless.
+            # ULID or non-hex sid maps via byte-sum.
+            # - only the preferred uid
+            # - stored session_uid row is authoritative at launch
             n = sum(sid.encode()) or 1
         return self.uid_base + (n % self.uid_range)
 
     async def _claim_host_uid(self) -> int:
-        """#221: a stable, collision-free host uid via the db registry. The bare hash
-        (_hash_uid) is the PREFERRED value; the registry probes to a free uid when two
-        sids collide and remembers the assignment, so it stays stable across rebuilds.
-        Falls back to the bare hash if the registry is unavailable (prior behaviour)."""
+        """Return a stable, collision-free host uid via the registry.
+
+        - the bare hash is preferred; registry probes on collision
+        - falls back to the bare hash if registry unavailable
+        """
         preferred = self._hash_uid()
         sid = Path(self.cwd).parent.name
         try:
@@ -977,41 +831,40 @@ class ClaudeSession:
             return preferred
 
     def _enable_sandbox(self, common: dict) -> None:
-        """Route code mode through the bubblewrap launcher (#104): set cli_path and
-        the SBX_* env the launcher reads. The launcher ``--clearenv``'s the inner
-        CLI (so the bot's env, incl. TELEGRAM_BOT_TOKEN, never reaches sandboxed
-        code) and gives it a private tmpfs HOME with the credential injected
-        read-only."""
+        """Route code mode through the bubblewrap launcher.
+
+        - sets `cli_path` and the `SBX_*` env the launcher reads
+        - launcher clears env, so bot secrets never reach the jail
+        - jail gets a private tmpfs HOME with read-only credential
+        """
         env = dict(common.get("env") or {})
         env["SBX_UID"] = str(self.sandbox_uid)
         env["SBX_GID"] = str(self.sandbox_uid)
         env["SBX_EXEC"] = "1" if self.sandbox_allow_exec else "0"
-        # The exec target. Under a per-session unprivileged uid the jail can't reach the
-        # default ~/.local/bin/claude (/root is 0700), so use the world-readable staged
-        # copy under /usr that bot.main maintains (see _stage_sandbox_claude).
+        # Exec target is a world-readable staged claude copy.
+        # - per-session uid can't reach /root (0700)
         if self.per_session_uid:
             env["SBX_CLAUDE"] = "/usr/local/bin/claude"
         else:
             env["SBX_CLAUDE"] = shutil.which("claude") or os.path.expanduser("~/.local/bin/claude")
         env["SBX_CREDS"] = os.path.expanduser("~/.claude/.credentials.json")
-        env["SBX_STATE"] = str(Path(self.cwd).parent / "state")  # #181: <sid>/state (was {cwd}.sbxstate)
-        # #119b: broker mode — the launcher binds a DUMMY credential and points the
-        # inner CLI at the host broker (ANTHROPIC_BASE_URL), so the real token is never
-        # in the jail. When unset, the launcher binds the real SBX_CREDS as before.
+        env["SBX_STATE"] = str(Path(self.cwd).parent / "state")  # <sid>/state holds jail state
+        # Broker mode: jail gets only a dummy credential.
+        # - launcher points inner CLI at the host broker
+        # - real token never enters the jail
+        # - unset: launcher binds real `SBX_CREDS`
         if self.cred_broker_url:
             env["SBX_BROKER_URL"] = self.cred_broker_url
-        # #119d: per-session user-supplied service creds — the launcher injects each
-        # KEY=VALUE from this file as --setenv into THIS jail only (file is per-session,
-        # root-owned 0600). Always pointed at <sid>/secrets.env; the launcher no-ops if
-        # absent. The owner's own credentials never enter any jail.
+        # Per-session user secrets are injected into this jail only.
+        # - launcher passes each KEY=VALUE via --setenv
+        # - file is `<sid>/secrets.env`, root-owned 0600
+        # - launcher no-ops if absent
         env["SBX_SECRETS_ENV"] = str(Path(self.cwd).parent / "secrets.env")
-        # #119c egress allowlist + #119e cgroup DoS limits apply to CODE sessions ONLY —
-        # that's the Bash/file-capable exfil surface the #119 threat model targets. Chat
-        # carries only the read-only web tools (no Bash, no host-data to leak), so egress
-        # there adds ~no security but WOULD break WebFetch (it fetches arbitrary URLs
-        # client-side) by blocking everything off the allowlist; leave chat egress open.
-        # SBX_USE_CGROUP gates the cgroup placement (needed for the firewall match AND the
-        # limits). The broker, seccomp and per-session secrets below apply to ALL modes.
+        # Egress allowlist and cgroup limits apply to code sessions only.
+        # - chat has no Bash or host data
+        # - allowlist would break WebFetch, so chat egress stays open
+        # - `SBX_USE_CGROUP` gates cgroup placement
+        # - broker, seccomp, secrets apply to all modes
         if self.mode == "code":
             if self.egress and self.egress_proxy_url:
                 env["SBX_EGRESS"] = "1"
@@ -1026,49 +879,47 @@ class ClaudeSession:
                 env["SBX_USE_CGROUP"] = "1"
         if self.seccomp_path and os.path.exists(self.seccomp_path):
             env["SBX_SECCOMP"] = self.seccomp_path
-        # Per-session unprivileged HOST uid (ALL modes): a distinct non-root uid derived
-        # from the session id. The launcher chowns the workdir to it and runs bwrap via
-        # setpriv as that uid, so a jail escape is unprivileged and can't reach another
-        # session's (differently-owned) files. Deterministic so the uid is stable across
-        # rebuilds (the on-disk chown stays valid).
+        # Per-session unprivileged host uid, derived from session id.
+        # - launcher runs bwrap via setpriv as that uid
+        # - an escape can't reach other sessions' files
+        # - deterministic, so on-disk chown survives rebuilds
         if self.per_session_uid:
-            # #221: prefer the registry-assigned uid (collision-free, claimed in
-            # _ensure_client); fall back to the bare deterministic hash when it hasn't
-            # been claimed yet (e.g. unit tests that build options directly).
+            # Prefer registry-assigned uid; fall back to deterministic hash.
+            # - registry claims collision-free uid in `_ensure_client`
             host_uid = self.host_uid if self.host_uid is not None else self._hash_uid()
             env["SBX_HOST_UID"] = str(host_uid)
             env["SBX_HOST_GID"] = str(host_uid)
         common["env"] = env
         common["cli_path"] = self._sandbox_launcher()
-        # No workdir chown: bwrap's user namespace maps the jail's uid to the
-        # OUTER (root) uid for host filesystem ops, so the root-owned workdir is
-        # writable inside; confinement comes from the bind mounts (only the workdir
-        # is rw-bound — secrets / other sessions / the host are simply not mounted).
+        # No workdir chown: bwrap maps jail uid to outer root.
+        # - confinement comes from bind mounts
+        # - only the workdir is bound read-write
 
     def _resolve_tools(self, universe: list[str]) -> list[str]:
-        """The enabled subset of a mode's tool universe for this session. None (the
-        default) = the whole universe; a stored list = only the tools the session has
-        switched on (intersection, so a stale/foreign name can never widen the set).
-        The Tools settings page (#129) edits the stored list."""
+        """Return the enabled subset of a mode's tool universe.
+
+        - None means the whole universe
+        - stored list is intersected; stale names can't widen it
+        """
         if self.tools_enabled is None:
             result = list(universe)
         else:
             enabled = set(self.tools_enabled)
             result = [t for t in universe if t in enabled]
-        # Per-user owner cap (#131): never widen beyond what the owner allows. A
-        # capped user's session can enable only tools in BOTH its toggles and the cap.
+        # Owner cap: never widen beyond what the owner allows.
+        # - capped user enables only tools in toggles and cap
         if self.tool_cap is not None:
             cap = set(self.tool_cap)
             result = [t for t in result if t in cap]
         return result
 
     def _global_memory_text(self) -> str:
-        """Read the owner's GLOBAL memory — ``~/.claude/CLAUDE.md`` plus any
-        ``~/.claude/memory/*.md`` — as a single string for DIRECT system-prompt
-        injection (#130). Returns "" when none exists or on any read error. This
-        REPLACES widening ``setting_sources=["user"]`` so ``settings.json``
-        (permissions / env) is never loaded. Read on each build so edits to the
-        owner's memory take effect on the next rebuild."""
+        """Read owner's global memory as one prompt string.
+
+        - `~/.claude/CLAUDE.md` plus `~/.claude/memory/*.md`
+        - returns empty string if none or on read error
+        - avoids loading `settings.json`; re-read on each build
+        """
         base = os.path.expanduser("~/.claude")
         parts: list[str] = []
         cmd = os.path.join(base, "CLAUDE.md")
@@ -1094,8 +945,10 @@ class ClaudeSession:
         return "\n\n".join(p for p in parts if p)
 
     def _global_memory_block(self) -> str:
-        """The owner's global memory wrapped as an injectable system-prompt section
-        (#130), or "" when global memory is off / there is nothing to inject."""
+        """Return the owner's global memory as a prompt section.
+
+        - empty string when disabled or nothing to inject
+        """
         if not self.global_memory:
             return ""
         mem = self._global_memory_text()
@@ -1108,14 +961,12 @@ class ClaudeSession:
         )
 
     def _workdir_claude_block(self) -> str:
-        """CODE sessions: inject a ``CLAUDE.md`` from the agent's WORKING DIRECTORY into
-        the system prompt (#314), so a code user (or the agent itself) can keep durable
-        project instructions like a real Claude Code project memory. We run with
-        ``setting_sources=[]`` (the #130 isolation invariant — never load settings.json),
-        so the SDK does NOT auto-load a project CLAUDE.md; we read + inject the CONTENT
-        ourselves, exactly like _global_memory_block. Re-read on each build, so an edit to
-        ./CLAUDE.md takes effect on the next session build. Returns "" for chat / no cwd /
-        missing-or-empty file / read error."""
+        """Inject the workdir `CLAUDE.md` into the code system prompt.
+
+        - settings are not loaded, so the SDK won't auto-load it
+        - re-read on each build
+        - empty for chat, no cwd, missing file, read error
+        """
         if self.mode != "code" or not self.cwd:
             return ""
         try:
@@ -1125,9 +976,8 @@ class ClaudeSession:
             return ""
         if not text:
             return ""
-        # Cap the injected size so a huge (or hostile) CLAUDE.md can't blow the context
-        # window or burn the shared subscription on every turn. ~16 KB is ample for
-        # project instructions.
+        # Cap injected size so a huge CLAUDE.md can't blow context.
+        # - about 16 KB is ample
         cap = 16384
         if len(text) > cap:
             text = text[:cap].rstrip() + "\n\n…[CLAUDE.md truncated at 16 KB]"
@@ -1138,23 +988,22 @@ class ClaudeSession:
         )
 
     def _session_memory_on(self) -> bool:
-        """#362: whether the agent-driven session-memory tool (`remember`) and its
-        re-injected notes are active for THIS session — CODE sessions owned by a
-        CODE-LEVEL user only (a chat session has no durable per-topic notes, and the
-        demotion gap — a user dropped code→chat who still holds a code session — must
-        not keep the capability). Gates the `remember` MCP server, its auto-allow entry,
-        and _session_notes_block. was (#352): the tool + notes were attached in BOTH modes
-        for everyone."""
+        """Return whether session memory (`remember` tool and notes) is active.
+
+        - code sessions owned by a code-level user only
+        - gates the MCP server, its auto-allow entry, and notes block
+        """
         return self.mode == "code" and self.user_level == "code"
 
     def _session_notes_block(self) -> str:
-        """#352: the per-topic session memory (the agent's own `remember` notes) wrapped as
-        an injectable system-prompt section, or "" when empty. Framed as LOW-AUTHORITY
-        continuity context — explicitly NOT instructions — so a note that entered via web
-        content (indirect prompt injection) cannot escalate into a command. Size is capped
-        on write (see _apply_session_note / _remember_tool)."""
-        # #362: code-only feature — nothing injected for chat sessions or non-code-level
-        # users (see _session_memory_on); any saved blob stays dormant in the DB.
+        """Wrap the topic's session notes as a prompt section.
+
+        - empty string when no notes
+        - framed as low-authority context, not instructions
+        - so web-injected notes cannot escalate into commands
+        """
+        # Code-only feature: nothing injected for chat or non-code users.
+        # - saved blob stays dormant in the DB
         if not self._session_memory_on():
             return ""
         notes = (self.session_notes or "").strip()
@@ -1170,26 +1019,26 @@ class ClaudeSession:
         )
 
     async def _remember_tool(self, args: dict) -> dict:
-        """#352 handler for the in-process `remember` tool. Appends (or, with replace=true,
-        rewrites) this topic's session notes, enforces the size cap, updates the LIVE blob so
-        the next build re-injects it, and persists via the on_remember hook. Returns the SDK
-        tool shape ({"content": [...], "is_error"?: bool}). Writes ONLY to this session's
-        notes — never another topic's."""
+        """Handle the in-process `remember` tool call.
+
+        - appends, or rewrites with `replace=true`
+        - enforces size cap, updates live blob, persists via `on_remember`
+        - returns the SDK tool result shape
+        - writes only this session's notes
+        """
         note = (args.get("note") or "").strip()
         if not note:
             return {"content": [{"type": "text",
                                  "text": "Nothing saved: the note was empty."}],
                     "is_error": True}
         replace = bool(args.get("replace"))
-        # #355: detect whether the cap will trim from the UNTRIMMED byte size computed directly
-        # from the inputs, so _apply_session_note runs ONCE. was: a second _apply_session_note
-        # call with cap=10**12 purely to measure the untrimmed length (redundant recompute).
-        # session_notes is always stored as a single clean blob, so .strip() here matches what
-        # _apply_session_note concatenates — the over-cap estimate and the real write agree.
+        # Detect cap trimming from untrimmed byte size of the inputs.
+        # - keeps `_apply_session_note` to a single call
+        # - notes are one clean blob; `.strip()` matches write
         prior = (self.session_notes or "").strip()
-        untrimmed = len(note.encode("utf-8"))  # note is already stripped above
+        untrimmed = len(note.encode("utf-8"))
         if not replace and prior:
-            untrimmed += len(prior.encode("utf-8")) + 1  # +1 for the joining "\n"
+            untrimmed += len(prior.encode("utf-8")) + 1  # +1 for joining newline
         over_cap = untrimmed > SESSION_NOTES_CAP
         self.session_notes = _apply_session_note(self.session_notes, note, replace)
         if self._on_remember is not None:
@@ -1201,11 +1050,11 @@ class ClaudeSession:
         return {"content": [{"type": "text", "text": msg}]}
 
     def _memory_server(self):
-        """#352: lazily build + cache the in-process SDK MCP server exposing the single
-        `remember` tool, so the agent curates its own durable per-topic notes — the
-        tool-free-chat equivalent of editing ./CLAUDE.md. The handler (_remember_tool) runs
-        IN THIS host process over the SDK stdio control channel, so it is unaffected by the
-        bubblewrap jail (no fs / net needed)."""
+        """Lazily build and cache the in-process `remember` MCP server.
+
+        - handler runs in the host over the SDK control channel
+        - unaffected by the jail; needs no fs or net
+        """
         if self._memory_server_cache is not None:
             return self._memory_server_cache
         schema = {
@@ -1238,13 +1087,11 @@ class ClaudeSession:
         return self._memory_server_cache
 
     async def run_shell(self, command: str, timeout: float = 60.0) -> tuple[int, str]:
-        """#224: run ONE shell command in THIS session's jail (no LLM, no tokens) and
-        return (returncode, combined stdout+stderr).
+        """Run one shell command in this session's jail, no LLM.
 
-        Requires the sandbox — refuses otherwise, since shell mode runs arbitrary user
-        commands and must stay confined (per-session uid + egress + seccomp + secrets).
-        Reuses the SBX_* env that `_enable_sandbox` builds; the launcher branches on
-        SBX_MODE=shell and execs `/bin/bash -lc "$SBX_SHELL_CMD"` instead of the CLI.
+        - returns (returncode, combined stdout and stderr)
+        - refuses without the sandbox
+        - reuses `SBX_*` env; launcher runs `SBX_SHELL_CMD` via bash
         """
         if not self.sandbox:
             return (126, "Shell mode requires the sandbox, which is disabled for this session.")
@@ -1280,9 +1127,12 @@ class ClaudeSession:
         return (proc.returncode if proc.returncode is not None else -1, text)
 
     async def shell_run(self, command: str, timeout: float = 60.0):
-        """#227a: run a command in this session's PERSISTENT jailed shell so cd/env persist
-        across messages. Lazily starts the held PTY shell; raises on a spawn failure so the
-        caller can fall back to the one-shot run_shell. Returns (rc_or_None, output, status)."""
+        """Run a command in the persistent jailed shell.
+
+        - lazily starts the held PTY shell
+        - raises on spawn failure; caller falls back to one-shot
+        - returns (rc_or_None, output, status)
+        """
         if not self.sandbox:
             return (126, "Shell mode requires the sandbox, which is disabled for this session.", "done")
         sh = self._shell
@@ -1292,36 +1142,39 @@ class ClaudeSession:
         return await sh.run(command, timeout=timeout)
 
     async def shell_peek(self) -> tuple[int | None, str, str]:
-        """#279: non-intrusive read of the persistent shell's pending output (no input sent)."""
+        """Read the persistent shell's pending output without sending input."""
         sh = self._shell
         if sh is None or not sh.alive():
             return (0, "", "done")
         return await sh.peek()
 
     async def shell_send_input(self, text: str, timeout: float = 60.0):
-        """#227b: forward a line of input to the program awaiting it in the persistent shell.
-        Returns (rc_or_None, output, status); ('','no shell','done') if none is running."""
+        """Forward a line of input to the awaiting program.
+
+        - returns (rc_or_None, output, status)
+        - returns ('', 'no shell', 'done') if no shell is running
+        """
         sh = self._shell
         if sh is None or not sh.alive():
             return (0, "", "done")
         return await sh.send_input(text, timeout=timeout)
 
     async def shell_send_keys(self, data: bytes, timeout: float = 60.0):
-        """#227b: forward raw key bytes (arrows/Enter/Tab/Ctrl-C) to the awaiting program."""
+        """Forward raw key bytes to the awaiting program."""
         sh = self._shell
         if sh is None or not sh.alive():
             return (0, "", "done")
         return await sh.send_raw(data, timeout=timeout)
 
     async def shell_interrupt(self) -> str:
-        """#227c/#246: send Ctrl-C to the persistent shell — a real SIGINT (controlling tty)."""
+        """Send Ctrl-C to the persistent shell as a real SIGINT."""
         sh = self._shell
         if sh is None or not sh.alive():
             return ""
         return await sh.interrupt()
 
     async def _start_shell(self) -> "PersistentShell":
-        """#227a: spawn the held login-bash on a PTY inside this session's jail."""
+        """Spawn the held login bash on a jailed PTY."""
         if self.per_session_uid and self.host_uid is None:
             with contextlib.suppress(Exception):
                 self.host_uid = await self._claim_host_uid()
@@ -1331,18 +1184,15 @@ class ClaudeSession:
         common: dict = {"env": dict(os.environ)}
         self._enable_sandbox(common)
         env = common["env"]
-        env["SBX_MODE"] = "shell_persist"      # launcher execs `bash -i` on the PTY
+        env["SBX_MODE"] = "shell_persist"      # launcher execs bash -i on PTY
         launcher = common["cli_path"]
         master, slave = os.openpty()
         os.set_blocking(master, False)
-        # #246: give the jailed bash a CONTROLLING TTY so Ctrl-C (the 0x03 byte) is a REAL
-        # SIGINT to the foreground process group — not just an ignorable byte (the #227c caveat).
-        # os.login_tty(slave) runs in the child (setsid + TIOCSCTTY + dup slave→0,1,2); pass_fds
-        # keeps `slave` open across subprocess's fd-closing so login_tty can use it. bwrap is NOT
-        # --new-session, so the controlling tty persists through setpriv→bwrap→bash, even across
-        # --unshare-pid (verified e2e). login_tty's setsid makes the launcher a session leader,
-        # so this replaces start_new_session=True with no change to the #179 reaper/cgroup invariant.
-        # was: start_new_session=True  (replaced for #246 — login_tty does the setsid)
+        # Jailed bash gets a controlling TTY for real Ctrl-C.
+        # - `os.login_tty(slave)` runs in child: setsid, TIOCSCTTY, dup
+        # - `pass_fds` keeps slave open across subprocess fd-closing
+        # - bwrap isn't --new-session, so tty survives --unshare-pid
+        # - setsid replaces start_new_session; reaper invariant unchanged
         def _ctty() -> None:
             os.login_tty(slave)
         try:
@@ -1352,44 +1202,48 @@ class ClaudeSession:
                 preexec_fn=_ctty, pass_fds=(slave,),
             )
         except BaseException:
-            # #248: on spawn failure the master fd would leak (the finally only
-            # closes slave) — close it too, else a repeatedly-failing _start_shell
-            # exhausts fds one master per attempt.
+            # Close master fd on spawn failure, else it leaks.
+            # - repeated failures would exhaust fds
             with contextlib.suppress(OSError):
                 os.close(master)
             raise
         finally:
             with contextlib.suppress(OSError):
-                os.close(slave)  # the child holds its own dup; we keep only the master
+                os.close(slave)  # child holds its own dup
         return PersistentShell(proc, master)
 
     async def _close_shell(self) -> None:
-        """#227a: kill + forget the persistent shell (best-effort)."""
+        """Kill and forget the persistent shell, best-effort."""
         sh, self._shell = self._shell, None
         if sh is not None:
             with contextlib.suppress(Exception):
                 await sh.close()
 
     def has_live_shell(self) -> bool:
-        """#274: True if this session holds a still-running persistent shell."""
+        """Return True if this session holds a running persistent shell."""
         return self._shell is not None and self._shell.alive()
 
     def detach_shell(self):
-        """#274: hand off the live persistent shell WITHOUT closing it, so it can survive
-        a client rebuild/reap (the ~500 MB claude client is freed; the ~3 MB jailed shell —
-        with the user's cd/env + any running command — is preserved). Returns it or None."""
+        """Hand off the live persistent shell without closing it.
+
+        - survives a client rebuild or reap
+        - big client freed; small shell keeps cd, env, commands
+        - returns the shell, or None
+        """
         sh, self._shell = self._shell, None
         return sh
 
     def adopt_shell(self, sh) -> None:
-        """#274: re-attach a previously-detached persistent shell (cd/env/running cmd intact)."""
+        """Re-attach a previously detached persistent shell, state intact."""
         if sh is not None and self._shell is None:
             self._shell = sh
 
     def _session_state_note(self) -> str:
-        """#276: a short, DYNAMIC note telling the model the CURRENT session's mode and what
-        the user can do about it (the static doc only describes the modes in general). Appended
-        to both system prompts so the model gives accurate guidance instead of guessing."""
+        """Return a short dynamic note on the session's current mode.
+
+        - tells the model what the user can do about it
+        - appended to both system prompts
+        """
         if self.mode == "code":
             return (
                 "\n\n## This session right now\n"
@@ -1406,7 +1260,7 @@ class ClaudeSession:
                 "edit files, tell them to send **/code** to turn THIS session into a full Claude Code "
                 "session (then **/shell** for a terminal), and **/chat** to switch back. Don't pretend "
                 "to run anything here — point them to /code. "
-                # #299: generating a document file is a code task too; this user CAN self-upgrade.
+                # Document generation is a code task; user can self-upgrade.
                 "This includes GENERATING a document (PDF, Excel/.xlsx, Word/.docx, PowerPoint/.pptx, "
                 "CSV, …): tell them to send /code and you will build the file there and send it back "
                 "as an attachment."
@@ -1418,8 +1272,8 @@ class ClaudeSession:
             "themselves — do NOT tell them to use /code. Only the bot's owner can grant code access. If "
             "they need to run commands or edit files, explain that the owner must grant them code access "
             "first. "
-            # #299: same gate for document generation — a chat-only user can't /code, so route them
-            # to the OWNER for a status upgrade rather than suggesting /code (which would be denied).
+            # Same gate for documents: chat-only users go to owner.
+            # - they can't /code, so suggesting it would be denied
             "This also covers GENERATING a document file (PDF, Excel/.xlsx, Word/.docx, PowerPoint/.pptx, "
             "CSV, …): it needs a code session, which this user cannot start themselves — so tell them to "
             "ask the bot's owner to grant them code access, after which a code session can build the "
@@ -1427,53 +1281,37 @@ class ClaudeSession:
         )
 
     def _build_options(self) -> ClaudeAgentOptions:
-        """Construct ClaudeAgentOptions for the current mode/model/cwd."""
+        """Construct ClaudeAgentOptions for the current mode, model and cwd."""
         env = self._build_env()
         mem_block = self._global_memory_block()
 
         common: dict = {
-            # #134: a big_memory session requests the 1M context window via the [1m]
-            # model-id suffix (see _one_m_model) — for 1M-capable models only (Opus by
-            # default; the `betas` param below was ignored under the subscription).
-            # was: "model": self.model,
-            # #428: back to the plain model — 1M is native on current models. was:
-            #   "model": _one_m_model(self.model) if self.big_memory else self.model,
+            # Plain model id; 1M context is native on current models.
             "model": self.model,
-            # Isolation: pass [] (NOT None) so the CLI loads NO user/project/local
-            # settings and NO CLAUDE.md. In this SDK version None means "load all
-            # filesystem sources" — the opposite of what we want.
-            #
-            # #130 FIX: GLOBAL MEMORY no longer widens setting_sources to ["user"].
-            # "user" ALSO loaded ~/.claude/settings.json — whose permissions.allow
-            # could AUTO-allow tools the bot keeps out of allowed_tools (bypassing the
-            # can_use_tool gate) and whose env could merge a settings ANTHROPIC_API_KEY
-            # into the child (flipping billing, the #1 hard rule). Instead we keep
-            # setting_sources=[] ALWAYS and INJECT the owner's CLAUDE.md / memory
-            # CONTENT directly into the system prompt (_global_memory_block + the
-            # chat/code branches below) — the memory reaches the model WITHOUT ever
-            # loading settings.json. Also works under the sandbox (the jail's HOME has
-            # no ~/.claude), where setting_sources=["user"] silently read nothing.
+            # Pass [] (not None): CLI loads no settings or CLAUDE.md.
+            # - None means load all filesystem sources
+            # - user settings could auto-allow tools or inject API key
+            # - owner memory is injected into the system prompt instead
+            # - also works in the jail, which has no ~/.claude
             "setting_sources": [],
             "include_partial_messages": True,  # enable text-delta streaming
             "env": env,
-            # #137: capture the child CLI's stderr so a startup/turn failure surfaces
-            # the REAL reason (stale resume id, limit, bwrap error) instead of the
-            # SDK's generic "Check stderr output for details". was: no stderr key.
+            # Capture child CLI stderr so failures show the real reason.
+            # - stale resume id, limit, or bwrap error
             "stderr": self._on_stderr,
         }
-        # #352/#362: the in-process session-memory tool (agent-driven `remember`) is a
-        # CODE-session feature for code-level users only (see _session_memory_on) — served
-        # over the SDK stdio control channel so it works in the jail. was (#352): attached in
-        # BOTH modes for everyone → `common["mcp_servers"] = {MEMORY_SERVER_NAME: self._memory_server()}`
+        # In-process session-memory tool: code sessions, code-level users only.
+        # - served over SDK stdio control channel, works in jail
         if self._session_memory_on():
             common["mcp_servers"] = {MEMORY_SERVER_NAME: self._memory_server()}
         if self.session_id:
             common["resume"] = self.session_id
-            # One-shot fork: resume the prior session but branch to a NEW id so the
-            # original is left untouched. Cleared after the first turn (sessions.py).
+            # One-shot fork: resume but branch to a new session id.
+            # - original stays untouched
+            # - cleared after the first turn
             if self.fork:
                 common["fork_session"] = True
-        # Reasoning effort + agentic turn cap apply to both modes (#23).
+        # Reasoning effort and turn cap apply to both modes.
         if self.effort:
             common["effort"] = self.effort
         if self.max_turns:
@@ -1484,45 +1322,29 @@ class ClaudeSession:
                 self._enable_sandbox(common)
             code_tools = self._resolve_tools(CODE_TOOLS)
             code_extra: dict = {}
-            # #187: ALWAYS append the outbox file-delivery instruction (+ the owner's
-            # CLAUDE.md/memory when present) as an ADDITIVE append to the default Claude
-            # Code preset — keeps the full agent prompt intact (the #130 mechanism),
-            # instead of loading via setting_sources=["user"] (+ settings.json). was:
-            # only set system_prompt when mem_block was non-empty (#130).
-            # #205: also state the per-session isolation so the agent can answer the
-            # user accurately if asked about privacy / where their files live.
-            # #269: outbox/isolation/table notes are now part of BOT_CONTEXT_NOTE (the doc).
-            # #314: also inject a CLAUDE.md from the agent's working directory (project
-            # instructions), mirroring the owner global-memory injection — kept out of
-            # setting_sources for the #130 reasons above.
-            # was (pre-#314, no workdir CLAUDE.md):
-            #   append = (BOT_CONTEXT_NOTE + CODE_ADDENDUM_NOTE + self._session_state_note()
-            #             + (("\n\n" + mem_block) if mem_block else ""))
+            # Always append bot context and owner memory to the preset.
+            # - keeps the full default agent prompt intact
+            # - includes session state note and workdir CLAUDE.md
+            # - injected, not loaded via setting_sources, for isolation
+            # - tells the agent about per-session isolation
             append = (BOT_CONTEXT_NOTE + CODE_ADDENDUM_NOTE + self._session_state_note()
                       + (("\n\n" + mem_block) if mem_block else "")
                       + self._workdir_claude_block()
-                      + self._session_notes_block())  # #352
+                      + self._session_notes_block())
             code_extra["system_prompt"] = {
                 "type": "preset", "preset": "claude_code", "append": append,
             }
-            # #134: the 1M window is now requested via the [1m] model-id suffix in
-            # common["model"] (see _one_m_model). The `betas` param below was a NO-OP
-            # under the OAuth subscription ("Custom betas are only available for API
-            # key users"), so it's commented out — kept for revert/history. was (#133):
-            # if self.big_memory:
-            #     code_extra["betas"] = ["context-1m-2025-08-07"]
+            # No `betas` param: custom betas are API-key only.
             return ClaudeAgentOptions(
                 cwd=self.cwd,
                 permission_mode=self.permission_mode,
                 can_use_tool=self.can_use_tool,
-                # `tools` = the (per-session enabled) callable universe; `allowed_tools`
-                # = only the read-only auto-allow subset of those. Dangerous enabled
-                # tools are usable but not auto-allowed, so the CLI evaluates them as
-                # "ask" and our can_use_tool gate fires for each before execution.
+                # `tools` is the callable universe; `allowed_tools` the auto-allow subset.
+                # - dangerous tools evaluate as ask
+                # - so the `can_use_tool` gate fires
                 tools=code_tools,
-                # #362: auto-allow the `remember` tool only when session memory is on
-                # (code session + code-level user — excludes a demoted user's code session).
-                # was (#352): unconditional `... + [MEMORY_TOOL]`.
+                # Auto-allow `remember` only when session memory is on.
+                # - code session and code-level user; excludes demoted users
                 allowed_tools=([t for t in code_tools if t in CODE_AUTO_ALLOW_TOOLS]
                                + ([MEMORY_TOOL] if self._session_memory_on() else [])),
                 add_dirs=list(self.add_dirs),
@@ -1530,42 +1352,29 @@ class ClaudeSession:
                 **common,
             )
 
-        # Chat mode: a conversation that ships ONLY the read-only web research
-        # tools (WebSearch / WebFetch) so it can look up current info like
-        # claude.ai — no Bash, no file edits. `tools` is the EXACT universe the
-        # model may call: an explicit list (NOT None — None would let the CLI
-        # enable its full default toolset; [] would make it tool-free). The same
-        # tools go in `allowed_tools` so they are AUTO-allowed (no approval UI —
-        # chat has no can_use_tool gate, matching the app). A stored
-        # tools_enabled=[] (via the Tools page) makes a truly tool-free chat.
+        # Chat mode ships only read-only web tools (search, fetch).
+        # - `tools` is the exact universe: explicit list, not None
+        # - None enables the full default toolset
+        # - same tools auto-allowed; chat has no `can_use_tool` gate
+        # - stored empty `tools_enabled` makes chat tool-free
         chat_tools = self._resolve_tools(CHAT_TOOLS)
-        # #180: jail chat too (was code-only). Chat is tool-free but still a
-        # subprocess — routing it through the bubblewrap launcher drops it to the
-        # unprivileged uid, confines it to the workdir, and keeps its transcript in
-        # the per-session <sid>/state dir instead of the host ~/.claude.
+        # Chat is jailed too: unprivileged uid, confined to workdir.
+        # - transcript lives in per-session state dir, not host ~/.claude
         if self.sandbox:
             self._enable_sandbox(common)
         chat_extra: dict = {}
-        # #134: 1M is now requested via the [1m] model-id suffix (common["model"], see
-        # _one_m_model); the `betas` param was ignored under the subscription. Commented
-        # out — kept for revert/history. was:
-        # if self.big_memory:
-        #     chat_extra["betas"] = ["context-1m-2025-08-07"]
         return ClaudeAgentOptions(
-            # #130: append the owner's CLAUDE.md/memory directly (mem_block is "" when
-            # global memory is off or empty), instead of loading it via setting_sources.
-            # #362: chat has no session memory (a code-only feature now) — was (#352):
-            #   ... + mem_block + self._session_notes_block()
+            # Append owner memory directly; empty when global memory is off.
+            # - chat has no session memory
             system_prompt=(CHAT_SYSTEM_PROMPT + BOT_CONTEXT_NOTE + self._session_state_note()
                            + mem_block),
-            # Chat now runs in the per-session workdir too (#133), so its conversation
-            # transcript lives in the SAME project as code mode — that's what lets a
-            # session upgrade chat→code (or back) and keep one continuous conversation.
-            # Chat has no file tools, so the cwd is only transcript storage here.
+            # Chat runs in the per-session workdir too.
+            # - shares transcript project with code mode
+            # - so chat to code upgrades keep one conversation
+            # - cwd is only transcript storage here
             cwd=self.cwd,
             tools=list(chat_tools),
-            # #362: chat no longer exposes the `remember` tool (code-only now).
-            # was (#352): `allowed_tools=list(chat_tools) + [MEMORY_TOOL]`.
+            # Chat exposes no `remember` tool.
             allowed_tools=list(chat_tools),
             permission_mode="default",
             **chat_extra,
@@ -1575,50 +1384,34 @@ class ClaudeSession:
     async def _ensure_client(self) -> None:
         """Lazily create and connect the underlying SDK client."""
         if self.client is None:
-            # Both modes run the agent IN self.cwd (chat too, #133 — that's where the
-            # conversation transcript lives, so chat↔code resume the SAME session). The
-            # CLI refuses to start if the directory does not exist, so create it up front.
+            # Both modes run in `self.cwd`, which must exist.
+            # - CLI refuses to start if the directory is missing
+            # - transcript lives there; chat and code share resume
             if self.cwd:
                 os.makedirs(self.cwd, exist_ok=True)
-                # #187: pre-create the outbox drop-dir so the agent can always write
-                # into it (`cp file outbox/`). Code mode only — chat is tool-free, so it
-                # never creates files; the host drains + clears it after each turn.
+                # Pre-create outbox drop-dir so the agent can write to it.
+                # - code mode only; host drains it each turn
                 if self.mode == "code":
                     os.makedirs(str(Path(self.cwd) / "outbox"), exist_ok=True)
                 if self.sandbox:
-                    # #181: per-session jail state dir (HOME → ~/.claude/projects), a
-                    # SIBLING of the cwd under one <sid> parent: <sid>/work (cwd) +
-                    # <sid>/state. #180: created for ALL modes now — chat is jailed too.
-                    # was: code-only `{cwd}.sbxstate`.
+                    # Per-session jail state dir, sibling of cwd under `<sid>`.
+                    # - layout: `<sid>/work` and `<sid>/state`
+                    # - created for all modes; holds HOME's .claude/projects
                     os.makedirs(str(Path(self.cwd).parent / "state"), exist_ok=True)
-                # #137: lock the workdir (+ state + the <sid> parent) to the owner only.
-                # The sandboxed CLI writes as the mapped uid with a 0022 umask, so
-                # outputs landed world-readable; 0700 keeps a session off-limits to
-                # other local users.
+                # Lock workdir, state and `<sid>` parent to owner only.
+                # - jailed CLI writes with umask 0022 as mapped uid
+                # - 0700 keeps sessions off-limits to local users
                 with contextlib.suppress(OSError):
                     os.chmod(self.cwd, 0o700)
                     if self.sandbox:
                         os.chmod(str(Path(self.cwd).parent / "state"), 0o700)
-                        os.chmod(str(Path(self.cwd).parent), 0o700)  # the <sid> parent
-            # was: assign self.client THEN connect() — replaced for #137
-            #   self.client = ClaudeSDKClient(self._build_options())
-            #   await self.client.connect()
-            # If connect() (or even the constructor) raised, self.client was left
-            # non-None but unconnected; the next turn's `self.client is None` check
-            # was False, so it skipped reconnect and every later query()/
-            # receive_response() hit an unconnected client → "Not connected. Call
-            # connect() first." until a process restart. Build into a LOCAL, connect
-            # it, and only publish to self.client AFTER connect() succeeds; tear the
-            # half-built client down on any failure so the next turn reconnects clean.
-            #
-            # #137: a STALE --resume id ("No conversation found with session ID …",
-            # which is what produced the reported exit-1 startup failure) is
-            # recoverable — drop the dead id and retry ONCE with a fresh session, so
-            # the user just keeps going instead of being wedged. Only retry on that
-            # exact signature; never on a limit/auth/billing failure.
-            # #221: claim a stable, collision-free host uid for this jail BEFORE building
-            # options (the claim is async; _enable_sandbox/_build_options are sync). Cached
-            # on self.host_uid so rebuilds reuse it; no-op for non-sandbox/non-uid sessions.
+                        os.chmod(str(Path(self.cwd).parent), 0o700)  # the `<sid>` parent
+            # Build client in a local; publish after connect succeeds.
+            # - else a failed connect leaves unconnected `self.client`
+            # - tear down the half-built client on failure
+            # - stale resume id: drop it, retry once fresh
+            # - never retry on limit, auth, or billing errors
+            # - claim host uid before sync option building
             if self.sandbox and self.per_session_uid and self.host_uid is None:
                 self.host_uid = await self._claim_host_uid()
             for attempt in (1, 2):
@@ -1642,19 +1435,17 @@ class ClaudeSession:
                         continue
                     raise exc
                 self.client = client
-                # #417: a fresh CLI process — nothing injected, nothing stashed, and session-state
-                # support is re-learned from this process's own events.
+                # Fresh CLI process: nothing injected or stashed.
+                # - session-state support is re-learned per process
                 self._injected, self._states_seen, self._stash = 0, False, []
                 self.followup_pending = False
-                # #411: refresh the bot-wide model catalog from this CLI's initialize response
-                # (the /model picker lists what the CLI offers, so a CLI update surfaces new
-                # models with no code change). Best-effort — never fails the connect.
+                # Refresh the model catalog from the CLI's initialize response.
+                # - best-effort; never fails the connect
                 with contextlib.suppress(Exception):
                     models.capture(await client.get_server_info())
-                # #411: ask the CLI what this session ACTUALLY runs as — the concrete model the
-                # alias resolved to and the applied effort (with none set, the model's own
-                # default, e.g. medium) — for the session line, and teach the catalog that
-                # default. A local control request: no API call, no tokens.
+                # Ask CLI what model and effort the session actually runs.
+                # - local control request: no API call, no tokens
+                # - teaches catalog the model's default effort
                 with contextlib.suppress(Exception):
                     resp = await client._query._send_control_request(
                         {"subtype": "get_settings"}, timeout=10.0)
@@ -1668,18 +1459,13 @@ class ClaudeSession:
     async def _send_query(self, prompt: str, attachments: list | None) -> None:
         """Send the user turn to the connected client.
 
-        Without attachments we send the plain string (the common path). With
-        attachments we send a multimodal user message — one text block (when the
-        prompt is non-empty) plus the given Anthropic content blocks (image and/or
-        document) — via query()'s async-iterable form. The per-message session_id
-        is the SDK's streaming key ("default"); conversation continuity still comes
-        from the `resume` option set at connect time, so attachment turns keep the
-        thread's context.
+        - plain string without attachments
+        - with attachments: multimodal message of text plus content blocks
+        - continuity comes from the `resume` option, not per-message session id
         """
-        # Defuse harness keyword triggers (ultrathink / ultracode / deployer extras)
-        # so a user's message can't silently escalate effort or spin up multi-agent
-        # orchestration. The DB transcript logs the ORIGINAL text (done upstream in
-        # sessions.py); only the CLI-bound copy is defused.
+        # Defuse harness keyword triggers in the CLI-bound message copy.
+        # - stops users escalating effort or multi-agent orchestration
+        # - DB transcript keeps the original text
         prompt = defuse_triggers(prompt, self._trigger_re)
         if not attachments:
             await self.client.query(prompt)
@@ -1701,12 +1487,12 @@ class ClaudeSession:
         await self.client.query(_stream())
 
     async def inject(self, prompt: str, attachments: list | None = None) -> bool:
-        """#417: hand a follow-up message to the RUNNING turn, the way the Claude Code CLI
-        takes input typed while it works: the CLI folds it in at the next tool-call boundary,
-        or — when the turn ends first — runs it as the next turn, which run() then reports
-        through ``followup_pending``. Only while a turn is active on a live client that streams
-        session state (without that signal a follow-up turn could not be told apart and would
-        bleed into the next reply). Returns False when the caller should queue it instead."""
+        """Hand a follow-up message to the running turn.
+
+        - CLI folds it in at a tool boundary
+        - only while a turn is active on a state-streaming client
+        - returns False when the caller should queue it instead
+        """
         if not (self.client is not None and self._turn_active and self._states_seen):
             return False
         try:
@@ -1718,18 +1504,20 @@ class ClaudeSession:
         return True
 
     async def _messages(self):
-        """#417: the client's message stream, replaying first any messages a previous run()
-        read past its result (the start of a follow-up turn)."""
+        """Yield the client's messages, replaying stashed ones first.
+
+        - stash holds messages read past a result
+        """
         while self._stash:
             yield self._stash.pop(0)
-        # A client without receive_messages (an older SDK, test doubles) still works through
-        # receive_response — it ends at the result, which is where run() stops reading anyway.
+        # Clients without `receive_messages` fall back to `receive_response`.
+        # - covers older SDKs and test doubles
         source = getattr(self.client, "receive_messages", None) or self.client.receive_response
         async for msg in source():
             yield msg
 
     def _note_state(self, msg) -> str | None:
-        """#417: track session_state_changed; returns the state for such a message."""
+        """Track `session_state_changed`; return the state for such a message."""
         if isinstance(msg, SystemMessage) and getattr(msg, "subtype", "") == "session_state_changed":
             self._states_seen = True
             state = (getattr(msg, "data", None) or {}).get("state")
@@ -1739,33 +1527,22 @@ class ClaudeSession:
         return None
 
     async def run(self, prompt: str | None, attachments: list | None = None):
-        """Run one turn and yield normalized EngineEvent objects.
+        """Run one turn and yield normalized `EngineEvent` objects.
 
-        #417: ``prompt=None`` renders a FOLLOW-UP turn the CLI started by itself for a
-        message injected mid-run (see inject / followup_pending) — nothing is sent, the
-        stream is read where the previous run() left it.
-
-        Yields text_delta events as they stream, tool/status/rate_limit events
-        as they occur, and finally exactly one result (or error) event.
-
-        attachments, when given, is a list of Anthropic content-block dicts (image
-        and/or document blocks) sent alongside the prompt text (multimodal input).
-        It works in BOTH chat and code mode — content blocks are model input, not
-        tools — so a tool-free chat session can still see pictures and PDFs.
+        - `prompt=None` renders a CLI-started follow-up turn
+        - yields deltas, tool, status events, then one result or error
+        - `attachments`: image or document blocks, works in chat and code
         """
-        # Fresh turn: clear any interrupt flag left over from a prior /stop.
+        # Fresh turn: clear interrupt flag left from prior /stop.
         self._interrupted = False
         try:
             await self._ensure_client()
-        except Exception as exc:  # connection / spawn failures
-            # _ensure_client already tore down its half-built local client, but be
-            # defensive in case a connected client survived a later failure path:
-            # drop it so the NEXT turn rebuilds + reconnects instead of reusing a
-            # dead handle (#137 — the "Not connected" loop).
+        except Exception as exc:  # connection and spawn failures
+            # Drop any surviving client so the next turn reconnects.
+            # - avoids reusing a dead handle ("Not connected" loop)
             await self._drop_client()
-            # #137: prefer the REAL captured CLI stderr over the SDK's generic
-            # "Command failed … Check stderr output for details", and classify it so
-            # the user sees a meaningful, localized message. was: error_detail=str(exc).
+            # Prefer real CLI stderr over the SDK's generic message.
+            # - classified so the user sees a localized message
             detail = self._stderr_text() or str(exc)
             if detail != str(exc):
                 logger.warning("session start failed: %s", detail)
@@ -1789,42 +1566,36 @@ class ClaudeSession:
 
         running_text = ""
         self.followup_pending = False
-        _stream_iter = None  # #417: closed in the finally below
+        _stream_iter = None  # closed in the finally below
 
         try:
-            # #417: a follow-up turn (prompt None) was started by the CLI itself — send nothing.
+            # Follow-up turn started by the CLI: send nothing.
             if prompt is not None:
                 await self._send_query(prompt, attachments)
             self._turn_active = True
 
-            # #343: wrap the SDK stream so a turn that produces NO first message within
-            # _FIRST_TOKEN_TIMEOUT_SEC (service overloaded/unavailable, CLI silently
-            # retrying the request) is cut short with a clear error instead of an endless
-            # "thinking…" hang. Only EACH wait BEFORE the first model event is bounded (the
-            # pre-_progressed __anext__ calls); once the model is streaming (_progressed) we
-            # never time it out (a long tool call / build legitimately emits no events for
-            # minutes).
-            # was: `async for msg in self.client.receive_response():`
-            # #417: was `self.client.receive_response().__aiter__()` — our own iterator replays
-            # what a previous run() read past its result, and the loop ends at the result itself.
+            # Wrap the SDK stream with a first-token timeout.
+            # - no first message in `_FIRST_TOKEN_TIMEOUT_SEC`: cut short, clear error
+            # - only waits before the first model event are bounded
+            # - long tool calls legitimately emit nothing for minutes
+            # - own iterator replays messages a previous run() read past
             _stream_iter = self._messages().__aiter__()
             _progressed = False
-            _answered = False  # #358: real ANSWER content started (text/tool/result), not thinking
+            _answered = False  # answer content started, not thinking
             while True:
                 try:
                     _next = _stream_iter.__anext__()
-                    # #358: bound THIS wait by phase — before any event: the first-token watchdog;
-                    # after thinking started but before any answer content: the stall watchdog (a
-                    # silent-after-reasoning upstream must not animate <tg-thinking> forever); once
-                    # answering: unbounded (a long tool call / build emits nothing for minutes).
-                    # was: `if _progressed or _FIRST_TOKEN_TIMEOUT_SEC <= 0: msg = await _next`
+                    # Bound each wait by phase.
+                    # - before any event: first-token watchdog
+                    # - thinking but no answer yet: stall watchdog
+                    # - answering: unbounded; long tool calls emit nothing
                     if _answered:
                         _wait = 0.0
                     elif not _progressed:
                         _wait = _FIRST_TOKEN_TIMEOUT_SEC
                     else:
                         _wait = _STALL_TIMEOUT_SEC
-                    if _wait > 0:              # 0.0 (answering) / negative → unbounded await
+                    if _wait > 0:              # 0.0 or negative means unbounded
                         msg = await asyncio.wait_for(_next, _wait)
                     else:
                         msg = await _next
@@ -1836,8 +1607,8 @@ class ClaudeSession:
                         "model response" if not _progressed else "answer after reasoning",
                         _wait,
                     )
-                    # #350: close the abandoned response generator (suppressing errors) before
-                    # tearing down the transport, so it is not left to the GC async-gen finalizer.
+                    # Close the abandoned response generator before transport teardown.
+                    # - suppress errors; avoid GC async-gen finalizer
                     with contextlib.suppress(Exception):
                         await _stream_iter.aclose()
                     await self._drop_client()
@@ -1846,35 +1617,30 @@ class ClaudeSession:
                         text=("The service is taking too long to respond — it may be "
                               "temporarily overloaded or unavailable. Please try again."),
                         error_key="err.service_unavailable",
-                        # was: error_detail="no model response within %ds" — dropped for #350
-                        # (the warning above already logs it; err.service_unavailable carries no
-                        # {detail} placeholder, so it was dead for the user).
+                        # Timeout detail is only logged; message has no `{detail}`.
                     )
                     return
-                # First real streamed message → the service IS responding, so stop bounding
-                # the wait. The init SystemMessage / UserMessage don't count (they arrive from
-                # local subprocess startup, before the API is even called).
+                # First real streamed message means the service is responding.
+                # - stop bounding the wait
+                # - init and user messages don't count (local startup)
                 if not _progressed and isinstance(
                     msg, (StreamEvent, AssistantMessage, ResultMessage, RateLimitEvent)
                 ):
                     _progressed = True
-                # #324: persist the session id as SOON as any message carries it (the init
-                # SystemMessage does), not only the terminal ResultMessage — so a turn KILLED
-                # mid-flight (a restart/crash/reap before the result) still leaves a RESUMABLE id.
-                # Without this the next message can't resume → the session loses ALL its context
-                # (the incident: a service restart killed an SVG turn before its result, the id
-                # was never saved, and the next message started a fresh "new session").
+                # Persist session id as soon as any message carries it.
+                # - a turn killed mid-flight still leaves a resumable id
+                # - else the next message loses all session context
                 _sid = getattr(msg, "session_id", None)
                 if _sid and _sid != self.session_id:
                     self.session_id = _sid
                     yield EngineEvent(kind="session", session_id=_sid)
-                # #411: the init message carries the concrete model the CLI resolved our
-                # model (a family alias) to — kept for usage accounting and display.
+                # Init message carries the concrete model the alias resolved to.
+                # - kept for usage accounting and display
                 if isinstance(msg, SystemMessage) and getattr(msg, "subtype", "") == "init":
                     _m = (getattr(msg, "data", None) or {}).get("model")
                     if isinstance(_m, str) and _m:
                         self.resolved_model = _m
-                self._note_state(msg)  # #417
+                self._note_state(msg)
                 # --- Incremental text deltas (preferred for live streaming) ---
                 if isinstance(msg, StreamEvent):
                     event = msg.event or {}
@@ -1882,31 +1648,28 @@ class ClaudeSession:
                         delta = event.get("delta") or {}
                         piece = delta.get("text")
                         if piece:
-                            _answered = True  # #358: real answer text → stop bounding the wait
+                            _answered = True  # real answer text ends bounded wait
                             running_text += piece
                             yield EngineEvent(kind="text_delta", text=piece)
                         else:
-                            # #240c: extended-thinking deltas arrive as the SAME event with a
-                            # `thinking_delta` (delta.thinking) instead of text. Surface them so
-                            # the consumer can stream the reasoning into the <tg-thinking> block.
-                            # NOT added to running_text — reasoning is not the answer.
+                            # Thinking deltas arrive as the same event with `thinking_delta`.
+                            # - surfaced for the `<tg-thinking>` block
+                            # - not added to running_text; reasoning isn't the answer
                             think = delta.get("thinking")
                             if think:
                                 yield EngineEvent(kind="thinking_delta", text=think)
                     elif event.get("type") == "content_block_start":
-                        # #319: a tool block is STARTING — surface it so the consumer shows a
-                        # live phase ("🌐 Searching the web…") DURING a slow call (esp. a
-                        # server-side WebSearch, whose assembled ToolUseBlock — and thus the
-                        # post-hoc `tool` event — only lands AFTER the search returns). Phase
-                        # only; the real `tool` event still adds sources. Defensive: a differing
-                        # SDK shape simply no-ops.
+                        # A tool block is starting: surface a live phase.
+                        # - server-side WebSearch's `tool` event lands only after it returns
+                        # - phase only; the real `tool` event still adds sources
+                        # - differing SDK shape simply no-ops
                         cb = event.get("content_block") or {}
                         if cb.get("type") in ("tool_use", "server_tool_use"):
                             _raw = cb.get("name") or ""
                             _name = {"web_search": "WebSearch",
                                      "web_fetch": "WebFetch"}.get(_raw, _raw)
                             if _name:
-                                _answered = True  # #358: a tool call is answer progress
+                                _answered = True  # tool call counts as progress
                                 yield EngineEvent(
                                     kind="tool_start", tool_name=_name, tool_input={})
                     continue
@@ -1914,33 +1677,23 @@ class ClaudeSession:
                 # --- Assistant message: text blocks + tool-use blocks ---
                 if isinstance(msg, AssistantMessage):
                     if getattr(msg, "error", None):
-                        # Auth/billing errors arrive HERE as an in-band
-                        # AssistantMessage.error (e.g. "authentication_failed"), NOT
-                        # as a connect/stream exception — so, unlike the other two
-                        # error paths, this one never dropped the client. A long-lived
-                        # `claude` subprocess holding a now-stale OAuth token (the
-                        # access token expired mid-run, or the owner re-logged in and
-                        # rewrote ~/.claude/.credentials.json) would then repeat the
-                        # 401 on EVERY following turn until a manual bot restart. Drop
-                        # the client for the credential-class errors so the next turn
-                        # rebuilds a fresh subprocess that re-reads the refreshed
-                        # credentials and self-heals — no restart needed. (The proper
-                        # central fix is the #119 broker: it owns token injection +
-                        # OAuth refresh so a single subprocess never goes stale.)
+                        # Auth errors arrive in-band as `AssistantMessage.error`, not exceptions.
+                        # - stale OAuth token would repeat the 401 every turn
+                        # - drop client for credential errors so next turn rebuilds
+                        # - rebuilt subprocess re-reads refreshed credentials
+                        # - broker owns token injection and refresh centrally
                         if str(msg.error) in ("authentication_failed", "billing_error"):
                             await self._drop_client()
-                        # #361: relabel a model REFUSAL (invalid_request + stop_reason
-                        # "refusal") to a distinct message instead of the generic "Invalid
-                        # request to the model." — a cyber-safeguard refusal gets its own.
-                        # was: text=_error_message(msg.error), error_key=_error_key(msg.error)
+                        # Relabel a model refusal to a distinct message.
+                        # - invalid_request with stop_reason refusal, not generic error
                         _err_key, _err_text = _refine_error(msg)
                         yield EngineEvent(
                             kind="error",
                             text=_err_text,
                             error_key=_err_key,
                             error_detail=str(msg.error),
-                            # #137: a mid-turn rate_limit means the window is spent —
-                            # let the consumer flip the usage display to "limited".
+                            # Mid-turn rate_limit means the window is spent.
+                            # - consumer flips usage display to limited
                             limit_hit=(str(msg.error) == "rate_limit"),
                         )
                         # An errored assistant message is terminal for this turn.
@@ -1948,15 +1701,14 @@ class ClaudeSession:
 
                     for block in msg.content or []:
                         if isinstance(block, TextBlock):
-                            _answered = True  # #358: assistant text block is answer content
-                            # Provide the full accumulated text as a fallback for
-                            # consumers; deltas above are still preferred.
+                            _answered = True  # assistant text block is answer content
+                            # Full accumulated text as fallback; deltas are preferred.
                             text = block.text or ""
                             if text and text not in running_text:
                                 running_text += text
                             yield EngineEvent(kind="text_full", text=running_text)
                         elif isinstance(block, ToolUseBlock):
-                            _answered = True  # #358: assistant tool-use block is answer content
+                            _answered = True  # tool-use block is answer content
                             yield EngineEvent(
                                 kind="tool",
                                 tool_name=block.name or "",
@@ -1977,10 +1729,10 @@ class ClaudeSession:
                     if getattr(msg, "session_id", None):
                         self.session_id = msg.session_id
                     final_text = msg.result if msg.result is not None else running_text
-                    # #417: messages were injected during this run — find out whether the
-                    # CLI folded them in (it goes idle right after this result) or is starting
-                    # a follow-up turn for them (anything else arrives) BEFORE reporting the
-                    # result, so the caller knows to render that turn as its own reply.
+                    # Injected messages: learn if folded in or a follow-up starts.
+                    # - folded in: CLI goes idle right after result
+                    # - else a follow-up turn starts for them
+                    # - decided before reporting result, so caller renders it separately
                     if self._injected and self._states_seen:
                         await self._settle_after_result(_stream_iter)
                     self._turn_active = False
@@ -1993,23 +1745,18 @@ class ClaudeSession:
                     )
                     return
 
-                # Any other message type (SystemMessage, UserMessage, etc.) is
-                # not surfaced to the Telegram layer; ignore silently.
+                # Other message types are not surfaced; ignore silently.
         except Exception as exc:
-            self._turn_active = False  # #417
-            # A requested interrupt (/stop) can surface as an exception out of
-            # receive_response(); that is a deliberate end, not a failure, so we
-            # return quietly and let the partial text already streamed stand as
-            # the final answer (no spurious "Execution error" line).
+            self._turn_active = False
+            # A requested interrupt can surface as an exception.
+            # - that is a deliberate end, not a failure
+            # - return quietly; streamed partial text stands as the answer
             if self._interrupted:
                 return
-            # The transport may be wedged after a query()/receive_response()
-            # failure (e.g. the CLI subprocess died mid-turn). Drop the client so
-            # the next turn reconnects cleanly rather than replaying the error on a
-            # dead handle (#137 — "Not connected. Call connect() first.").
+            # Transport may be wedged after a failure; drop the client.
+            # - next turn reconnects instead of replaying the error
             await self._drop_client()
-            # #137: surface the real CLI stderr + classify (limit vs generic), same
-            # as the connect-time path. was: error_detail=str(exc) only.
+            # Surface real CLI stderr and classify it, as at connect.
             detail = self._stderr_text() or str(exc)
             if detail != str(exc):
                 logger.warning("turn failed: %s", detail)
@@ -2029,20 +1776,19 @@ class ClaudeSession:
                     error_detail=detail,
                 )
         finally:
-            # #417: whatever ended the run (result, in-band error, failure, interrupt), the turn
-            # is no longer accepting injections, and our message iterator (an unbounded
-            # receive_messages() wrapper, unlike the old receive_response()) is closed.
+            # Whatever ended the run, the turn stops accepting injections.
+            # - close our message iterator, an unbounded `receive_messages()` wrapper
             self._turn_active = False
             if _stream_iter is not None:
                 with contextlib.suppress(Exception):
                     await _stream_iter.aclose()
 
     async def _settle_after_result(self, stream_iter) -> None:
-        """#417: after a result in a run that injected messages, read on until the CLI either
-        reports idle (the injections were folded into this turn — done) or emits anything else
-        (it started a follow-up turn for them): that first message is stashed for the next
-        run(None) and ``followup_pending`` is raised. Bounded: if nothing arrives, give up
-        quietly (a late follow-up then merges into the next turn instead of hanging this one)."""
+        """Read past a result until idle or follow-up.
+
+        - first non-idle message is stashed and `followup_pending` raised
+        - bounded: gives up quietly if nothing arrives
+        """
         while True:
             try:
                 msg = await asyncio.wait_for(stream_iter.__anext__(), _SETTLE_TIMEOUT_SEC)
@@ -2052,7 +1798,7 @@ class ClaudeSession:
             if state == "idle":
                 return
             if state is not None:
-                continue  # running / requires_action: keep waiting for the decision
+                continue  # running / requires_action: keep waiting
             self._stash.append(msg)
             self.followup_pending = True
             return
@@ -2060,10 +1806,7 @@ class ClaudeSession:
     async def context_usage(self):
         """Return raw SDK context-window usage, or None if unavailable.
 
-        Exposes ClaudeSDKClient.get_context_usage() for the handler layer.
-        The return shape is an SDK object/dict; we return it raw and let
-        handlers.py format it defensively (str()/getattr). Any failure (no
-        connected client, SDK error) yields None so callers can fall back.
+        - any failure yields None so callers can fall back
         """
         if self.client is None:
             return None
@@ -2073,11 +1816,10 @@ class ClaudeSession:
             return None
 
     async def interrupt(self) -> None:
-        """Cancel the in-flight turn, if any (used by /stop).
+        """Cancel the in-flight turn, if any.
 
-        Sets _interrupted first so run() treats any exception the interrupt
-        raises inside receive_response() as a clean, deliberate end rather than
-        an error to surface (the already-streamed partial text stands as final).
+        - sets `_interrupted` first so `run()` ends cleanly
+        - already-streamed partial text stands as final
         """
         self._interrupted = True
         if self.client:
@@ -2085,13 +1827,11 @@ class ClaudeSession:
                 await self.client.interrupt()
 
     async def _drop_client(self) -> None:
-        """Disconnect and forget the current client (best-effort).
+        """Disconnect and forget the current client, best-effort.
 
-        Shared teardown for failure paths in run(): after a connect/query/stream
-        failure the handle may be unusable, so we disconnect (suppressing errors)
-        and set self.client = None so _ensure_client rebuilds + reconnects on the
-        next turn. Per-thread rec.lock (sessions.py) serializes turns for a given
-        session, so this never races a concurrent run() on the same client.
+        - shared teardown for failure paths in `run()`
+        - next turn rebuilds the client
+        - per-thread lock prevents racing a concurrent `run()`
         """
         client, self.client = self.client, None
         if client:
@@ -2100,17 +1840,13 @@ class ClaudeSession:
 
     async def aclose(self) -> None:
         """Disconnect and drop the underlying client."""
-        # was: inline disconnect + self.client = None — replaced for #137
         await self._drop_client()
-        await self._close_shell()  # #227a: tear down the persistent jailed shell too
+        await self._close_shell()  # tear down persistent jailed shell too
 
     def set_model(self, model: str) -> None:
         """Update the model, applied on the next client build.
 
-        We deliberately do NOT fire a detached client.set_model() task here: a
-        bare create_task() can be garbage-collected before completion and would
-        race an in-flight turn on the live client. Model changes go through the
-        rebuild path (SessionManager.on_mode_or_model_or_cwd_change), which
-        aclose()s the old client and builds a new one with the new model.
+        - no detached `set_model()` task: could be collected or race
+        - changes go through the rebuild path
         """
         self.model = model

@@ -1,9 +1,8 @@
-"""Tests for the #119 sandbox completion: seccomp filter (119e), egress proxy host
-matching (119c), and the engine SBX_* env wiring (119c/119d/119e).
+"""Tests for sandbox completion: seccomp, egress proxy, `SBX_*` env.
 
-The seccomp test runs a tiny classic-BPF interpreter over the generated program: it
-is the regression guard for the fall-through bug where DENY sat in the fall-through
-position and EVERY non-denied syscall returned EPERM (the process then SIGSEGV'd).
+- seccomp test runs a tiny classic-BPF interpreter
+- guards against deny in fall-through position
+- that bug made every non-denied syscall return EPERM
 """
 
 import importlib.util
@@ -22,7 +21,7 @@ def _load(mod_file):
     return mod
 
 
-# --------------------------------------------------------------- seccomp (119e)
+# ---- seccomp ----
 mkseccomp = _load("make-seccomp.py")
 egress = _load("egress-proxy.py")
 
@@ -37,8 +36,10 @@ def _decode(blob):
 
 
 def _run_bpf(ins, nr, arch):
-    """Minimal classic-BPF seccomp interpreter for the opcodes the generator emits
-    (LD_ABS of nr/arch, JEQ, RET). Returns the action constant the filter yields."""
+    """Minimal classic-BPF seccomp interpreter for generated opcodes.
+
+    - returns the action constant the filter yields
+    """
     a, pc = 0, 0
     for _ in range(10_000):
         code, jt, jf, k = ins[pc]
@@ -58,26 +59,27 @@ def test_seccomp_blob_is_well_formed():
     blob = mkseccomp.build(mkseccomp.DENY_X86_64)
     assert len(blob) % 8 == 0
     ins = _decode(blob)
-    # ALLOW must be the fall-through sink (second-to-last); DENY (ERRNO) the last,
-    # reached only by an explicit jump. Get this wrong and everything returns EPERM.
+    # ALLOW is the fall-through sink (second-to-last).
+    # - DENY (ERRNO) is last, reached only by explicit jump
+    # - getting this wrong makes everything return EPERM
     assert ins[-2] == (0x06, 0, 0, ALLOW)
     assert ins[-1] == (0x06, 0, 0, ERRNO_EPERM)
 
 
 def test_seccomp_denies_only_the_denylist():
     ins = _decode(mkseccomp.build(mkseccomp.DENY_X86_64))
-    # Common syscalls (write=1, mmap=9, getpid=39, execve=59) MUST be allowed —
-    # the exact class the fall-through bug broke.
+    # Common syscalls (write, mmap, getpid, execve) must be allowed.
+    # - the class the fall-through bug broke
     for nr in (0, 1, 9, 10, 39, 59, 231, 257):
         assert _run_bpf(ins, nr, X86_64) == ALLOW, f"syscall {nr} wrongly denied"
     # Every denylisted syscall is refused with EPERM on x86_64.
     for nr in mkseccomp.DENY_X86_64:
         assert _run_bpf(ins, nr, X86_64) == ERRNO_EPERM, f"syscall {nr} not denied"
-    # On a non-x86_64 arch we ALLOW (we only know x86_64 numbers).
+    # Non-x86_64 arch is allowed; only x86_64 numbers are known.
     assert _run_bpf(ins, 248, 0xDEADBEEF) == ALLOW
 
 
-# ----------------------------------------------------------- egress proxy (119c)
+# ---- egress proxy ----
 def test_host_allowlist_suffix_match():
     allow = frozenset({"github.com", "pypi.org"})
     assert egress._host_allowed("github.com", allow)
@@ -88,7 +90,7 @@ def test_host_allowlist_suffix_match():
     assert not egress._host_allowed("example.com", allow)
 
 
-# --------------------------------------------------- engine SBX_* env (119c/d/e)
+# ---- engine `SBX_*` env ----
 def _enabled_env(cwd, **kw):
     s = engine.ClaudeSession(mode="code", model="claude-opus-4-8", cwd=cwd,
                              sandbox=True, **kw)
@@ -109,12 +111,12 @@ def test_enable_sandbox_sets_egress_limits_seccomp(tmp_path):
     env = common["env"]
     assert env["SBX_EGRESS"] == "1"
     assert env["SBX_PROXY_URL"] == "http://127.0.0.1:8790"
-    assert env["SBX_USE_CGROUP"] == "1"          # egress/limits need the cgroup
+    assert env["SBX_USE_CGROUP"] == "1"          # egress and limits need the cgroup
     assert env["SBX_MEM_MAX"] == "536870912"
     assert env["SBX_CPU_MAX"] == "150000 100000"
     assert env["SBX_PIDS_MAX"] == "256"
     assert env["SBX_SECCOMP"] == str(blob)
-    # #119d: the per-session secrets file is ALWAYS pointed at <sid>/secrets.env.
+    # The per-session secrets file always points at `<sid>/secrets.env`.
     assert env["SBX_SECRETS_ENV"].endswith("/sid/secrets.env")
     assert common["cli_path"].endswith("sandbox-claude.sh")
 
@@ -123,9 +125,9 @@ def test_enable_sandbox_no_egress_no_cgroup(tmp_path):
     cwd = str(tmp_path / "sid" / "work")
     env = _enabled_env(cwd)["env"]
     assert "SBX_EGRESS" not in env
-    assert "SBX_USE_CGROUP" not in env           # nothing requested → no cgroup placement
+    assert "SBX_USE_CGROUP" not in env           # nothing requested: no cgroup placement
     assert "SBX_SECCOMP" not in env
-    assert env["SBX_SECRETS_ENV"].endswith("/sid/secrets.env")  # still set (119d)
+    assert env["SBX_SECRETS_ENV"].endswith("/sid/secrets.env")  # still set
 
 
 def test_enable_sandbox_seccomp_path_must_exist(tmp_path):
@@ -135,7 +137,7 @@ def test_enable_sandbox_seccomp_path_must_exist(tmp_path):
 
 
 def test_per_session_uid_deterministic_in_range(tmp_path):
-    cwd = str(tmp_path / "abc123" / "work")   # 'abc123' parses as hex (a real sid digest)
+    cwd = str(tmp_path / "abc123" / "work")   # `abc123` parses as hex (a real sid digest)
     e1 = _enabled_env(cwd, per_session_uid=True, uid_base=700000, uid_range=1000)["env"]
     e2 = _enabled_env(cwd, per_session_uid=True, uid_base=700000, uid_range=1000)["env"]
     assert e1["SBX_HOST_UID"] == e2["SBX_HOST_UID"]      # stable per session (chown stays valid)
@@ -156,31 +158,34 @@ def test_chat_session_skips_egress_but_keeps_broker(tmp_path):
     common = {}
     s._enable_sandbox(common)
     env = common["env"]
-    # egress + cgroup limits are CODE-only (chat has no Bash exfil surface + needs WebFetch)
+    # Egress and cgroup limits are code-only.
+    # - chat has no Bash exfil surface and needs WebFetch
     assert "SBX_EGRESS" not in env
     assert "SBX_USE_CGROUP" not in env
     assert "SBX_MEM_MAX" not in env
-    # the broker (token out of EVERY jail) + seccomp + secrets still apply to chat
+    # Broker, seccomp and secrets still apply to chat.
+    # - broker keeps the token out of every jail
     assert env["SBX_BROKER_URL"] == "http://127.0.0.1:8789"
     assert env["SBX_SECCOMP"] == str(blob)
     assert env["SBX_SECRETS_ENV"].endswith("/sid/secrets.env")
 
 
-# ------------------------------------------------------ cred-broker path allowlist (119b)
+# ---- cred-broker path allowlist ----
 _broker = _load("cred-broker.py")
 
 
 def test_cred_broker_path_allowlist():
-    """#234: the inbound path allowlist matches by path segment, not a bare prefix —
-    only `/v1/messages` itself and `/v1/messages/...` sub-paths pass, never a sibling
-    like `/v1/messages_evil`. The query string is ignored."""
+    """Inbound path allowlist matches by segment, not bare prefix.
+
+    - `/v1/messages` and sub-paths pass; siblings never
+    - query string is ignored
+    """
     f = _broker._path_allowed
-    # allowed: the exact path, sub-paths (e.g. count_tokens), and with a query string
+    # allowed: exact path, sub-paths, and with a query string
     assert f("POST", "/v1/messages") is True
     assert f("POST", "/v1/messages/count_tokens") is True
     assert f("POST", "/v1/messages?beta=true") is True
-    # blocked: a bare-prefix sibling that the old startswith() let through, a different
-    # method, and an unrelated path
+    # blocked: bare-prefix sibling, different method, unrelated path
     assert f("POST", "/v1/messages_evil") is False
     assert f("POST", "/v1/messagesX") is False
     assert f("GET", "/v1/messages") is False

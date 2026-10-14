@@ -1,36 +1,11 @@
 #!/usr/bin/env python3
-"""#237 — live verifier for rich-message drafts, tables, and the draft→final handoff.
+"""Live verifier for rich-message drafts, tables, and final handoff.
 
-Calls the Telegram Bot API DIRECTLY (stdlib urllib — NO aiogram, NO streamer.py, NO the
-/test demo), so it isolates the rich-draft/table behavior from the rest of the bot:
-
-  - if a glitch (empty table body, a full disappear→reappear at finalize) reproduces HERE,
-    it is the draft model / client / our message SHAPE — NOT aiogram or our streamer/clip;
-  - if it does NOT reproduce here but does in the bot, the bug is in our pipeline.
-
-Ground truth: see ../rich-message-spec.md (extracted verbatim from the official docs).
-Key facts this exercises:
-  - sendRichMessageDraft: ephemeral ~30s preview; draft_id MUST be non-zero; same draft_id
-    animates; private chat only. InputRichMessage = exactly one of {"markdown"} / {"html"}.
-  - This bot streams + persists with the MARKDOWN form ({"markdown": …}); HTML is only for
-    menus + the native-table fallback. So we test the markdown form by default.
-  - A markdown table needs header + separator (|:--|) + COMPLETE rows; a partial row is
-    invalid GFM (renders as the header line alone) — hence we only ever send valid prefixes.
-  - <tg-thinking>…</tg-thinking> (RichBlockThinking) is draft-ONLY; never in the final send.
-  - finish = sendRichMessage with the COMPLETE message (the draft does not persist itself).
-
-Usage (run on the host; reads TELEGRAM_BOT_TOKEN + OWNER_ID from ../.env):
-    python3 deploy/verify-rich-draft.py                 # markdown table, draft→final
-    python3 deploy/verify-rich-draft.py --thinking      # open with a <tg-thinking> draft
-    python3 deploy/verify-rich-draft.py --html          # same table via the HTML <table> form
-    python3 deploy/verify-rich-draft.py --wide          # #243: a 21-column table (over the 20 limit)
-    python3 deploy/verify-rich-draft.py --wide --cols 25
-    python3 deploy/verify-rich-draft.py --chat 12345    # target chat (default: OWNER_ID)
-    python3 deploy/verify-rich-draft.py --step 0.7      # seconds between draft frames
-
-Watch the chat and report: does the table fill ROW-BY-ROW, and does the message stay put at
-finalize (no disappear→reappear)?  Sending via the bot token while the service polls is fine
-(only getUpdates conflicts, not sendMessage).
+- calls the Bot API directly with stdlib `urllib`, no aiogram
+- isolates draft behavior from the bot's streamer pipeline
+- markdown tables need complete rows; partial is invalid
+- `<tg-thinking>` is draft-only; final send is `sendRichMessage`
+- usage: `python3 deploy/verify-rich-draft.py` with `--thinking`, `--html`, `--wide`
 """
 from __future__ import annotations
 
@@ -41,7 +16,7 @@ import time
 import urllib.request
 from pathlib import Path
 
-DRAFT_ID = 424242  # non-zero; reused so Telegram animates successive frames
+DRAFT_ID = 424242  # non-zero; reused so frames animate
 
 _ENV = Path(__file__).resolve().parent.parent / ".env"
 
@@ -77,8 +52,9 @@ def _final(token: str, chat: int, markdown: str | None = None, html: str | None 
     print(f"  FINAL sendRichMessage -> ok={out.get('ok')} {('' if out.get('ok') else out)}")
 
 
-# A small table built up the way the bot streams it: intro prose, then header, then the
-# separator, then one COMPLETE data row at a time (each frame a valid markdown prefix).
+# Table built the way the bot streams it.
+# - intro prose, header, separator, then one row per frame
+# - each frame is a valid markdown prefix
 HEADER = "| Address | Opcode | Mnemonic |"
 SEP = "|:--------|:-------|:---------|"
 ROWS = [
@@ -91,12 +67,13 @@ INTRO = "Rich-draft verifier — the table below should fill in **row by row**:"
 
 def _markdown_frames() -> list[str]:
     frames = [INTRO]
-    # header alone (no separator yet → not a valid table; renders as a text line)
+    # Header alone: no separator, so a plain text line.
     frames.append(f"{INTRO}\n\n{HEADER}")
-    # header + separator → a valid but EMPTY-body table (this is the state the bot shows
-    # transiently; confirm it renders as a header-only table, not as broken text)
+    # Header plus separator: valid table with an empty body.
+    # - the bot shows this state transiently
+    # - confirm it renders header-only, not as broken text
     frames.append(f"{INTRO}\n\n{HEADER}\n{SEP}")
-    # add one complete row per frame
+    # Add one complete row per frame.
     acc = f"{INTRO}\n\n{HEADER}\n{SEP}"
     for r in ROWS:
         acc = f"{acc}\n{r}"
@@ -106,14 +83,16 @@ def _markdown_frames() -> list[str]:
 
 
 def _wide_markdown(ncols: int = 21) -> str:
-    """#243: a markdown table with `ncols` columns (default 21 — one over the documented
-    20-column limit). Use this to verify what the client does with an over-limit table:
-    reject the send, truncate to 20, or auto-convert to an image."""
+    """Markdown table with `ncols` columns, default 21.
+
+    - one over the documented 20-column limit
+    - shows whether the client rejects, truncates or converts to image
+    """
     header = "| " + " | ".join(f"C{i + 1}" for i in range(ncols)) + " |"
     sep = "|" + "|".join([":--"] * ncols) + "|"
     row1 = "| " + " | ".join(f"r1c{i + 1}" for i in range(ncols)) + " |"
     row2 = "| " + " | ".join(f"r2c{i + 1}" for i in range(ncols)) + " |"
-    intro = f"#243 over-limit check — this table has **{ncols} columns** (limit is 20):"
+    intro = f"Over-limit check — this table has **{ncols} columns** (limit is 20):"
     return f"{intro}\n\n{header}\n{sep}\n{row1}\n{row2}"
 
 
@@ -127,7 +106,7 @@ def _html_table() -> str:
 
 
 def _math_markdown() -> str:
-    """#297: a reply mixing INLINE ($…$) and BLOCK ($$…$$) LaTeX math."""
+    """Reply mixing inline and block LaTeX math."""
     return (
         "Euler's identity: $e^{i\\pi}+1=0$.\n\n"
         "A definite integral as a block formula:\n"
@@ -141,13 +120,13 @@ def main() -> None:
     ap.add_argument("--chat", type=int, default=0, help="target chat id (default: OWNER_ID)")
     ap.add_argument("--step", type=float, default=0.7, help="seconds between draft frames")
     ap.add_argument("--math", action="store_true",
-                    help="#297: verify $…$ inline + $$…$$ block math (draft snap + parsed blocks)")
+                    help="verify $…$ inline + $$…$$ block math (draft snap + parsed blocks)")
     ap.add_argument("--thinking", action="store_true",
                     help="open with a <tg-thinking> draft (draft-only block)")
     ap.add_argument("--html", action="store_true",
                     help="use the HTML <table> form instead of markdown")
     ap.add_argument("--wide", action="store_true",
-                    help="#243: send a >20-column table (default 21) to verify over-limit behavior")
+                    help="send a >20-column table (default 21) to verify over-limit behavior")
     ap.add_argument("--cols", type=int, default=21, help="column count for --wide (default 21)")
     args = ap.parse_args()
 
@@ -157,15 +136,16 @@ def main() -> None:
           f"form: {'html' if args.html else 'markdown'}  thinking: {args.thinking}")
 
     if args.thinking:
-        # <tg-thinking> is valid ONLY in a draft; it must NOT appear in the final message.
+        # `<tg-thinking>` is valid only in drafts, never the final.
         print("thinking draft:")
         _draft(token, chat, markdown="<tg-thinking>Generating…</tg-thinking>")
         time.sleep(args.step)
 
     if args.math:
-        # #297: $…$ → inline mathematical_expression, $$…$$ → block. Stream a partial frame
-        # (unclosed $$ at the frontier — should render as literal text, then snap to the formula
-        # on the complete frame), then dump the server-parsed blocks to confirm the mapping.
+        # Inline `$…$` and block `$$…$$` map to math blocks.
+        # - stream a partial frame with an unclosed `$$`
+        # - expect literal text, then a snap to the formula
+        # - dump server-parsed blocks to confirm the mapping
         full = _math_markdown()
         partial = full.split("$$")[0] + "$$\\int_0^1 x^2"   # unclosed block at the frontier
         print("math: partial (unclosed $$) draft, then the complete message:")
@@ -181,7 +161,7 @@ def main() -> None:
         return
 
     if args.wide:
-        # #243: send an over-limit (>20-col) table draft + final and report what the client does.
+        # Send an over-20-column table draft and final.
         full = _wide_markdown(args.cols)
         print(f"wide table: {args.cols} columns (limit 20) — draft then final:")
         _draft(token, chat, markdown=full)
@@ -191,7 +171,7 @@ def main() -> None:
         return
 
     if args.html:
-        # HTML form streams the whole <table> as one valid block per frame.
+        # HTML form streams the whole table per frame.
         full = _html_table()
         print("html drafts (whole table grows is not row-wise here — sent once):")
         _draft(token, chat, html=full)

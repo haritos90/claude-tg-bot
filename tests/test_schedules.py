@@ -1,4 +1,7 @@
-"""Unit tests for the #188 schedule parser + next-run computation (pure)."""
+"""Unit tests for the schedule parser and next-run computation.
+
+- pure, no I/O
+"""
 
 from datetime import datetime
 
@@ -54,7 +57,7 @@ def test_bad_phrase_raises():
 
 
 def test_next_run_daily_advances_past_now():
-    # 2026-06-19 12:00 local; daily at 09:00 → next is the 20th 09:00.
+    # 12:00 local; daily at 09:00 gives next day 09:00.
     now = datetime(2026, 6, 19, 12, 0, 0).timestamp()
     nxt = schedules.next_run_after({"kind": "daily", "hour": 9, "minute": 0}, now)
     d = datetime.fromtimestamp(nxt)

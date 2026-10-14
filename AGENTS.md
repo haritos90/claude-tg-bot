@@ -17,8 +17,7 @@ until Telegram fixes drafts streaming in groups.
 
 ## 1. Working on the project
 
-Code comments reference maintainer task ids as `#N`. Don't reuse these numbers.
-Describe your changes in the PR.
+Code comments carry no task ids, dates or history. Describe your changes in the PR.
 
 Docs are part of the change:
 
@@ -76,8 +75,9 @@ Development and test extras are in `requirements/dev.txt` (`pytest`, `ruff`); ru
    an allowlisted user, and fails closed. Allowlist management is owner-only.
 6. Conventional Commits: `<type>(<scope>): <imperative summary>`.
 7. Keep changes small and idiomatic — match the surrounding file, comment the why not the what.
-8. Preserve replaced code as a commented-out block. When changing or removing
-   existing logic, comment the old version next to the new code so changes stay auditable.
+8. Comments and docstrings are one line of about 5 words, 10 at most; when more is needed,
+   add a `- ` list under it, each line within the same limit. No task references, no dates,
+   no commented-out old code — delete replaced code, git history keeps it.
 
 ---
 

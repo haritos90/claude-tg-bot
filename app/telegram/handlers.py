@@ -1,19 +1,9 @@
-"""aiogram Router: all commands, plain-text routing, and permission callbacks.
+"""Telegram control surface: commands, text routing, permission callbacks.
 
-This is the Telegram-facing control surface of the bot. Every update reaching
-these handlers has already passed the access middleware (owner + allowlist), so
-non-owner-gated handlers are open to any allowed user. User-facing strings are
-English; code/comments are English too.
-
-Per-topic isolation: each forum topic is identified by message_thread_id; the
-General topic (no thread id) is represented by the integer key 0. The helper
-thread_key() collapses None -> 0. When sending into a topic we must pass
-message_thread_id=None for key 0 and the key otherwise; reply() handles this.
-
-Note: the bot is now DM-first — each user's sessions are negative-keyed DM
-sessions in a private chat. The supergroup/forum-Topics path below (positive
-keys, message_thread_id routing) is frozen/dormant; it is kept but not the live
-mode (see AGENTS.md).
+- updates arrive pre-filtered by the access middleware
+- a topic is keyed by `message_thread_id`; General is 0
+- the live mode is DM sessions with negative keys
+- the supergroup topics path is dormant
 """
 
 from __future__ import annotations
@@ -26,14 +16,13 @@ import io
 import json
 import logging
 import re
-# import shutil  # unused after #177 — session-delete teardown moved to archive.py
 import time
 import zipfile
 from pathlib import Path
-from datetime import datetime, timezone  # #412: timezone for the CLI last-check stamp
+from datetime import datetime, timezone  # CLI last-check timezone
 
 from aiogram import Router, F
-from aiogram.exceptions import TelegramBadRequest  # #173: detect "not modified" on rich edits
+from aiogram.exceptions import TelegramBadRequest  # detect "not modified" on rich edits
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     BotCommand,
@@ -51,68 +40,43 @@ from app.storage import db
 from app.core import engine
 from app import i18n
 from app.telegram import markup
-from app.telegram import streamer as streamer_mod  # #323: set_owner_premium (custom-emoji gate)
+from app.telegram import streamer as streamer_mod  # custom-emoji premium gate
 from app.core import schedules
-from app.core import sessions as _sessions  # module (build_router's `sessions` param is the instance)
-from app.core import transcribe  # #363: local speech-to-text for voice notes
+from app.core import sessions as _sessions
+from app.core import transcribe  # local speech-to-text for voice notes
 from app.access import settings_schema as ss
 from app.storage import usage
 from app.access.allowlist import normalize_date
-from app.telegram.rich_message import EditRichMessage, SendRichMessage  # #164/#173: native rich
-from app.core import models  # #411: model catalog reported by the Claude Code CLI
-from app.core import cli_update  # #412: CLI version / update for the Admin page
+from app.telegram.rich_message import EditRichMessage, SendRichMessage  # native rich messages
+from app.core import models  # model catalog from the CLI
+from app.core import cli_update  # CLI version and update checks
 
 log = logging.getLogger("handlers")
 
 
-# was — replaced for #411 (models come from the CLI's own catalog — app/core/models.py — and
-# sessions store the family ALIAS the CLI resolves to its newest model, so no model version is
-# hardcoded here any more):
-#   # Friendly aliases mapped to concrete model ids for the /model command.
-#   MODEL_ALIASES: dict[str, str] = {
-#       "opus": "claude-opus-4-8",
-#       "sonnet": "claude-sonnet-4-6",
-#       "haiku": "claude-haiku-4-5-20251001",
-#   }
-#   # Reverse map so the settings menu can show a friendly alias for a stored id.
-#   MODEL_ID_TO_ALIAS: dict[str, str] = {v: k for k, v in MODEL_ALIASES.items()}
-
-# The two session types. A session's type is FIXED at creation (no switching).
+# Session type is fixed at creation.
 VALID_MODES = ("chat", "code")
 
-# was — replaced for #415 (the levels come from the CLI's catalog for the session's model,
-# models.effort_levels; only `max` stays special, as a per-user permission — _may_max_effort):
-#   # Reasoning-effort levels accepted by /effort (SDK EffortLevel literals, #23).
-#   EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+# Effort levels come from the CLI per model.
+# - only `max` is special, as a per-user permission
 
-
-# #428: unused since the 1M toggle was retired (it named the BIG_MEMORY_1M_MODELS families).
-# def _one_m_models_label() -> str:
-#     """#415: the models the [1m] variant is enabled for (BIG_MEMORY_1M_MODELS tags), named
-#     by the CLI catalog where a family alias matches (e.g. "Opus 5.5"), else the raw tag."""
-#     names: list[str] = []
-#     for tag in engine._ONE_M_MODELS:
-#         # #422: was: `... and not r["value"].lower().startswith("claude-")` — via models.is_pinned
-#         hits = [models.label(r["value"]) for r in models.entries()
-#                 if tag in r["value"].lower() and not models.is_pinned(r["value"])]
-#         for n in (hits or [tag]):
-#             if n not in names:
-#                 names.append(n)
-#     return ", ".join(names) or "—"
 
 
 def _effort_label(level: str | None, lang: str) -> str:
-    """#415: display name of an effort level — the CLI's own name, translated when the i18n
-    catalog happens to have it (opportunistic: no list of levels is assumed). None → the
-    localized 'default'."""
+    """Display name of an effort level, localized when known.
+
+    - `None` gives the localized default label
+    """
     if not level:
         return i18n.t("settings.val_default", lang)
     return i18n.maybe_t(f"effort.level.{level}", lang, level)
 
 
 def _effort_default_label(model: str | None, lang: str) -> str:
-    """#415: the 'default' choice of the effort picker, naming what default means for this
-    model when the CLI has reported it (e.g. "default (medium)")."""
+    """The default choice of the effort picker.
+
+    - names the model's CLI default level when reported
+    """
     dflt = models.default_effort(model) if model else None
     if dflt:
         return i18n.t("effort.default_label", lang, level=_effort_label(dflt, lang))
@@ -120,62 +84,56 @@ def _effort_default_label(model: str | None, lang: str) -> str:
 
 
 def mode_glyph(mode: str) -> str:
-    """The visual marker for a session type — used everywhere a session is shown
-    so chat and code sessions are always told apart at a glance. Code uses a big
-    green square (terminal-like), chat a speech bubble (owner request 2026-06-15;
-    was the ▸ shell-prompt caret of #96)."""
+    """Visual marker for a session type, shown everywhere.
+
+    - code is a green square, chat a speech bubble
+    """
     return "🟩" if mode == "code" else "💬"
 
 
 def mode_tagline(mode: str, cwd: str | None = None, lang: str = "en") -> str:
-    """One-line description of what a session of this type does (HTML)."""
+    """One-line HTML description of what a session type does."""
     if mode == "code":
-        # #203: the workdir path is an internal detail the user never interacts with,
-        # so it is no longer appended to session descriptions (card / options / mode /
-        # created / upgraded). `cwd` stays in the signature for callers/compat.
-        # was (replaced for #203):
-        #   where = (i18n.t("mode.tagline_where", lang, cwd=markup.escape_html(cwd))
-        #            if cwd else "")
+        # The workdir path is not shown in session descriptions.
+        # - `cwd` stays in the signature for callers
         where = ""
         return i18n.t("mode.tagline_code", lang, glyph=mode_glyph("code"), where=where)
     return i18n.t("mode.tagline_chat", lang, glyph=mode_glyph("chat"))
 
-# Valid usage display modes for /usage.
+# Valid usage display modes.
 VALID_USAGE_MODES = ("off", "footer", "pinned", "both")
 
-# Attachments. Anthropic accepts these media types as image content blocks;
-# Telegram photos are always JPEG, an image sent as a file carries its own mime.
+# Accepted image media types for content blocks.
+# - photos are always JPEG; file images carry their mime
 ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
-# Raw-size caps before base64 (Anthropic: ~5 MB/image, ~32 MB request for PDFs).
+# Raw-size caps before base64.
+# - about 5 MB per image, 32 MB request for PDFs
 MAX_IMAGE_BYTES = 5 * 1024 * 1024
 MAX_PDF_BYTES = 20 * 1024 * 1024
 MAX_TEXT_BYTES = 1 * 1024 * 1024
-# #363: voice note (Opus/OGG) raw-size cap. The Telegram Bot API getFile download limit
-# is ~20 MB and a voice note is far smaller; the real gate is the DURATION limit
-# (settings.voice_max_seconds). This just stops a huge forwarded audio from OOMing decode.
+# Raw-size cap for a voice note.
+# - the real gate is the duration limit
+# - this stops a huge forwarded audio from OOMing decode
 MAX_VOICE_BYTES = 20 * 1024 * 1024
-# A text/code file is inlined into the prompt; cap the characters so a huge file
-# cannot blow up the context window.
+# Character cap for inlined text files, protecting the context window.
 MAX_TEXT_INLINE_CHARS = 200_000
 
-# #235: a Telegram album (media_group) is delivered as separate updates that share a
-# media_group_id; we buffer the items for a short window and submit them as ONE turn.
-# The window is (re)started on each arriving item so a slow album still coalesces; it is
-# short enough to stay invisible for a normal burst. Combined inline text is capped at
-# MAX_TEXT_INLINE_CHARS total, and the item count at MAX_ALBUM_ITEMS, with a dropped-note
-# (no silent truncation).
+# Album buffering: items sharing a `media_group_id` become one turn.
+# - the debounce window restarts on each arriving item
+# - inline text is capped at `MAX_TEXT_INLINE_CHARS`
+# - item count is capped at `MAX_ALBUM_ITEMS`, with a dropped note
 ALBUM_DEBOUNCE_SECS = 0.8
 MAX_ALBUM_ITEMS = 20
 
 
 def _combine_album_parts(parts, header, truncated_label):
-    """#235 (pure + testable): combine buffered album items into one turn's (text, blocks).
+    """Combine buffered album items into one turn's text and blocks.
 
-    ``parts`` is a list of ``(message_id, {"blocks": [...] | None, "inline": str})``; items
-    are ordered by message_id so the model sees them in send order. Image/PDF blocks are
-    concatenated; text/code ``inline`` segments are joined under ``header``. If the joined
-    inline text exceeds MAX_TEXT_INLINE_CHARS it is cut and ``truncated_label`` appended.
-    Any dropped-over-cap note is added by the caller. Returns ``(text, blocks)``.
+    - `parts` is a list of `(message_id, {blocks, inline})`
+    - items are ordered by message id
+    - image and PDF blocks are concatenated
+    - inline text is joined under `header`, cut at the cap
+    - returns `(text, blocks)`; the caller adds dropped-item notes
     """
     blocks: list = []
     inlines: list[str] = []
@@ -190,10 +148,9 @@ def _combine_album_parts(parts, header, truncated_label):
     text = f"{header}\n\n{combined}" if combined else header
     return text, blocks
 
-# Friendly /permissions names <-> SDK permission_mode values (code mode only).
-# Per-name help text lives in the l10n table under "perm.help.<name>".
+# Friendly permission names map to SDK `permission_mode` values.
+# - help text lives in the l10n table under `perm.help.<name>`
 PERM_NAME_TO_MODE: dict[str, str] = {
-    # "ask": "default",  # #223: "ask" dropped — auto-edits is the minimum floor now
     "auto-edits": "acceptEdits",
     "plan": "plan",
     "full-access": "bypassPermissions",
@@ -201,54 +158,34 @@ PERM_NAME_TO_MODE: dict[str, str] = {
 PERM_MODE_TO_NAME: dict[str, str] = {v: k for k, v in PERM_NAME_TO_MODE.items()}
 
 
-# Commands advertised to Telegram via setMyCommands, ordered MOST-USED FIRST so
-# the menu reads top-to-bottom by how often you reach for each one. Everything in
-# the menu is discoverable by tapping it — no need to remember typed commands.
-#
-# #139: names + descriptions + scope now live in ONE place — commands.py (the
-# COMMANDS registry). These module-level lists are DERIVED from it so they can't
-# drift across languages or surfaces. The literal arrays below are commented out
-# (kept for audit/revert); replaced by commands.menu_slugs()/code_slugs()/
-# owner_slugs(). Descriptions come from Cmd.label[lang], not the cmd.* i18n rows.
-#
-# was — replaced for #139:
-# _COMMAND_NAMES: list[str] = [
-#     "new", "sessions", "settings", "rename",
-#     "status", "code", "chat", "clear",
-#     "recap", "history", "files", "export",
-#     "fork", "maxturns", "context", "queue", "clearqueue", "retry",
-#     "help", "whoami",
-# ]
-# _OWNER_COMMAND_NAMES: list[str] = ["auto", "allow", "deny", "users", "level", "expire", "limit", "sandbox"]
-# _CODE_COMMAND_NAMES: list[str] = ["code", "files", "export", "permissions", "maxturns"]
+# Commands advertised to Telegram, derived from the registry.
+# - ordered most-used first
+# - lists derive from `commands.py` registry, so they can't drift
+# - descriptions come from `Cmd.label[lang]`
 _COMMAND_NAMES: list[str] = commands.menu_slugs()
 _OWNER_COMMAND_NAMES: list[str] = commands.owner_slugs()
 _CODE_COMMAND_NAMES: list[str] = commands.code_slugs()
 
 
 def _chat_command_names() -> list[str]:
-    """The command set a chat-level user sees (all but the code-mode-only ones)."""
+    """Command set a chat-level user sees."""
     return [n for n in _COMMAND_NAMES if n not in _CODE_COMMAND_NAMES]
 
 
 def _chat_menu_names() -> list[str]:
-    """#315: the SHORT "/" menu a chat-level user gets — just the everyday trio at the
-    top of the registry (/new, /sessions, /settings); everything else is reachable from
-    /settings and the inline menus, so a chat user's command list stays uncluttered
-    (/clear in particular is not shown — it is the 6th menu command, so [:3] drops it).
-    Code users and the owner keep the full set (see _apply_user_menu / setup_commands)."""
+    """Short slash menu for chat-level users: the everyday trio.
+
+    - code users and the owner keep the full set
+    """
     return _chat_command_names()[:3]
 
 
 def _build_commands(names: list[str], lang: str) -> list[BotCommand]:
-    """Build a BotCommand list with descriptions in the given locale.
+    """Build a `BotCommand` list with descriptions in one locale.
 
-    #139: the description is now sourced from the COMMANDS registry
-    (Cmd.label[lang]), the single source of truth, rather than the cmd.* i18n
-    rows. Falls back to English if a locale is somehow absent.
+    - labels come from the `COMMANDS` registry
+    - falls back to English when the locale is absent
     """
-    # was — replaced for #139 (cmd.* i18n lookup):
-    # return [BotCommand(command=name, description=i18n.t(f"cmd.{name}", lang)) for name in names]
     by = commands.by_slug()
     out: list[BotCommand] = []
     for name in names:
@@ -259,25 +196,18 @@ def _build_commands(names: list[str], lang: str) -> list[BotCommand]:
 
 
 async def setup_commands(bot, owner_id: int | None = None) -> None:
-    """Register the bot's command list with Telegram (setMyCommands).
+    """Register the command list with Telegram per locale.
 
-    Registered once per supported locale via the ``language_code`` parameter so a
-    Russian Telegram client sees a Russian menu and an English one sees English.
-    The default (no language_code) scope falls back to English. The owner's
-    private chat gets the shared menu PLUS the owner-only admin commands, so those
-    never appear for anyone else. A scoped list REPLACES (not appends to) the
-    default for that scope, so we send the combined list explicitly per locale.
+    - one `setMyCommands` call per supported `language_code`
+    - the owner's private chat also gets admin commands
+    - a scoped list replaces the default, so send it combined
     """
-    # #139: fail loudly at startup if the command registry (commands.py) has
-    # drifted from the live @router handlers or is missing a locale, so the
-    # menu/help/handler surfaces can't silently diverge again.
+    # Fail loudly if command registry drifts from handlers or locales.
     commands.assert_commands_consistent(languages=tuple(i18n.LANGUAGES))
-    # Default scope (everyone except the owner): the CHAT-level set — code-mode-only
-    # commands are omitted so a chat-only user doesn't see commands they can't use
-    # (#102). The owner's private chat (below) overrides this with the full set.
-    # #315: chat-level users get only the everyday trio in the "/" menu (was the full
-    # chat set `_chat_command_names()`); the rest is reachable via /settings. Code users
-    # get their full menu per-user on first contact (see `_ensure_state` / `_apply_user_menu`).
+    # Default scope: chat-level users get only everyday commands.
+    # - code-only commands are omitted
+    # - code users get full menu on first contact
+    # - owner's private chat overrides with the full set
     chat_names = _chat_menu_names()
     await bot.set_my_commands(_build_commands(chat_names, i18n.DEFAULT_LANG))
     for lang in i18n.LANGUAGES:
@@ -302,47 +232,34 @@ async def setup_commands(bot, owner_id: int | None = None) -> None:
 
 
 def thread_key(message: Message) -> int:
-    """Return the isolation key for a message: real thread id, or 0 for General."""
+    """Return the isolation key: thread id, or 0."""
     return message.message_thread_id or 0
 
 
 def build_router(settings, sessions, gate, bot, allowlist) -> Router:
-    """Build the aiogram Router wiring all commands, text, and callbacks.
+    """Build the aiogram Router wiring commands, text, and callbacks.
 
-    Args:
-        settings: loaded Settings (bot_token, owner_id, default_model, ...).
-        sessions: SessionManager orchestrating per-thread ClaudeSessions.
-        gate: PermissionGate handling code-mode approval callbacks.
-        bot: the aiogram Bot instance (used for create_forum_topic, etc.).
-        allowlist: the Allowlist used by the owner-only access commands.
+    - `settings`, `sessions`, `gate`, `bot`, `allowlist` are the shared services
     """
     router = Router(name="main")
 
     async def reply(message: Message, text: str, reply_markup=None) -> None:
-        """Send `text` (already Telegram HTML) back into the same topic.
+        """Send already-built Telegram HTML into the same topic.
 
-        Command handlers author their own HTML directly (<b>, <code>, and values
-        pre-escaped with markup.escape_html), so we send it AS-IS. We must NOT
-        run it through md_to_html — that would HTML-escape the tags again and
-        Telegram would show literal "<b>" / "&lt;". Long text is split; very long
-        becomes a .md document. (Model output is rendered elsewhere, in Streamer.)
-
-        reply_markup (#188): an optional inline keyboard attached to the message
-        (e.g. the /schedules pause/delete controls).
+        - sent as-is; running `md_to_html` would double-escape the tags
+        - long text is split; very long becomes a .md document
+        - `reply_markup` attaches an optional inline keyboard
         """
-        # Reply into the same place the message came from: a supergroup topic
-        # keeps its message_thread_id; a private chat (DM) has no thread. We use
-        # the message's own context here (NOT the session key) so DM sessions,
-        # which use synthetic negative keys, still post to the user's chat.
+        # Reply where the message came from.
+        # - supergroup topic keeps its thread id; DM has none
+        # - use message context, not session key (synthetic in DMs)
         send_kwargs: dict = {}
         if message.chat.type != "private" and message.message_thread_id:
             send_kwargs["message_thread_id"] = message.message_thread_id
 
-        # #172: send command replies as NATIVE rich messages too, so their look/font
-        # matches /status, /userstats and the streamed answers (the owner flagged the
-        # inconsistency). `text` is already valid Telegram HTML → use the html field;
-        # rich messages also need no char-splitting. Fall back to the classic
-        # doc/chunked path below on any failure, so a reply is never lost.
+        # Send replies as native rich messages for consistent look.
+        # - `text` is already HTML; no char-splitting needed
+        # - fall back to document/chunked path on failure
         try:
             await bot(SendRichMessage(chat_id=message.chat.id,
                                       rich_message={"html": text},
@@ -351,7 +268,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         except Exception:
             pass
 
-        # Very long: send as a document rather than spamming chunks.
+        # Very long text goes out as a document.
         if markup.should_send_as_file(text):
             try:
                 document = markup.as_document(text, "message.md")
@@ -362,13 +279,11 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 )
                 return
             except Exception:
-                # Fall through to chunked text on any document failure.
+                # Fall through to chunked text if document fails.
                 pass
 
-        # `text` is already valid Telegram HTML — send as-is, only splitting if
-        # it exceeds the size limit (command replies are short, so this is
-        # almost always a single chunk).
-        _kb_pending = reply_markup  # #188: attach to the first chunk only
+        # Send `text` as-is, splitting only past the size limit.
+        _kb_pending = reply_markup  # first chunk only
         for chunk in markup.split_message(text):
             if not chunk:
                 continue
@@ -382,8 +297,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                     **send_kwargs,
                 )
             except Exception:
-                # Last resort: deliver a fully-escaped plain version so content
-                # is not lost if the HTML failed to parse.
+                # Last resort: send fully-escaped plain text.
                 try:
                     await bot.send_message(
                         chat_id=message.chat.id,
@@ -394,21 +308,19 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 except Exception:
                     pass
 
-    # ------------------------------------------------------------------ helpers
+    # ---- helpers ----
 
     async def reply_rich_html(message: Message, html: str) -> None:
-        """#170: send a READ-ONLY reply as a native rich message (sendRichMessage html)
-        so headings, lists and checklists render. Falls back to the classic HTML
-        reply() if the (new) API call fails — a reply is never lost."""
+        """Send a read-only reply as a native rich message.
+
+        - falls back to a classic HTML reply on failure
+        """
         send_kwargs: dict = {}
         if message.chat.type != "private" and message.message_thread_id:
             send_kwargs["message_thread_id"] = message.message_thread_id
-        # #339: the rich {"html"} field collapses raw newlines (HTML whitespace folding), which
-        # glued /status's plain lines + section headers onto adjacent text (the <ul> checklists
-        # still break as blocks, but the prose between them merged). Convert \n → <br> for the
-        # rich send, like _send_menu (#202). Assumes no <pre> blocks in the content (#209 —
-        # true for the sole caller, /status). The classic fallback keeps the RAW text
-        # (parse_mode="HTML" renders \n as a newline and ignores <br>).
+        # Rich HTML folds raw newlines; convert them to `<br>`.
+        # - assumes no `<pre>` blocks in the content
+        # - classic fallback keeps raw text; `<br>` is ignored there
         rich_html = html.replace("\n", "<br>")
         try:
             await bot(SendRichMessage(chat_id=message.chat.id,
@@ -417,19 +329,14 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             await reply(message, html)
 
     async def _send_menu(chat_id: int, text: str, kb=None, **send_kwargs):
-        """#173: OPEN an inline-keyboard menu as a NATIVE rich message (sendRichMessage
-        + reply_markup), so menu screens (settings hub, user cards, session menus)
-        carry the same rich font as command replies and streamed answers — not the
-        classic ``parse_mode="HTML"`` look. ``text`` is already valid Telegram HTML →
-        the ``html`` rich field. Returns the sent Message (callers may need its id), or
-        None if both the rich and the classic fallback send fail — so a menu is never
-        lost even when the rich API rejects the payload."""
-        # #202: rich-message HTML folds raw newlines (HTML whitespace collapsing),
-        # which squashed multi-line menus (session list, cards) onto ONE line. Convert
-        # \n → <br> for the rich html field; the classic fallback keeps the raw text
-        # (parse_mode="HTML" renders \n as a newline and doesn't support <br>).
-        # #209: assumes menu text carries no <pre>/preformatted blocks (none do today) —
-        # revisit this substitution if a menu ever includes preformatted content.
+        """Open an inline-keyboard menu as a native rich message.
+
+        - `text` is valid Telegram HTML, sent as the `html` field
+        - returns the sent Message, or `None` if all sends fail
+        """
+        # Rich HTML folds raw newlines; convert them to `<br>`.
+        # - assumes menu text has no preformatted blocks
+        # - classic fallback keeps raw newlines
         rich_html = text.replace("\n", "<br>")
         try:
             return await bot(SendRichMessage(chat_id=chat_id, rich_message={"html": rich_html},
@@ -443,20 +350,19 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             return None
 
     async def _edit_menu(msg, text: str, kb=None) -> None:
-        """#173: EDIT a menu in place as a NATIVE rich message (editMessageText +
-        rich_message, Bot API 10.1) so the nav-edits keep the rich font instead of
-        downgrading to classic HTML on every tap. An unchanged body ("message is not
-        modified") is a no-op. Any other failure (e.g. the message was opened classic
-        before this shipped, or the rich edit is rejected) falls back to the classic
-        ``edit_text`` — preserving exactly the prior behaviour."""
-        rich_html = text.replace("\n", "<br>")  # #202: see _send_menu (newline → <br>)
+        """Edit a menu in place as a native rich message.
+
+        - an unchanged body ("message is not modified") is a no-op
+        - any other failure falls back to the classic `edit_text`
+        """
+        rich_html = text.replace("\n", "<br>")
         try:
             await bot(EditRichMessage(chat_id=msg.chat.id, message_id=msg.message_id,
                                       rich_message={"html": rich_html}, reply_markup=kb))
             return
         except TelegramBadRequest as exc:
             if "not modified" in str(exc).lower():
-                return  # identical content already on screen — nothing to do
+                return  # identical content already shown
         except Exception:
             pass
         with contextlib.suppress(Exception):
@@ -465,19 +371,16 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
     async def _session_key(message: Message) -> int:
         """Resolve the session key for an incoming message.
 
-        Supergroup → the forum topic id (0 for General). Private chat (DM) → the
-        user's CURRENT bot-managed session, creating a default "Session 1" on first
-        contact. DM sessions use synthetic NEGATIVE keys so they never collide with
-        supergroup topics (>= 0) or another user's sessions — preserving the hard
-        per-session isolation guarantee.
+        - supergroup: the forum topic id (0 for General)
+        - DM: the user's current session, created on first contact
+        - DM keys are negative so they never collide with topics
         """
         if message.chat.type == "private":
-            uid = message.chat.id  # == the user id in a private chat
+            uid = message.chat.id  # same as user id in DMs
             cur = await db.get_dm_current(uid)
-            # Heal a missing OR dangling pointer: on first contact (None), and when
-            # the pointer references a deleted/missing row, re-point to the user's
-            # most-recent real DM session (a negative key) or mint a fresh default.
-            # Otherwise _ensure_state would resurrect an empty row at the stale key.
+            # Heal a missing or dangling current-session pointer.
+            # - re-point to most recent DM session, else mint one
+            # - else `_ensure_state` would resurrect an empty stale row
             if cur is None or await db.get_thread(cur) is None:
                 page, _ = await db.browse_threads(uid, None, limit=8, offset=0)
                 cur = next((r["thread_id"] for r in page if r["thread_id"] < 0), None)
@@ -491,10 +394,9 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         return message.message_thread_id or 0
 
     async def _callback_key(cb: CallbackQuery) -> int:
-        """Resolve the session key a callback (menu tap) should act on.
+        """Resolve the session key a menu tap should act on.
 
-        In a DM the menu message is the bot's, so we key by the TAPPER's current
-        DM session, not the message context.
+        - in a DM it is the tapper's current session
         """
         msg = cb.message
         if msg is not None and msg.chat.type == "private":
@@ -504,9 +406,11 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
 
     @router.callback_query(F.data.startswith("shk:"))
     async def on_shell_key(cb: CallbackQuery) -> None:
-        """#227b: interactive-shell keypad. A key button sends ONE keystroke to the session's
-        persistent shell and re-renders this message with the new output; `more`/`less` just
-        flip the keypad between the primary and extra keys."""
+        """Interactive-shell keypad callback.
+
+        - a key button sends one keystroke and re-renders the output
+        - `more` and `less` flip between primary and extra keys
+        """
         msg = cb.message
         if msg is None:
             await cb.answer()
@@ -517,7 +421,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 await msg.edit_reply_markup(reply_markup=_sessions.shell_keypad(more=(token == "more")))
             await cb.answer()
             return
-        # #291: resolve the session key once (was awaited twice → two get_dm_current reads).
+        # Resolve the session key once.
         key = await _callback_key(cb)
         rendered, awaiting = await sessions.shell_key(key, token, _lang(cb))
         if rendered is None:
@@ -527,8 +431,9 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         with contextlib.suppress(Exception):
             await bot(EditRichMessage(chat_id=msg.chat.id, message_id=msg.message_id,
                                       rich_message={"markdown": rendered}, reply_markup=kb))
-        # #279: keep the tracked keypad message current (this msg, edited in place) so a later
-        # /shell toggle strips/restores the RIGHT message; clear it once input is no longer awaited.
+        # Keep the tracked keypad message current.
+        # - later /shell toggle then edits the right message
+        # - clear it once input is no longer awaited
         if awaiting:
             sessions.set_shell_kb(key, msg.chat.id, msg.message_id, rendered)
         else:
@@ -536,7 +441,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         await cb.answer()
 
     def _command_arg(message: Message) -> str:
-        """Return the text after the command word, stripped (may be empty)."""
+        """Return the text after the command word, stripped."""
         text = message.text or message.caption or ""
         parts = text.split(maxsplit=1)
         if len(parts) < 2:
@@ -548,83 +453,73 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         return bool(message.from_user) and message.from_user.id == settings.owner_id
 
     def _has_code_access(uid: int | None, uname: str | None) -> bool:
-        """#283: True iff this USER may use code-only features — the owner, or a user whose
-        allowlist LEVEL is "code". Gates the code-only commands by the caller's level (not
-        just the session's mode), so a user demoted code→chat — who still owns their existing
-        code-mode sessions — can't keep using /shell, /secret, /permissions, Tools on them."""
+        """True iff the user may use code-only features.
+
+        - true for the owner or an allowlist level of "code"
+        - gates by user level, so a demoted user is blocked
+        """
         return uid == settings.owner_id or allowlist.level_of(uid, uname) == "code"
 
     def _may_max_effort(uid: int | None, uname: str | None) -> bool:
-        """Whether this user may select the (expensive) `max` reasoning effort — the
-        owner (unless self-revoked for testing, #185), or a user explicitly granted it.
-        Guests are blocked so they can't burn the owner's one shared subscription via
-        max thinking (#120 / effort gate). decision-20: `max` is the one effort level the
-        bot names — every other level comes from the CLI."""
-        # #185: route the owner through allow_max_effort_of too — it defaults the owner
-        # to True, so default behaviour is unchanged, but an owner self-revoke now gates
-        # the owner. was an unconditional owner pass:
-        #   if uid is not None and uid == settings.owner_id: return True
+        """Whether this user may select the expensive `max` effort.
+
+        - the owner, unless self-revoked, or an explicitly granted user
+        - guests are blocked to protect the shared subscription
+        - `max` is the only effort level the bot names itself
+        """
+        # Owner goes through `allow_max_effort_of` too.
+        # - defaults to True, so behaviour is unchanged
+        # - owner self-revoke now gates the owner
         return bool(allowlist.allow_max_effort_of(uid, uname))
 
     def _lang(obj) -> str:
-        """Resolve the acting user's interface locale (Message or CallbackQuery).
+        """Resolve the acting user's interface locale.
 
-        Reads the per-user cache warmed by LanguageMiddleware; falls back to the
-        default locale when the user is somehow unknown.
+        - reads the per-user cache warmed by `LanguageMiddleware`
+        - falls back to the default locale
         """
         user = getattr(obj, "from_user", None)
         return i18n.cached_lang(getattr(user, "id", 0) or 0)
 
-    # #315: users whose privilege-filtered "/" menu we've already applied this process,
-    # so first contact sets it once (a code user gets their full menu without needing a
-    # /language tap; a chat user gets the short everyday-trio menu) without re-calling
-    # setMyCommands on every message.
+    # Users whose command menu was already applied this process.
+    # - first contact sets it once per user
+    # - avoids calling `setMyCommands` on every message
     _menu_applied: set[int] = set()
 
     async def _ensure_state(message: Message):
-        """Ensure a ThreadState row exists for this session; return it.
+        """Ensure a `ThreadState` row exists for this session; return it.
 
-        The default working directory is per-session: BASE_WORKDIR/<sid> (#140),
-        so each session's code-mode work is isolated from every other session's
-        files. (DM sessions are created by allocate_dm_session, which sets the same
-        per-sid cwd; this path only fires for a brand-new key — e.g. a supergroup
-        topic or General(0).)
+        - default workdir is `BASE_WORKDIR/<sid>`, isolated per session
+        - only fires for a brand-new key such as a topic
         """
         key = await _session_key(message)
-        # #140: name the per-session workdir by the stable public sid, not the raw
-        # key. was: default_cwd = str(settings.base_workdir / str(key))
-        # #181: nested layout — the session cwd is <sid>/work.
-        default_cwd = str(settings.base_workdir / db.session_pubid(key) / "work")  # #332: ULID dir (was session_sid)
+        # Workdir is named by public session id, nested as `<sid>/work`.
+        default_cwd = str(settings.base_workdir / db.session_pubid(key) / "work")  # ULID directory name
         st = await db.ensure_thread(
             key, message.chat.id, settings.default_model, default_cwd
         )
-        # #315: on first contact (DM, once per process per user) set this user's
-        # privilege-filtered command menu in their language — so a code user sees their
-        # full menu without needing a /language tap, and a chat user gets the short
-        # everyday-trio menu. Best-effort; /language re-applies it on demand.
+        # Set the user's command menu on first contact.
+        # - once per process per user, in their language
+        # - best-effort; /language re-applies it on demand
         if (message.chat.type == "private" and message.from_user
                 and message.from_user.id not in _menu_applied):
             _menu_applied.add(message.from_user.id)
             with contextlib.suppress(Exception):
                 await _apply_user_menu(message.chat.id, message.from_user.id,
                                        message.from_user.username, _lang(message))
-        # #323: record the OWNER's Telegram-Premium status from their own messages — it gates
-        # whether the bot may use custom (animated) emoji in the thinking tag (the OWNER's
-        # premium, not the viewer's). Cheap; updates the streamer module flag live.
+        # Record the owner's Telegram Premium status.
+        # - gates custom animated emoji in the thinking tag
+        # - owner's premium counts, not the viewer's
         if message.from_user and message.from_user.id == settings.owner_id:
             streamer_mod.set_owner_premium(bool(message.from_user.is_premium))
         return st
 
     async def _rebuild_session(thread_id: int) -> bool:
-        """Ask the SessionManager to drop/rebuild the in-memory session.
+        """Ask the session manager to drop the in-memory session.
 
-        After mode/model/cwd/permission changes the next message must use the
-        new settings, which requires closing the old SDK client. SessionManager
-        exposes a helper for this; we call whichever spelling exists and
-        otherwise fall back to a full reset so settings still take effect.
-
-        Returns True when the rebuild was DEFERRED because a turn is currently
-        running (the change then applies once that run finishes); False otherwise.
+        - the next message then uses the new settings
+        - falls back to a full reset without a helper
+        - returns True when deferred because a turn is running
         """
         helper = getattr(sessions, "on_mode_or_model_or_cwd_change", None)
         if callable(helper):
@@ -632,22 +527,24 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 return bool(await helper(thread_id))
             except Exception:
                 pass
-        # Fallback: a reset closes the client and drops the record so the next
-        # message rebuilds from persisted state. (Loses in-memory session id,
-        # but that is the safe, correct behaviour after a settings change.)
+        # Fallback: reset closes the client and drops the record.
+        # - next message rebuilds from persisted state
+        # - in-memory session id is lost, which is intended
         try:
             await sessions.reset(thread_id)
         except Exception:
             pass
         return False
 
-    # ------------------------------------------------------------------ settings
+    # ---- settings ----
 
     @router.message(Command("tools"))
     async def cmd_tools(message: Message) -> None:
-        """Open the per-session Tools page — toggle each tool on/off (#129/#141).
-        Chat shows the web research tools; code shows the full agent toolset. Back
-        returns to the unified /settings hub (the old st: tools page is retired)."""
+        """Open the per-session Tools page with on/off toggles.
+
+        - chat shows web tools, code shows the full toolset
+        - Back returns to the settings hub
+        """
         await _ensure_state(message)
         key = await _session_key(message)
         lang = _lang(message)
@@ -656,7 +553,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         except Exception:
             state = None
         try:
-            await _send_menu(  # #173: native rich menu open
+            await _send_menu(
                 message.chat.id, i18n.t("settings.tools_title", lang),
                 _ss_tools_keyboard(state, lang),
             )
@@ -665,14 +562,11 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
 
     @router.message(Command("settings"))
     async def cmd_settings(message: Message) -> None:
-        """Open the unified, scope-tabbed settings hub for this session.
+        """Open the scope-tabbed settings hub for this session.
 
-        #138/#141: /settings opens the REGISTRY-DRIVEN hub (This session / My
-        defaults / Global) — see ``_send_ss_hub``. Model / Effort / Permissions /
-        Max turns / Memory / Sandbox / Language are registry rows; Tools, Usage
-        (owner) and Users (owner) are ``sx:`` sub-pages that return to this hub.
-        The old flat ``st:`` hub is retired (``on_settings_cb`` is now a thin
-        stale-button shim)."""
+        - scopes: this session, my defaults, global
+        - Tools, Usage, and Users are sub-pages returning to this hub
+        """
         await _ensure_state(message)
         key = await _session_key(message)
         lang = _lang(message)
@@ -688,13 +582,10 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
 
     @router.callback_query(F.data.startswith("st:"))
     async def on_settings_cb(cb: CallbackQuery) -> None:
-        """#141: the OLD flat settings hub is RETIRED — /settings now opens the
-        registry-driven ``sx:`` hub, with Tools / Usage / Users ported onto it as
-        sub-pages. This is a thin compatibility shim catching STALE ``st:`` buttons
-        left in old chat messages: ``st:close`` deletes the menu; anything else
-        bounces to the unified hub. The old flat-hub page builders (_settings_keyboard,
-        _settings_text, _settings_apply, _gather_vals, _onoff_label) were DELETED in #214
-        (dead since #141 — nothing live ever called them); this shim and _mark stay."""
+        """Shim for stale `st:` buttons from old messages.
+
+        - `st:close` deletes the menu; anything else opens the hub
+        """
         try:
             msg = cb.message
             if msg is None:
@@ -720,22 +611,22 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             with contextlib.suppress(Exception):
                 await cb.answer(i18n.t("common.error", _lang(cb)))
 
-    # ---------------------------------------------- generic settings v2 (#138)
-    # The registry-driven, scope-tabbed /settings hub. It reuses the resolver +
-    # role gate from settings_schema so visibility/edit are decided in ONE place,
-    # and supersedes the bespoke per-setting wiring above where it maps cleanly.
+    # Generic registry-driven, scope-tabbed settings hub.
+    # - reuses resolver and role gate from `settings_schema`
+    # - visibility and edit rights decided in one place
 
     def _role_of(uid: int | None, uname: str | None) -> ss.Role:
-        """The acting user's registry Role (owner / code / chat)."""
+        """The acting user's registry role: owner, code, or chat."""
         is_owner = uid is not None and uid == settings.owner_id
         level = None if is_owner else allowlist.level_of(uid, uname)
         return ss.role_for(is_owner, level)
 
     async def _build_ss_ctx(key: int, uid: int | None, role: ss.Role) -> ss.Ctx:
-        """Build a resolution Ctx for the bound session, preloading the USER-scope
-        defaults (incl. the locale from its own kv store) AND the #151 access config
-        (owner base overrides + this user's exceptions) so resolve()/effective_access()
-        stay synchronous on the hot path."""
+        """Build a resolution `Ctx` for the bound session.
+
+        - preloads user defaults, locale, and access config
+        - keeps `resolve()` and `effective_access()` synchronous
+        """
         try:
             state = await db.get_thread(key)
         except Exception:
@@ -745,12 +636,12 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             for skey in ss.SETTINGS:
                 with contextlib.suppress(Exception):
                     user_defaults[skey] = await db.get_user_default(uid, skey)
-            # Language lives in its OWN kv store, not the generic user_default kv.
+            # Language lives in its own kv store.
             with contextlib.suppress(Exception):
                 lang_pref = await db.get_user_lang(uid)
                 if lang_pref is not None:
                     user_defaults["language"] = lang_pref
-        # #151: owner's per-option base-access overrides + this user's exceptions.
+        # Owner's per-option base-access overrides plus this user's exceptions.
         access_base: dict = {}
         with contextlib.suppress(Exception):
             access_base = await db.get_access_overrides()
@@ -764,7 +655,10 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                            access_exceptions=access_exceptions)
 
     def _visible_tabs(role: ss.Role) -> list:
-        """Scope tabs this role may see. Non-owners never get the Global tab."""
+        """Scope tabs this role may see.
+
+        - non-owners never get the Global tab
+        """
         tabs = [ss.Scope.SESSION, ss.Scope.USER]
         if role >= ss.Role.OWNER:
             tabs.append(ss.Scope.GLOBAL)
@@ -776,32 +670,33 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                       tab=i18n.t(_scope_tab_key(scope), lang))
 
     def _ss_code_blocked(setting, scope, ctx: ss.Ctx) -> bool:
-        """Hide a CODE-ONLY setting on the SESSION tab when the bound session is a
-        chat (menu.md §1.7) — gated on the session MODE, not the user's level, so a
-        code-level user in a chat session doesn't see Permissions / Max turns / Sandbox."""
+        """Hide code-only settings on the session tab for chat sessions.
+
+        - gated on session mode, not the user's level
+        """
         if scope != ss.Scope.SESSION or not ss.is_code_only(setting.key):
             return False
         return getattr(ctx.state, "mode", None) != "code"
 
     def _ss_hub_keyboard(scope, ctx: ss.Ctx, role: ss.Role, lang: str) -> InlineKeyboardMarkup:
-        """Tabbed hub keyboard for the active scope: a tab row, then one row per
-        visible setting (resolved value + source badge + control affordance), then
-        the bespoke Tools page and the owner-only Usage / Users rows LAST (menu.md
-        §1.8), then Close. All sub-pages are sx:-namespaced and return to this hub
-        (#141/#142 — the old st: flat hub is retired)."""
+        """Tabbed hub keyboard for the active scope.
+
+        - tab row, then one row per visible setting
+        - Tools and owner-only Usage and Users rows last, then Close
+        - sub-pages are `sx:` namespaced and return to the hub
+        """
         B = InlineKeyboardButton
         rows: list[list[InlineKeyboardButton]] = []
-        # Tab row (mark the active tab).
+        # Tab row, marking the active tab.
         tab_row = []
         for sc in _visible_tabs(role):
             label = i18n.t(_scope_tab_key(sc), lang)
             tab_row.append(B(text=(f"• {label}" if sc == scope else label),
                              callback_data=f"sx:tab:{_SCOPE_CODE[sc]}"))
         rows.append(tab_row)
-        # The GLOBAL tab is the owner's ACCESS-CONFIG surface (#151): it lists EVERY
-        # registry option (so base access is settable for ALL of them, even ones with
-        # no global VALUE scope like effort/max_turns). SESSION/USER list the options
-        # storable at that scope.
+        # GLOBAL tab is the owner's access-config surface.
+        # - lists every registry option, even without global value scope
+        # - SESSION and USER list options storable at that scope
         if scope == ss.Scope.GLOBAL:
             setting_list = [ss.SETTINGS[k] for k in ss.PAGE_ORDER
                             if k in ss.SETTINGS and ss.SETTINGS[k].can_view(role)]
@@ -809,23 +704,22 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             setting_list = ss.settings_for_scope(scope, role)
         # One row per visible setting at this scope.
         for setting in setting_list:
-            # On SESSION/USER a setting needs a setter for this scope; the GLOBAL row
-            # is the value/access admin page, so no per-scope setter is required.
+            # SESSION/USER rows need a setter; GLOBAL is an admin page.
             if scope != ss.Scope.GLOBAL and setting.set.get(scope) is None:
                 continue
-            # Code-only rows don't appear in a chat session (menu.md §1.7).
+            # Code-only rows don't appear in chat sessions.
             if _ss_code_blocked(setting, scope, ctx):
                 continue
-            # #151 access model: HIDDEN settings don't appear; READ-ONLY show but
-            # can't be changed; DELEGATED are fully editable. (Owner is always full;
-            # the GLOBAL tab is owner-only so every option is visible there.)
+            # Access model: hidden settings are omitted.
+            # - read-only shows but can't be changed
+            # - delegated is fully editable; owner is always full
             if scope != ss.Scope.GLOBAL and not ss.can_view_setting(setting, ctx):
                 continue
             editable = ss.can_edit_setting(setting, ctx)
-            # #138-fix: on the SESSION tab show the effective resolved value; on the
-            # USER/GLOBAL tabs show what THAT scope contributes. For a non-editable
-            # (read-only) setting the user's per-scope value doesn't count, so show
-            # the access-aware effective value (global) instead (#151 soft-revoke).
+            # Show the value that belongs to this scope.
+            # - SESSION tab shows the effective resolved value
+            # - USER/GLOBAL tabs show what that scope contributes
+            # - read-only settings show the access-aware global value
             value, src = (ss.resolve_from(setting, ctx, scope) if editable
                           else ss.resolve_effective(setting, ctx))
             name = _setting_name(setting, lang)
@@ -835,57 +729,57 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             text = i18n.t("settings.v2_row", lang, name=name, val=vlabel, badge=badge)
             sc_code = _SCOPE_CODE[scope]
             if scope == ss.Scope.GLOBAL:
-                # Owner Global tab: the row opens the option-admin page (global value
-                # + base access + per-user exceptions) — menu.md §4.4 (#151).
+                # Owner Global tab row opens the option-admin page.
                 cb = f"sx:opt:{setting.key}"
             elif not editable:
-                cb = f"sx:ro:{setting.key}"           # read-only → a "locked" toast
+                cb = f"sx:ro:{setting.key}"           # read-only shows a locked toast
             else:
-                # #275: EVERY editable setting — including booleans — opens a value picker
-                # with a Back button, so a tap never silently flips a value in place (the
-                # user sees the choices first). (was: bool → an immediate `sx:tog` flip.)
+                # Every editable setting opens a value picker with Back.
+                # - a tap never silently flips a value
                 cb = f"sx:nav:{sc_code}:{setting.key}"
             rows.append([B(text=text, callback_data=cb)])
-        # Bespoke pages (Tools grid / Usage picker / Users admin) are sx: sub-pages
-        # linked from the SESSION tab only. Tools is code-only (menu.md §1.7); the
-        # owner-only Usage + Users rows go LAST, above Close (menu.md §1.8).
+        # Bespoke pages are sub-pages linked from the SESSION tab.
+        # - Tools is code-only
+        # - owner-only Usage and Users rows go last, above Close
         if scope == ss.Scope.SESSION:
-            # #283: code-only rows require BOTH a code session AND a code-level user (so a
-            # demoted user who still owns a code session doesn't see Tools/Secret).
+            # Code-only rows need a code session and code-level user.
+            # - demoted users with code sessions don't see Tools/Secret
             if getattr(ctx.state, "mode", None) == "code" and role >= ss.Role.CODE:
                 rows.append([B(text=i18n.t("settings.row_tools", lang), callback_data="sx:tools")])
-                rows.append([B(text=i18n.t("settings.row_secret", lang),  # #222: discoverable
+                rows.append([B(text=i18n.t("settings.row_secret", lang),
                                callback_data="sx:secret")])
             if role >= ss.Role.OWNER:
                 rows.append([B(text=i18n.t("settings.row_usage", lang,
                                            val=getattr(sessions, "usage_mode", "footer")),
                                callback_data="sx:usage")])
                 rows.append([B(text=i18n.t("settings.row_users", lang), callback_data="sx:users")])
-                # #178 + owner Admin hub: the Admin sub-page (archive retention,
-                # global toggles, user-management launchers) sits LAST (menu.md §1.8).
+                # Admin sub-page sits last.
+                # - archive retention, global toggles, user-management launchers
                 rows.append([B(text=i18n.t("settings.row_admin", lang), callback_data="sx:admin")])
-        # #218: surface the owner Admin sub-page on the GLOBAL tab too. The global
-        # session limit, archive retention and global toggles are account-wide config,
-        # so the Global tab (the owner's global surface) is a natural home for it — not
-        # only the Session tab. Same sx:admin page; no duplication of the controls.
+        # Also surface the owner Admin sub-page on the GLOBAL tab.
+        # - session limit, retention and toggles are account-wide config
+        # - same page; controls are not duplicated
         if scope == ss.Scope.GLOBAL and role >= ss.Role.OWNER:
             rows.append([B(text=i18n.t("settings.row_admin", lang), callback_data="sx:admin")])
         rows.append([B(text=i18n.t("btn.close", lang), callback_data="sx:close")])
         return InlineKeyboardMarkup(inline_keyboard=rows)
 
-    # ----------------------------------------------- owner Admin sub-page (#178)
-    # Retention picker choices: (days, i18n_key). 0 = keep forever ("never").
+    # ---- owner Admin sub-page ----
+    # - retention picker choices: (days, i18n key)
+    # - 0 means keep forever
     _RETENTION_CHOICES = (
         (30, "admin.ret_1mo"), (90, "admin.ret_3mo"), (180, "admin.ret_6mo"),
         (365, "admin.ret_12mo"), (0, "admin.ret_never"),
     )
-    # #261: idle→fresh-session picker choices (minutes; 0 = off).
+    # Idle-to-fresh-session picker choices, in minutes; 0 is off.
     _IDLE_RESET_CHOICES = (0, 15, 30, 60, 120, 240)
 
     def _idle_reset_min() -> int:
-        """Effective global idle→fresh-session window in MINUTES — the live value held by
-        the SessionManager (loaded from kv ``idle_reset_sec`` at startup, owner-set in
-        Admin), falling back to the config default. 0 = off."""
+        """Effective global idle-to-fresh-session window in minutes.
+
+        - live value from the session manager, else config default
+        - 0 means off
+        """
         sec = float(getattr(sessions, "_idle_reset", 0) or 0)
         return int(sec // 60)
 
@@ -907,22 +801,22 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                      B(text=i18n.t("btn.close", lang), callback_data="sx:close")])
         return InlineKeyboardMarkup(inline_keyboard=rows)
 
-    # was (#412 — an interval picker, replaced for #423 by a daily UTC time):
-    #   _CLI_UPDATE_CHOICES = (0, 6, 12, 24, 72, 168)
-    #   def _cli_update_label(hours, lang): off / "{n} d" / "{n} h" (admin.cli_days / cli_hours)
-    # #423: the daily update time picker — off, or a whole UTC hour every three hours (any
-    # "HH:MM" set via CLI_UPDATE_AT_UTC is shown as is).
+    # CLI update time picker: off, or every third UTC hour.
+    # - any `HH:MM` from `CLI_UPDATE_AT_UTC` is shown as is
     _CLI_UPDATE_TIMES: tuple = (None,) + tuple((h, 0) for h in range(0, 24, 3))
 
     def _cli_update_label(hm, lang: str) -> str:
-        """#423: "12:00 UTC", or the localized "off"."""
+        """Format "12:00 UTC", or the localized "off"."""
         if not hm:
             return i18n.t("admin.cli_off", lang)
         return i18n.t("admin.cli_daily", lang, time=_sessions.format_update_time(hm))
 
     def _cli_update_text(lang: str) -> str:
-        """#412: the CLI page header — installed version (and the jail copy when it lags),
-        the last check and its outcome, then the cadence prompt."""
+        """CLI page header: installed version and jail copy if behind.
+
+        - also shows the last check and its outcome
+        - then the cadence prompt
+        """
         host_v = cli_update.version_of(cli_update.host_cli()) or "?"
         ver = host_v
         if getattr(settings, "sandbox_per_session_uid", False):
@@ -949,7 +843,6 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         return "\n".join(lines)
 
     def _ss_cli_keyboard(cur, lang: str) -> InlineKeyboardMarkup:
-        # #423: was _ss_cli_keyboard(cur_hours, lang) over _CLI_UPDATE_CHOICES (hours).
         B = InlineKeyboardButton
         btns = [B(text=("✓ " if hm == cur else "") + _cli_update_label(hm, lang),
                   callback_data="sx:admin:cliset:" + (f"{hm[0]:02d}{hm[1]:02d}" if hm else "off"))
@@ -961,8 +854,10 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         return InlineKeyboardMarkup(inline_keyboard=rows)
 
     def _ss_admin_bool_keyboard(which: str, cur: bool, lang: str) -> InlineKeyboardMarkup:
-        """#275: On/Off picker (with Back) for an Admin boolean, so it no longer flips in
-        place. `which` is the toggle key (cs/wp)."""
+        """On/Off picker with Back for an Admin boolean.
+
+        - `which` is the toggle key
+        """
         B = InlineKeyboardButton
         rows = [[
             B(text=("✓ " if cur else "") + i18n.onoff(True, lang),
@@ -975,9 +870,11 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         return InlineKeyboardMarkup(inline_keyboard=rows)
 
     async def _archive_retention_days() -> int:
-        """Effective archive retention in days: the owner's runtime value (kv
-        ``archive_retention_days``, set here) if present, else the startup default
-        (``settings.archive_retention_days``). 0 = keep forever."""
+        """Effective archive retention in days.
+
+        - the owner's runtime value, else the startup default
+        - 0 means keep forever
+        """
         raw = await db.get_kv("archive_retention_days")
         if raw is not None:
             try:
@@ -1005,7 +902,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
 
     def _ss_admin_keyboard(lang: str, ret_days: int, cs_on: bool, wp_on: bool,
                            gsl: int = 10, idle_min: int = 30,
-                           cli_at=(12, 0)) -> InlineKeyboardMarkup:  # #423: was cli_hours=24
+                           cli_at=(12, 0)) -> InlineKeyboardMarkup:
         B = InlineKeyboardButton
         gsl_lbl = "∞" if gsl <= 0 else str(gsl)
         rows = [
@@ -1014,10 +911,10 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
              B(text=i18n.t("admin.gsl_btn", lang, val=gsl_lbl), callback_data="sx:admin:gsl")],
             [B(text=i18n.t("admin.idle_btn", lang, val=_idle_reset_label(idle_min, lang)),
                callback_data="sx:admin:idle")],
-            # #412/#423: Claude Code CLI daily update time (+ a check-now action inside).
+            # CLI daily update time, plus a check-now action.
             [B(text=i18n.t("admin.cli_btn", lang, val=_cli_update_label(cli_at, lang)),
                callback_data="sx:admin:cli")],
-            # #275: open an On/Off picker (with Back) instead of flipping in place.
+            # Open an On/Off picker with Back, not flip in place.
             [B(text=i18n.t("admin.tog_codesplit", lang, val=i18n.onoff(cs_on, lang)),
                callback_data="sx:admin:bool:cs"),
              B(text=i18n.t("admin.tog_workingplate", lang, val=i18n.onoff(wp_on, lang)),
@@ -1040,15 +937,17 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         wp = bool(getattr(sessions, "working_plate", True))
         gsl = await _global_session_limit()
         idle_min = _idle_reset_min()
-        # was: cli_hours = float(getattr(sessions, "cli_update_hours", 0) or 0)  # #412
-        cli_at = getattr(sessions, "cli_update_at", None)  # #423
+        cli_at = getattr(sessions, "cli_update_at", None)
         with contextlib.suppress(Exception):
-            await _edit_menu(msg, i18n.t("admin.title", lang),  # #173: native rich nav-edit
+            await _edit_menu(msg, i18n.t("admin.title", lang),
                              _ss_admin_keyboard(lang, days, cs, wp, gsl, idle_min, cli_at))
 
     def _scope_model(ctx: ss.Ctx, scope) -> str:
-        """#415: the model effective at a settings scope (what an effort picker lists the
-        CLI's levels for); the deployment default when nothing resolves."""
+        """Model effective at a settings scope.
+
+        - an effort picker lists that model's CLI levels
+        - falls back to the deployment default
+        """
         val = None
         with contextlib.suppress(Exception):
             val, _ = ss.resolve_from(ss.SETTINGS["model"], ctx, scope)
@@ -1056,26 +955,24 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
 
     def _ss_picker_keyboard(setting, scope, ctx: ss.Ctx, lang: str,
                             may_max: bool = True) -> InlineKeyboardMarkup:
-        """Choice picker for one fixed-choice setting at a scope (#101 convention).
-        ``may_max`` hides the gated `max` effort level from users not allowed it
-        (the apply path still enforces it for a forged tap)."""
+        """Choice picker for one fixed-choice setting at a scope.
+
+        - `may_max` hides the gated `max` effort from other users
+        - the apply path still enforces it against forged taps
+        """
         B = InlineKeyboardButton
-        # #138-fix: mark the value held at THIS scope (chain from it), not the
-        # cross-scope resolved one, so the picker's ✓ matches the tab.
+        # Mark the value held at this scope, not resolved.
         value, _ = ss.resolve_from(setting, ctx, scope)
-        # #415: effort lists the levels of the model effective at THIS scope (and the model
-        # picker falls back to it before the CLI has reported a catalog).
+        # Effort lists levels of the model effective at this scope.
+        # - model picker falls back before CLI reports a catalog
         scope_model = _scope_model(ctx, scope) if setting.key in ("effort", "model") else None
         cur_label = _setting_value_label(setting, value, lang, scope_model)
         sc_code = _SCOPE_CODE[scope]
         choices = _setting_choice_labels(setting, lang, scope_model)
         if setting.key == "effort" and not may_max:
             choices = [(v, lbl) for v, lbl in choices if v != "max"]
-        # #223: full-access (bypassPermissions) is now offered to all code users — the
-        # #119 sandbox (per-session uid + egress + jail) confines the blast radius to the
-        # user's own session and they opt into the risk. was OWNER-ONLY (#150):
-        # if setting.key == "permission_mode" and ctx.role < ss.Role.OWNER:
-        #     choices = [(v, lbl) for v, lbl in choices if v not in ("full-access", "bypassPermissions")]
+        # Full-access is offered to all code users.
+        # - the sandbox confines the blast radius to their session
         btns = [B(text=_mark(label, cur_label),
                   callback_data=f"sx:set:{sc_code}:{setting.key}:{cbval}")
                 for cbval, label in choices]
@@ -1085,51 +982,44 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
 
     async def _ss_apply(setting, scope, raw_val, ctx: ss.Ctx, role: ss.Role,
                         uid: int | None, uname: str | None, key: int) -> bool:
-        """Apply a tap AFTER re-checking edit_role + scope authorization server-side.
+        """Apply a tap after re-checking role and scope server-side.
 
-        Returns True if the value was written. A guest/non-owner tapping an
-        owner-only or global control (forged callback) is REJECTED here — the button
-        is never authorization (#138, AGENTS §2)."""
-        # 1. The setting must be editable by THIS user: the structural role gate AND
-        #    the #151 access model (effective access == DELEGATED). A READ-ONLY/HIDDEN
-        #    setting can't be written even by a forged callback (owner is always full).
+        - returns True if the value was written
+        - forged owner-only taps are rejected; buttons never authorize
+        """
+        # 1. Setting must be editable by this user.
+        # - role gate and access model must both allow it
+        # - blocks forged callbacks for read-only or hidden settings
         if not ss.can_edit_setting(setting, ctx):
             return False
-        # 2. The GLOBAL scope is owner-only regardless of the setting's edit_role.
+        # 2. GLOBAL scope is owner-only regardless of `edit_role`.
         if scope == ss.Scope.GLOBAL and role < ss.Role.OWNER:
             return False
         # 3. There must be a setter for this scope.
         setter = setting.set.get(scope)
         if setter is None:
             return False
-        # 4. Per-setting extra gates that the role matrix alone doesn't cover.
+        # 4. Per-setting extra gates the role matrix doesn't cover.
         if setting.key == "effort" and raw_val == "max" and not _may_max_effort(uid, uname):
             return False
-        # #411: only a model the CLI offers (or a fallback family alias) — a forged tap can't
-        # store an arbitrary string the CLI would reject on the next turn.
+        # Accept only models the CLI offers, or a family alias.
+        # - a forged tap can't store an arbitrary string
         if setting.key == "model" and not models.is_selectable(raw_val):
             return False
-        # #415: likewise an effort level must be one the CLI lists (any model) — "default"
-        # clears it. Nothing to check against before the CLI has reported a catalog.
+        # Effort must be a CLI-listed level; default clears it.
+        # - nothing to check before the CLI reports a catalog
         if (setting.key == "effort" and raw_val not in ("default", "none", "reset")
                 and models.entries() and raw_val not in models.all_effort_levels()):
             return False
-        # #223: full-access (bypassPermissions) un-gated for code users (the #119 sandbox
-        # confines it to their own session; the user opts into the risk). was OWNER-ONLY
-        # (AGENTS §2 / #150):
-        # if (setting.key == "permission_mode"
-        #         and raw_val in ("full-access", "bypassPermissions")
-        #         and role < ss.Role.OWNER):
-        #     return False
         # 5. Coerce the callback string into the stored value.
         value = _coerce_ss_value(setting, raw_val)
-        # Setters may be sync (GLOBAL model/sandbox mutate config in-process) or
-        # async (db writes) — await only when the call returned an awaitable.
+        # Setters may be sync or async.
+        # - await only when the call returned an awaitable
         result = setter(ctx, value)
         if inspect.isawaitable(result):
             await result
-        # Language has side effects (locale cache + per-chat menu); model/effort/etc.
-        # need the live SDK client rebuilt for a SESSION change to take effect now.
+        # Language has side effects: locale cache and per-chat menu.
+        # - model/effort changes need the live SDK client rebuilt
         if setting.key == "language" and value:
             i18n.remember_lang(uid, value)
             with contextlib.suppress(Exception):
@@ -1139,12 +1029,12 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         return True
 
     def _coerce_ss_value(setting, raw_val):
-        """Map a picker/toggle callback token into the value the setter stores."""
+        """Map a picker callback token to the stored value."""
         if setting.type is bool:
             return raw_val if isinstance(raw_val, bool) else (raw_val == "on")
         if setting.key == "model":
-            # #411: store the catalog value itself (a family alias, or a pinned id) — the CLI
-            # resolves an alias to the newest model. was: MODEL_ALIASES.get(raw_val, raw_val)
+            # Store the catalog value itself, an alias or pinned id.
+            # - the CLI resolves an alias to the newest model
             return models.match(raw_val) or raw_val
         if setting.key == "permission_mode":
             return PERM_NAME_TO_MODE.get(raw_val, raw_val)
@@ -1161,29 +1051,27 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
 
     async def _send_ss_hub(chat_id: int, key: int, uid: int | None, uname: str | None,
                            lang: str, scope=ss.Scope.SESSION, edit_msg=None) -> None:
-        """Render (or re-render) the tabbed hub at ``scope``."""
+        """Render (or re-render) the tabbed hub at `scope`."""
         role = _role_of(uid, uname)
         if scope not in _visible_tabs(role):
-            scope = ss.Scope.SESSION  # bounce a forged/stale Global tab to session
+            scope = ss.Scope.SESSION  # bounce forged Global tab to session
         ctx = await _build_ss_ctx(key, uid, role)
         text = _ss_text(scope, role, lang)
         kb = _ss_hub_keyboard(scope, ctx, role, lang)
         if edit_msg is not None:
             with contextlib.suppress(Exception):
-                await _edit_menu(edit_msg, text, kb)  # #173: native rich nav-edit
+                await _edit_menu(edit_msg, text, kb)
             return
-        await _send_menu(chat_id, text, kb)  # #173: native rich menu open
+        await _send_menu(chat_id, text, kb)
 
     async def _send_setting_picker(chat_id: int, key: int, uid: int | None,
                                    uname: str | None, lang: str, setting_key: str,
                                    scope=ss.Scope.SESSION) -> bool:
-        """Open the hub PICKER for one registry setting as a NEW message (#145/#146).
+        """Open the hub picker for one setting as a message.
 
-        The slash commands (/model, /effort, /permissions, /maxturns, /language)
-        are thin entry points to the SAME ``sx:`` picker, so there is ONE code path
-        per setting — no separate pm:/pe:/lang: keyboards to drift. Returns False
-        (so the caller can fall back) when the setting isn't viewable for this role
-        or is code-only in a chat session."""
+        - slash commands share this one code path with the hub
+        - returns False if not viewable or code-only here
+        """
         role = _role_of(uid, uname)
         setting = ss.SETTINGS.get(setting_key)
         if setting is None or not setting.can_view(role):
@@ -1196,7 +1084,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         kb = _ss_picker_keyboard(setting, scope, ctx, lang,
                                  may_max=_may_max_effort(uid, uname))
         with contextlib.suppress(Exception):
-            await _send_menu(  # #173: native rich menu open
+            await _send_menu(
                 chat_id,
                 i18n.t("settings.v2_pick", lang, name=_setting_name(setting, lang)),
                 kb)
@@ -1204,7 +1092,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
 
     @router.callback_query(F.data.startswith("sx:"))
     async def on_settings_v2_cb(cb: CallbackQuery) -> None:
-        """Drive the registry-based settings hub: tab switch / picker / apply."""
+        """Drive the settings hub: tab switch, picker, apply."""
         try:
             parts = (cb.data or "").split(":")
             verb = parts[1] if len(parts) > 1 else ""
@@ -1234,11 +1122,11 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 return
 
             if verb == "secret":
-                # #222: open the /secret arg-capture prompt from the hub (Session tab,
-                # code only) so the feature is discoverable without the "/" command menu.
+                # Open the `/secret` arg-capture prompt from the hub.
+                # - Session tab, code only; makes it discoverable
                 ctx = await _build_ss_ctx(key, uid, role)
                 if getattr(ctx.state, "mode", None) != "code" or not _has_code_access(uid, uname):
-                    await cb.answer(i18n.t("common.error", lang))  # #283: level gate too
+                    await cb.answer(i18n.t("common.error", lang))  # level gate too
                     return
                 secrets = _read_secrets(key)
                 names = (", ".join(f"<code>{markup.escape_html(n)}</code>" for n in secrets)
@@ -1253,14 +1141,14 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             if verb == "nav" and len(parts) >= 4:
                 scope = _CODE_SCOPE.get(parts[2], ss.Scope.SESSION)
                 setting = ss.SETTINGS.get(parts[3])
-                # Gate: must be viewable, and the Global tab is owner-only.
+                # Gate: must be viewable; Global tab is owner-only.
                 if (setting is None or not setting.can_view(role)
                         or (scope == ss.Scope.GLOBAL and role < ss.Role.OWNER)):
                     await cb.answer(i18n.t("common.error", lang))
                     return
                 ctx = await _build_ss_ctx(key, uid, role)
                 with contextlib.suppress(Exception):
-                    await _edit_menu(  # #173: native rich nav-edit
+                    await _edit_menu(
                         msg,
                         i18n.t("settings.v2_pick", lang, name=_setting_name(setting, lang)),
                         _ss_picker_keyboard(
@@ -1276,34 +1164,33 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                     return
                 ctx = await _build_ss_ctx(key, uid, role)
                 if verb == "tog":
-                    # #138-fix: flip the value held at THIS scope (chain from it),
-                    # so toggling on the "my defaults" tab doesn't invert a session
-                    # override and write the result to the user-default scope.
+                    # Flip the value held at this scope.
+                    # - avoids inverting a session override into user defaults
                     value, _ = ss.resolve_from(setting, ctx, scope)
                     raw_val = not bool(value)  # flip the scope-local bool
                 else:
                     raw_val = parts[4] if len(parts) > 4 else ""
                 ok = await _ss_apply(setting, scope, raw_val, ctx, role, uid, uname, key)
                 if not ok:
-                    # Forged / unauthorized tap, or a gated choice (e.g. max effort).
+                    # Forged or unauthorized tap, or a gated choice.
                     await cb.answer(i18n.t("settings.denied", lang), show_alert=True)
                     return
-                lang = _lang(cb)  # a language change updates the acting locale
+                lang = _lang(cb)  # updates the acting locale
                 await _send_ss_hub(msg.chat.id, key, uid, uname, lang, scope, edit_msg=msg)
                 await cb.answer(i18n.t("settings.saved", lang))
                 return
 
-            # ---- bespoke sx: sub-pages (Tools / Users / Usage), Back → hub (#141) ----
+            # ---- bespoke sx: sub-pages ----
             if verb == "tools":
-                # Per-session Tools grid (code-only; menu.md §1.7). Render in place.
+                # Per-session Tools grid, code-only; render in place.
                 state = None
                 with contextlib.suppress(Exception):
                     state = await db.get_thread(key)
                 if getattr(state, "mode", None) != "code" or not _has_code_access(uid, uname):
-                    await cb.answer(i18n.t("settings.denied", lang), show_alert=True)  # #283
+                    await cb.answer(i18n.t("settings.denied", lang), show_alert=True)
                     return
                 with contextlib.suppress(Exception):
-                    await _edit_menu(msg, i18n.t("settings.tools_title", lang),  # #173: rich nav-edit
+                    await _edit_menu(msg, i18n.t("settings.tools_title", lang),
                                      _ss_tools_keyboard(state, lang))
                 await cb.answer()
                 return
@@ -1315,19 +1202,20 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                     state = await db.get_thread(key)
                 mode = getattr(state, "mode", "chat")
                 universe = engine.CODE_TOOLS if mode == "code" else engine.CHAT_TOOLS
-                if mode == "code" and tool in universe and _has_code_access(uid, uname):  # #283
+                if mode == "code" and tool in universe and _has_code_access(uid, uname):
                     base = (state.tools_enabled if state and state.tools_enabled is not None
                             else list(universe))
                     enabled = {t for t in base if t in universe}
                     enabled.discard(tool) if tool in enabled else enabled.add(tool)
                     ordered = [t for t in universe if t in enabled]
-                    # None = the whole universe on (a tool added later defaults ON).
+                    # None means the whole tool universe is on.
+                    # - tools added later default on
                     await db.set_tools_enabled(
                         key, None if set(ordered) == set(universe) else ordered)
                     await _rebuild_session(key)
                     state = await db.get_thread(key)
                     with contextlib.suppress(Exception):
-                        await _edit_menu(msg, i18n.t("settings.tools_title", lang),  # #173: rich nav-edit
+                        await _edit_menu(msg, i18n.t("settings.tools_title", lang),
                                          _ss_tools_keyboard(state, lang))
                 await cb.answer()
                 return
@@ -1338,7 +1226,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                     return
                 snap = allowlist.snapshot()
                 with contextlib.suppress(Exception):
-                    await _edit_menu(  # #173: native rich nav-edit
+                    await _edit_menu(
                         msg, "\n".join(await _users_text(snap, lang)),
                         _users_keyboard(snap, lang))
                 await cb.answer()
@@ -1349,7 +1237,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                     await cb.answer(i18n.t("settings.denied", lang), show_alert=True)
                     return
                 with contextlib.suppress(Exception):
-                    await _edit_menu(  # #173: native rich nav-edit
+                    await _edit_menu(
                         msg,
                         i18n.t("settings.v2_pick", lang, name=i18n.t("settings.usage_name", lang)),
                         _ss_usage_keyboard(getattr(sessions, "usage_mode", "footer"), lang))
@@ -1368,7 +1256,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 await cb.answer(i18n.t("settings.saved", lang))
                 return
 
-            # ---- owner Admin sub-page (#178): retention + global toggles + launchers ----
+            # ---- owner Admin sub-page ----
             if verb == "admin":
                 if role < ss.Role.OWNER:
                     await cb.answer(i18n.t("settings.denied", lang), show_alert=True)
@@ -1379,7 +1267,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                     # Open the archive-retention picker.
                     cur = await _archive_retention_days()
                     with contextlib.suppress(Exception):
-                        await _edit_menu(  # #173: native rich nav-edit
+                        await _edit_menu(
                             msg, i18n.t("admin.retention_title", lang),
                             _ss_retention_keyboard(cur, lang))
                     await cb.answer()
@@ -1394,7 +1282,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                     await cb.answer(i18n.t("admin.ret_saved", lang, val=_retention_label(days, lang)))
                     return
                 if sub == "idle":
-                    # #261: open the idle→fresh-session picker.
+                    # Open the idle-to-fresh-session picker.
                     with contextlib.suppress(Exception):
                         await _edit_menu(
                             msg, i18n.t("admin.idle_title", lang),
@@ -1402,15 +1290,14 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                     await cb.answer()
                     return
                 if sub == "cli":
-                    # #412: open the CLI auto-update page (version, last check, daily time).
+                    # Open the CLI auto-update page.
                     with contextlib.suppress(Exception):
                         await _edit_menu(msg, _cli_update_text(lang),
                                          _ss_cli_keyboard(sessions.cli_update_at, lang))
                     await cb.answer()
                     return
                 if sub == "cliset":
-                    # #423: arg is "HHMM" (UTC) or "off". was (#412): hours = max(0, int(arg))
-                    #   → sessions.set_cli_update_hours(hours)
+                    # Arg is `HHMM` in UTC, or `off`.
                     raw = str(arg or "")
                     hm = (_sessions.parse_update_time(f"{raw[:2]}:{raw[2:]}")
                           if len(raw) == 4 and raw.isdigit() else None)
@@ -1420,12 +1307,12 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                         i18n.t("admin.cli_saved", lang, val=_cli_update_label(hm, lang)))
                     return
                 if sub == "clinow":
-                    # #412: run one update round now; the page re-renders with the outcome.
+                    # Run one update round now; page re-renders with the outcome.
                     await cb.answer(i18n.t("admin.cli_checking", lang))
                     with contextlib.suppress(Exception):
                         await sessions.update_cli_now()
                     with contextlib.suppress(Exception):
-                        await sessions.probe_models()  # #411: new CLI → refresh the model list
+                        await sessions.probe_models()  # new CLI refreshes the model list
                     with contextlib.suppress(Exception):
                         await _edit_menu(msg, _cli_update_text(lang),
                                          _ss_cli_keyboard(sessions.cli_update_at, lang))
@@ -1441,8 +1328,8 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                         i18n.t("admin.idle_saved", lang, val=_idle_reset_label(mins, lang)))
                     return
                 if sub == "gsl":
-                    # Global default per-user session limit → arg-capture the owner's
-                    # next message (a number, or off/unlimited). Handled by _run_pending.
+                    # Global per-user session limit: capture the owner's next message.
+                    # - a number, or off/unlimited; handled by `_run_pending`
                     pending[(msg.chat.id, thread_key(msg), uid or 0)] = "gsessionlimit"
                     with contextlib.suppress(Exception):
                         await bot.send_message(msg.chat.id, i18n.t("admin.gsl_prompt", lang),
@@ -1450,9 +1337,9 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                     await cb.answer()
                     return
                 if sub == "cmd" and arg in ("allow", "deny", "level", "expire", "limit"):
-                    # Launch an owner arg-capture command from the Admin page (#101):
-                    # set up the pending capture + send the command's own prompt. The
-                    # owner's next message is consumed by on_text → _run_pending → _do_*.
+                    # Launch an owner arg-capture command from the Admin page.
+                    # - set up pending capture and send the command's prompt
+                    # - next owner message goes through `_run_pending`
                     pending[(msg.chat.id, thread_key(msg), uid or 0)] = arg
                     with contextlib.suppress(Exception):
                         await bot.send_message(msg.chat.id, i18n.t(f"{arg}.prompt", lang),
@@ -1460,8 +1347,8 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                     await cb.answer()
                     return
                 if sub == "bool" and arg in ("cs", "wp"):
-                    # #275: open the On/Off picker (with Back) for a global owner toggle
-                    # (code-block split / working plate) instead of flipping in place.
+                    # Open On/Off picker for global owner toggles.
+                    # - code-block split, working plate
                     cur = (bool(getattr(sessions, "split_code_messages", True)) if arg == "cs"
                            else bool(getattr(sessions, "working_plate", True)))
                     name = i18n.t("admin.name_codesplit" if arg == "cs"
@@ -1480,19 +1367,19 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                     await _send_ss_admin(msg, lang)
                     await cb.answer(i18n.t("settings.saved", lang))
                     return
-                # Default (sx:admin): render the Admin page.
+                # Default: render the Admin page.
                 await _send_ss_admin(msg, lang)
                 await cb.answer()
                 return
 
-            # ---- #151 access model: read-only toast + owner option-admin pages ----
+            # ---- access model: read-only toast, option-admin pages ----
             if verb == "ro":
-                # A READ-ONLY row was tapped (the owner hasn't delegated it) — explain.
+                # A read-only row was tapped; explain it isn't delegated.
                 await cb.answer(i18n.t("settings.ro_toast", lang), show_alert=True)
                 return
 
             if verb == "opt" and len(parts) >= 3:
-                # Owner option-admin page (Global tab): global value + base access.
+                # Owner option-admin page: global value and base access.
                 if role < ss.Role.OWNER:
                     await cb.answer(i18n.t("settings.denied", lang), show_alert=True)
                     return
@@ -1502,7 +1389,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                     return
                 octx = await _build_ss_ctx(key, uid, role)
                 with contextlib.suppress(Exception):
-                    await _edit_menu(  # #173: native rich nav-edit
+                    await _edit_menu(
                         msg,
                         i18n.t("settings.opt_title", lang, name=_setting_name(setting, lang)),
                         _ss_option_admin_kb(setting, octx, lang))
@@ -1520,7 +1407,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                     return
                 octx = await _build_ss_ctx(key, uid, role)
                 with contextlib.suppress(Exception):
-                    await _edit_menu(  # #173: native rich nav-edit
+                    await _edit_menu(
                         msg,
                         i18n.t("settings.acc_title", lang, name=_setting_name(setting, lang)),
                         _ss_access_kb(setting, octx, lang))
@@ -1528,7 +1415,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 return
 
             if verb == "accset" and len(parts) >= 4:
-                # Apply a base-access change (owner) → re-render the option-admin page.
+                # Apply a base-access change, then re-render the option-admin page.
                 if role < ss.Role.OWNER:
                     await cb.answer(i18n.t("settings.denied", lang), show_alert=True)
                     return
@@ -1540,7 +1427,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 octx = await _build_ss_ctx(key, uid, role)
                 if setting is not None:
                     with contextlib.suppress(Exception):
-                        await _edit_menu(  # #173: native rich nav-edit
+                        await _edit_menu(
                             msg,
                             i18n.t("settings.opt_title", lang, name=_setting_name(setting, lang)),
                             _ss_option_admin_kb(setting, octx, lang))
@@ -1552,10 +1439,10 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             with contextlib.suppress(Exception):
                 await cb.answer(i18n.t("common.error", _lang(cb)))
 
-    # ------------------------------------------------------------ language
+    # ---- language ----
 
     def _language_keyboard(current: str) -> InlineKeyboardMarkup:
-        """Inline picker listing every supported locale (✓ on the current one)."""
+        """Inline picker listing every supported locale."""
         rows = [
             [InlineKeyboardButton(
                 text=_mark(i18n.lang_name(code), i18n.lang_name(current)),
@@ -1565,12 +1452,14 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         return InlineKeyboardMarkup(inline_keyboard=rows)
 
     async def _apply_user_menu(chat_id: int, uid: int, uname: str | None, lang: str) -> None:
-        """Set this user's per-chat command menu in their chosen language + access
-        level, OVERRIDING Telegram's client-language default — so /language actually
-        updates the `/` menu, and a chat-level user never sees code commands. DM only."""
+        """Set the user's per-chat command menu language and access level.
+
+        - overrides Telegram's client-language default
+        - chat-level users never see code commands; DM only
+        """
         is_owner = uid == settings.owner_id
         level = "code" if is_owner else (allowlist.level_of(uid, uname) or "chat")
-        # #315: chat users get the short everyday-trio menu; code users keep the full set.
+        # Chat users get the short menu; code users full.
         names = list(_COMMAND_NAMES) if level == "code" else _chat_menu_names()
         if is_owner:
             names = names + _OWNER_COMMAND_NAMES
@@ -1582,7 +1471,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
 
     @router.message(Command("language"))
     async def cmd_language(message: Message) -> None:
-        """Show the language picker, or set it directly: /language ru | en."""
+        """Show the language picker, or set it directly."""
         await _ensure_state(message)
         lang = _lang(message)
         uid = message.from_user.id if message.from_user else 0
@@ -1592,23 +1481,23 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             if base in i18n.LANGUAGES:
                 await db.set_user_lang(uid, base)
                 i18n.remember_lang(uid, base)
-                # Refresh the "/" command menu in the chosen language via a per-chat
-                # scope, which overrides Telegram's client-language default.
+                # Refresh the command menu in the chosen language.
+                # - per-chat scope overrides Telegram's client-language default
                 if message.chat.type == "private":
                     uname = message.from_user.username if message.from_user else None
                     await _apply_user_menu(message.chat.id, uid, uname, base)
                 await reply(message, i18n.t("lang.set", base, name=i18n.lang_name(base)))
                 return
             # Unknown value: fall through to the picker.
-        # No/invalid arg → the unified hub picker (USER scope; #145/#146 — one code
-        # path per setting; the standalone lang: picker is retired below).
+        # No or invalid arg: show the unified hub picker.
+        # - USER scope; one code path per setting
         key = await _session_key(message)
         uname = message.from_user.username if message.from_user else None
         if await _send_setting_picker(message.chat.id, key, uid, uname, lang,
                                       "language", ss.Scope.USER):
             return
         with contextlib.suppress(Exception):
-            await _send_menu(  # #173: native rich menu open
+            await _send_menu(
                 message.chat.id,
                 i18n.t("lang.title", lang, name=i18n.lang_name(lang)),
                 _language_keyboard(lang),
@@ -1616,7 +1505,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
 
     @router.callback_query(F.data.startswith("lang:"))
     async def on_language_cb(cb: CallbackQuery) -> None:
-        """Apply a tap on the /language picker (set the user's interface locale)."""
+        """Apply a tap on the language picker."""
         try:
             parts = (cb.data or "").split(":")
             code = parts[2] if len(parts) > 2 else ""
@@ -1629,7 +1518,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             lang = _lang(cb)
             if cb.message is not None:
                 with contextlib.suppress(Exception):
-                    await _edit_menu(  # #173: native rich (was classic edit_text)
+                    await _edit_menu(
                         cb.message,
                         i18n.t("lang.set", lang, name=i18n.lang_name(lang)),
                     )
@@ -1638,23 +1527,21 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             with contextlib.suppress(Exception):
                 await cb.answer(i18n.t("common.error", _lang(cb)))
 
-    # ----------------------------------------------------------- arg capture
-    # Commands needing free text (/new, /rename) can prompt and capture the
-    # user's NEXT plain message as the argument, instead of forcing inline typing
-    # (Telegram sends a picked command immediately). Keyed by (chat, thread, user);
-    # consumed by the next plain message or cleared by /cancel.
+    # ---- arg capture ----
+    # - commands needing free text prompt, then capture next message
+    # - keyed by (chat, thread, user)
+    # - consumed by next plain message or cleared by /cancel
     pending: dict[tuple, str] = {}
 
-    # #288: per-uid lock serializing idle-rotation so two near-simultaneous DM
-    # messages can't both pass the idle check and each mint a fresh session
-    # (TOCTOU between get_thread and _new_dm_session). One lock per chat uid.
+    # Per-uid lock serializing idle rotation.
+    # - stops two near-simultaneous DMs both minting a fresh session
+    # - TOCTOU between `get_thread` and `_new_dm_session`
     rotate_locks: dict[int, asyncio.Lock] = {}
 
-    # #235: media-group (album) coalescing buffer, keyed by (chat_id, thread_key,
-    # media_group_id). Each value is a dict: {"parts": [(message_id, part)], "caption":
-    # str, "msg": Message (representative reply target), "lang": str, "timer": Task,
-    # "dropped": int}. A `part` is {"blocks": [...], "inline": str}. Filled by the
-    # attachment handlers and flushed by _flush_album once the debounce window closes.
+    # Media-group (album) coalescing buffer.
+    # - keyed by (chat_id, thread_key, media_group_id)
+    # - value: parts, caption, msg, lang, timer, dropped
+    # - filled by attachment handlers, flushed by `_flush_album`
     album_buf: dict[tuple, dict] = {}
 
     def _pkey(message: Message) -> tuple:
@@ -1662,14 +1549,17 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         return (message.chat.id, thread_key(message), uid)
 
     def _parse_new(arg: str) -> tuple[str, str]:
-        """Parse `[chat|code] <name>` → (mode, name). No type prefix → chat."""
+        """Parse `[chat|code] <name>` into `(mode, name)`.
+
+        - no type prefix means chat
+        """
         parts = arg.strip().split(maxsplit=1)
         if parts and parts[0].lower() in VALID_MODES:
             return parts[0].lower(), (parts[1].strip() if len(parts) > 1 else "")
         return "chat", arg.strip()
 
     async def _new_dm_session(uid: int, mode: str, name: str) -> int:
-        """Create a DM session of the given (fixed) type, switch to it, return key."""
+        """Create a typed DM session, switch to it, return key."""
         key = await db.allocate_dm_session(
             uid, name, settings.default_model, str(settings.base_workdir), mode=mode
         )
@@ -1677,36 +1567,38 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         return key
 
     async def _global_session_limit() -> int:
-        """The global default per-user session limit: kv `max_sessions_default` (owner-set
-        in Admin) else `settings.max_sessions_default`. 0 = unlimited."""
+        """Global default per-user session limit.
+
+        - owner-set value, else the config default
+        - 0 means unlimited
+        """
         raw = await db.get_kv("max_sessions_default")
-        default = getattr(settings, "max_sessions_default", 500)  # #268: 10→500
+        default = getattr(settings, "max_sessions_default", 500)
         try:
             return max(0, int(raw)) if raw is not None else default
         except (TypeError, ValueError):
             return default
 
     async def _effective_max_sessions(uid: int, uname: str | None) -> int:
-        """Resolve a user's session-count cap (read-only to the user): the per-user
-        override (allowlist) → the owner is uncapped by default → the GLOBAL default.
-        0 = unlimited."""
+        """Resolve a user's session-count cap.
+
+        - order: per-user override, owner uncapped, global default
+        - 0 means unlimited
+        """
         override = allowlist.max_sessions_of(uid, uname)
         if override is not None:
             return override
         if uid == settings.owner_id:
-            return 0  # owner uncapped by default (#185-style; settable per-user)
+            return 0  # owner uncapped by default; per-user settable
         return await _global_session_limit()
 
     async def _session_limit_block(uid: int, uname: str | None, lang: str) -> str | None:
-        """If the user is at/over their session cap, return the block message (which
-        offers to delete or /clear an existing session); else None. The cap counts ALL
-        of the user's DM sessions (chat + code).
+        """Return the block message at the session cap, else `None`.
 
-        #197: this is intentionally DM-ONLY. The cap is a per-USER limit and
-        `browse_threads(uid)` counts threads keyed by the user's id (their DM surface).
-        Supergroup forum-topic sessions are keyed by the GROUP's chat_id (a shared group
-        resource, not a per-user session), so they live outside this cap by design — the
-        non-private create path (forum-topic creation) deliberately does not call this."""
+        - counts all the user's DM sessions, chat and code
+        - DM-only: the cap is per-user, keyed by user id
+        - forum-topic sessions are keyed by group, outside the cap
+        """
         cap = await _effective_max_sessions(uid, uname)
         if cap <= 0:
             return None
@@ -1716,19 +1608,21 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         return i18n.t("session.limit_reached", lang, cap=cap, total=total)
 
     def _default_session_name(mode: str, lang: str) -> str:
-        """Localized default name for a session created without one."""
+        """Localized default name for an unnamed session."""
         return i18n.t(
             "session.default_name_code" if mode == "code" else "session.default_name_chat",
             lang,
         )
 
     async def _session_meta_line(st, lang: str) -> str:
-        """#415: "Model: Opus 5.5 · Effort: medium" — what the session runs on, straight from
-        the CLI: the model's display name (catalog) and the effort it runs at (its own level,
-        else the model's CLI default; omitted for a model that takes none)."""
+        """Model and effort line for a session.
+
+        - the model's catalog display name and its effort level
+        - effort falls back to the model's CLI default
+        - effort is omitted for a model that takes none
+        """
         model, effort = await sessions.model_and_effort(st)
-        # #422: the model it RUNS AS ("Opus 5.5" for the CLI's "default" too). was:
-        #   mlabel = markup.escape_html(models.label(model))
+        # Show the model the session runs as.
         mlabel = markup.escape_html(models.runs_as_label(model))
         if not models.effort_levels(model) and models.entries():
             return i18n.t("session.card_meta_model", lang, model=mlabel)
@@ -1736,9 +1630,10 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                       effort=markup.escape_html(_effort_label(effort, lang)))
 
     async def _session_model_line(st, lang: str) -> str:
-        """#424: "Opus 5.5 · medium" — the model a session runs on (display name with its
-        version, from the CLI) and its effort; just the model for one that takes no effort level
-        (or while its default effort is still unknown)."""
+        """Short "Opus 5.5 · medium" label for a session's model.
+
+        - just the model if it takes no effort
+        """
         model, effort = await sessions.model_and_effort(st)
         name = markup.escape_html(models.runs_as_label(model))
         if not effort or (models.entries() and not models.effort_levels(model)):
@@ -1747,9 +1642,11 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                       effort=markup.escape_html(_effort_label(effort, lang)))
 
     def _created_text(mode: str, name: str, lang: str, meta: str = "") -> str:
-        """Confirmation shown after creating + switching to a session — leads with
-        the mode glyph + tagline so the session type is unmistakable. #415: ``meta`` is the
-        session's model + effort line (_session_meta_line)."""
+        """Confirmation after creating and switching to a session.
+
+        - leads with the mode glyph and tagline
+        - `meta` is the model and effort line
+        """
         return i18n.t(
             "session.created",
             lang,
@@ -1760,48 +1657,22 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         )
 
     async def _dispose_session(uid: int, key: int, name: str | None) -> bool:
-        """#307: reset + delete + archive ONE session (shared by the cap-evictor and the
-        untitled-empty GC). Returns True if the row was deleted. #413: the body moved to
-        SessionManager.dispose_dm_session so the background untitled sweep shares it. was:
-            with contextlib.suppress(Exception):
-                await sessions.reset(key)
-            ok = False
-            with contextlib.suppress(Exception):
-                ok = await db.delete_dm_session(uid, key)
-            if ok:
-                with contextlib.suppress(Exception):
-                    archive.archive_session(settings.base_workdir, db.session_pubid(key),  # #332
-                                            owner_id=uid, key=key, name=name)
-            return ok"""
+        """Reset, delete, and archive one session.
+
+        - shared by the cap evictor and the untitled-empty cleanup
+        - returns True if the row was deleted
+        - the body lives in `SessionManager.dispose_dm_session`
+        """
         return await sessions.dispose_dm_session(uid, key, name)
 
     async def _gc_untitled_empties(uid: int, keep: int) -> int:
-        """#307: enforce AT MOST ONE empty untitled session per user, except ``keep`` (the
-        current/target). #413: extended to name-or-dispose — a USED session still on the
-        "Not named yet" placeholder (the CLI writes no title for a <10-char prompt such as a
-        bare "you there?", and #345 skips a <10-letter one) is named by the auto-name priority
-        or, with nothing to name it by, archived (SessionManager.tidy_untitled). Returns the
-        number archived. was (#307 — zero-request sessions only, a used one never touched):
-            try:
-                page, _ = await db.browse_threads(uid, None, limit=100, offset=0)
-            except Exception:
-                return 0
-            cands = [r for r in page
-                     if r["thread_id"] != keep and r["thread_id"] < 0
-                     and not r.get("favorite") and r.get("name_auto", True)]
-            if not cands:
-                return 0
-            stats: dict = {}
-            with contextlib.suppress(Exception):
-                stats = await db.get_usage_totals_bulk([r["thread_id"] for r in cands])
-            n = 0
-            for r in cands:
-                tid = r["thread_id"]
-                if int((stats.get(tid) or {}).get("requests", 0) or 0) != 0:
-                    continue  # has usage → not empty; keep it
-                if await _dispose_session(uid, tid, r.get("name")):
-                    n += 1
-            return n"""
+        """Keep at most one empty untitled session per user.
+
+        - `keep` (current or target) is exempt
+        - a used session still unnamed is auto-named, else archived
+        - the CLI writes no title for very short prompts
+        - returns the number archived
+        """
         try:
             _named, disposed = await sessions.tidy_untitled(uid, keep)
         except Exception:
@@ -1809,10 +1680,12 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         return disposed
 
     async def _evict_oldest_empty(uid: int, exclude: int) -> bool:
-        """#266: free one session slot by archiving the user's OLDEST disposable session —
-        non-current, non-favorite, with ZERO usage (never really used). Returns True if one
-        was archived. Never touches a session that has any usage, so nothing with content is
-        ever auto-deleted (the idle-rotation falls back to an in-place reset instead)."""
+        """Free one session slot by archiving the oldest disposable session.
+
+        - non-current, non-favorite, with zero usage
+        - returns True if one was archived
+        - a session with any usage is never auto-deleted
+        """
         page, _ = await db.browse_threads(uid, None, limit=100, offset=0)
         cands = []
         for r in page:
@@ -1828,21 +1701,18 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         if not cands:
             return False
         victim = min(cands, key=lambda r: r.get("created_at") or 0)
-        # #307: reset + delete + archive via the shared helper (was inlined here).
+        # Reset, delete and archive via the shared helper.
         return await _dispose_session(uid, victim["thread_id"], victim.get("name"))
 
     async def _rotate_if_idle(message: Message) -> tuple[int, bool]:
-        """#266/#271: resolve the current DM session key, starting a NEW session first when
-        the current one has been idle past the configured window. Returns (key, rotated).
-        DM only — supergroup topics are a shared resource and never auto-rotate. The old
-        session stays in /sessions with its history; the fresh one becomes current and (via
-        #260) auto-names itself, inheriting the old session's mode. At the session cap, the
-        oldest disposable empty session is archived to make room; if there's nothing
-        disposable, falls back to an in-place context reset so no session with content is
-        lost. #271: callable from a command entry too (not just a chat turn), so the fresh
-        session shows up the moment the user interacts (e.g. opens /sessions), not only on
-        the next typed message. Rotates AT MOST once per idle gap: the new session has
-        last_active=0, so a follow-up interaction won't rotate again."""
+        """Resolve the current DM session key, rotating when idle.
+
+        - starts a new session when idle past the window
+        - returns `(key, rotated)`; DM only, topics never rotate
+        - the new session inherits the old one's mode
+        - at the cap, archives the oldest disposable empty session
+        - with none disposable, resets in place; no content lost
+        """
         key = await _session_key(message)
         if message.chat.type != "private":
             return key, False
@@ -1850,57 +1720,53 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         window = await sessions.idle_reset_seconds(uid)
         if window <= 0:
             return key, False
-        # #288: serialize the decide-then-rotate on a per-uid lock and re-read the
-        # CURRENT key + its last_active INSIDE the lock — a concurrent message may
-        # have already rotated (so `key` is stale) or refreshed last_active.
+        # Serialize decide-then-rotate on a per-uid lock.
+        # - re-read current key and `last_active` inside the lock
+        # - a concurrent message may have rotated or refreshed
         lock = rotate_locks.setdefault(uid, asyncio.Lock())
         async with lock:
             key = await _session_key(message)
             st = await db.get_thread(key)
-            # #329: idle is the USER's overall inactivity gap, NOT this session's age. A month-old
-            # session is fine to keep; only a >window gap since the user's LAST activity (any
-            # message OR an explicit switch, which stamps ula=now) rotates to a fresh session — so
-            # opening an old session and continuing it never rotates it away.
-            # was: keyed on st.last_active (the session's own age) → every old session rotated.
+            # Idle means the user's overall inactivity gap.
+            # - not this session's age; old sessions stay
+            # - only a gap since last activity rotates
+            # - an explicit switch stamps activity too
             user_la = await db.get_user_last_active(uid)
             now = time.time()
-            await db.set_user_last_active(uid, now)  # this message IS user activity
+            await db.set_user_last_active(uid, now)  # this message is user activity
             if st is None or not st.last_active:
-                return key, False  # current session has no content → already fresh, nothing to rotate
+                return key, False  # empty session is already fresh
             if not user_la or (now - user_la) < window:
-                return key, False  # user was active within the window → continue this session
+                return key, False  # active within window: continue session
             lang = _lang(message)
             uname = message.from_user.username if message.from_user else None
             if await _session_limit_block(uid, uname, lang) is not None:
-                # At the cap: free a slot by archiving an empty session, else reset in place.
+                # At cap: archive an empty session, else reset in place.
                 if not await _evict_oldest_empty(uid, exclude=key):
                     with contextlib.suppress(Exception):
                         await sessions.rotate_in_place(key)
                     return key, False
-            # #274: an auto-started (idle) session is ALWAYS a chat — never code. Code is a
-            # privileged, resource-heavier mode entered only on an explicit user action
-            # (/code or /new code), so an automatic rotation must not silently mint one.
-            # was: _new_dm_session(uid, st.mode, _default_session_name(st.mode, lang))
+            # Auto-started idle sessions are always chat, never code.
+            # - code is privileged and entered only explicitly
             newk = await _new_dm_session(uid, "chat", _default_session_name("chat", lang))
-            # #413: a rotation is exactly where an earlier rotation's leftover lands — e.g. a
-            # session that only ever got a liveness probe ("you there?") and never a name. Name
-            # or archive such leftovers now instead of letting them pile up in /sessions.
+            # Rotation is where leftover unnamed sessions land.
+            # - name or archive them now to avoid pile-up
             with contextlib.suppress(Exception):
                 await _gc_untitled_empties(uid, newk)
             return newk, True
 
     async def _session_key_for_turn(message: Message) -> int:
-        """The session key for a CONVERSATIONAL turn (on_text / attachments). Thin wrapper
-        over _rotate_if_idle that drops the rotated flag (the turn stays silent on idle —
-        the new session is surfaced passively in /sessions, never as a push notice)."""
+        """Session key for a conversational turn.
+
+        - wraps the idle rotation and drops the rotated flag
+        - idle rotation is silent, surfaced only in `/sessions`
+        """
         key, _ = await _rotate_if_idle(message)
         return key
 
     async def _do_new(message: Message, arg: str) -> None:
-        # #133: every session is BORN a chat; the type is no longer fixed (/code and
-        # /chat switch it later). An explicit "code" request (or /newcode) creates the
-        # chat then upgrades it — only if the user has code access (#102). In the
-        # (frozen) supergroup we still create a forum topic.
+        # Sessions are born chat; /code and /chat switch later.
+        # - explicit code request upgrades only with code access
         lang = _lang(message)
         mode, name = _parse_new(arg)
         uid = message.from_user.id if message.from_user else 0
@@ -1922,45 +1788,23 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 await db.switch_mode(key, "code")
                 await _rebuild_session(key)
             final = "code" if want_code else "chat"
-            # #415: name the model + effort the new session runs on. was:
-            #   txt = _created_text(final, name, lang)
-            # #424: only the mode glyph + "Opus 5.5 · medium". was (#415):
-            #   meta = await _session_meta_line(await db.get_thread(key), lang)
+            # Name the model and effort the new session runs on.
             meta = ""
             with contextlib.suppress(Exception):
                 meta = await _session_model_line(await db.get_thread(key), lang)
             txt = _created_text(final, name, lang, meta or markup.escape_html(name))
-            # #424: dropped — the confirmation is the model line only. was (#133):
-            #   On a fresh CHAT, tell code-capable users they can upgrade.
-            #   if final == "chat" and can_code:
-            #       txt += "\n" + i18n.t("session.upgrade_hint", lang)
             await reply(message, txt)
             return
-        # #253: supergroup support PAUSED — rich-draft streaming doesn't work in supergroups
-        # (TEXTDRAFT_PEER_INVALID, #3/#39), so the forum-topic create path is disabled and the
-        # bot is DM-only for now. Reply with the paused notice instead of creating a topic.
-        # (#197 note: when revived, the per-user cap stays DM-only by design — a topic session
-        # is keyed by the group's chat_id, outside the per-USER cap. See _session_limit_block.)
+        # Supergroup support is paused; DM-only for now.
+        # - rich-draft streaming fails in supergroups (`TEXTDRAFT_PEER_INVALID`)
+        # - reply with a paused notice, not a topic
+        # - per-user cap stays DM-only; topics keyed by group chat_id
         await reply(message, i18n.t("topic.disabled", lang))
         return
-        # was (revive with #253): non-private → create a forum TOPIC.
-        # try:
-        #     topic = await bot.create_forum_topic(chat_id=message.chat.id, name=name)
-        # except Exception as exc:
-        #     await reply(
-        #         message,
-        #         i18n.t("topic.create_error", lang, err=markup.escape_html(str(exc))),
-        #     )
-        #     return
-        # created_name = getattr(topic, "name", name)
-        # await reply(
-        #     message,
-        #     i18n.t("topic.created", lang, name=markup.escape_html(created_name)),
-        # )
 
     async def _do_rename(message: Message, name: str, key: int | None = None) -> None:
-        # DM: rename a bot-managed session (the given key, else the current one).
-        # Supergroup: rename the topic.
+        # DM: rename a bot-managed session (given key, else current).
+        # - supergroup: rename the topic
         lang = _lang(message)
         if message.chat.type == "private":
             target = key if key is not None else await _session_key(message)
@@ -1975,28 +1819,9 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 i18n.t("session.renamed", lang, name=markup.escape_html(name)),
             )
             return
-        # #253: supergroup paused — forum-topic rename disabled (see _do_new). DM-only for now.
+        # Supergroup paused: forum-topic rename disabled, DM-only for now.
         await reply(message, i18n.t("topic.disabled", lang))
         return
-        # was (revive with #253): rename the forum topic.
-        # if not message.message_thread_id:
-        #     await reply(message, i18n.t("topic.not_a_topic_rename", lang))
-        #     return
-        # try:
-        #     await bot.edit_forum_topic(
-        #         chat_id=message.chat.id,
-        #         message_thread_id=message.message_thread_id,
-        #         name=name,
-        #     )
-        # except Exception as exc:
-        #     await reply(
-        #         message,
-        #         i18n.t("topic.rename_error", lang, err=markup.escape_html(str(exc))),
-        #     )
-        #     return
-        # await reply(
-        #     message, i18n.t("topic.renamed", lang, name=markup.escape_html(name))
-        # )
 
     async def _run_pending(action: str, message: Message, text: str) -> None:
         if action == "new":
@@ -2034,14 +1859,14 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
 
     @router.message(Command("cancel"))
     async def cmd_cancel(message: Message) -> None:
-        """Cancel a pending 'command → send the argument' prompt."""
+        """Cancel a pending 'command then send the argument' prompt."""
         lang = _lang(message)
         if pending.pop(_pkey(message), None):
             await reply(message, i18n.t("common.cancelled", lang))
         else:
             await reply(message, i18n.t("common.nothing_cancel", lang))
 
-    # --------------------------------------------------- recurring schedules (#188)
+    # ---- recurring schedules ----
 
     _MAX_SCHEDULES_PER_USER = 5
 
@@ -2052,7 +1877,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         return datetime.fromtimestamp(ts).strftime("%a %m-%d %H:%M")
 
     async def _do_schedule(message: Message, text: str) -> None:
-        """Parse and persist a `<when> | <prompt>` schedule for the current session."""
+        """Parse and persist a `<when> | <prompt>` schedule."""
         lang = _lang(message)
         uid = message.from_user.id if message.from_user else 0
         try:
@@ -2076,12 +1901,15 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
 
     @router.message(Command("schedule"))
     async def cmd_schedule(message: Message) -> None:
-        """Create a recurring scheduled prompt. With no arg, prompt + capture (#101)."""
+        """Create a recurring scheduled prompt.
+
+        - with no argument, prompts and captures the next message
+        """
         await _ensure_state(message)
         lang = _lang(message)
         arg = _command_arg(message)
         if not arg:
-            # #258: one bubble, not two (usage + prompt were separate reply()s).
+            # One bubble, not two separate replies.
             pending[_pkey(message)] = "schedule"
             await reply(message, i18n.t("schedule.usage", lang) + "\n\n"
                         + i18n.t("schedule.prompt", lang))
@@ -2089,7 +1917,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         await _do_schedule(message, arg)
 
     def _schedules_keyboard(rows: list[dict], lang: str) -> InlineKeyboardMarkup | None:
-        """Per-schedule pause/resume + delete buttons."""
+        """Per-schedule pause/resume and delete buttons."""
         kb: list[list[InlineKeyboardButton]] = []
         for r in rows:
             sid = int(r["id"])
@@ -2120,7 +1948,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
 
     @router.message(Command("schedules"))
     async def cmd_schedules(message: Message) -> None:
-        """List the user's schedules with pause/resume/delete controls."""
+        """List the user's schedules with pause, resume, and delete controls."""
         await _ensure_state(message)
         lang = _lang(message)
         uid = message.from_user.id if message.from_user else 0
@@ -2129,7 +1957,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
 
     @router.callback_query(F.data.startswith("sch:"))
     async def on_schedules_cb(cb: CallbackQuery) -> None:
-        """Pause/resume or delete a schedule, then re-render the list in place."""
+        """Pause, resume, or delete a schedule, then re-render in place."""
         lang = _lang(cb)
         uid = cb.from_user.id if cb.from_user else 0
         try:
@@ -2139,7 +1967,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             await cb.answer()
             return
         row = await db.get_schedule(sid)
-        # Ownership check: only the schedule's owner may touch it.
+        # Only the schedule's owner may touch it.
         if row is None or int(row["owner_uid"]) != uid:
             await cb.answer(i18n.t("common.error", lang))
             return
@@ -2149,10 +1977,9 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         elif verb == "tog":
             now_on = not bool(row["enabled"])
             if now_on:
-                # Resuming: recompute the next run from now so it doesn't fire for every missed
-                # slot while paused. #257: only enable if the recompute SUCCEEDS — otherwise the
-                # row would re-enable with a stale (past) next_run and fire immediately on the
-                # next sweep (exactly the missed-slot storm this avoids). A bad spec stays paused.
+                # Resuming recomputes the next run from now.
+                # - avoids firing for every missed slot while paused
+                # - enable only if recompute succeeds; bad spec stays paused
                 try:
                     spec = json.loads(row["spec"])
                     await db.update_schedule_run(
@@ -2167,15 +1994,16 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             await cb.answer()
             return
         text, kb = await _render_schedules(uid, lang)
-        if cb.message is not None:  # #258: None for an old/inaccessible message
+        if cb.message is not None:  # None for old or inaccessible message
             with contextlib.suppress(Exception):
                 await cb.message.edit_text(text, parse_mode="HTML", reply_markup=kb)
 
-    # --------------------------------------------------------- session browser
-    # /sessions: browse + search + (DM) switch to a session. Paginated to respect
-    # Telegram limits; the per-message search keyword is held in `browsers`.
+    # ---- session browser ----
+    # - /sessions: browse, search, and (DM) switch sessions
+    # - paginated for Telegram limits
+    # - per-message search keyword held in `browsers`
     _SESSIONS_PAGE = 6
-    browsers: dict[tuple, str | None] = {}  # (chat_id, msg_id) -> keyword
+    browsers: dict[tuple, str | None] = {}  # (chat_id, msg_id) to keyword
 
     async def _session_stats(thread_id: int) -> tuple[int, str]:
         try:
@@ -2196,9 +2024,9 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         offset: int, lang: str = "en", idle_note: str | None = None,
         uname: str | None = None,
     ) -> tuple[str, InlineKeyboardMarkup]:
-        # #307: collapse stray empty untitled sessions (idle rotation / New-chat taps /
-        # opening /sessions after an idle gap can leave several) BEFORE listing — DM only,
-        # never the current one — so the list never shows more than the single live empty.
+        # Collapse stray empty untitled sessions before listing.
+        # - DM only, never the current one
+        # - list then shows at most one live empty
         if is_dm:
             with contextlib.suppress(Exception):
                 await _gc_untitled_empties(chat_id, current_key)
@@ -2210,53 +2038,27 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             head += i18n.t("sessions.head_search", lang, kw=markup.escape_html(keyword))
         head += i18n.t("sessions.head_total", lang, total=total)
         lines = [head, ""]
-        # #271: passive notice that this very open auto-started a fresh session after idle
-        # (the new session is `current`). Never a push — only shown here when /sessions is
-        # opened, so it respects the "no spammy auto-notices" rule.
+        # Passive notice that opening /sessions auto-started a fresh session.
+        # - never a push; shown only on open
         if idle_note:
             lines.append(idle_note)
             lines.append("")
         kb_rows: list[list[InlineKeyboardButton]] = []
-        # #311: per-session usage stats removed from the Sessions list (the bulk usage
-        # query + the pre-padded msgs/tokens/units columns). Was:
-        #   # #285: one GROUP BY for the whole page's usage instead of an N+1 per-row query.
-        #   stats = {}
-        #   with contextlib.suppress(Exception):
-        #       stats = await db.get_usage_totals_bulk([r["thread_id"] for r in rows])
-        #   # #307: pre-format + pad the stat columns (msgs / tokens / weighted-units).
-        #   def _statvals(tid: int) -> tuple[str, str, str]:
-        #       t = stats.get(tid, {}) or {}
-        #       return (str(int(t.get("requests", 0) or 0)),
-        #               _fmt_tokens((t.get("input", 0) or 0) + (t.get("output", 0) or 0)),
-        #               _fmt_tokens(t.get("units", 0) or 0))
-        #   _sv = {r["thread_id"]: _statvals(r["thread_id"]) for r in rows}
-        #   _rw = max((len(v[0]) for v in _sv.values()), default=1)
-        #   _tw = max((len(v[1]) for v in _sv.values()), default=1)
-        #   _uw = max((len(v[2]) for v in _sv.values()), default=1)
         for r in rows:
             name = _session_name(r)
-            # #136: no sid shown in the list (was `sid = db.session_sid(...)`).
             mark = i18n.t("sessions.current_mark", lang) if r["thread_id"] == current_key else ""
             icon = mode_glyph(r["mode"])
             lines.append(i18n.t(
-                # #211: drop {mode}/{date} — the icon conveys the mode and the date is
-                # list noise. was: mode=i18n.mode_word(r["mode"], lang),
-                #                  date=_fmt_date(r["created_at"]),
+                # Icon conveys the mode; date is list noise.
                 "sessions.row", lang, icon=icon,
                 name=markup.escape_html(name), mark=mark,
             ))
-            # #311: per-session usage stats line removed from the Sessions list. Was:
-            #   _rq, _tk, _un = _sv[r["thread_id"]]
-            #   lines.append(i18n.t("sessions.row_stats", lang, reqs=_rpad_mono(_rq, _rw),
-            #                       toks=_rpad_mono(_tk, _tw), units=_rpad_mono(_un, _uw)))
-            # The button is the session NAME (its sid + stats are in the text line
-            # above); tapping it opens the per-session options menu (#95).
+            # Button is the session name; tap opens its options menu.
             label = f"{icon} {name[:40]}"
             if is_dm:
-                # One full-width button per session = its name; tapping it opens the
-                # per-session options menu (Switch · Recap · Rename · Status · ⭐ ·
-                # 🗑). Favorites (⭐) sort first (browse_threads) and are marked, so
-                # the list stays scannable without a control row per session (#95).
+                # One full-width button per session, labeled with its name.
+                # - tap opens the per-session options menu
+                # - favorites sort first and are marked
                 fav = bool(r.get("favorite"))
                 kb_rows.append([
                     InlineKeyboardButton(
@@ -2271,7 +2073,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 )
         if not rows:
             lines.append(i18n.t("sessions.none_match", lang))
-        # #307: paging buttons (◂ / ▸), built once and shared by the DM + group layouts.
+        # Paging buttons, shared by DM and group layouts.
         prev_btn = (InlineKeyboardButton(text=i18n.t("btn.prev", lang),
                                          callback_data=f"ses:pg:{max(0, offset - _SESSIONS_PAGE)}")
                     if offset > 0 else None)
@@ -2279,13 +2081,10 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                                          callback_data=f"ses:pg:{offset + _SESSIONS_PAGE}")
                     if offset + _SESSIONS_PAGE < total else None)
         if is_dm:
-            # #307: the New-chat row carries the pager — ◂ before it, ▸ after it; on page 1
-            # only ▸ shows (nothing before it). The "New code" button is RETIRED: a session
-            # is born a chat and promoted with /code (owner workflow), so the browser offers
-            # only New chat.
-            # was (#95/#281/#290): a separate nav row + a New code button gated by
-            # _has_code_access(chat_id, uname) for code-access users —
-            #   new_row = [New chat]; if _has_code_access(...): new_row.append(New code)
+            # New-chat row carries the pager.
+            # - left arrow before it, right arrow after it
+            # - page 1 shows only the right arrow
+            # - no New code button; sessions are promoted with /code
             row = [b for b in (prev_btn,
                                InlineKeyboardButton(text=i18n.t("btn.new_chat", lang),
                                                     callback_data="ses:new:chat"),
@@ -2315,15 +2114,15 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         send_kwargs: dict = {}
         if message.message_thread_id:
             send_kwargs["message_thread_id"] = message.message_thread_id
-        # #173: native rich menu open; _send_menu returns the sent Message (or None).
         sent = await _send_menu(chat_id, text, kb, **send_kwargs)
         if sent is not None:
             browsers[(chat_id, sent.message_id)] = keyword
 
     async def _session_switch_line(key: int, lang: str = "en") -> str:
-        """#280: the SINGLE confirmation line shown on switching into a session — just
-        "switched to <glyph> <name>". The mode tagline + sid/model/date/usage meta (the
-        old card's other lines) are dropped here; they live in /status & /settings."""
+        """Single confirmation line shown on switching into a session.
+
+        - the other session details live in status and settings
+        """
         st = await db.get_thread(key)
         if st is None:
             return i18n.t("common.switched", lang)
@@ -2331,7 +2130,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         line = i18n.t("session.switched_to", lang, glyph=mode_glyph(st.mode),
                       name=markup.escape_html(name)
                       + (" [shell]" if getattr(st, "shell_mode", False) else ""))
-        # #415: plus what the session runs on (model + effort, from the CLI). was: return line
+        # Also show what the session runs on (model, effort).
         with contextlib.suppress(Exception):
             line += "\n" + await _session_meta_line(st, lang)
         return line
@@ -2341,63 +2140,51 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         if st is None:
             return i18n.t("common.switched", lang)
         name = st.name or ("General" if key == 0 else f"#{abs(key)}")
-        # #311: per-session usage stats removed from the session card.
-        # was: reqs, toks = await _session_stats(key)
         lines = [
             i18n.t("session.switched_to", lang, glyph=mode_glyph(st.mode),
                    name=markup.escape_html(name)
                    + (" [shell]" if getattr(st, "shell_mode", False) else "")),
-            # #330: dropped the mode tagline (the glyph already conveys chat/code) and
-            # the sid/date from the meta line — only the model is kept. was:
-            #   mode_tagline(st.mode, cwd=st.cwd, lang=lang),
-            # #411/#415: model + effort straight from the CLI (_session_meta_line). was:
-            #   i18n.t("session.card_meta", lang,
-            #          model=MODEL_ID_TO_ALIAS.get(st.model, st.model),
-            #          effort=st.effort or "high"),  # #331: effort tier ("high" = the SDK default)
+            # Meta line shows only model and effort from CLI.
             await _session_meta_line(st, lang),
         ]
         return "\n".join(lines)
 
     async def _owned_session(key: int, uid: int):
-        """Return the ThreadState if `key` is a DM session owned by `uid`, else
-        None. Ownership is chat_id OR created_by (a migrated/legacy row may carry
-        only one) — used to gate every per-session options-menu action (#95)."""
+        """Return the `ThreadState` if `uid` owns DM session `key`.
+
+        - ownership is `chat_id` or `created_by`; legacy rows carry one
+        - gates every per-session options-menu action
+        """
         st = await db.get_thread(key)
         if st is None or (st.chat_id != uid and st.created_by != uid):
             return None
         return st
 
     async def _session_options(key: int, lang: str):
-        """(text, keyboard) for a single session's options menu (#95): Switch ·
-        Recap · Rename · Status · ⭐ favorite · 🗑 delete · Back. None if gone."""
+        """Return `(text, keyboard)` for one session's options menu.
+
+        - actions: switch, recap, rename, status, favorite, delete, back
+        - returns `None` if the session is gone
+        """
         st = await db.get_thread(key)
         if st is None:
             return None
         name = st.name or ("General" if key == 0 else f"#{abs(key)}")
-        # #311: per-session usage stats removed from the session options menu.
-        # was: reqs, toks = await _session_stats(key)
         text = "\n".join([
             i18n.t("sessions.options_header", lang, glyph=mode_glyph(st.mode),
                    name=markup.escape_html(name)
                    + (" [shell]" if getattr(st, "shell_mode", False) else "")),
-            # #330: dropped the mode tagline (the glyph already conveys chat/code) and
-            # the sid/date from the meta line — only the model is kept. was:
-            #   mode_tagline(st.mode, cwd=st.cwd, lang=lang),
-            # #411/#415: model + effort straight from the CLI (_session_meta_line). was:
-            #   i18n.t("session.card_meta", lang,
-            #          model=MODEL_ID_TO_ALIAS.get(st.model, st.model),
-            #          effort=st.effort or "high"),  # #331: effort tier ("high" = the SDK default)
+            # Meta line shows only model and effort from CLI.
             await _session_meta_line(st, lang),
         ])
         fav = bool(st.favorite)
         B = InlineKeyboardButton
-        # Upgrade chat→code (only if the session OWNER has code access) / downgrade
-        # code→chat (#133). The owner of a DM session is its creator.
+        # Upgrade to code only if the session owner has access.
+        # - downgrade code to chat; DM owner is the creator
         owner_uid = st.created_by or st.chat_id
         can_code = (owner_uid == settings.owner_id) or (allowlist.level_of(owner_uid, None) == "code")
         rows = [[B(text=i18n.t("btn.switch", lang), callback_data=f"ses:sw:{key}")]]
-        # 📋 Recap is the AI one-line recap (ses:recap runs the model); the verbatim
-        # last exchange is the /last command (user request 2026-06-16).
+        # Recap runs the model; /last shows the verbatim exchange.
         rows += [
             [B(text=i18n.t("btn.recap", lang), callback_data=f"ses:recap:{key}"),
              B(text=i18n.t("btn.status", lang), callback_data=f"ses:status:{key}")],
@@ -2405,9 +2192,8 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
              B(text=i18n.t("btn.unfavorite" if fav else "btn.favorite", lang),
                callback_data=f"ses:fav:{key}")],
         ]
-        # Convert (🟩 up / 💬 down) no longer takes a full-width high row (user request
-        # 2026-06-16): it moves DOWN and pairs with 📦 Export files in a code session
-        # (both code-related), or with 📄 Transcript in a chat session.
+        # Convert pairs with Export in code, Transcript in chat.
+        # - no full-width high row
         convert_btn = None
         if st.mode == "chat" and can_code:
             convert_btn = B(text=i18n.t("btn.upgrade_code", lang), callback_data=f"ses:up:{key}")
@@ -2420,7 +2206,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             export_btn = B(text=i18n.t("btn.export_files", lang), callback_data=f"ses:exfiles:{key}")
             rows.append([convert_btn, export_btn] if convert_btn else [export_btn])
         else:
-            # Chat: no Export — pair Transcript with Convert (if the owner has code access).
+            # Chat: pair Transcript with Convert if owner has code access.
             content_row = [transcript_btn]
             if convert_btn is not None:
                 content_row.append(convert_btn)
@@ -2433,26 +2219,28 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         return text, kb
 
     async def _repost_options(cb: CallbackQuery, key: int, lang: str) -> None:
-        """Move the per-session options menu to the bottom after an action posted
-        content below it: send a fresh menu, then delete the old one (#95 feedback)."""
+        """Move the options menu to the bottom after posting content.
+
+        - sends a fresh menu, then deletes the old one
+        """
         opts = await _session_options(key, lang)
         if opts is None:
             return
         text, kb = opts
         with contextlib.suppress(Exception):
-            await _send_menu(cb.message.chat.id, text, kb)  # #173: native rich menu open
+            await _send_menu(cb.message.chat.id, text, kb)
         with contextlib.suppress(Exception):
             await cb.message.delete()
 
     def _workdir_zip(key: int):
-        """Zip the session's working directory into an in-memory archive. Returns
-        (BufferedInputFile, None) or (None, error_key) — capped to keep the upload
-        within Telegram's bot limit."""
-        # #140: the workdir is named by the public sid, not the raw key — match it
-        # (the zip FILENAME already uses the sid from #136).
-        # was: root = settings.base_workdir / str(key)  — replaced for #140
-        # #181: zip only the user's WORK files (state/transcript live in <sid>/state).
-        root = settings.base_workdir / db.session_pubid(key) / "work"  # #332: ULID dir (was session_sid)
+        """Zip the session's working directory into an in-memory archive.
+
+        - returns `(BufferedInputFile, None)` or `(None, error_key)`
+        - capped to fit Telegram's bot upload limit
+        """
+        # Workdir is named by public sid; zip only work files.
+        # - state and transcript live in `<sid>/state`
+        root = settings.base_workdir / db.session_pubid(key) / "work"  # ULID directory name
         files = [p for p in root.rglob("*") if p.is_file()] if root.exists() else []
         if not files:
             return None, "export.empty"
@@ -2470,16 +2258,16 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         data = buf.getvalue()
         if len(data) > 49 * 1024 * 1024:
             return None, "export.too_big"
-        # #136: name the archive by the public sid, not the raw internal id, so the
-        # download doesn't leak the numbering. was: f"session-{abs(key)}-files.zip".
+        # Name the archive by public sid, not the raw id.
+        # - download doesn't leak internal numbering
         return BufferedInputFile(data, filename=f"session-{db.session_pubid(key)}-files.zip"), None
 
     @router.message(Command("sessions"))
     async def cmd_sessions(message: Message) -> None:
-        """Browse / search / switch sessions (DM) or topics (supergroup)."""
+        """Browse, search, and switch sessions (DM) or topics (supergroup)."""
         await _ensure_state(message)
-        # #271: opening /sessions after the idle window auto-starts a fresh session and
-        # shows it as current (creation happens on interaction, not only on a chat turn).
+        # Opening /sessions after idle auto-starts a fresh current session.
+        # - creation happens on interaction, not only chat turns
         _, rotated = await _rotate_if_idle(message)
         note = i18n.t("sessions.idle_rotated", _lang(message)) if rotated else None
         await _open_sessions(message, _command_arg(message) or None, idle_note=note)
@@ -2522,11 +2310,11 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 opts = await _session_options(key, lang)
                 if opts is not None:
                     text, kb = opts
-                    await _edit_menu(msg, text, kb)  # #173: native rich nav-edit
+                    await _edit_menu(msg, text, kb)
                 await cb.answer()
                 return
             if verb in ("up", "down") and len(parts) > 2 and is_dm:
-                # Upgrade / downgrade the session type (#133), then re-render the menu.
+                # Upgrade or downgrade the session type, then re-render the menu.
                 key = int(parts[2])
                 if await _owned_session(key, cb.from_user.id) is None:
                     await cb.answer()
@@ -2540,13 +2328,11 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 opts = await _session_options(key, lang)
                 if opts is not None:
                     text, kb = opts
-                    await _edit_menu(msg, text, kb)  # #173: native rich nav-edit
+                    await _edit_menu(msg, text, kb)
                 await cb.answer(i18n.t("mode.switched_toast", lang, mode=i18n.mode_word(new_mode, lang)))
                 return
             if verb == "recap" and len(parts) > 2 and is_dm:
-                # 📋 Recap → AI one-line recap of THIS session (user request
-                # 2026-06-16): run the model with the recap prompt and let it stream.
-                # The verbatim last prompt+reply is the /last command instead.
+                # Recap runs the model with the recap prompt and streams.
                 key = int(parts[2])
                 if await _owned_session(key, cb.from_user.id) is None:
                     await cb.answer()
@@ -2555,7 +2341,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 if blk:
                     await cb.answer(blk, show_alert=True)
                     return
-                await cb.answer()  # ack before the model run streams its reply
+                await cb.answer()  # ack before the model run streams
                 with contextlib.suppress(Exception):
                     await sessions.handle_text(chat_id, key, i18n.t("recap.prompt", lang))
                 return
@@ -2620,16 +2406,9 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                     await cb.answer(i18n.t("session.limit_reached_short", lang), show_alert=True)
                     return
                 await _new_dm_session(uid, mode, _default_session_name(mode, lang))
-                # #322: a New-chat tap now DISMISSES the sessions browser entirely — the new
-                # (empty) session is current, so the user just starts typing their question
-                # instead of being shown the session list + buttons again. Collapse any stray
-                # empties first (the re-render that used to follow did this via #307).
-                # was: re-render the list and edit the message in place —
-                #   current = await db.get_dm_current(uid)
-                #   text, kb = await _render_sessions(chat_id, is_dm, current or 0, keyword, 0,
-                #                                     lang, uname=cb.from_user.username)
-                #   with contextlib.suppress(Exception):
-                #       await _edit_menu(msg, text, kb)  # #173
+                # New-chat tap dismisses the sessions browser entirely.
+                # - new empty session is current; user just types
+                # - collapse stray empties first
                 with contextlib.suppress(Exception):
                     await _gc_untitled_empties(uid, await db.get_dm_current(uid) or 0)
                 browsers.pop(bkey, None)
@@ -2640,34 +2419,30 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             if verb == "sw" and len(parts) > 2:
                 key = int(parts[2])
                 if is_dm:
-                    # Only the tapper's OWN DM session (a negative key) may be
-                    # switched to — a forged callback_data must not point this
-                    # user at someone else's session.
+                    # Only the tapper's own DM session may be switched to.
+                    # - a forged callback_data must not target another user's session
                     st = await db.get_thread(key)
                     if key >= 0 or st is None or st.chat_id != cb.from_user.id:
                         await cb.answer()
                         return
-                    # #102: a chat-level user may not switch INTO a code session.
+                    # A chat-level user may not switch into a code session.
                     if st.mode == "code" and allowlist.level_of(cb.from_user.id, cb.from_user.username) != "code":
                         await cb.answer(i18n.t("access.code_denied", lang), show_alert=True)
                         return
                     await db.set_dm_current(cb.from_user.id, key)
-                    # #329: an explicit switch IS user activity — stamp the user's last-active time
-                    # so the NEXT message continues this session instead of idle-rotating it. The
-                    # user deliberately chose this session (however old); never rotate it away.
+                    # An explicit switch counts as user activity.
+                    # - stamp last-active so the next message continues it
+                    # - never idle-rotate a deliberately chosen session
                     with contextlib.suppress(Exception):
                         await db.set_user_last_active(cb.from_user.id, time.time())
-                    # #307: switching INTO a real session collapses any empty untitled
-                    # sessions left behind (e.g. an abandoned idle rotation / New-chat tap).
+                    # Switching into a real session collapses empty untitled leftovers.
                     with contextlib.suppress(Exception):
                         await _gc_untitled_empties(cb.from_user.id, key)
-                    # #280: switching shows ONLY the one-line confirmation — no Recap/
-                    # Transcript quick buttons (they live in the session options menu /
-                    # /settings) and no sid/model/usage meta lines (debug noise).
+                    # Switching shows only a one-line confirmation.
+                    # - Recap/Transcript live in the options menu
                     with contextlib.suppress(Exception):
                         await _send_menu(chat_id, await _session_switch_line(key, lang))
-                    # #136: close the now-stale options menu the Switch button came
-                    # from so it doesn't linger above the switch card.
+                    # Close the stale options menu the Switch button came from.
                     with contextlib.suppress(Exception):
                         await msg.delete()
                 await cb.answer(i18n.t("common.switched", lang))
@@ -2681,11 +2456,11 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 new_fav = not bool(st.favorite)
                 with contextlib.suppress(Exception):
                     await db.set_favorite(key, new_fav)
-                # Re-render the per-session options menu so the ⭐ toggles in place.
+                # Re-render the options menu so the star toggles in place.
                 opts = await _session_options(key, lang)
                 if opts is not None:
                     text, kb = opts
-                    await _edit_menu(msg, text, kb)  # #173: native rich nav-edit
+                    await _edit_menu(msg, text, kb)
                 await cb.answer(
                     i18n.t("common.favorited" if new_fav else "common.unfavorited", lang)
                 )
@@ -2699,7 +2474,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                     InlineKeyboardButton(text=i18n.t("btn.cancel", lang), callback_data="ses:pg:0"),
                 ]])
                 with contextlib.suppress(Exception):
-                    await _edit_menu(  # #173: native rich nav-edit
+                    await _edit_menu(
                         msg,
                         i18n.t("session.delete_confirm", lang, name=markup.escape_html(name)),
                         kb,
@@ -2709,10 +2484,10 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             if verb == "delok" and len(parts) > 2 and is_dm:
                 key = int(parts[2])
                 uid = cb.from_user.id
-                # Capture the name BEFORE the row is dropped (for the archive meta).
+                # Capture the name before the row is dropped.
                 st = await db.get_thread(key)
                 sname = (st.name if st else None)
-                # Tear down any live subprocess/worker, then drop the row + workdir.
+                # Tear down any live worker, then drop row and workdir.
                 with contextlib.suppress(Exception):
                     await sessions.reset(key)
                 deleted = False
@@ -2720,26 +2495,16 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                     deleted = await db.delete_dm_session(uid, key)
                 if deleted:
                     with contextlib.suppress(Exception):
-                        # #140/#332: workdirs are named by the public ULID, not the raw key.
-                        sid = db.session_pubid(key)  # was db.session_sid (legacy 6-hex)
-                        # was: destroy the workdir + sbxstate outright (rmtree) —
-                        #      replaced for #177. We now ARCHIVE to cold storage
-                        #      instead of deleting, so nothing is lost (the transcript
-                        #      lives OUTSIDE the workdir, in ~/.claude/projects/, and
-                        #      was being orphaned by the old path). Retention/auto-
-                        #      purge of the archives is deferred — #178.
-                        # wd = settings.base_workdir / sid
-                        # if wd.exists():
-                        #     shutil.rmtree(wd, ignore_errors=True)
-                        # sbx = settings.base_workdir / f"{sid}.sbxstate"
-                        # if sbx.exists():
-                        #     shutil.rmtree(sbx, ignore_errors=True)
+                        # Workdirs are named by public ULID, not raw key.
+                        sid = db.session_pubid(key)
+                        # Archive to cold storage instead of deleting.
+                        # - the transcript lives outside the workdir, in `~/.claude/projects/`
                         archive.archive_session(
                             settings.base_workdir, sid,
                             owner_id=uid, key=key, name=sname,
                         )
-                    # If the deleted session was current, switch to the most recent
-                    # remaining one (or create a fresh default so there's always one).
+                    # If the deleted session was current, switch to the latest.
+                    # - else create a fresh default so one always exists
                     if await db.get_dm_current(uid) == key:
                         remaining, _ = await db.browse_threads(uid, None, limit=1, offset=0)
                         if remaining:
@@ -2754,7 +2519,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 text, kb = await _render_sessions(chat_id, is_dm, current or 0, keyword, 0, lang,
                                                   uname=cb.from_user.username)
                 with contextlib.suppress(Exception):
-                    await _edit_menu(msg, text, kb)  # #173: native rich nav-edit
+                    await _edit_menu(msg, text, kb)
                 await cb.answer(
                     i18n.t("common.deleted" if deleted else "session.delete_failed", lang)
                 )
@@ -2767,7 +2532,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 text, kb = await _render_sessions(chat_id, is_dm, current or 0, keyword, offset, lang,
                                                   uname=cb.from_user.username)
                 with contextlib.suppress(Exception):
-                    await _edit_menu(msg, text, kb)  # #173: native rich nav-edit
+                    await _edit_menu(msg, text, kb)
                 await cb.answer()
                 return
             await cb.answer()
@@ -2775,9 +2540,9 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             with contextlib.suppress(Exception):
                 await cb.answer(i18n.t("common.error", _lang(cb)))
 
-    # ------------------------------------------------------------------ commands
+    # ---- commands ----
 
-    # Help groups in display order (help_group key → header i18n key). #148.
+    # Help groups in display order (group key to header key).
     _HELP_GROUPS = (
         ("sessions", "help.group_sessions"),
         ("settings", "help.group_settings"),
@@ -2788,10 +2553,12 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
     )
 
     def _help_text(message: Message) -> str:
-        """Help GENERATED from the command registry (#148): intro blurb, then one
-        section per help_group with each command's localized label, filtered to the
-        user's access (chat users omit code/owner commands), then the footer. Keeps
-        /help permanently in sync with commands.COMMANDS — no hand-maintained list."""
+        """Generate help from the command registry.
+
+        - intro, then one section per help group, then the footer
+        - filtered to the user's access
+        - stays in sync with `commands.COMMANDS`
+        """
         lang = _lang(message)
         uid = message.from_user.id if message.from_user else 0
         uname = message.from_user.username if message.from_user else None
@@ -2826,59 +2593,32 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
 
     @router.message(Command("newchat"))
     async def cmd_newchat(message: Message) -> None:
-        """Create a 💬 chat session (promotable to code with /code; #133). Optional
-        name: /newchat foo."""
+        """Create a chat session, promotable to code. Optional name."""
         await _ensure_state(message)
         await _do_new(message, f"chat {_command_arg(message)}".strip())
 
     @router.message(Command("newcode"))
     async def cmd_newcode(message: Message) -> None:
-        """Create a 🟩 code session (downgradable to chat with /chat; #133). Optional
-        name: /newcode foo."""
+        """Create a code session, downgradable to chat. Optional name."""
         await _ensure_state(message)
         await _do_new(message, f"code {_command_arg(message)}".strip())
 
     @router.message(Command("new"))
     async def cmd_new(message: Message) -> None:
-        """Create a new session — born as a 💬 chat (#133); upgrade to code with /code
-        (or /newcode) when you need a terminal/files. Optional name: /new my project.
-        (No more chat/code chooser — every session starts as chat and is promotable.)"""
+        """Create a new session, born as chat. Optional name.
+
+        - upgrade to code later for files or a terminal
+        """
         await _ensure_state(message)
         await _do_new(message, _command_arg(message))
 
-    # #143: the /new chat/code chooser is DEAD — since #133 /new always creates a
-    # chat (no chooser) and the /sessions browser emits ses:new:chat / ses:new:code
-    # (handled by on_sessions_cb), so NOTHING emits "new:". Handler commented out
-    # (kept for audit/revert); the session.new_pick i18n string is removed too.
-    # @router.callback_query(F.data.startswith("new:"))
-    # async def on_new_cb(cb: CallbackQuery) -> None:
-    #     """Handle the /new type chooser (💬 Chat / 🟩 Code) — DM only."""
-    #     try:
-    #         mode = (cb.data or "new:chat").split(":", 1)[1]
-    #         if mode not in VALID_MODES:
-    #             mode = "chat"
-    #         msg = cb.message
-    #         if msg is None or msg.chat.type != "private":
-    #             await cb.answer()
-    #             return
-    #         uid = cb.from_user.id
-    #         lang = _lang(cb)
-    #         if mode == "code" and allowlist.level_of(uid, cb.from_user.username) != "code":
-    #             await cb.answer(i18n.t("access.code_denied", lang), show_alert=True)
-    #             return
-    #         name = _default_session_name(mode, lang)
-    #         await _new_dm_session(uid, mode, name)
-    #         with contextlib.suppress(Exception):
-    #             await msg.edit_text(_created_text(mode, name, lang), parse_mode="HTML")
-    #         await cb.answer(i18n.t("common.created", lang))
-    #     except Exception:
-    #         with contextlib.suppress(Exception):
-    #             await cb.answer(i18n.t("common.error", _lang(cb)))
-
     async def _switch_session_mode(key: int, uid: int, uname, new_mode: str, lang: str):
-        """Switch a session to new_mode (#133), carrying its conversation. Gates an
-        upgrade to code by access level; the workdir files persist either way.
-        Returns (reply_text, ok)."""
+        """Switch a session to `new_mode`, carrying its conversation.
+
+        - an upgrade to code is gated by access level
+        - workdir files persist either way
+        - returns `(reply_text, ok)`
+        """
         st = await db.get_thread(key)
         if st is None:
             return i18n.t("common.error", lang), False
@@ -2896,8 +2636,10 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
 
     @router.message(Command("code"))
     async def cmd_code(message: Message) -> None:
-        """Upgrade the current session to a 🟩 code session (#133) — needs code access.
-        Keeps the conversation; the session gets a working dir + the full toolset."""
+        """Upgrade the current session to code; needs code access.
+
+        - keeps the conversation, adds a workdir and full toolset
+        """
         await _ensure_state(message)
         key = await _session_key(message)
         uid = message.from_user.id if message.from_user else 0
@@ -2907,8 +2649,11 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
 
     @router.message(Command("chat"))
     async def cmd_chat(message: Message) -> None:
-        """Downgrade the current session back to 💬 chat (#133) — keeps the conversation
-        AND the workdir files (just no code tools until you /code again)."""
+        """Downgrade the current session to chat.
+
+        - keeps the conversation and the workdir files
+        - code tools are unavailable until upgraded again
+        """
         await _ensure_state(message)
         key = await _session_key(message)
         uid = message.from_user.id if message.from_user else 0
@@ -2918,10 +2663,11 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
 
     @router.message(Command("mode"))
     async def cmd_mode(message: Message) -> None:
-        """#218: TOGGLE this session's type (chat ⇄ code), carrying the conversation
-        and workdir files. Upgrading to code needs code access (a guest gets the
-        access-denied reply). was: only PRINTED how to switch via /code, /chat — a
-        command named /mode now actually switches, reusing _switch_session_mode."""
+        """Toggle this session's type between chat and code.
+
+        - carries the conversation and workdir files
+        - upgrading needs code access; a guest is denied
+        """
         state = await _ensure_state(message)
         key = await _session_key(message)
         lang = _lang(message)
@@ -2939,8 +2685,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         arg = _command_arg(message)
 
         if not arg:
-            # No arg → the unified hub picker (#145/#146: one code path per setting;
-            # the old standalone pm: picker is retired).
+            # No arg: show the unified hub picker.
             uid = message.from_user.id if message.from_user else None
             uname = message.from_user.username if message.from_user else None
             if await _send_setting_picker(message.chat.id, key, uid, uname, lang, "model"):
@@ -2949,12 +2694,9 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                                         model=markup.escape_html(models.label(state.model))))
             return
 
-        # Resolve a friendly alias OR an exact model id; reject anything else.
-        # was: model = MODEL_ALIASES.get(arg.lower(), arg) — which set ANY string as a
-        # bogus model. #215: an unknown arg now falls back to the picker (closed choice).
-        # #411: the accepted set is the CLI's own catalog (aliases + pinned ids). was:
-        #   arg_l = arg.lower()
-        #   model = MODEL_ALIASES.get(arg_l) or (arg_l if arg_l in MODEL_ID_TO_ALIAS else None)
+        # Resolve a friendly alias or exact model id; reject others.
+        # - accepted set is the CLI's own catalog
+        # - unknown arg falls back to the picker
         model = models.match(arg)
         if model is None:
             uid = message.from_user.id if message.from_user else None
@@ -2970,15 +2712,15 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         defer = i18n.t("common.defer_note", lang) if deferred else ""
         await reply(
             message,
-            # #411: show what the alias resolves to (e.g. "Opus 5.5"). was: model=model
+            # Show what the alias resolves to.
             i18n.t("model.set", lang, model=markup.escape_html(models.label(model)), defer=defer),
         )
 
-    # ---- Pro commands (#23): /effort /maxturns /dirs /fork --------------------
+    # ---- Pro commands: /effort /maxturns /dirs /fork ----
 
     @router.message(Command("effort"))
     async def cmd_effort(message: Message) -> None:
-        """Show/set reasoning effort: low | medium | high | xhigh | max."""
+        """Show or set reasoning effort."""
         state = await _ensure_state(message)
         key = await _session_key(message)
         lang = _lang(message)
@@ -2987,12 +2729,10 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         may_max = _may_max_effort(uid, uname)
         arg = _command_arg(message).lower().strip()
         if not arg:
-            # No arg → the unified hub picker (#145/#146; the gated `max` level is
-            # hidden by _ss_picker_keyboard for users not allowed it). The old
-            # standalone pe: picker is retired.
+            # No arg: show the unified hub picker.
+            # - gated `max` level hidden for users not allowed it
             if await _send_setting_picker(message.chat.id, key, uid, uname, lang, "effort"):
                 return
-            # #415: was cur = state.effort or "default"
             cur = (_effort_label(state.effort, lang) if state.effort
                    else _effort_default_label(state.model, lang))
             await reply(message, i18n.t("effort.pick", lang, cur=markup.escape_html(cur)))
@@ -3003,10 +2743,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             defer = i18n.t("common.defer_note", lang) if deferred else ""
             await reply(message, i18n.t("effort.reset", lang, defer=defer))
             return
-        # #415: the accepted levels are what the CLI lists for this session's model. was:
-        #   if arg not in EFFORT_LEVELS:
-        #       await reply(message, i18n.t("effort.usage", lang))
-        #       return
+        # Accepted levels come from the CLI for this model.
         levels = models.effort_levels(state.model or settings.default_model)
         if not levels and models.entries():
             await reply(message, i18n.t("effort.unsupported", lang,
@@ -3023,20 +2760,20 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         await db.set_effort(key, arg)
         deferred = await _rebuild_session(key)
         defer = i18n.t("common.defer_note", lang) if deferred else ""
-        # #415: the level under its (opportunistically translated) name. was: val=arg
+        # Show the level under its translated name.
         await reply(message, i18n.t("effort.set", lang,
                                     val=markup.escape_html(_effort_label(arg, lang)), defer=defer))
 
     @router.message(Command("maxturns"))
     async def cmd_maxturns(message: Message) -> None:
-        """Show/set the agentic turn cap (code mode): /maxturns N | off."""
+        """Show or set the agentic turn cap: N or off."""
         state = await _ensure_state(message)
         key = await _session_key(message)
         lang = _lang(message)
         arg = _command_arg(message).lower().strip()
         if not arg:
-            # No arg → the unified hub picker (#145/#146). Code-only (menu.md §1.7);
-            # in a chat session fall back to showing the value.
+            # No arg: show the hub picker; code-only.
+            # - in a chat session, show the value instead
             uid = message.from_user.id if message.from_user else None
             uname = message.from_user.username if message.from_user else None
             if state.mode == "code" and await _send_setting_picker(
@@ -3065,8 +2802,10 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
 
     @router.message(Command("fork"))
     async def cmd_fork(message: Message) -> None:
-        """Branch the current session into a new one that shares history up to now
-        but diverges going forward (the original is left untouched). DM only."""
+        """Branch the current session into a new one sharing history.
+
+        - the original is left untouched; DM only
+        """
         state = await _ensure_state(message)
         lang = _lang(message)
         if message.chat.type != "private":
@@ -3088,8 +2827,8 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             await reply(message, block)
             return
         new_key = await _new_dm_session(uid, state.mode, name)
-        # Seed the branch: resume the current underlying session id, and fork on the
-        # first turn so the original session is not mutated (#23).
+        # Seed the branch from the current underlying session id.
+        # - fork on first turn so the original isn't mutated
         if state.mode == "code":
             await db.set_code_session(new_key, cur_sid)
         else:
@@ -3104,10 +2843,11 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
 
     @router.message(Command("clear", "reset"))
     async def cmd_reset(message: Message) -> None:
-        """Clear the session context and start fresh — the Claude Code /clear
-        equivalent (forceful: cancels the run, drops the resume ids + transcript).
-        Renamed /reset → /clear to match Claude Code (owner request); /reset kept as
-        an alias."""
+        """Clear the session context and start fresh.
+
+        - cancels the run and drops resume ids and transcript
+        - `/reset` remains an alias
+        """
         await _ensure_state(message)
         key = await _session_key(message)
         lang = _lang(message)
@@ -3121,67 +2861,22 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             return
         await reply(message, i18n.t("session.cleared", lang))
 
-    # #428 / decision-26: /memory (the 1M-context toggle) is RETIRED — 1M is the native window
-    # of every current model and the CLI offers no size choice. The handler is COMMENTED OUT
-    # (not deleted) for revert; the big_memory column + db.set_big_memory stay intact.
-    # @router.message(Command("memory"))
-    # async def cmd_memory(message: Message) -> None:
-    #     """Toggle (or show) big memory for this topic: the 1M context window in
-    #     chat plus a durable chat session that survives restarts and /stop."""
-    #     state = await _ensure_state(message)
-    #     key = await _session_key(message)
-    #     lang = _lang(message)
-    #     arg = _command_arg(message).lower()
-    #     # #352/#362: the agent-saved session notes are a code-only feature, so only surface
-    #     # their size in a code session for a code-level user. was (#352): shown in any session.
-    #     _uid = message.from_user.id if message.from_user else None
-    #     _uname = message.from_user.username if message.from_user else None
-    #     _mem_on = state.mode == "code" and _has_code_access(_uid, _uname)
-    #     _n = len((state.session_notes or "").strip()) if _mem_on else 0
-    #     mem_suffix = i18n.t("memory.notes", lang, n=_n) if _n else ""
-    #
-    #     if not arg:
-    #         # No arg → toggle in place (menu.md §2: "none → toggle"; #145). Was a
-    #         # show-only text reply that forced the user to type /memory on|off.
-    #         on = not bool(state.big_memory)
-    #         await db.set_big_memory(key, on)
-    #         deferred = await _rebuild_session(key)
-    #         note = i18n.t("common.defer_note", lang) if deferred else ""
-    #         await reply(message, i18n.t("memory.on" if on else "memory.off", lang, note=note,
-    #                                     models=markup.escape_html(_one_m_models_label()))
-    #                     + mem_suffix)
-    #         return
-    #
-    #     if arg not in ("on", "off"):
-    #         await reply(message, i18n.t("memory.usage", lang))
-    #         return
-    #
-    #     on = arg == "on"
-    #     if bool(state.big_memory) == on:
-    #         await reply(message, i18n.t("memory.already", lang, state=i18n.onoff(on, lang)))
-    #         return
-    #
-    #     await db.set_big_memory(key, on)
-    #     deferred = await _rebuild_session(key)
-    #     note = i18n.t("common.defer_note", lang) if deferred else ""
-    #     await reply(message, i18n.t("memory.on" if on else "memory.off", lang, note=note,
-    #                                 models=markup.escape_html(_one_m_models_label()))
-    #                 + mem_suffix)
+    # `/memory` (1M-context toggle) is retired.
+    # - 1M is the native window of current models
+    # - `big_memory` column and `db.set_big_memory` stay intact
 
     @router.message(Command("forget"))
     async def cmd_forget(message: Message) -> None:
-        """#352: clear this topic's agent-saved session memory (the `remember` notes)."""
+        """Clear this topic's agent-saved session memory."""
         state = await _ensure_state(message)
         key = await _session_key(message)
         lang = _lang(message)
-        # #362: session memory is a code-only feature — reject in a chat session
-        # (matches /files, /shell, …). was (#352): available in any session.
+        # Session memory is code-only; reject in chat sessions.
         if state.mode != "code":
             await reply(message, i18n.t("common.code_only", lang))
             return
-        # #369: gate on the caller's LEVEL too, not just the session mode — a user demoted
-        # code->chat must not wipe session memory on a stale code-mode session (the demotion gap;
-        # matches cmd_memory / cmd_shell / cmd_files — see _has_code_access).
+        # Gate on the caller's level too, not just session mode.
+        # - demoted user must not wipe memory via stale session
         if not _has_code_access(message.from_user.id if message.from_user else 0,
                                 message.from_user.username if message.from_user else None):
             await reply(message, i18n.t("access.code_denied", lang))
@@ -3196,7 +2891,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         await reply(message, i18n.t("forget.done", lang, n=len(prior), note=note))
 
     def _build_tree(root: Path, max_entries: int = 120, max_depth: int = 4) -> str:
-        """A compact, read-only directory tree (depth- and entry-capped) for /files."""
+        """Compact read-only directory tree, capped in depth and entries."""
         out: list[str] = []
         state = {"count": 0, "truncated": False}
 
@@ -3225,18 +2920,19 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
 
     @router.message(Command("files"))
     async def cmd_files(message: Message) -> None:
-        """Read-only tree of the current session's working directory (#100 —
-        replaces /cwd + /dirs; a session's working dir is fixed)."""
+        """Read-only tree of the current session's working directory.
+
+        - a session's working dir is fixed
+        """
         state = await _ensure_state(message)
         lang = _lang(message)
         if state.mode != "code":
             await reply(message, i18n.t("common.code_only", lang))
             return
         root = Path(state.cwd)
-        # #136: show the SESSION NAME, never the host path. The real cwd
-        # (./workdirs/<id>) leaked the internal numbering and that the dir lives
-        # above a shared parent — the user only owns "their" workspace. The path is
-        # never surfaced now; only the files they create inside it.
+        # Show the session name, never the host path.
+        # - path leaked internal numbering and parent directory
+        # - user sees only files they create
         ws_name = markup.escape_html(state.name or _default_session_name(state.mode, lang))
         if not root.exists():
             await reply(message, i18n.t("files.empty", lang, name=ws_name))
@@ -3249,16 +2945,15 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         if len(body) <= markup.SAFE_LIMIT:
             await reply(message, body)
         else:
-            # A big tree won't fit a message (and splitting <pre> breaks tags) —
-            # deliver it as a plain-text document instead. was: f"{root}\n\n{tree}"
-            # (leaked the host path) — header uses the session name now.
+            # Big trees won't fit a message; send a text document.
+            # - header uses the session name, not the host path
             with contextlib.suppress(Exception):
                 doc = markup.as_document(f"{state.name or ''}\n\n{tree}".strip(), "files.txt")
                 await bot.send_document(chat_id=message.chat.id, document=doc)
 
     @router.message(Command("export"))
     async def cmd_export(message: Message) -> None:
-        """Export the code session's working-directory FILES as a .zip (#104 follow-up)."""
+        """Export the code session's working-directory files as a .zip."""
         state = await _ensure_state(message)
         lang = _lang(message)
         if state.mode != "code":
@@ -3274,17 +2969,15 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 chat_id=message.chat.id, document=doc, caption=i18n.t("export.caption", lang)
             )
 
-    # ----------------------------------------------------- /secret (#119d)
-    # Per-session user-supplied service credentials (e.g. a GitHub token). Stored in
-    # <sid>/secrets.env (root-owned 0600, a sibling of the agent's workdir — NOT inside
-    # it) and injected by deploy/sandbox-claude.sh as env vars into THIS session's jail
-    # ONLY: never into other sessions, and the OWNER's own credentials never enter any
-    # jail. A user leaking their own credential is their problem, not the owner's — the
-    # #119 threat model. Values are never echoed back.
+    # ---- /secret ----
+    # - per-session service credentials, e.g. a GitHub token
+    # - stored in `<sid>/secrets.env`, root-owned 0600, outside the workdir
+    # - injected as env vars into this session's jail only
+    # - owner credentials never enter any jail; values never echoed
     _SECRET_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
     def _secrets_path(key: int) -> Path:
-        return settings.base_workdir / db.session_pubid(key) / "secrets.env"  # #332: ULID dir (was session_sid)
+        return settings.base_workdir / db.session_pubid(key) / "secrets.env"  # ULID directory name
 
     def _read_secrets(key: int) -> dict[str, str]:
         out: dict[str, str] = {}
@@ -3303,7 +2996,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         tmp = path.parent / (path.name + ".tmp")
         tmp.write_text("".join(f"{k}={v}\n" for k, v in secrets.items()), encoding="utf-8")
         tmp.chmod(0o600)
-        tmp.replace(path)   # atomic swap; mode 0600 so only root (the bot) reads it
+        tmp.replace(path)   # atomic swap; mode 0600, root-readable
 
     async def _do_secret(message: Message, text: str) -> None:
         lang = _lang(message)
@@ -3331,12 +3024,12 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             _write_secrets(key, secrets)
             await reply(message, i18n.t("secret.stored", lang, name=markup.escape_html(k)))
             return
-        # No parseable arg → list current NAMES (never values) + prompt, capturing the
-        # next message as the KEY=VALUE to add (the #101 arg-capture convention).
+        # No parseable arg: list current names (never values) and prompt.
+        # - captures next message as the `KEY=VALUE` to add
         names = (", ".join(f"<code>{markup.escape_html(n)}</code>" for n in secrets)
                  or i18n.t("secret.none", lang))
         pending[_pkey(message)] = "secret"
-        # #222: attach a "How to use" button → the detailed guide (secret.guide).
+        # Attach a How-to-use button linking the guide.
         kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
             text=i18n.t("secret.btn_guide", lang), callback_data="secret:guide")]])
         skw: dict = {}
@@ -3346,15 +3039,18 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
 
     @router.message(Command("secret"))
     async def cmd_secret(message: Message) -> None:
-        """Store a per-session service credential (e.g. a GitHub token), injected as an
-        env var into THIS session's jail only (#119d). Code sessions only."""
+        """Store a per-session service credential as an env var.
+
+        - injected into this session's jail only
+        - code sessions only
+        """
         state = await _ensure_state(message)
         lang = _lang(message)
         if state.mode != "code":
             await reply(message, i18n.t("common.code_only", lang))
             return
-        # #283: gate on the USER's level too, not just the session mode (a demoted user may
-        # still own a code session).
+        # Gate on the user's level too, not just session mode.
+        # - a demoted user may still own a code session
         if not _has_code_access(message.from_user.id if message.from_user else 0,
                                 message.from_user.username if message.from_user else None):
             await reply(message, i18n.t("access.code_denied", lang))
@@ -3363,8 +3059,10 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
 
     @router.callback_query(F.data == "secret:guide")
     async def on_secret_guide_cb(cb: CallbackQuery) -> None:
-        """#222: show the detailed how-to (incl. the GitHub-over-HTTPS walkthrough)
-        behind the "How to use" button on the /secret prompt."""
+        """Show the detailed how-to behind the "How to use" button.
+
+        - includes the GitHub-over-HTTPS walkthrough
+        """
         lang = _lang(cb)
         if cb.message is not None:
             with contextlib.suppress(Exception):
@@ -3374,48 +3072,30 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
 
     @router.message(Command("sandbox"))
     async def cmd_sandbox(message: Message) -> None:
-        """#231: the sandbox is now MANDATORY for every session (chat AND code) — always
-        on, no per-session opt-out. The toggle is retired (it existed to debug isolation
-        vs bot bugs, #138/#180; the jail is stable now). This handler is kept only so a
-        typed /sandbox gives a clear answer; it no longer changes anything."""
+        """Answer a typed sandbox command; changes nothing.
+
+        - the sandbox is mandatory for every session, with no opt-out
+        - the toggle is retired
+        """
         await _ensure_state(message)
         lang = _lang(message)
         if not _is_owner(message):
             await reply(message, i18n.t("common.owner_only_access", lang))
             return
         await reply(message, i18n.t("sandbox.mandatory", lang))
-        # was (#138/#145/#180): per-session toggle — set/clear no_sandbox and rebuild.
-        # Removed for #231 (sandbox is mandatory; no_sandbox is never set anymore).
-        # key = await _session_key(message)
-        # arg = _command_arg(message).lower().strip()
-        # if arg in ("on", "off"):
-        #     await db.set_no_sandbox(key, arg == "off")
-        #     deferred = await _rebuild_session(key)
-        #     note = i18n.t("common.defer_note", lang) if deferred else ""
-        #     await reply(message, i18n.t("sandbox.set_on" if arg == "on" else "sandbox.set_off", lang, note=note))
-        #     return
-        # uid = message.from_user.id if message.from_user else None
-        # sctx = await _build_ss_ctx(key, uid, _role_of(uid, None))
-        # value, _src = ss.resolve(ss.SETTINGS["sandbox"], sctx)
-        # new_on = not bool(value)
-        # await db.set_no_sandbox(key, not new_on)
-        # deferred = await _rebuild_session(key)
-        # note = i18n.t("common.defer_note", lang) if deferred else ""
-        # await reply(message, i18n.t("sandbox.set_on" if new_on else "sandbox.set_off", lang, note=note))
 
     @router.message(Command("permissions"))
     async def cmd_permissions(message: Message) -> None:
         state = await _ensure_state(message)
         key = await _session_key(message)
         lang = _lang(message)
-        # Permissions apply ONLY to code sessions. Chat carries only the read-only,
-        # AUTO-approved web tools — no gated/dangerous tools (and the engine hardcodes
-        # permission_mode="default" for chat) — so this setting is inert there. Say so
-        # instead of storing a silent no-op (owner UX request).
+        # Permissions apply only to code sessions.
+        # - chat has only auto-approved read-only web tools
+        # - engine hardcodes default mode for chat; setting inert
         if state.mode != "code":
             await reply(message, i18n.t("perm.chat_na", lang))
             return
-        # #283: gate on the caller's level too (demotion gap — see _has_code_access).
+        # Gate on the caller's level too (demotion gap).
         if not _has_code_access(message.from_user.id if message.from_user else 0,
                                 message.from_user.username if message.from_user else None):
             await reply(message, i18n.t("access.code_denied", lang))
@@ -3423,13 +3103,12 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         arg = _command_arg(message).lower()
 
         if not arg:
-            # No arg → the unified hub picker (#145/#146). full-access is owner-only
-            # (hidden + apply-gated). The text list is the fallback.
+            # No arg: show the hub picker; text list is fallback.
             uid = message.from_user.id if message.from_user else None
             uname = message.from_user.username if message.from_user else None
             if await _send_setting_picker(message.chat.id, key, uid, uname, lang, "permission_mode"):
                 return
-            # #212: unset → new default acceptEdits. was: .get(state.permission_mode, "ask")
+            # Unset defaults to `acceptEdits`.
             current = PERM_MODE_TO_NAME.get(state.permission_mode or "acceptEdits", "auto-edits")
             lines = [
                 i18n.t("perm.current", lang, current=current),
@@ -3447,12 +3126,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             await reply(message, i18n.t("perm.unknown", lang, names=names))
             return
 
-        # #223: full-access (bypassPermissions) is now available to all code users — the
-        # #119 sandbox confines it to their own session and they opt into the risk. was
-        # owner-only:
-        # if arg == "full-access" and not _is_owner(message):
-        #     await reply(message, i18n.t("perm.full_access_owner_only", lang))
-        #     return
+        # Full-access is available to all code users; sandbox confines it.
 
         sdk_mode = PERM_NAME_TO_MODE[arg]
         await db.set_permission_mode(key, sdk_mode)
@@ -3470,10 +3144,10 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
 
     @router.message(Command("auto"))
     async def cmd_auto(message: Message) -> None:
-        """Owner shortcut: /auto on|off toggles code-mode auto-approval.
+        """Owner shortcut toggling code-mode auto-approval.
 
-        on  → bypassPermissions (run every tool without asking — like a real
-              Claude Code session); off → default (ask for dangerous tools).
+        - on: `bypassPermissions`, runs every tool without asking
+        - off: `default`, asks for dangerous tools
         """
         lang = _lang(message)
         if not _is_owner(message):
@@ -3485,10 +3159,9 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         is_on = state.permission_mode == "bypassPermissions"
 
         if not arg:
-            # No arg → toggle in place (menu.md §2: "none → toggle"; #145). Was a
-            # show-only reply that forced typing /auto on|off.
+            # No arg: toggle in place rather than show-only reply.
             new_on = not is_on
-            # #223: off → the auto-edits floor (was "default"/ask, now removed).
+            # Off sets the auto-edits floor.
             await db.set_permission_mode(key, "bypassPermissions" if new_on else "acceptEdits")
             deferred = await _rebuild_session(key)
             note = i18n.t("common.defer_note", lang) if deferred else ""
@@ -3498,7 +3171,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             await reply(message, i18n.t("auto.usage", lang))
             return
 
-        new_mode = "bypassPermissions" if arg == "on" else "acceptEdits"  # #223: was "default"/ask
+        new_mode = "bypassPermissions" if arg == "on" else "acceptEdits"
         await db.set_permission_mode(key, new_mode)
         deferred = await _rebuild_session(key)
         note = i18n.t("common.defer_note", lang) if deferred else ""
@@ -3506,27 +3179,29 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
 
     @router.message(Command("shell"))
     async def cmd_shell(message: Message) -> None:
-        """#224: toggle shell mode for THIS code session — one command flips it on/off.
-        In shell mode every message runs as a command in the session's jail (no model);
-        does NOT change the session type. Code sessions only."""
+        """Toggle shell mode for this code session.
+
+        - every message runs as a jail command, no model
+        - does not change the session type
+        """
         state = await _ensure_state(message)
         lang = _lang(message)
         if state.mode != "code":
             await reply(message, i18n.t("shell.code_only", lang))
             return
-        # #283: gate on the caller's level too (demotion gap — see _has_code_access).
+        # Gate on the caller's level too (demotion gap).
         if not _has_code_access(message.from_user.id if message.from_user else 0,
                                 message.from_user.username if message.from_user else None):
             await reply(message, i18n.t("access.code_denied", lang))
             return
         key = await _session_key(message)
         new_on = not bool(state.shell_mode)
-        # #279: capture the live keypad message + paused-input render BEFORE toggling.
+        # Capture live keypad message and paused render before toggling.
         kb_ref = sessions.shell_kb_ref(key)
         resume_render = sessions.shell_resume_render(key)
         await sessions.set_shell_mode(key, new_on)
         if not new_on and kb_ref is not None:
-            # Detach → strip the now-stale keypad from its message (we're back in agent mode).
+            # Detach strips the stale keypad; back in agent mode.
             cid, mid = kb_ref
             with contextlib.suppress(Exception):
                 await bot(EditRichMessage(
@@ -3536,9 +3211,9 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             sessions.set_shell_kb(key, None, None)
         await reply(message, i18n.t("shell.on" if new_on else "shell.off", lang))
         if new_on and resume_render is not None:
-            # Re-attach with a command still waiting → re-offer the keypad where input paused,
-            # so the user continues instead of restarting the interactive flow (#279). Refresh
-            # first in case the program advanced (printed a new prompt) while detached.
+            # Re-attach with a waiting command re-offers the keypad.
+            # - user continues instead of restarting the flow
+            # - refresh first in case the program advanced
             live = await sessions.shell_refresh(key, lang)
             render = live or resume_render
             send_kwargs = ({"message_thread_id": message.message_thread_id}
@@ -3559,11 +3234,11 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
 
         if not arg:
             cur = getattr(sessions, "usage_mode", "footer")
-            # Owner → the unified hub usage picker (#147). Non-owner → read-only text
-            # (the display is account-wide; menu.md Table 7: 🟢 view · 👑 change).
+            # Owner gets the hub usage picker; others a read-only text.
+            # - display is account-wide
             if _is_owner(message):
                 with contextlib.suppress(Exception):
-                    await _send_menu(  # #173: native rich menu open
+                    await _send_menu(
                         message.chat.id,
                         i18n.t("settings.v2_pick", lang, name=i18n.t("settings.usage_name", lang)),
                         _ss_usage_keyboard(cur, lang))
@@ -3584,15 +3259,14 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             await reply(message, i18n.t("usage.unknown", lang, names=names))
             return
 
-        # The usage display is GLOBAL (the subscription windows are account-wide
-        # and the pinned message is shared), so only the owner may change it — a
-        # guest could otherwise flip the owner's display for everyone.
+        # Usage display is global; only the owner may change it.
+        # - a guest could flip the display for everyone
         if not _is_owner(message):
             await reply(message, i18n.t("common.owner_only_usage", lang))
             return
 
-        # Prefer the SessionManager setter; fall back to the attribute so the
-        # command still works even if the helper is unavailable.
+        # Prefer the SessionManager setter; fall back to the attribute.
+        # - keeps the command working if the helper is unavailable
         setter = getattr(sessions, "set_usage_mode", None)
         if callable(setter):
             await setter(arg)
@@ -3603,11 +3277,10 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             i18n.t("usage.set", lang, name=arg, help=i18n.t(f"usage.help.{arg}", lang)),
         )
 
-    # ---- /codesplit (owner): each fenced code block as its OWN message --------
-    # Workaround while Telegram mobile lacks a per-code-block "copy" button (desktop
-    # has one): sending each block as a separate message makes long-press → Copy
-    # grab the whole snippet. Owner-toggleable so it's trivial to turn OFF once the
-    # mobile clients gain the copy button. Global rendering setting (#codesplit).
+    # ---- /codesplit (owner): each code block as own message ----
+    # - workaround while mobile Telegram lacks a per-block copy button
+    # - separate messages let long-press Copy grab the whole snippet
+    # - owner-toggleable so it's easy to turn off later
     def _codesplit_kb(cur: bool, lang: str) -> InlineKeyboardMarkup:
         B = InlineKeyboardButton
         return InlineKeyboardMarkup(inline_keyboard=[[
@@ -3617,8 +3290,10 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
 
     @router.message(Command("codesplit"))
     async def cmd_codesplit(message: Message) -> None:
-        """Owner: toggle whether each fenced code block is sent as its OWN message
-        (easy mobile copy) or kept inline. Global; persisted; next-reply effect."""
+        """Owner: toggle sending each fenced code block separately.
+
+        - global and persisted; affects the next reply
+        """
         lang = _lang(message)
         if not _is_owner(message):
             await reply(message, i18n.t("codesplit.owner_only", lang))
@@ -3630,7 +3305,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             await reply(message, i18n.t("codesplit.set", lang, state=i18n.onoff(arg == "on", lang)))
             return
         with contextlib.suppress(Exception):
-            await _send_menu(  # #173: native rich menu open
+            await _send_menu(
                 message.chat.id,
                 i18n.t("codesplit.show", lang, state=i18n.onoff(cur, lang)),
                 _codesplit_kb(cur, lang),
@@ -3638,7 +3313,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
 
     @router.callback_query(F.data.startswith("csm:"))
     async def on_codesplit_cb(cb: CallbackQuery) -> None:
-        """Apply a /codesplit toggle tap (owner-only — it is a global setting)."""
+        """Apply a code-split toggle tap (owner-only, global setting)."""
         lang = _lang(cb)
         if not (cb.from_user and cb.from_user.id == settings.owner_id):
             with contextlib.suppress(Exception):
@@ -3648,7 +3323,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         await sessions.set_split_code_messages(val)
         if cb.message is not None:
             with contextlib.suppress(Exception):
-                await _edit_menu(  # #173: native rich nav-edit
+                await _edit_menu(
                     cb.message,
                     i18n.t("codesplit.show", lang, state=i18n.onoff(val, lang)),
                     _codesplit_kb(val, lang),
@@ -3665,9 +3340,11 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
 
     @router.message(Command("workingplate"))
     async def cmd_workingplate(message: Message) -> None:
-        """Owner: globally toggle the "Working…" + ⏹ Stop control plate (#175). OFF =
-        no plate at all (A/B test whether it makes generation visibly jump). Global;
-        persisted; takes effect on the next turn."""
+        """Owner: globally toggle the "Working…" plus Stop control plate.
+
+        - off means no plate at all
+        - global and persisted; affects the next turn
+        """
         lang = _lang(message)
         if not _is_owner(message):
             await reply(message, i18n.t("codesplit.owner_only", lang))
@@ -3679,7 +3356,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             await reply(message, i18n.t("workingplate.set", lang, state=i18n.onoff(arg == "on", lang)))
             return
         with contextlib.suppress(Exception):
-            await _send_menu(  # #173: native rich menu open
+            await _send_menu(
                 message.chat.id,
                 i18n.t("workingplate.show", lang, state=i18n.onoff(cur, lang)),
                 _workingplate_kb(cur, lang),
@@ -3687,7 +3364,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
 
     @router.callback_query(F.data.startswith("wpl:"))
     async def on_workplate_cb(cb: CallbackQuery) -> None:
-        """Apply a /workingplate toggle tap (owner-only — it is a global setting)."""
+        """Apply a working-plate toggle tap (owner-only, global setting)."""
         lang = _lang(cb)
         if not (cb.from_user and cb.from_user.id == settings.owner_id):
             with contextlib.suppress(Exception):
@@ -3697,29 +3374,13 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         await sessions.set_working_plate(val)
         if cb.message is not None:
             with contextlib.suppress(Exception):
-                await _edit_menu(  # #173: native rich nav-edit
+                await _edit_menu(
                     cb.message,
                     i18n.t("workingplate.show", lang, state=i18n.onoff(val, lang)),
                     _workingplate_kb(val, lang),
                 )
         with contextlib.suppress(Exception):
             await cb.answer(i18n.t("settings.saved", lang))
-
-    # /stop command REMOVED 2026-06-15 (owner request) — the ⏹ Stop is an inline
-    # BUTTON on the live control message (streamer + on_stop_cb), so a typed command
-    # is redundant. Kept commented per the project convention; restore by uncommenting
-    # this + re-adding "stop" to _COMMAND_NAMES.
-    # @router.message(Command("stop"))
-    # async def cmd_stop(message: Message) -> None:
-    #     await _ensure_state(message)
-    #     key = await _session_key(message)
-    #     lang = _lang(message)
-    #     try:
-    #         stopped = await sessions.stop(key)
-    #     except Exception as exc:
-    #         await reply(message, i18n.t("stop.error", lang, err=markup.escape_html(str(exc))))
-    #         return
-    #     await reply(message, i18n.t("stop.done" if stopped else "stop.nothing", lang))
 
     @router.message(Command("whoami"))
     async def cmd_whoami(message: Message) -> None:
@@ -3728,7 +3389,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         uid = getattr(user, "id", None)
         uname = getattr(user, "username", None)
         lines = [i18n.t("whoami", lang, uid=uid, uname=uname or "-")]
-        # Per-user rolling usage + any caps (#120), so a user can see their own spend.
+        # Per-user rolling usage and caps, shown to the user.
         if uid is not None:
             try:
                 bd = await db.get_user_breakdown(uid)
@@ -3742,8 +3403,10 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         await reply(message, "\n".join(lines))
 
     def _parse_grant(arg: str) -> tuple[str, str | None, str | None, str | None]:
-        """Parse ``<id|@user> [chat|code] [until DATE]`` into
-        ``(target, level|None, expiry|None, error_key|None)``."""
+        """Parse `<id|@user> [chat|code] [until DATE]` arguments.
+
+        - returns `(target, level|None, expiry|None, error_key|None)`
+        """
         toks = arg.split()
         target = toks[0]
         level: str | None = None
@@ -3794,7 +3457,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             return
         arg = _command_arg(message)
         if not arg:
-            # Arg-capture (#101): no arg → prompt and capture the next message.
+            # No arg: prompt and capture the next message.
             pending[_pkey(message)] = "allow"
             await reply(message, i18n.t("allow.prompt", lang))
             return
@@ -3818,7 +3481,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             return
         arg = _command_arg(message)
         if not arg:
-            # Arg-capture (#101): no arg → prompt and capture the next message.
+            # No arg: prompt and capture the next message.
             pending[_pkey(message)] = "deny"
             await reply(message, i18n.t("deny.prompt", lang))
             return
@@ -3834,7 +3497,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             await reply(message, i18n.t("level.usage", lang))
             return
         target = toks[0]
-        # Full form "<user> chat|code" → apply directly.
+        # Full form "<user> chat|code" applies directly.
         if len(toks) >= 2 and toks[1].lower() in VALID_MODES:
             lvl = toks[1].lower()
             if allowlist.set_level(target, lvl):
@@ -3842,15 +3505,10 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             else:
                 await reply(message, i18n.t("level.not_found", lang, val=markup.escape_html(target)))
             return
-        # #216: a target but no/invalid level → show a chat|code PICKER (closed choice),
-        # not the level.usage error (repo convention: fixed-choice → picker). The user
-        # part stays free-text (open input); only the level becomes a tap.
-        # was: if len(toks) < 2 or toks[1].lower() not in VALID_MODES: reply(level.usage)
-        # #220: the picker round-trips `target` through callback_data ("setlvl:<target>:<level>"),
-        # which Telegram caps at 64 bytes and on_level_pick parses by ":". A ":" inside the
-        # target corrupts that split and an over-long handle overflows the cap — no real
-        # @username or numeric id hits either, so treat it as not-found rather than building a
-        # broken button (the full-form "<user> chat|code" path above is unaffected).
+        # No valid level: show a chat|code picker.
+        # - callback_data is capped at 64 bytes
+        # - a `:` in the target breaks the parse
+        # - such targets are treated as not-found
         if ":" in target or len(f"setlvl:{target}:code".encode()) > 64:
             await reply(message, i18n.t("level.not_found", lang, val=markup.escape_html(target)))
             return
@@ -3869,7 +3527,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
 
     @router.message(Command("level"))
     async def cmd_level(message: Message) -> None:
-        """Owner: set a user's access level — /level @user chat|code."""
+        """Owner: set a user's access level, chat or code."""
         lang = _lang(message)
         if not _is_owner(message):
             await reply(message, i18n.t("common.owner_only_access", lang))
@@ -3883,7 +3541,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
 
     @router.callback_query(F.data.startswith("setlvl:"))
     async def on_level_pick(cb: CallbackQuery) -> None:
-        """#216: apply a chat|code choice from the /level picker (owner-only)."""
+        """Apply a chat or code level choice (owner-only)."""
         lang = _lang(cb)
         uid = cb.from_user.id if cb.from_user else None
         if uid != settings.owner_id:
@@ -3935,7 +3593,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
 
     @router.message(Command("expire"))
     async def cmd_expire(message: Message) -> None:
-        """Owner: set/clear a user's access expiry — /expire @user YYYY-MM-DD|never."""
+        """Owner: set or clear a user's access expiry."""
         lang = _lang(message)
         if not _is_owner(message):
             await reply(message, i18n.t("common.owner_only_access", lang))
@@ -3952,19 +3610,8 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         if not _is_owner(message):
             await reply(message, i18n.t("common.owner_only_access", lang))
             return
-        # #120: /limit now sets a ROLLING-WINDOW cap (day or week), replacing the
-        # #105 lifetime token grant. Syntax: /limit <id|@user> <tokens> [day|week] | off.
-        #
-        # was (#105 lifetime grant — top-up; replaced by rolling caps above):
-        #   amt = toks[1].lower()
-        #   if amt in ("off", "none", "unlimited"): tokens = None
-        #   else:
-        #       try:
-        #           tokens = int(amt.replace("_", "").replace(",", ""))
-        #           if tokens < 0: raise ValueError
-        #       except ValueError: ... ; return
-        #   if not allowlist.grant_tokens(target, tokens): ... ; return
-        #   reply limit.unlimited / limit.set
+        # Limit sets a rolling-window cap (day or week).
+        # - Syntax: /limit <id|@user> <tokens> [day|week] | off
         toks = arg.split()
         if len(toks) < 2:
             await reply(message, i18n.t("limit.usage", lang))
@@ -3993,9 +3640,10 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
 
     @router.message(Command("limit"))
     async def cmd_limit(message: Message) -> None:
-        """Owner: set a user's rolling usage cap — /limit @user <units> [day|week]|off (#120).
+        """Owner: set a user's rolling usage cap, or off.
 
-        #192: the cap is enforced against WEIGHTED USAGE UNITS (#165), not raw tokens."""
+        - enforced against weighted usage units, not raw tokens
+        """
         lang = _lang(message)
         if not _is_owner(message):
             await reply(message, i18n.t("common.owner_only_access", lang))
@@ -4008,9 +3656,10 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         await _do_limit(message, arg)
 
     def _who_label(fname, uname, fallback: str) -> str:
-        """#272: a user's display label — owner-assigned friendly name (bold) then
-        @username. `fallback` (already HTML-safe) is used only when BOTH are missing
-        (e.g. a pinned entry with no username → its numeric id)."""
+        """A user's display label: friendly name (bold), then `@username`.
+
+        - `fallback` (HTML-safe) is used only when both are missing
+        """
         bits = []
         if fname:
             bits.append(f"<b>{markup.escape_html(str(fname))}</b>")
@@ -4019,26 +3668,23 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         return " ".join(bits) if bits else fallback
 
     async def _users_text(snap: dict, lang: str) -> list[str]:
-        """The /users summary lines (owner + each entry/pending), each WITH per-user
-        usage (day/week/total) — shown for everyone regardless of whether limits are
-        set (owner request). The token column shows the #120 ROLLING caps (day/week)."""
-        # #285: fetch every user's usage in ONE GROUP BY (was an N+1 per-user query).
-        # #293: get_all_users_breakdown returns a list; key it by uid for the per-user lookup.
-        # #419: tokens only — the weighted-units line (#303) is gone. was:
-        #   units = {r["uid"]: r for r in await db.get_all_users_breakdown("units")}
+        """The `/users` summary lines for owner and each entry.
+
+        - each has per-user usage (day, week, total)
+        - shown whether or not limits are set
+        - token column shows the rolling day and week caps
+        """
+        # Fetch all users' usage in one GROUP BY.
+        # - breakdown returns a list; key it by uid
         tokens = {}
         with contextlib.suppress(Exception):
             tokens = {r["uid"]: r for r in await db.get_all_users_breakdown("raw")}
 
         def _usage_lines(uid):
-            # #303: the weighted-units line and, below it, a same-format raw-tokens line;
-            # either is omitted if that user has no usage rows for the metric.
-            # #308: NBSP-pad each value to a fixed width inside the monospace <code> block so
-            # the day/week/total columns line up vertically across users.
+            # NBSP-pad values so monospace columns align.
             def _w(v):
                 return _rpad_mono(_fmt_tokens(v), 6)
             out = []
-            # #419: was a units line first (users.entry_usage from the "units" breakdown).
             tb = tokens.get(uid)
             if tb:
                 out.append(i18n.t("users.entry_usage_tok", lang, day=_w(tb["day"]),
@@ -4046,9 +3692,10 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             return out
 
         def _user_meta(rec) -> str:
-            """#286: build the trailing meta — only show 'exp' when the user is actually
-            time-limited and 'caps' when actually capped (a never-expiring, uncapped user
-            shows neither, instead of noisy 'exp: never · caps: ∞')."""
+            """Build the trailing meta line for a user.
+
+            - show 'exp' only when time-limited, 'caps' only when capped
+            """
             parts = []
             exp = rec.get("expires_at")
             if exp:
@@ -4059,8 +3706,8 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             return "".join(parts)
 
         owner_id = snap.get("owner_id")
-        # #272: label = friendly name + @username (id moved to the per-user card). The
-        # owner's name/username live in owner_prefs (the owner has no access entry).
+        # Label is friendly name plus @username.
+        # - owner's name lives in `owner_prefs`
         oprefs = snap.get("owner_prefs", {})
         owner_who = _who_label(oprefs.get("friendly_name"), oprefs.get("username"),
                                i18n.t("users.btn_owner_bare", lang))
@@ -4068,67 +3715,60 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             i18n.t("users.header", lang),
             i18n.t("users.owner_id", lang, who=owner_who),
         ]
-        lines.extend(_usage_lines(owner_id))   # owner is uncapped but still worth seeing (#303)
+        lines.extend(_usage_lines(owner_id))   # Owner uncapped but still shown
         entries = snap.get("entries", {})
         pending_u = snap.get("pending", {})
         if not entries and not pending_u:
             lines.append(i18n.t("users.none_entries", lang))
         for uid, rec in entries.items():
-            # #272: name then @username; the id only as a last-resort identifier when a
-            # pinned entry has neither (was: "<code>{id}</code> <b>fname</b> @username").
+            # Name then @username; id only as last resort.
             who = _who_label(rec.get("friendly_name"), rec.get("username"),
                              f"<code>{uid}</code>")
-            # #286: exp/caps shown only when actually set (see _user_meta).
+            # Expiry and caps shown only when set.
             lines.append(i18n.t("users.entry", lang, who=who,
                                 level=rec.get("level", "chat"), meta=_user_meta(rec)))
-            lines.extend(_usage_lines(uid))   # #303: units + tokens lines
+            lines.extend(_usage_lines(uid))
         for name, rec in pending_u.items():
             who = _who_label(rec.get("friendly_name"), name, f"@{markup.escape_html(name)}")
             lines.append(i18n.t("users.pending", lang, who=who,
                                 level=rec.get("level", "chat"), meta=_user_meta(rec)))
-            # pending (un-pinned) users have no id yet → no usage to show.
-        # #303: dropped the trailing description footer — the card is self-explanatory and
-        # each user now carries an extra tokens line, so the prose only added clutter. The
-        # `users.footnote` / `users.tap_hint` keys are kept (unused) for an easy revert.
-        # was:
-        # lines.append("")
-        # lines.append(i18n.t("users.footnote", lang))
-        # lines.append(i18n.t("users.tap_hint", lang))
+            # Pending (un-pinned) users have no id, so no usage.
         return lines
 
     def _users_keyboard(snap: dict, lang: str) -> InlineKeyboardMarkup:
-        """One tappable button per user (owner first), opening their settings card
-        (#120 per-user management). callback_data carries the target token: a numeric
-        id for entries / the owner, or a username for an un-pinned pending user."""
+        """One tappable button per user, owner first.
+
+        - opens that user's settings card
+        - `callback_data` is a numeric id, or a username if pending
+        """
         B = InlineKeyboardButton
         rows: list[list[InlineKeyboardButton]] = []
         owner_id = snap.get("owner_id")
         rows.append([B(text=i18n.t("users.btn_owner", lang), callback_data=f"usr:card:{owner_id}")])
         for uid, rec in snap.get("entries", {}).items():
-            # #284: prefer the owner-assigned friendly name on the button too; fall back to
-            # @username, then the id (plain text — inline button labels aren't HTML).
+            # Button label: friendly name, then @username, then id.
+            # - plain text; button labels aren't HTML
             uname = rec.get("username")
             who = rec.get("friendly_name") or (f"@{uname}" if uname else str(uid))
             rows.append([B(
                 text=i18n.t("users.btn_entry", lang, who=who, level=rec.get("level", "chat")),
                 callback_data=f"usr:card:{uid}")])
         for name, rec in snap.get("pending", {}).items():
-            who = rec.get("friendly_name") or f"@{name}"  # #284
+            who = rec.get("friendly_name") or f"@{name}"
             rows.append([B(
                 text=i18n.t("users.btn_pending", lang, who=who, level=rec.get("level", "chat")),
                 callback_data=f"usr:card:{name}")])
         rows.append([B(text=i18n.t("users.btn_add", lang), callback_data="usr:add"),
                      B(text=i18n.t("users.btn_stats", lang), callback_data="usr:stats")])
         rows.append([
-            # #142: Back returns to the unified sx: hub (was st:nav:admin — the
-            # deprecated flat hub; that was the "another menu pops up" bug).
+            # Back returns to the unified `sx:` hub.
             B(text=i18n.t("settings.back_to", lang), callback_data="sx:tab:s"),
             B(text=i18n.t("btn.close", lang), callback_data="usr:close"),
         ])
         return InlineKeyboardMarkup(inline_keyboard=rows)
 
-    # #275: per-user card On/Off + level pickers (with Back) — same "never flip in place"
-    # rule as the /settings hub. `which` ∈ {mem, eff}.
+    # Per-user card pickers open with Back, never flip in place.
+    # - `which` is mem or eff
     _USER_BOOL_OPTS = {
         "mem": ("usercard.pick_memory", "global_memory"),
         "eff": ("usercard.pick_maxeffort", "allow_max_effort"),
@@ -4155,9 +3795,11 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         return InlineKeyboardMarkup(inline_keyboard=rows)
 
     async def _render_user_card(target: str, lang: str):
-        """Build the (text, keyboard) for one user's settings card. Owner-aware: the
-        owner card exposes the SELF-LIMIT toggles (memory, idle-TTL, max-effort, tool
-        cap, day/week token caps — #185) but not level/expiry/access/name/remove."""
+        """Build `(text, keyboard)` for one user's settings card.
+
+        - the owner card shows self-limit toggles only
+        - level, expiry, access, name, remove are hidden for owner
+        """
         B = InlineKeyboardButton
         d = allowlist.describe(target)
         if d is None:
@@ -4165,12 +3807,12 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 B(text=i18n.t("usercard.btn_back", lang), callback_data="usr:list")]])
             return i18n.t("usercard.not_found", lang), kb
         is_owner = d["kind"] == "owner"
-        # #308: interactive identity — friendly name (if any) + a CLICKABLE link to the
-        # user's Telegram profile (was the plain "fname (@user)" text in brackets). The link
-        # is real HTML, so the title below is NOT re-escaped; the id is the final fallback.
+        # Identity: friendly name plus clickable Telegram profile link.
+        # - link is real HTML; title is not re-escaped
+        # - id is the final fallback
         uid_ = d.get("id")
         uname_ = d.get("username")
-        fname = d.get("friendly_name")  # #171: owner-assigned alias
+        fname = d.get("friendly_name")  # Owner-assigned alias
         if uname_:
             _u = markup.escape_html(str(uname_))
             link = f'<a href="https://t.me/{_u}">@{_u}</a>'
@@ -4182,10 +3824,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         tid = d.get("id")
         bd = await db.get_user_breakdown(tid) if tid is not None else \
             {"day": 0, "week": 0, "total": 0, "requests": 0}
-        # #419: the day/week/total figures are TOKENS, the same measure the caps enforce.
-        # was (#165, weighted units):
-        #   ub = await db.get_user_breakdown(tid, "units") if tid is not None else \
-        #       {"day": 0, "week": 0, "total": 0}
+        # Day/week/total figures are tokens, matching the caps.
         ub = bd
         rate = d.get("rate") or {"day": None, "week": None}
 
@@ -4194,12 +3833,12 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
 
         idle_raw = await db.get_user_default(tid, "idle_ttl_min") if tid is not None else None
 
-        def _idle_lbl(v):  # #182: None → default, ≤0 → ∞, N → "{N}m"
+        def _idle_lbl(v):  # None default, 0 unlimited, N minutes
             if v is None:
                 return i18n.t("usercard.idle_default", lang)
             return "∞" if int(v) <= 0 else f"{int(v)}m"
 
-        def _ms_lbl(v):  # session limit: None → "default", 0 → ∞, N → "{N}"
+        def _ms_lbl(v):  # None default, 0 unlimited, N sessions
             if v is None:
                 return i18n.t("usercard.sessions_default", lang)
             return "∞" if int(v) <= 0 else str(int(v))
@@ -4207,7 +3846,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         kind_label = (i18n.t("usercard.kind_owner", lang) if is_owner else
                       i18n.t("usercard.kind_pending", lang) if d["kind"] == "pending" else "")
         lines = [
-            i18n.t("usercard.title", lang, who=who, kind=kind_label),  # #308: who is pre-built HTML (link)
+            i18n.t("usercard.title", lang, who=who, kind=kind_label),  # who is pre-built HTML
             i18n.t("usercard.level", lang, level=d.get("level", "chat")),
             i18n.t("usercard.expiry", lang,
                    expiry=markup.escape_html(str(d.get("expires_at") or i18n.t("users.never", lang)))),
@@ -4226,40 +3865,38 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
 
         rows: list[list[InlineKeyboardButton]] = []
         mem_btn = B(text=i18n.t("usercard.btn_memory", lang, state=i18n.onoff(d.get("global_memory"), lang)),
-                    callback_data=f"usr:bopt:{target}:mem")  # #275: opens On/Off picker
-        # #182: per-user idle-TTL — shown on EVERY card, including the owner's own
-        # (the owner can set it on themselves to tune/test reaper behaviour).
+                    callback_data=f"usr:bopt:{target}:mem")  # Opens On/Off picker
+        # Idle-TTL is shown on every card.
+        # - owner can set it to test the reaper
         idle_btn = B(text=i18n.t("usercard.btn_idle", lang, val=_idle_lbl(idle_raw)),
                      callback_data=f"usr:idle:{target}")
         ses_btn = B(text=i18n.t("usercard.btn_sessions", lang, val=_ms_lbl(d.get("max_sessions"))),
                     callback_data=f"usr:max:{target}")
         if is_owner:
-            # #185: the owner can self-impose the per-user limits (to TEST them). Show
-            # the same toggles as a guest EXCEPT level/expiry/access/name/remove (the
-            # owner is always code, never expires, always full access, can't self-remove).
-            # was: rows.append([mem_btn, idle_btn])
+            # Owner can self-impose per-user limits for testing.
+            # - level, expiry, access, name, remove are hidden
+            # - owner is always code and never expires
             rows.append([mem_btn,
                          B(text=i18n.t("usercard.btn_maxeffort", lang, state=i18n.onoff(d.get("allow_max_effort"), lang)),
-                           callback_data=f"usr:bopt:{target}:eff")])  # #275
+                           callback_data=f"usr:bopt:{target}:eff")])
             rows.append([B(text=i18n.t("usercard.btn_tools", lang, val=_fmt_cap(d.get("tool_cap"), lang)),
                            callback_data=f"usr:tools:{target}"),
                          idle_btn])
             rows.append([B(text=i18n.t("usercard.btn_day", lang), callback_data=f"usr:rday:{target}"),
                          B(text=i18n.t("usercard.btn_week", lang), callback_data=f"usr:rweek:{target}"),
                          ses_btn])
-            # #272: the owner can set their OWN friendly name (stored in owner_prefs) so
-            # the /users list + stats label them by name, not a bare id.
+            # Owner can set their own friendly name in `owner_prefs`.
             rows.append([B(text=i18n.t("usercard.btn_name", lang), callback_data=f"usr:name:{target}")])
             if rate.get("day") is not None or rate.get("week") is not None:
                 rows.append([B(text=i18n.t("usercard.btn_clear_limits", lang), callback_data=f"usr:rclr:{target}")])
         else:
             nxt = "code" if d.get("level") == "chat" else "chat"
             rows.append([B(text=i18n.t("usercard.btn_level", lang, level=d.get("level", "chat"), next=nxt),
-                           callback_data=f"usr:lopt:{target}"),  # #275
+                           callback_data=f"usr:lopt:{target}"),
                          ses_btn])
             rows.append([mem_btn,
                          B(text=i18n.t("usercard.btn_maxeffort", lang, state=i18n.onoff(d.get("allow_max_effort"), lang)),
-                           callback_data=f"usr:bopt:{target}:eff")])  # #275
+                           callback_data=f"usr:bopt:{target}:eff")])
             rows.append([B(text=i18n.t("usercard.btn_tools", lang, val=_fmt_cap(d.get("tool_cap"), lang)),
                            callback_data=f"usr:tools:{target}"),
                          B(text=i18n.t("usercard.btn_access", lang), callback_data=f"usr:acc:{target}")])
@@ -4275,12 +3912,14 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
 
     async def _render_user_tools(target: str, lang: str):
-        """(text, keyboard) for the per-user TOOL CAP sub-page (#131): toggle which
-        tools this user may use at all. cap=None = every tool allowed."""
+        """Return `(text, keyboard)` for the per-user tool-cap sub-page.
+
+        - toggles which tools this user may use
+        - `cap=None` means every tool is allowed
+        """
         B = InlineKeyboardButton
         d = allowlist.describe(target)
-        # #185: the owner CAN open its own tool-cap sub-page now (self-impose for testing).
-        # was: if d is None or d["kind"] == "owner": return await _render_user_card(...)
+        # Owner can open its own tool-cap sub-page.
         if d is None:
             return await _render_user_card(target, lang)
         cap = d.get("tool_cap")
@@ -4294,10 +3933,11 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
     async def _render_user_access(target: str, lang: str):
-        """(text, keyboard) for the per-user ACCESS-exceptions sub-page (#151, menu.md
-        §3.4/§4): one row per option showing this user's effective access — their
-        EXCEPTION if set, else the owner's base for that option. Tapping opens a
-        per-option picker (Base / Delegated / Read-only / Hidden)."""
+        """Return `(text, keyboard)` for the per-user access-exceptions page.
+
+        - one row per option: exception if set, else owner base
+        - tapping opens a per-option picker
+        """
         B = InlineKeyboardButton
         d = allowlist.describe(target)
         if d is None or d["kind"] == "owner":
@@ -4326,8 +3966,11 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
     def _user_access_picker_kb(target: str, skey: str, lang: str) -> InlineKeyboardMarkup:
-        """Per-option access picker on a user card: Base (clear) / Delegated /
-        Read-only / Hidden, then Back → the user's access sub-page (#151)."""
+        """Per-option access picker on a user card.
+
+        - choices: Base (clear), Delegated, Read-only, Hidden
+        - Back returns to the user's access sub-page
+        """
         B = InlineKeyboardButton
         opts = [("base", i18n.t("usercard.access_base_opt", lang)),
                 ("delegated", _access_label(ss.Access.DELEGATED, lang)),
@@ -4340,8 +3983,10 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
 
     @router.callback_query(F.data.startswith("req:"))
     async def on_access_request_cb(cb: CallbackQuery) -> None:
-        """#277: owner taps Allow on an unknown-user access-request notice → grant chat/code
-        access by the user's numeric id (the way to add someone whose id you didn't have)."""
+        """Owner taps Allow on an unknown-user access request.
+
+        - grants chat or code access by the user's numeric id
+        """
         lang = _lang(cb)
         if not (cb.from_user and cb.from_user.id == settings.owner_id):
             await cb.answer(i18n.t("common.owner_only_access", lang))
@@ -4355,10 +4000,9 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 await cb.answer()
                 return
             level = "code" if verb == "ac" else "chat"
-            # #290: the notice fires only for currently-unknown users, but the user may have
-            # been granted between the notice and this tap. Don't let a stale Allow silently
-            # re-set an existing user's level (e.g. demote code→chat) — skip and point the
-            # owner to /users for an intentional change.
+            # Skip a stale Allow for an already-known user.
+            # - avoids silently re-setting an existing level
+            # - point the owner to /users instead
             existing = allowlist.level_of(tuid, None)
             if existing is not None:
                 if cb.message is not None:
@@ -4385,18 +4029,20 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         if not _is_owner(message):
             await reply(message, i18n.t("common.owner_only_access", lang))
             return
-        if message.from_user:  # #272: learn the owner's @username for their label
+        if message.from_user:  # learn owner's @username for label
             with contextlib.suppress(Exception):
                 allowlist.note_owner_identity(message.from_user.id, message.from_user.username)
         snap = allowlist.snapshot()
-        await _send_menu(  # #173: native rich menu open
+        await _send_menu(
             message.chat.id, "\n".join(await _users_text(snap, lang)),
             _users_keyboard(snap, lang),
         )
 
     async def _do_whois(message: Message, arg: str) -> None:
-        """#333 (owner): map a user id → their sessions → workdir → transcript, for
-        debugging 'where is user X's chat'. Read-only; never mutates."""
+        """Owner: map a user id to sessions, workdir, transcript.
+
+        - read-only; never mutates
+        """
         lang = _lang(message)
         if not _is_owner(message):
             await reply(message, i18n.t("common.owner_only_access", lang))
@@ -4415,9 +4061,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             lvl = allowlist.level_of(uid, None)
             if lvl:
                 label = i18n.t("whois.label", lang, level=markup.escape_html(str(lvl)))
-        # #335: report the count of LISTED rows (the loop iterates `rows`, capped at
-        # limit=500), not the full browse_threads COUNT — they agree at the ~10 per-user
-        # cap but would misreport "n" vs the visible list if the cap were ever raised.
+        # Report count of listed rows, not total count.
         out = [i18n.t("whois.head", lang, uid=uid, n=len(rows), label=label)]
         for r in rows:
             tid = r["thread_id"]
@@ -4428,9 +4072,8 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             cwd = (st.cwd if st else "") or ""
             status = i18n.t("whois.tx_none", lang)
             if cwd:
-                # #335: the sandboxed transcript lives at <sid>/state/<encoded-cwd>/;
-                # use the SHARED encoder (archive.live_transcript_dir) so this matches the
-                # ai-title reader and what's actually on disk (was a private re.sub here).
+                # Use the shared encoder for the transcript dir.
+                # - matches the ai-title reader and disk layout
                 tdir = archive.live_transcript_dir(cwd)
                 if tdir.is_dir() and any(tdir.glob("*.jsonl")):
                     status = i18n.t("whois.tx_live", lang)
@@ -4451,7 +4094,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             return
         arg = _command_arg(message)
         if not arg:
-            # Arg-capture (#101): no arg → prompt and consume the next message.
+            # No arg: prompt and consume the next message.
             pending[_pkey(message)] = "whois"
             await reply(message, i18n.t("whois.prompt", lang))
             return
@@ -4459,14 +4102,16 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
 
     @router.callback_query(F.data.startswith("usr:"))
     async def on_user_cb(cb: CallbackQuery) -> None:
-        """Per-user management card taps (#120). Owner-only: a guest must never
-        manage access. Mutations re-render the card in place; free-text values
-        (expiry / day / week caps) go through arg-capture (_apply_user_value)."""
+        """Handle per-user management card taps (owner-only).
+
+        - mutations re-render the card in place
+        - free-text values go through arg-capture
+        """
         lang = _lang(cb)
         if not (cb.from_user and cb.from_user.id == settings.owner_id):
             await cb.answer(i18n.t("common.owner_only_access", lang))
             return
-        with contextlib.suppress(Exception):  # #272: learn the owner's @username
+        with contextlib.suppress(Exception):  # learn owner's @username
             allowlist.note_owner_identity(cb.from_user.id, cb.from_user.username)
         try:
             parts = (cb.data or "").split(":", 2)
@@ -4482,7 +4127,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 await cb.answer()
                 return
             if verb == "add":
-                # ➕ Add user — arg-capture (reuses /allow's prompt + _do_allow path).
+                # Add user: arg-capture reusing /allow's prompt path.
                 pending[(msg.chat.id, thread_key(msg), cb.from_user.id)] = "allow"
                 with contextlib.suppress(Exception):
                     await bot.send_message(msg.chat.id, i18n.t("allow.prompt", lang), parse_mode="HTML")
@@ -4491,14 +4136,13 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             if verb == "list":
                 snap = allowlist.snapshot()
                 with contextlib.suppress(Exception):
-                    await _edit_menu(  # #173: native rich nav-edit
+                    await _edit_menu(
                         msg, "\n".join(await _users_text(snap, lang)),
                         _users_keyboard(snap, lang))
                 await cb.answer()
                 return
             if verb == "stats":
-                # #172: the 📊 button on the /users page → the per-user stats table,
-                # so /userstats is reachable from the menu (not just by typing it).
+                # The stats button opens the per-user stats table.
                 send_kwargs: dict = {}
                 if msg.chat.type != "private" and msg.message_thread_id:
                     send_kwargs["message_thread_id"] = msg.message_thread_id
@@ -4506,7 +4150,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 await cb.answer()
                 return
             if verb in ("exp", "rday", "rweek", "name", "idle", "max"):
-                # Free-text value → arg-capture the owner's next message.
+                # Free-text value: capture the owner's next message.
                 action = {"exp": "usrexp", "rday": "usrrday", "rweek": "usrrweek",
                           "name": "usrname", "idle": "usridle", "max": "usrmax"}[verb]
                 pending[(msg.chat.id, thread_key(msg), cb.from_user.id)] = f"{action}:{target}"
@@ -4520,43 +4164,44 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             if verb == "tools":
                 text, kb = await _render_user_tools(target, lang)
                 with contextlib.suppress(Exception):
-                    await _edit_menu(msg, text, kb)  # #173: native rich nav-edit
+                    await _edit_menu(msg, text, kb)
                 await cb.answer()
                 return
             if verb == "tcap":
-                # target carries "<target>:<toolname>" (split(":",2) kept it whole).
+                # Target carries "<target>:<toolname>".
                 tgt, _, tool = target.partition(":")
                 d = allowlist.describe(tgt)
-                # #185: allow the owner to toggle its OWN tool cap (was `d["kind"] != "owner"`).
+                # Owner may toggle its own tool cap.
                 if d and tool in ALL_TOOLS:
                     cap = d.get("tool_cap")
                     allowed = set(cap) if cap is not None else set(ALL_TOOLS)
                     allowed.discard(tool) if tool in allowed else allowed.add(tool)
                     ordered = [t for t in ALL_TOOLS if t in allowed]
-                    # Store None when ALL tools are allowed, so a tool added later
-                    # stays allowed by default; otherwise the explicit allowed list.
+                    # Store None when all tools allowed.
+                    # - a tool added later stays allowed
+                    # - otherwise store the explicit allowed list
                     allowlist.set_tool_cap(tgt, None if set(ordered) == set(ALL_TOOLS) else ordered)
                 text, kb = await _render_user_tools(tgt, lang)
                 with contextlib.suppress(Exception):
-                    await _edit_menu(msg, text, kb)  # #173: native rich nav-edit
+                    await _edit_menu(msg, text, kb)
                 await cb.answer()
                 return
             if verb == "acc":
-                # Per-user ACCESS-exceptions sub-page (#151, menu.md §3.4).
+                # Per-user access-exceptions sub-page.
                 text, kb = await _render_user_access(target, lang)
                 with contextlib.suppress(Exception):
-                    await _edit_menu(msg, text, kb)  # #173: native rich nav-edit
+                    await _edit_menu(msg, text, kb)
                 await cb.answer()
                 return
             if verb == "accopt":
-                # Open the per-option access picker. target = "<target>:<option>".
+                # Open per-option access picker; target is "<target>:<option>".
                 tgt, _, skey = target.partition(":")
                 if skey not in ss.SETTINGS:
                     await cb.answer()
                     return
                 setting = ss.SETTINGS[skey]
                 with contextlib.suppress(Exception):
-                    await _edit_menu(  # #173: native rich nav-edit
+                    await _edit_menu(
                         msg,
                         i18n.t("usercard.access_opt_title", lang,
                                name=_setting_name(setting, lang)),
@@ -4564,7 +4209,8 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 await cb.answer()
                 return
             if verb == "accset":
-                # Apply a per-user access exception. target = "<target>:<option>:<level>".
+                # Apply a per-user access exception.
+                # - target is "<target>:<option>:<level>"
                 bits = target.split(":")
                 if len(bits) >= 3:
                     tgt, skey, level = bits[0], bits[1], bits[2]
@@ -4572,7 +4218,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                         allowlist.set_access_exception(
                             tgt, skey, None if level == "base" else level)
                     text, kb = await _render_user_access(tgt, lang)
-                    await _edit_menu(msg, text, kb)  # #173: native rich nav-edit
+                    await _edit_menu(msg, text, kb)
                 await cb.answer(i18n.t("settings.saved", lang))
                 return
             if verb == "del":
@@ -4583,7 +4229,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                                           callback_data=f"usr:card:{target}")],
                 ])
                 with contextlib.suppress(Exception):
-                    await _edit_menu(  # #173: native rich nav-edit
+                    await _edit_menu(
                         msg, i18n.t("usercard.confirm_remove", lang,
                                     who=markup.escape_html(target)),
                         kb)
@@ -4593,13 +4239,12 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 allowlist.remove(target)
                 snap = allowlist.snapshot()
                 with contextlib.suppress(Exception):
-                    await _edit_menu(  # #173: native rich nav-edit
+                    await _edit_menu(
                         msg, "\n".join(await _users_text(snap, lang)),
                         _users_keyboard(snap, lang))
                 await cb.answer(i18n.t("common.deleted", lang))
                 return
-            # #275: bool/level settings open a PICKER (with Back) instead of flipping in
-            # place — same rule as the /settings hub.
+            # Bool/level settings open a picker, not flip in place.
             if verb == "bopt":
                 tgt, _, which = target.partition(":")
                 if which not in _USER_BOOL_OPTS:
@@ -4644,28 +4289,29 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                     await _edit_menu(msg, text, kb)
                 await cb.answer(i18n.t("settings.saved", lang))
                 return
-            # In-place actions (re-render the card afterwards).
+            # In-place actions re-render the card afterwards.
             if verb == "rclr":
                 allowlist.set_rate(target, day=None, week=None)
             text, kb = await _render_user_card(target, lang)
             with contextlib.suppress(Exception):
-                await _edit_menu(msg, text, kb)  # #173: native rich nav-edit
+                await _edit_menu(msg, text, kb)
             await cb.answer()
         except Exception:
             with contextlib.suppress(Exception):
                 await cb.answer(i18n.t("common.error", lang))
 
     async def _apply_user_value(message: Message, action: str, text: str) -> None:
-        """Apply an arg-captured user-card value (expiry / day cap / week cap /
-        friendly name), then re-post the card. action is 'usrexp:<t>' / 'usrrday:<t>'
-        / 'usrrweek:<t>' / 'usrname:<t>' (#171)."""
+        """Apply an arg-captured user-card value, then re-post the card.
+
+        - `action` is `usrexp`, `usrrday`, `usrrweek`, or `usrname`, each with `:<t>`
+        """
         lang = _lang(message)
         if not _is_owner(message):
             return
         kind, _, target = action.partition(":")
         raw = text.strip()
         if kind == "usrname":
-            # '-' / off / none / clear wipes the alias; otherwise set it.
+            # '-', off, none, clear wipe the alias; else set.
             allowlist.set_friendly_name(target, raw)
         elif kind == "usrexp":
             if raw.lower() in ("never", "none", "off"):
@@ -4678,8 +4324,8 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 allowlist.set_expiry(target, exp)
         elif kind in ("usrrday", "usrrweek"):
             window = "day" if kind == "usrrday" else "week"
-            # '0' is NOT a clear here — it sets a 0-token deny-all cap, consistent
-            # with `/limit @user 0 day` (#120 audit). Clear with off/none/unlimited.
+            # '0' sets a zero-token deny-all cap, not a clear.
+            # - clear with off, none, or unlimited
             if raw.lower() in ("off", "none", "unlimited"):
                 allowlist.set_rate(target, **{window: None})
             else:
@@ -4689,10 +4335,11 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                     return
                 allowlist.set_rate(target, **{window: n})
         elif kind == "usridle":
-            # #182: per-user idle-TTL (minutes). off/none/inf/∞/never/0 → 0 (never
-            # reap); default/clear → unset (fall back to the server default); else a
-            # positive integer of minutes. Stored in the per-uid KV keyed by uid, so
-            # it works for ANY target including the owner (no allowlist entry needed).
+            # Idle-TTL in minutes.
+            # - off/none/inf/never/0 means never reap
+            # - default/clear unsets, using the server default
+            # - otherwise a positive integer
+            # - stored per uid, so it works for the owner
             d = allowlist.describe(target)
             tid = d.get("id") if d else None
             if tid is None:
@@ -4714,8 +4361,10 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                     return
                 await db.set_user_default(tid, "idle_ttl_min", minutes)
         elif kind == "usrmax":
-            # Per-user session-count cap. default/clear/- → inherit the global default;
-            # off/none/unlimited/0 → 0 (unlimited); else a positive integer.
+            # Per-user session-count cap.
+            # - default/clear/- inherits the global default
+            # - off/none/unlimited/0 means unlimited
+            # - otherwise a positive integer
             low = raw.lower()
             if low in ("default", "clear", "reset", "-"):
                 allowlist.set_max_sessions(target, None)
@@ -4732,11 +4381,14 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                     return
                 allowlist.set_max_sessions(target, n)
         card_text, kb = await _render_user_card(target, lang)
-        await _send_menu(message.chat.id, card_text, kb)  # #173: native rich user card
+        await _send_menu(message.chat.id, card_text, kb)  # Native rich user card
 
     async def _set_global_session_limit(message: Message, text: str) -> None:
-        """Owner sets the GLOBAL default per-user session limit (kv `max_sessions_default`;
-        applies to users without a per-user override). off/none/unlimited/0 → unlimited."""
+        """Owner sets the global default per-user session limit.
+
+        - applies to users without a per-user override
+        - off, none, unlimited, or 0 means unlimited
+        """
         lang = _lang(message)
         if not _is_owner(message):
             return
@@ -4761,8 +4413,8 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         state = await _ensure_state(message)
         key = await _session_key(message)
 
-        # #135: refresh the account usage so /status shows the LIVE per-window % (not
-        # a stale snapshot from the last turn / poll). Best-effort.
+        # Refresh account usage so /status shows live percentages.
+        # - best-effort
         with contextlib.suppress(Exception):
             await sessions.refresh_account_usage()
 
@@ -4779,11 +4431,9 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         cache_left = st.get("cache_seconds_left", 0) or 0
         rate = st.get("rate")
 
-        # #212: unset → new default acceptEdits. was: .get(state.permission_mode, "ask")
+        # Unset defaults to `acceptEdits`.
         perm_name = PERM_MODE_TO_NAME.get(state.permission_mode or "acceptEdits", "auto-edits")
         usage_mode = getattr(sessions, "usage_mode", "footer")
-        # Streaming setting RETIRED (native streaming always on); see /stream note.
-        # stream_on = bool(st.get("stream", True))
 
         lang = _lang(message)
         sess_name = state.name or ("General" if key == 0 else f"#{abs(key)}")
@@ -4799,13 +4449,8 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             lines.append(i18n.t("status.directory", lang, cwd=markup.escape_html(str(cwd))))
             lines.append(i18n.t("status.permissions", lang, perm=markup.escape_html(perm_name)))
         lines.append(i18n.t("status.usage_display", lang, usage=markup.escape_html(str(usage_mode))))
-        # Streaming row RETIRED (native streaming always on); restore with /stream.
-        # lines.append(i18n.t("status.streaming", lang, state=i18n.onoff(stream_on, lang)))
-        # #170: session flags as a NATIVE checklist (the checkbox is the on/off).
+        # Session flags render as a native checklist.
         _chk = lambda on: " checked" if on else ""  # noqa: E731
-        # #428: the "1M context" checkbox is gone with the retired toggle. was:
-        #   f'<li><input type="checkbox"{_chk(bool(state.big_memory))}> '
-        #   f'{markup.escape_html(i18n.t("status.chk_bigmem", lang))}</li>'
         lines.append(
             "<ul>"
             f'<li><input type="checkbox"{_chk(busy)}> '
@@ -4814,13 +4459,12 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         )
         lines.append(i18n.t("status.cache", lang, secs=int(cache_left)))
 
-        # #172: subscription usage windows as a native LIST — a bold header then one
-        # <li> per window (5h, 7d, 7d Opus, 7d Sonnet, …) so it reads cleanly instead
-        # of a run-on line. Falls back to the latest per-thread snapshot.
+        # Usage windows as a native list, one item per window.
+        # - falls back to the latest per-thread snapshot
         rbt = getattr(sessions, "rate_by_type", {}) or {}
         win_items = []
         with contextlib.suppress(Exception):
-            # #415: every window the API reported (was: only the fixed usage.WINDOW_ORDER).
+            # Show every window the API reported.
             for _wk, _info in usage.ordered_windows(rbt):
                 _s = usage.window_str(_info, lang)
                 if _s:
@@ -4836,7 +4480,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 lines.append(i18n.t("status.limits_header", lang))
                 lines.append(rate_str)
 
-        # Small utilization trend per window (#15), when we have numeric history.
+        # Small utilization trend per window, when history exists.
         trend_lines: list[str] = []
         for rl_type, label in (("five_hour", "5h"), ("seven_day", "7d")):
             try:
@@ -4857,7 +4501,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             lines.append("<b>" + i18n.t("status.trend_header", lang) + "</b>")
             lines.append("<ul>" + "".join(f"<li>{t}</li>" for t in trend_lines) + "</ul>")
 
-        # #172: per-session usage TOTALS as a native list.
+        # Per-session usage totals as a native list.
         try:
             totals = await db.get_usage_totals(key)
         except Exception:
@@ -4875,12 +4519,12 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 "</ul>"
             )
 
-        # #170: render /status as a native rich message (heading + checklist).
+        # Render /status as a native rich message.
         await reply_rich_html(message, "\n".join(lines))
 
     @router.message(Command("context"))
     async def cmd_context(message: Message) -> None:
-        """Show the live session's context-window token usage (best effort)."""
+        """Show the live session's context-window token usage, best effort."""
         await _ensure_state(message)
         key = await _session_key(message)
         lang = _lang(message)
@@ -4897,12 +4541,10 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             await reply(message, i18n.t("context.no_session", lang))
             return
 
-        # Format defensively: the SDK returns a ContextUsageResponse, which is a
-        # TypedDict (dict subclass) with keys totalTokens / maxTokens /
-        # percentage. We also tolerate a legacy attribute-style object or None.
-        # _cu() reads the first present key/attr from either shape; we prefer the
-        # SDK's own percentage when given, else derive it from used/total. Never
-        # raise — fall back to a compact string for a genuinely unknown shape.
+        # Format defensively: the SDK shape varies.
+        # - ContextUsageResponse is a TypedDict; legacy objects tolerated
+        # - prefer SDK percentage, else derive from used/total
+        # - never raise; fall back to a compact string
         used = _cu(info, "totalTokens", "used_tokens", "used")
         total = _cu(info, "maxTokens", "total_tokens", "total")
         pct = _cu(info, "percentage")
@@ -4933,16 +4575,18 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
 
     @router.message(Command("limits"))
     async def cmd_limits(message: Message) -> None:
-        """Show the caller's OWN rolling usage limits (#164). For the owner this
-        instead shows the REAL account/subscription usage (the global windows) —
-        a delegated user never sees the owner's account-wide numbers."""
+        """Show the caller's own rolling usage limits.
+
+        - the owner instead sees real account subscription usage
+        - a delegated user never sees account-wide numbers
+        """
         await _ensure_state(message)
         lang = _lang(message)
         uid = message.from_user.id if message.from_user else 0
         uname = message.from_user.username if message.from_user else None
 
         if _is_owner(message):
-            # Owner → the real account (subscription) usage, refreshed live.
+            # Owner sees real account usage, refreshed live.
             with contextlib.suppress(Exception):
                 await sessions.refresh_account_usage()
             body = usage.pinned_text(getattr(sessions, "rate_by_type", {}) or {}, lang)
@@ -4952,11 +4596,9 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 await reply(message, i18n.t("limits.account_empty", lang))
             return
 
-        # Delegated user → their own trailing-5h / trailing-7d use vs cap. #165: the
-        # day/week figures and the caps are WEIGHTED USAGE UNITS (cost-aware), while the
-        # request count still comes from the raw breakdown.
-        bd = await db.get_user_breakdown(uid)      # tokens + the request count
-        # #419: was ub = await db.get_user_breakdown(uid, "units") — weighted units (#165)
+        # Delegated users see trailing 5h and 7d use vs cap.
+        # - request count comes from the raw breakdown
+        bd = await db.get_user_breakdown(uid)      # tokens plus request count
         ub = bd
         caps = allowlist.rate_of(uid, uname)
 
@@ -4979,29 +4621,25 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             f"{i18n.t('limits.requests', lang)}: <b>{bd['requests']}</b>",
             i18n.t("limits.sessions", lang, used=scount, cap=scap_lbl),
             i18n.t("limits.rolling_note", lang),
-            # #419: was i18n.t("limits.units_note", lang) — usage is in tokens now
         ]
         await reply(message, "\n".join(lines))
 
     async def _send_userstats(chat_id: int, send_kwargs: dict, lang: str) -> None:
-        """#164: build + send the per-user usage dashboard as a NATIVE table (one row
-        per user): input+output tokens for the trailing 5h / week / lifetime, plus
-        requests and last-seen (#419: the #293 weighted-units columns are gone). Falls
-        back to a monospace grid if sendRichMessage fails. Shared by /userstats and the
-        📊 button on /users (#172)."""
-        rows = await db.get_all_users_breakdown("raw")   # raw tokens, one row per DM user
+        """Send the per-user usage dashboard as a native table.
+
+        - one row per user: tokens for 5h, week, lifetime
+        - plus requests and last-seen
+        - falls back to a monospace grid if the send fails
+        """
+        rows = await db.get_all_users_breakdown("raw")   # Raw tokens per DM user
         if not rows:
             with contextlib.suppress(Exception):
                 await bot.send_message(chat_id, i18n.t("userstats.empty", lang),
                                        parse_mode="HTML", **send_kwargs)
             return
-        # #419: was — weighted units for the same users (#293):
-        #   units_by_uid = {u["uid"]: u for u in await db.get_all_users_breakdown("units")}
-        # uid → PLAIN-text label (the table escapes, so no HTML here). #272: show the
-        # friendly name AND @username together (was: fname OR @username), and resolve
-        # the OWNER from owner_prefs (the owner has no access entry → showed only an id).
-        # #308: the stats table shows ONLY the friendly name (no @username link); it falls
-        # back to the id when the user has no friendly name set.
+        # Map uid to plain-text label; the table escapes.
+        # - friendly name only, id as fallback
+        # - owner resolved from `owner_prefs`
         def _plain_who(fname, uname, fallback: str) -> str:
             return str(fname) if fname else fallback
 
@@ -5029,8 +4667,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 return f"{int(d // 3600)}h"
             return f"{int(d // 86400)}d"
 
-        # #419: tokens per window (User | 5h | Wk | Tot | req | last). was (#293): a units
-        # column after each tokens column (userstats.col_5h_un / col_wk_un / col_tot_un).
+        # Tokens per window: User, 5h, Wk, Tot, req, last.
         header = [
             i18n.t("userstats.col_user", lang),
             i18n.t("userstats.col_5h_tok", lang),
@@ -5067,12 +4704,12 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
 
     @router.message(Command("userstats"))
     async def cmd_userstats(message: Message) -> None:
-        """Owner-only per-user usage dashboard (native table, #164)."""
+        """Owner-only per-user usage dashboard (native table)."""
         lang = _lang(message)
         if not _is_owner(message):
             await reply(message, i18n.t("common.owner_only_access", lang))
             return
-        if message.from_user:  # #272: learn the owner's @username for their label
+        if message.from_user:  # learn owner's @username for label
             with contextlib.suppress(Exception):
                 allowlist.note_owner_identity(message.from_user.id, message.from_user.username)
         send_kwargs: dict = {}
@@ -5082,23 +4719,22 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
 
     @router.message(Command("test"))
     async def cmd_test(message: Message) -> None:
-        """#172: owner-only self-test — SIMULATE a streamed generation (paragraphs, a wide
-        table, an asm snippet, and an SVG diagram, #295) so the live rich-draft formatting
-        can be eyeballed (it should format as it streams, not snap to rich at the end; the
-        SVG is rasterized to a PNG photo at finish)."""
+        """Owner-only self-test simulating a streamed generation.
+
+        - paragraphs, a wide table, an asm snippet, an SVG diagram
+        - lets live rich-draft formatting be eyeballed
+        - the SVG is rasterized to a PNG at finish
+        """
         if not _is_owner(message):
             return
         await sessions.stream_demo(message.chat.id)
 
     async def _recap_messages(key: int, lang: str) -> list[str]:
-        """Build a session's last exchange as ready-to-send HTML message(s).
+        """Build a session's last exchange as ready-to-send HTML messages.
 
-        Claude's reply is RENDERED (md_to_html) — escape_html would leak literal
-        headers / bold / code fences. The user's prompt is shown verbatim
-        (escaped). A long, code-heavy reply is split into size-safe rendered chunks
-        (never splitting already-rendered HTML across a tag). The transcript table
-        (#47) is separate from the model's SDK-resumed memory, so an empty log with
-        a live session id says so accurately rather than "no conversation".
+        - reply rendered via `md_to_html`; prompt escaped verbatim
+        - long replies split into size-safe chunks, never across a tag
+        - the transcript table is separate from the SDK's resumed memory
         """
         try:
             msgs = await db.get_recent_messages(key, limit=8)
@@ -5135,8 +4771,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
 
     @router.message(Command("last"))
     async def cmd_last(message: Message) -> None:
-        """Show the last exchange VERBATIM (your last prompt + Claude's last reply).
-        Was /recap before 2026-06-16; /recap now generates an AI one-line recap."""
+        """Show the last exchange verbatim: last prompt and reply."""
         await _ensure_state(message)
         key = await _session_key(message)
         lang = _lang(message)
@@ -5145,15 +4780,16 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
 
     @router.message(Command("recap"))
     async def cmd_recap(message: Message) -> None:
-        """Generate a one-line AI recap of the current session — the model summarizes
-        the conversation so far (like Claude Code's /recap). For the verbatim last
-        prompt+reply, use /last (user request 2026-06-16). Runs a model turn, so it
-        goes through the normal access/quota gate + streaming via _submit."""
+        """Generate a one-line AI recap of the current session.
+
+        - runs a model turn via the access gate and `_submit`
+        - the verbatim last exchange is `/last`
+        """
         await _ensure_state(message)
         lang = _lang(message)
-        # #270: recap the CURRENT session (no idle rotation). If it has no logged turns,
-        # answer helpfully (point at /sessions) instead of running a model turn that would
-        # produce a confused "we've never talked" recap.
+        # Recap the current session, without idle rotation.
+        # - no logged turns: point at /sessions
+        # - avoids a confused "never talked" recap
         key = await _session_key(message)
         try:
             msgs = await db.get_recent_messages(key, limit=1)
@@ -5165,10 +4801,11 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         await _submit(message, i18n.t("recap.prompt", lang), key=key)
 
     async def _history_doc(key: int, lang: str):
-        """Build a session's transcript as a Markdown document. Returns
-        (document, None) on success, or (None, note) when there's nothing to
-        export (or building failed) so the caller can show the note. Also used by
-        the /sessions Export quick-action (#95)."""
+        """Build a session's transcript as a Markdown document.
+
+        - returns `(document, None)` or `(None, note)` if nothing to export
+        - also used by the sessions Export action
+        """
         try:
             msgs = await db.get_recent_messages(key, limit=2000)
         except Exception:
@@ -5215,46 +4852,6 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 i18n.t("history.export_error", lang, err=markup.escape_html(str(exc))),
             )
 
-    # --- /stream toggle RETIRED (owner, 2026-06-15) -------------------------- #
-    # DM uses native Telegram streaming (sendMessageDraft), which is always on, so
-    # the per-session live-vs-single-message toggle is no longer needed. The whole
-    # handler is COMMENTED OUT (not deleted) so streaming/speed control can be
-    # restored by uncommenting this block + re-adding a /settings row + a stream apply
-    # branch (the old _settings_apply "stream" branch was removed in #214). The
-    # underlying plumbing (sessions.set_stream, the
-    # stream_enabled column, rec.stream_enabled) is intentionally kept intact.
-    # @router.message(Command("stream"))
-    # async def cmd_stream(message: Message) -> None:
-    #     """Toggle (or show) whether replies stream live vs arrive as one message."""
-    #     await _ensure_state(message)
-    #     key = await _session_key(message)
-    #     lang = _lang(message)
-    #     arg = _command_arg(message).lower()
-    #
-    #     if not arg:
-    #         try:
-    #             st = sessions.status(key) or {}
-    #         except Exception:
-    #             st = {}
-    #         current = i18n.onoff(bool(st.get("stream", True)), lang)
-    #         await reply(message, i18n.t("stream.show", lang, current=current))
-    #         return
-    #
-    #     if arg not in ("on", "off"):
-    #         await reply(message, i18n.t("stream.usage", lang))
-    #         return
-    #
-    #     enabled = arg == "on"
-    #     try:
-    #         await sessions.set_stream(key, enabled)
-    #     except Exception as exc:
-    #         await reply(
-    #             message,
-    #             i18n.t("stream.change_error", lang, err=markup.escape_html(str(exc))),
-    #         )
-    #         return
-    #     await reply(message, i18n.t("stream.set", lang, state=i18n.onoff(enabled, lang)))
-
     @router.message(Command("rename"))
     async def cmd_rename(message: Message) -> None:
         """Rename the current session (DM) or forum topic (supergroup)."""
@@ -5272,125 +4869,27 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
 
     @router.message(Command("close"))
     async def cmd_close(message: Message) -> None:
-        """Close the current forum topic (only valid inside a real topic).
-        #253: supergroup paused — disabled, DM-only for now (see _do_new)."""
+        """Close the current forum topic (real topics only).
+
+        - supergroup support is paused; DM-only for now
+        """
         await _ensure_state(message)
         lang = _lang(message)
         await reply(message, i18n.t("topic.disabled", lang))
         return
-        # was (revive with #253): close the forum topic.
-        # if not message.message_thread_id:
-        #     await reply(message, i18n.t("topic.not_a_topic_close", lang))
-        #     return
-        # try:
-        #     await bot.close_forum_topic(
-        #         chat_id=message.chat.id,
-        #         message_thread_id=message.message_thread_id,
-        #     )
-        # except Exception as exc:
-        #     await reply(
-        #         message,
-        #         i18n.t("topic.close_error", lang, err=markup.escape_html(str(exc))),
-        #     )
-        #     return
-        # await reply(message, i18n.t("topic.closed", lang))
 
-    # #417: the /queue view (per-item cancel), its callbacks and /clearqueue are retired —
-    # a message sent while a reply runs is handed to that run (the CLI folds it in at the
-    # next tool-call boundary or answers it as the next turn), so there is no bot-side
-    # queue to manage. was:
-    # async def _render_queue(key: int, lang: str = "en") -> tuple[str, InlineKeyboardMarkup | None]:
-    #     """Build the /queue view: each pending prompt with a ✖ cancel button."""
-    #     try:
-    #         items = sessions.queue_items(key)
-    #     except Exception:
-    #         items = []
-    #     if not items:
-    #         return i18n.t("queue.empty", lang), None
-    #     lines = [i18n.t("queue.header", lang, n=len(items))]
-    #     kb_rows: list[list[InlineKeyboardButton]] = []
-    #     for i, it in enumerate(items, start=1):
-    #         lines.append(f"{i}. <code>{markup.escape_html(str(it['text']))}</code>")
-    #         kb_rows.append([InlineKeyboardButton(
-    #             text=i18n.t("queue.cancel_btn", lang, i=i), callback_data=f"qx:{key}:{it['id']}")])
-    #     kb_rows.append([
-    #         InlineKeyboardButton(text=i18n.t("btn.clear_all", lang), callback_data=f"qx:{key}:all"),
-    #         InlineKeyboardButton(text=i18n.t("btn.close", lang), callback_data="qx:close"),
-    #     ])
-    #     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=kb_rows)
-    #
-    # @router.message(Command("queue"))
-    # async def cmd_queue(message: Message) -> None:
-    #     """Show the prompts waiting to run next, each with a cancel button."""
-    #     await _ensure_state(message)
-    #     key = await _session_key(message)
-    #     text, kb = await _render_queue(key, _lang(message))
-    #     send_kwargs: dict = {}
-    #     if message.message_thread_id:
-    #         send_kwargs["message_thread_id"] = message.message_thread_id
-    #     # #173: native rich menu open
-    #     await _send_menu(message.chat.id, text, kb, **send_kwargs)
-    #
-    # @router.callback_query(F.data.startswith("qx:"))
-    # async def on_queue_cb(cb: CallbackQuery) -> None:
-    #     """Handle /queue cancel taps (cancel one by id, clear all, or close)."""
-    #     try:
-    #         parts = (cb.data or "").split(":")
-    #         msg = cb.message
-    #         if msg is None:
-    #             await cb.answer()
-    #             return
-    #         lang = _lang(cb)
-    #         if len(parts) >= 2 and parts[1] == "close":
-    #             with contextlib.suppress(Exception):
-    #                 await msg.delete()
-    #             await cb.answer()
-    #             return
-    #         key = int(parts[1])
-    #         # Only the tapper's OWN DM session (a negative key) may be touched —
-    #         # never let a forged callback_data clear/cancel another user's queue.
-    #         st = await db.get_thread(key)
-    #         if key >= 0 or st is None or st.chat_id != cb.from_user.id:
-    #             await cb.answer()
-    #             return
-    #         target = parts[2] if len(parts) > 2 else ""
-    #         if target == "all":
-    #             n = await sessions.clear_queue(key)
-    #             await cb.answer(i18n.t("queue.cleared_toast", lang, n=n))
-    #         else:
-    #             removed = await sessions.cancel_queued(key, int(target))
-    #             await cb.answer(i18n.t("queue.cancelled_toast" if removed else "queue.already_running", lang))
-    #         text, kb = await _render_queue(key, lang)
-    #         with contextlib.suppress(Exception):
-    #             await _edit_menu(msg, text, kb)  # #173: native rich nav-edit
-    #     except Exception:
-    #         with contextlib.suppress(Exception):
-    #             await cb.answer(i18n.t("common.error", _lang(cb)))
-    #
-    # @router.message(Command("clearqueue"))
-    # async def cmd_clearqueue(message: Message) -> None:
-    #     """Drop the queued prompts without stopping the current run."""
-    #     await _ensure_state(message)
-    #     key = await _session_key(message)
-    #     try:
-    #         n = await sessions.clear_queue(key)
-    #     except Exception as exc:
-    #         await reply(
-    #             message,
-    #             i18n.t("queue.clear_error", _lang(message), err=markup.escape_html(str(exc))),
-    #         )
-    #         return
-    #     await reply(message, i18n.t("queue.cleared", _lang(message), n=int(n or 0)))
+    # A message sent mid-reply is handed to the running turn.
+    # - no bot-side queue to manage
 
     @router.callback_query(F.data.startswith("stop:"))
     async def on_stop_cb(cb: CallbackQuery) -> None:
-        """Inline ⏹ Stop button (on the per-turn control message) → graceful stop."""
+        """Inline Stop button on the per-turn control message: graceful stop."""
         try:
             lang = _lang(cb)
             parts = (cb.data or "").split(":")
             tid = int(parts[1]) if len(parts) > 1 else 0
-            # Only the tapper's OWN DM session (a negative key) may be stopped —
-            # a forged callback_data must not interrupt another user's turn.
+            # Only the tapper's own DM session may be stopped.
+            # - a forged callback_data must not interrupt others
             st = await db.get_thread(tid)
             if tid >= 0 or st is None or st.chat_id != cb.from_user.id:
                 await cb.answer()
@@ -5399,15 +4898,14 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             await cb.answer(i18n.t("stopbtn.stopping" if stopped else "stopbtn.nothing", lang))
             if cb.message is not None:
                 if stopped:
-                    # Instant feedback: grey out the button; the streamer removes the
-                    # whole control message once the interrupted turn finishes.
+                    # Grey out the button for instant feedback.
+                    # - streamer removes the control message after the turn
                     with contextlib.suppress(Exception):
                         await cb.message.edit_reply_markup(reply_markup=None)
                 else:
-                    # Nothing to stop — typically an ORPHANED control message left
-                    # over after a bot restart (the new process has no record of that
-                    # turn, so its Stop button is dead). Delete the stale message so
-                    # the button clears instead of lingering forever.
+                    # Nothing to stop: likely an orphaned control message.
+                    # - a bot restart leaves a dead Stop button
+                    # - delete the stale message
                     with contextlib.suppress(Exception):
                         await cb.message.delete()
         except Exception:
@@ -5433,42 +4931,37 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         else:
             await reply(message, i18n.t("retry.nothing", lang))
 
-    # ----------------------------------------------------------- plain text
+    # ---- plain text ----
 
     async def _access_block(uid: int | None, uname: str | None, lang: str, key: int) -> str | None:
-        """Pre-turn access gate (#102/#105). Returns an i18n denial string if the
-        user may NOT run a turn right now — a chat-level user in a code session, or
-        a user over their token quota — else None. The owner is exempt (level_of →
-        "code", token_grant_of → None, so neither check fires). Takes the acting
-        identity directly so callback handlers (e.g. the session-menu AI recap
-        button) can gate a turn too, not only message handlers."""
+        """Pre-turn access gate.
+
+        - returns an i18n denial string if the turn is blocked
+        - denied: chat-level user in a code session, or over quota
+        - the owner is exempt
+        - takes the identity directly so callbacks can gate turns too
+        """
         uid = uid or 0
         st = await db.get_thread(key)
         if st is not None and st.mode == "code" and allowlist.level_of(uid, uname) != "code":
             return i18n.t("access.code_denied", lang)
-        # Effort gate enforced PER-TURN (#123 audit): the max-effort permission is
-        # checked at selection time, but if the owner later revokes it a stored
-        # effort=max would keep burning the shared subscription. Downgrade it here so
-        # revocation takes effect on the next turn (handle_text then rebuilds the
-        # session) — mirrors the run-time code-level gate above. Owner is exempt.
+        # Effort gate is enforced per turn.
+        # - a revoked max-effort permission downgrades a stored max
+        # - handle_text then rebuilds the session
+        # - owner is exempt
         if st is not None and st.effort == "max" and not _may_max_effort(uid, uname):
-            # #420: the level under max for this model (was a hardcoded "xhigh").
+            # Level under max for this model.
             await db.set_effort(key, models.effort_below_max(st.model or settings.default_model))
-        # Rolling-window rate limits (#120 → #165 → #264 → #419): deny when the user's
-        # trailing 5h or trailing-7d TOKENS (input + output) reach their cap — #419 dropped
-        # the weighted units below; the notes are kept for history. Windows are computed
-        # from usage timestamps, so they free up on their own (no reset job). #165: the
-        # cap counts cost-weighted units (model weight + cache + output) instead of raw
-        # input+output, so a big warm context no longer reads as near-zero spend; caps
-        # are therefore interpreted in units (≈ Sonnet-input-token-equivalents). #264: the
-        # short window is 5h (Anthropic's real reset cadence), not 24h, so the owner can
-        # carve the shared subscription fairly. Legacy lifetime token_grant (#105) is not
-        # enforced — superseded by these.
+        # Rolling-window rate limits deny at the cap.
+        # - trailing 5h or 7d tokens (input + output)
+        # - windows derive from usage timestamps, so self-freeing
+        # - 5h matches Anthropic's reset cadence
+        # - legacy lifetime token grant is not enforced
         rate = allowlist.rate_of(uid, uname)
         now = time.time()
         day_cap = rate.get("day")
         if day_cap is not None:
-            used = await db.get_user_usage_window(uid, since=now - db.SHORT_WINDOW_SEC)  # #264: was 24h
+            used = await db.get_user_usage_window(uid, since=now - db.SHORT_WINDOW_SEC)
             if used >= day_cap:
                 return i18n.t("access.rate_day_exceeded", lang,
                               used=_fmt_tokens(used), cap=_fmt_tokens(day_cap))
@@ -5483,22 +4976,22 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
     @router.message(F.text & ~F.text.startswith("/"))
     async def on_text(message: Message) -> None:
         """Route a plain text message into the thread's Claude session."""
-        # Ignore the bot's own messages defensively (normally not delivered).
+        # Ignore the bot's own messages defensively.
         if message.from_user is not None and message.from_user.is_bot:
             return
         text = (message.text or "").strip()
         if not text:
             return
-        # If a command is awaiting its argument (e.g. /new just asked for a name),
-        # consume this message as that argument instead of routing it to the model.
+        # Consume this message as a pending command argument.
+        # - instead of routing it to the model
         action = pending.pop(_pkey(message), None)
         if action:
             await _run_pending(action, message, text)
             return
-        key = await _session_key_for_turn(message)  # #266: may start a fresh session on idle
-        # #427: how long after Telegram stamped the message it reached the bot (no content) — a
-        # message the user sent while a reply draft streamed is held by Telegram until the reply
-        # is final; the stamp tells whether the client or the server held it.
+        key = await _session_key_for_turn(message)  # may start fresh session on idle
+        # Delivery lag since Telegram stamped the message.
+        # - tells whether client or server held it
+        # - messages sent during a draft wait until final
         with contextlib.suppress(Exception):
             log.info("thread %s: message reached the bot %.1f s after Telegram stamped it",
                      key, time.time() - message.date.timestamp())
@@ -5517,36 +5010,33 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 i18n.t("text.process_error", _lang(message), err=markup.escape_html(str(exc))),
             )
 
-    # -------------------------------------------------------- attachments
+    # ---- attachments ----
 
     async def _ack_queue(message: Message, status: int, lang: str) -> None:
-        """#236: surface handle_text()'s queued/full status to the user. Silent when the
-        prompt started immediately (the common case); a positive status is the number of
-        prompts now waiting behind the running turn; SUBMIT_QUEUE_FULL means it was
-        rejected. Best-effort: a failed ack must not break the (already accepted) turn."""
+        """Surface queued or full status of a submitted prompt.
+
+        - silent when the prompt started immediately
+        - a positive status is the number of prompts waiting
+        - `SUBMIT_QUEUE_FULL` means it was rejected
+        - best-effort: a failed ack must not break the turn
+        """
         try:
             if status == _sessions.SUBMIT_QUEUE_FULL:
                 await reply(message, i18n.t("queue.full_reject", lang,
                                             n=_sessions.MAX_QUEUED_MESSAGES))
-            # #427: a message that waits behind the running reply is silent, like input typed
-            # while the Claude Code CLI works — it is folded into the turn or runs right after
-            # it. was (#236):
-            #   elif status and status > 0:
-            #       await reply(message, i18n.t("queue.queued_ack", lang, n=status))
+            # A message behind a running reply is silent.
+            # - folded into the turn or runs right after
         except Exception:
             pass
 
     async def _submit(message: Message, text: str, attachments=None, key: int | None = None,
                       gated: bool = False) -> None:
-        """Route a turn (text + optional content blocks) into the thread session.
+        """Route a turn (text plus optional blocks) into the session.
 
-        #266: a conversational turn resolves the key via _session_key_for_turn (may start a
-        fresh session on idle). A caller that must target the CURRENT session without rotating
-        (e.g. /recap summarizing this session) passes an explicit `key`.
-
-        #370: `gated=True` means the caller (on_voice) already ran _access_block for this key
-        before its expensive work, so skip the redundant re-check (which otherwise doubles the
-        per-turn rate-window queries)."""
+        - a conversational turn resolves its key via `_session_key_for_turn`, possibly rotating
+        - an explicit `key` targets the current session without rotating
+        - `gated=True` skips the re-check when the caller already ran `_access_block`
+        """
         if key is None:
             key = await _session_key_for_turn(message)
         if not gated:
@@ -5568,18 +5058,19 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             )
 
     async def _route_attachment(message, caption, blocks, inline, default_key, lang):
-        """#235: send ONE attachment item to the model. A standalone item submits its own
-        turn (unchanged behavior). An album item (``media_group_id`` set) is buffered with
-        the others sharing that id and the whole group is submitted as a single turn once
-        the debounce window closes."""
+        """Send one attachment item to the model.
+
+        - standalone items submit their own turn
+        - album items (`media_group_id`) are buffered, then submitted as one turn
+        """
         mgid = getattr(message, "media_group_id", None)
         if not mgid:
             header = caption or i18n.t(default_key, lang)
             text = f"{header}\n\n{inline}" if inline else header
             await _submit(message, text, blocks or None)
             return
-        # Album: resolve the (only) await BEFORE touching the buffer so the get-or-create
-        # below runs without an await — concurrent item handlers can't double-create it.
+        # Album: do the only await before touching the buffer.
+        # - keeps get-or-create atomic across concurrent handlers
         skey = await _session_key(message)
         key = (message.chat.id, skey, mgid)
         buf = album_buf.get(key)
@@ -5598,8 +5089,10 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         buf["timer"] = asyncio.create_task(_album_after(key))
 
     async def _album_after(key):
-        """#235: debounce timer body — flush the album once no new item has arrived for
-        ALBUM_DEBOUNCE_SECS. Cancelled (and replaced) by each new item in the group."""
+        """Debounce timer body: flush the album when items stop.
+
+        - cancelled and replaced by each new item in the group
+        """
         try:
             await asyncio.sleep(ALBUM_DEBOUNCE_SECS)
         except asyncio.CancelledError:
@@ -5607,8 +5100,11 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         await _flush_album(key)
 
     async def _flush_album(key):
-        """#235: combine all buffered items of one album into a single turn — image/PDF
-        blocks concatenated, text/code segments joined under one caption header."""
+        """Combine buffered album items into a single turn.
+
+        - image and PDF blocks concatenated
+        - text and code joined under one caption header
+        """
         buf = album_buf.pop(key, None)
         if buf is None or not buf["parts"]:
             return
@@ -5621,8 +5117,11 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         await _submit(buf["msg"], text, blocks or None)
 
     async def _download(downloadable, limit: int, file_size: int | None, lang: str = "en"):
-        """Download a Telegram file to bytes. Returns (bytes, None) on success or
-        (None, user_message) when it is too large or cannot be read."""
+        """Download a Telegram file to bytes.
+
+        - returns `(bytes, None)` or `(None, user_message)`
+        - the message covers too-large or unreadable files
+        """
         mb = limit // (1024 * 1024)
         if file_size and file_size > limit:
             return None, i18n.t("attach.too_large", lang, mb=mb)
@@ -5639,11 +5138,11 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
 
     @router.message(F.photo)
     async def on_photo(message: Message) -> None:
-        """A Telegram photo → image content block (Telegram photos are JPEG)."""
+        """Convert a Telegram photo to an image content block (JPEG)."""
         if message.from_user is not None and message.from_user.is_bot:
             return
         lang = _lang(message)
-        photo = message.photo[-1]  # the largest available size
+        photo = message.photo[-1]  # largest available size
         data, err = await _download(
             photo, MAX_IMAGE_BYTES, getattr(photo, "file_size", None), lang
         )
@@ -5656,16 +5155,16 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             "source": {"type": "base64", "media_type": "image/jpeg", "data": b64},
         }
         caption = (message.caption or "").strip()
-        # #235: route through the album coalescer (no-op for a standalone photo).
+        # Route through the album coalescer.
         await _route_attachment(message, caption, [block], "", "attach.default_image_prompt", lang)
 
     @router.message(F.document)
     async def on_document(message: Message) -> None:
-        """A file attachment → image block, PDF document block, or inlined text.
+        """Convert a file attachment to a block or inlined text.
 
-        Dispatch by mime/extension: images and PDFs go to the model as content
-        blocks; a UTF-8-decodable text/code file is inlined into the prompt;
-        anything else is rejected with a hint. Works in chat and code mode.
+        - images and PDFs go to the model as content blocks
+        - UTF-8 text or code files are inlined into the prompt
+        - anything else is rejected with a hint
         """
         if message.from_user is not None and message.from_user.is_bot:
             return
@@ -5676,7 +5175,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         size = getattr(doc, "file_size", None)
         caption = (message.caption or "").strip()
 
-        # Image sent as a file (uncompressed).
+        # Image sent as an uncompressed file.
         if mime.startswith("image/"):
             if mime not in ALLOWED_IMAGE_TYPES:
                 await reply(message, i18n.t("attach.bad_image", lang))
@@ -5694,7 +5193,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                                     "attach.default_image_prompt", lang)
             return
 
-        # PDF → document block (native PDF understanding: text + page images).
+        # PDF becomes a native document block.
         if mime == "application/pdf" or fname.lower().endswith(".pdf"):
             data, err = await _download(doc, MAX_PDF_BYTES, size, lang)
             if err:
@@ -5713,7 +5212,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                                     "attach.default_doc_prompt", lang)
             return
 
-        # Text/code file → inline the decoded content into the prompt.
+        # Text/code file: inline the decoded content.
         data, err = await _download(doc, MAX_TEXT_BYTES, size, lang)
         if err:
             await reply(message, err)
@@ -5727,27 +5226,25 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         if len(content) > MAX_TEXT_INLINE_CHARS:
             content = content[:MAX_TEXT_INLINE_CHARS]
             note = f"\n\n{i18n.t('attach.truncated', lang)}"
-        # #235: pass the file body as an inline SEGMENT (no header) so the album coalescer
-        # can join several files under one caption header; standalone files are unchanged.
+        # Pass file body as an inline segment.
+        # - lets the album coalescer join files under one caption
         inline = f"--- {fname} ---\n{content}{note}"
         await _route_attachment(message, caption, None, inline,
                                 "attach.default_doc_prompt", lang)
 
     @router.message(F.voice)
     async def on_voice(message: Message) -> None:
-        """A Telegram voice note → local transcription → routed like a typed turn (#363).
+        """Transcribe a voice note locally; route like typed text.
 
-        Fully on-device (ffmpeg + faster-whisper run in the HOST process): the audio
-        never enters the per-session jail and never leaves the box. Recognition need not
-        be perfect — the agent tolerates errors the way it tolerates typos. The recognised
-        text is shown back (so mis-recognition is visible at a glance) and then submitted
-        exactly like a typed message. OFF unless VOICE_TRANSCRIPTION is set (optional deps).
+        - ffmpeg and faster-whisper run in the host process
+        - the recognised text is shown back before submitting
+        - off unless `VOICE_TRANSCRIPTION` is set
         """
         if message.from_user is not None and message.from_user.is_bot:
             return
         lang = _lang(message)
         if not settings.voice_transcription:
-            return  # feature off by deployment choice — stay silent (no spammy notice)
+            return  # Feature off by deployment: stay silent.
         if not transcribe.available():
             await reply(message, i18n.t("voice.disabled", lang))
             return
@@ -5757,16 +5254,16 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         if cap and dur and dur > cap:
             await reply(message, i18n.t("voice.too_long", lang, sec=cap))
             return
-        # #365: a voice note may be the free-text ARGUMENT a command is awaiting (e.g. /rename
-        # asked for a name). Pop that pending action up front (like on_text); if present, the
-        # transcript becomes the argument, not a model turn (restored below on a mis-hear).
+        # A voice note may be a pending command argument.
+        # - pop pending first; transcript becomes the argument
+        # - restored below on a mis-hear
         action = pending.pop(_pkey(message), None)
-        # #365: for a real turn, gate BEFORE the expensive download + CPU transcription so a
-        # quota-exhausted / code-denied user can't burn the single inference lock. A pending
-        # management action is not a model turn, so — like on_text — it skips the gate.
+        # Gate before download and transcription for real turns.
+        # - stops quota-exhausted users burning the inference lock
+        # - pending management actions skip the gate
         key = None
         if action is None:
-            key = await _session_key_for_turn(message)   # #266: may start a fresh session on idle
+            key = await _session_key_for_turn(message)   # may start fresh session on idle
             uid = message.from_user.id if message.from_user else 0
             uname = message.from_user.username if message.from_user else None
             block = await _access_block(uid, uname, lang, key)
@@ -5778,18 +5275,18 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         )
         if err:
             if action is not None:
-                # #365/#370: keep the capture alive on failure; setdefault so a NEWER pending set
-                # during this await is not clobbered by the restore.
+                # Keep the capture alive on failure.
+                # - `setdefault` avoids clobbering a newer pending
                 pending.setdefault(_pkey(message), action)
             await reply(message, err)
             return
-        # A placeholder the user sees while we transcribe; it then BECOMES the recognised
-        # text so a bad transcription is visible. reply() returns nothing to edit, so use
-        # message.answer() (returns the sent Message).
+        # Placeholder shown during transcription, then becomes the transcript.
+        # - makes a bad transcription visible
+        # - use `message.answer()`; `reply()` returns nothing
         holder = None
         try:
-            # message_thread_id keeps the placeholder in the originating forum topic if group
-            # sessions are ever revived (None / ignored in a DM, the live surface).
+            # Keeps the placeholder in the originating forum topic.
+            # - None and ignored in a DM
             holder = await message.answer(
                 i18n.t("voice.transcribing", lang),
                 message_thread_id=message.message_thread_id,
@@ -5802,23 +5299,22 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 data,
                 model=settings.voice_model,
                 lang=settings.voice_lang,
-                max_seconds=cap,                         # #366: bound the decoded audio too
+                max_seconds=cap,                         # bound decoded audio too
                 download_root=(settings.voice_model_path
                                or transcribe.default_model_root(str(settings.base_workdir))),
             )
         except transcribe.AudioTooLong:
-            # #370: the byte cap tripped (Telegram duration metadata absent/understated) — tell the
-            # user it was too long, not that recognition failed.
+            # Byte cap tripped: report too long, not failure.
+            # - Telegram duration metadata may be absent
             text = ""
             fail_msg = i18n.t("voice.too_long", lang, sec=cap)
-        except Exception as exc:  # ffmpeg / model / decode failure
+        except Exception as exc:  # ffmpeg, model, or decode failure
             log.warning("voice transcription failed: %s", exc)
             text = ""
         text = (text or "").strip()
         if not text:
             if action is not None:
-                # #365/#370: keep the capture alive on failure; setdefault so a newer pending is
-                # not clobbered.
+                # Keep capture alive on failure; keep newer pending.
                 pending.setdefault(_pkey(message), action)
             if holder is not None:
                 try:
@@ -5836,39 +5332,35 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 await reply(message, shown)
         else:
             await reply(message, shown)
-        # #365: a captured argument runs its command with the transcript; otherwise it's a turn.
+        # Captured argument runs its command; otherwise a turn.
         if action is not None:
             await _run_pending(action, message, text)
             return
-        # Prepend a marker so the MODEL knows this was a voice note (and may contain
-        # recognition errors) — otherwise it guesses / hedges ("looks like speech
-        # recognition"). The on-screen bubble above stays the clean transcript.
-        # #370: gated=True — the access gate already ran above (before download + transcription),
-        # so skip the now-redundant re-check inside _submit.
+        # Prefix a marker so the model knows it's voice.
+        # - transcript may contain recognition errors
+        # - on-screen bubble stays the clean transcript
+        # - gate already ran, so skip the re-check in `_submit`
         await _submit(message, i18n.t("voice.model_note", lang, text=text), key=key, gated=True)
 
     @router.message(F.location | F.venue)
     async def on_location(message: Message) -> None:
-        """A location / venue the USER shares from Telegram's attach menu → a map turn (#373).
+        """Turn a user-shared location or venue into a map turn.
 
-        The SYMMETRIC inbound half of the bot's own map-pin replies (#344): the user drops a pin
-        (or a named place) from the composer and the model receives the coordinates as an ordinary
-        turn, so "what's near here?" / "is this on my route?" work with no typing. A venue also
-        carries a title + address; a plain pin is just the point. Nothing is echoed back — the
-        user's shared pin already sits in the chat and the model's reply is the acknowledgement.
-        A live-location share delivers its first fix here; later live updates arrive as edited
-        messages (a different router surface) and are ignored — the opening position is enough.
+        - the model receives coordinates as an ordinary turn
+        - a venue also carries a title and address
+        - nothing is echoed back
+        - only a live share's first fix is used
         """
         if message.from_user is not None and message.from_user.is_bot:
             return
         lang = _lang(message)
-        # A venue message carries BOTH message.venue and message.location; a plain share has only
-        # message.location. Prefer the venue's own point, fall back to the top-level location.
+        # A venue carries both venue and location fields.
+        # - prefer the venue point, else top-level location
         venue = message.venue
         loc = message.location or (venue.location if venue is not None else None)
         if loc is None:
             return
-        # 5 decimals ≈ 1 m — plenty of precision, and keeps the model note compact.
+        # 5 decimals is about 1 m, and compact.
         lat = f"{loc.latitude:.5f}"
         lon = f"{loc.longitude:.5f}"
         if venue is not None:
@@ -5876,20 +5368,19 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                           address=venue.address, lat=lat, lon=lon)
         else:
             note = i18n.t("location.model_note", lang, lat=lat, lon=lon)
-        # _submit resolves the session key (may rotate on idle) and runs the access gate.
+        # `_submit` resolves the session key and runs the gate.
+        # - key may rotate on idle
         await _submit(message, note)
 
-    # ------------------------------------------------- permission callbacks
+    # ---- permission callbacks ----
 
     @router.callback_query(F.data.startswith("perm:"))
     async def on_perm_callback(callback_query: CallbackQuery) -> None:
-        """Forward an inline-button decision to the PermissionGate.
+        """Forward an inline-button decision to the `PermissionGate`.
 
-        Authorizing a dangerous tool is an OWNER-ONLY action. The allowlist gates
-        who may talk to the bot, but only the owner may approve Bash/Write/Edit in
-        code mode — otherwise a guest could green-light arbitrary host commands.
-        A non-owner tap is acknowledged and ignored; the prompt stays open for the
-        owner to decide.
+        - only the owner may approve dangerous tools
+        - a non-owner tap is acknowledged and ignored
+        - the prompt stays open for the owner
         """
         user = callback_query.from_user
         if user is None or user.id != settings.owner_id:
@@ -5901,7 +5392,7 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         try:
             await gate.handle_decision(callback_query)
         except Exception:
-            # Never let a callback failure bubble up; acknowledge politely.
+            # Never let a callback failure bubble up.
             try:
                 await callback_query.answer(i18n.t("permgate.processing_error", _lang(callback_query)))
             except Exception:
@@ -5910,33 +5401,20 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
     return router
 
 
-# --------------------------------------------------------------- settings menu
-# An inline-button menu (/settings) so settings are changed by tapping instead of
-# typing a "kilometer of commands". callback_data is compact ("st:<verb>:<args>")
-# to stay under Telegram's 64-byte limit.
+# Settings menu: tap buttons instead of typing commands.
+# - callback_data "st:<verb>:<args>" stays under 64 bytes
 
 
 def _mark(name: str, current: str) -> str:
-    """Button label with a ✓ when this option is the current value."""
+    """Button label with a check mark on the current option."""
     return f"✓ {name}" if name == current else name
 
 
-# --------------------------------------------------------------- #138 PART 2
-# Generic, REGISTRY-DRIVEN /settings UI (settings_schema). Three scope tabs —
-# "This session" / "My defaults" / "Global" — gated by the role matrix: non-owners
-# never see the Global tab nor the owner-only rows (sandbox, global model). Each
-# visible Setting renders as one row showing its RESOLVED value + a badge of WHICH
-# scope supplies it, with an inline control (picker for a fixed choice, on/off
-# toggle for a bool). callback_data stays compact:
-#   sx:hub            — the tabbed hub (defaults to the session tab)
-#   sx:tab:<sc>       — switch scope tab        (sc = s|u|g)
-#   sx:nav:<sc>:<key> — open a choice picker for one setting
-#   sx:tog:<sc>:<key> — toggle a bool setting
-#   sx:set:<sc>:<key>:<val> — apply a value (edit_role RE-CHECKED server-side)
-#   sx:close
-# This SUPERSEDES the bespoke per-setting wiring where it maps cleanly (model /
-# effort / permissions / memory / sandbox / language); the Tools grid and the
-# Users admin remain their own pages, linked from the hub (NOT folded in).
+# Generic registry-driven /settings UI.
+# - tabs: session, defaults, global; role-gated
+# - non-owners never see Global or owner-only rows
+# - rows show resolved value plus source-scope badge
+# - Tools grid and Users admin stay separate pages
 _SCOPE_CODE = {ss.Scope.SESSION: "s", ss.Scope.USER: "u", ss.Scope.GLOBAL: "g"}
 _CODE_SCOPE = {v: k for k, v in _SCOPE_CODE.items()}
 
@@ -5951,18 +5429,18 @@ def _scope_tab_key(scope) -> str:
 
 
 def _setting_name(setting, lang: str) -> str:
-    """The bare display name for a registry setting, derived from its ``name_key``
-    row by dropping the trailing value-placeholder + chevron (e.g. "🧠 Model: {val}
-    ▸" → "🧠 Model", "🌐 Language: {name} ▸" → "🌐 Language"). The row keys carry a
-    `{val}`/`{name}` slot for the OLD single-page menu; here we only want the label."""
+    """Bare display name of a registry setting.
+
+    - drops the value placeholder and chevron from the row key
+    """
     raw = i18n.t(setting.name_key, lang)
-    # Drop a trailing ": {placeholder}" and any trailing " ▸" chevron.
+    # Drop trailing ": {placeholder}" and any " ▸" chevron.
     raw = re.sub(r":?\s*\{[^}]*\}\s*▸?\s*$", "", raw)
     return raw.rstrip(" ▸").strip()
 
 
 def _scope_badge(scope, lang: str) -> str:
-    """A short localized badge naming WHICH scope currently supplies a value."""
+    """Short localized badge naming which scope supplies a value."""
     return i18n.t({
         ss.Scope.SESSION: "settings.badge_session",
         ss.Scope.USER: "settings.badge_user",
@@ -5971,47 +5449,50 @@ def _scope_badge(scope, lang: str) -> str:
 
 
 def _setting_value_label(setting, value, lang: str, model: str | None = None) -> str:
-    """Human label for a resolved value: bool → on/off; model id → friendly alias;
-    None → the localized 'default'/'unlimited'; else the raw value. ``model`` (#415) is the
-    model effective at the same scope — the effort labels name its CLI default."""
+    """Human label for a resolved setting value.
+
+    - bool becomes on/off, model id becomes its alias
+    - `None` becomes the localized default or unlimited
+    - `model` is the effective model, used to name effort defaults
+    """
     if value is None:
         if setting.key == "max_turns":
             return i18n.t("maxturns.unlimited", lang)
         if setting.key == "effort":
-            return _effort_default_label(model, lang)  # #415
+            return _effort_default_label(model, lang)
         return i18n.t("settings.val_default", lang)
     if setting.type is bool:
         return i18n.onoff(bool(value), lang)
     if setting.key == "model":
-        return models.label(value)  # #411: was MODEL_ID_TO_ALIAS.get(value, value)
+        return models.label(value)
     if setting.key == "permission_mode":
         return PERM_MODE_TO_NAME.get(value, value)
     if setting.key == "language":
         return i18n.lang_name(value)
     if setting.key == "effort":
-        return _effort_label(value, lang)  # #415: opportunistically translated CLI level
+        return _effort_label(value, lang)  # opportunistically translated CLI level
     return str(value)
 
 
 def _setting_choice_labels(setting, lang: str,
                            model: str | None = None) -> list[tuple[str, str]]:
-    """[(callback_value, button_label)] for a fixed-choice setting's picker. ``model``
-    (#415) is the model effective at the picker's scope — effort lists ITS CLI levels."""
+    """Return `[(callback_value, button_label)]` for a fixed-choice picker.
+
+    - `model` is the effective model; effort lists its CLI levels
+    """
     if setting.type is bool:
-        # #275: booleans get a 2-option picker (On / Off) like any other setting, so they
-        # open a sub-menu with Back instead of flipping in place. Labels match
-        # _setting_value_label's bool rendering so the picker's ✓ lands on the current value.
+        # Booleans get an On/Off picker like other settings.
+        # - opens a sub-menu with Back
+        # - labels match `_setting_value_label`, so the check lands
         return [("on", i18n.onoff(True, lang)), ("off", i18n.onoff(False, lang))]
     if setting.key == "model":
-        # #411: the families the CLI currently offers (labelled with what each resolves to),
-        # not a hardcoded trio. was: [(a, a) for a in ("opus", "sonnet", "haiku")]
-        # Before the CLI has reported any catalog, offer just the scope's current model.
+        # Offer the model families the CLI currently reports.
+        # - before any catalog, offer only the current model
         return [(v, models.label(v))
                 for v in models.picker_values(fallback=(model,) if model else ())]
     if setting.key == "effort":
-        # #415: the levels the CLI lists for this model (none for a model without effort),
-        # labelled by the opportunistic translation. was:
-        #   [(lv, lv) for lv in EFFORT_LEVELS] + [("default", i18n.t("settings.val_default", lang))]
+        # Offer the effort levels the CLI lists for this model.
+        # - none for a model without effort
         return ([(lv, _effort_label(lv, lang)) for lv in models.effort_levels(model)]
                 + [("default", _effort_default_label(model, lang))])
     if setting.key == "permission_mode":
@@ -6020,7 +5501,7 @@ def _setting_choice_labels(setting, lang: str,
     if setting.key == "language":
         return [(code, i18n.lang_name(code)) for code in i18n.LANGUAGES]
     if setting.key == "max_turns":
-        # A free integer in /maxturns; the hub offers sensible presets + unlimited.
+        # Free integer via /maxturns; hub offers presets and unlimited.
         return [("10", "10"), ("25", "25"), ("50", "50"), ("100", "100"),
                 ("default", i18n.t("maxturns.unlimited", lang))]
     # Fallback: render the raw choices.
@@ -6028,9 +5509,11 @@ def _setting_choice_labels(setting, lang: str,
 
 
 def _ss_tools_keyboard(state, lang: str = "en") -> InlineKeyboardMarkup:
-    """Per-session Tools grid for the unified hub (#129/#141): one ✅/⬜ toggle per
-    tool in the session's universe (chat → web tools, code → full toolset), then
-    Back → the hub. Replaces the old st: tools page."""
+    """Per-session Tools grid with one toggle per tool.
+
+    - chat shows web tools, code shows the full toolset
+    - Back returns to the settings hub
+    """
     B = InlineKeyboardButton
     mode = getattr(state, "mode", "chat") if state else "chat"
     universe = engine.CODE_TOOLS if mode == "code" else engine.CHAT_TOOLS
@@ -6046,8 +5529,10 @@ def _ss_tools_keyboard(state, lang: str = "en") -> InlineKeyboardMarkup:
 
 
 def _ss_usage_keyboard(cur: str, lang: str = "en") -> InlineKeyboardMarkup:
-    """Usage-display picker for the unified hub (owner; #147): off/footer/pinned/both
-    (✓ on the current), then Back → the hub. Replaces the old st: admin→usage page."""
+    """Usage-display picker for the settings hub (owner only).
+
+    - options: off, footer, pinned, both
+    """
     B = InlineKeyboardButton
     btns = [B(text=_mark(m, cur), callback_data=f"sx:usageset:{m}")
             for m in ("off", "footer", "pinned", "both")]
@@ -6057,7 +5542,7 @@ def _ss_usage_keyboard(cur: str, lang: str = "en") -> InlineKeyboardMarkup:
 
 
 def _access_label(access, lang: str = "en") -> str:
-    """Localized label for an Access level (Delegated / Read-only / Hidden; #151)."""
+    """Localized label for an access level."""
     return i18n.t({
         ss.Access.DELEGATED: "settings.access_delegated",
         ss.Access.READONLY: "settings.access_readonly",
@@ -6066,14 +5551,16 @@ def _access_label(access, lang: str = "en") -> str:
 
 
 def _ss_option_admin_kb(setting, ctx, lang: str = "en") -> InlineKeyboardMarkup:
-    """Owner OPTION-ADMIN page (Global tab → a setting; #151, menu.md §4.4): edit the
-    GLOBAL value and the BASE access (Hidden / Read-only / Delegated). Per-user
-    exceptions live on the user card (👥 Users). Back → the Global tab."""
+    """Owner page for one setting: global value and base access.
+
+    - per-user exceptions live on the user card
+    - Back returns to the Global tab
+    """
     B = InlineKeyboardButton
     rows: list[list[InlineKeyboardButton]] = []
     if setting.set.get(ss.Scope.GLOBAL) is not None:
         gval, _ = ss.resolve_from(setting, ctx, ss.Scope.GLOBAL)
-        vlabel = _setting_value_label(setting, gval, lang,  # #415: GLOBAL scope → default model
+        vlabel = _setting_value_label(setting, gval, lang,  # Global scope sets the default model
                                       getattr(getattr(ctx, "settings", None), "default_model", None))
         cbv = (f"sx:tog:g:{setting.key}" if setting.type is bool
                else f"sx:nav:g:{setting.key}")
@@ -6086,8 +5573,10 @@ def _ss_option_admin_kb(setting, ctx, lang: str = "en") -> InlineKeyboardMarkup:
 
 
 def _ss_access_kb(setting, ctx, lang: str = "en") -> InlineKeyboardMarkup:
-    """Base-access picker for one option (owner; #151): Delegated / Read-only / Hidden
-    (✓ on the current), Back → the option-admin page."""
+    """Base-access picker for one option (owner only).
+
+    - Back returns to the option admin page
+    """
     B = InlineKeyboardButton
     cur = ss.configured_base_access(setting, ctx)
     btns = [B(text=_mark(_access_label(a, lang), _access_label(cur, lang)),
@@ -6102,11 +5591,10 @@ _SPARK_CHARS = "▁▂▃▄▅▆▇█"
 
 
 def _sparkline(values) -> str:
-    """Render a tiny unicode sparkline from utilization fractions (0..1).
+    """Render a unicode sparkline from utilization fractions (0..1).
 
-    Non-numeric points (the CLI often omits utilization) are skipped. Returns ""
-    when fewer than 2 numeric points exist, so /status only shows a trend when
-    there is something meaningful to show.
+    - non-numeric points are skipped
+    - returns an empty string with fewer than 2 numeric points
     """
     nums = [v for v in (values or []) if isinstance(v, (int, float))]
     if len(nums) < 2:
@@ -6119,7 +5607,7 @@ def _sparkline(values) -> str:
 
 
 def _fmt_date(ts) -> str:
-    """Format an epoch timestamp as YYYY-MM-DD ("?" on bad input)."""
+    """Format an epoch as YYYY-MM-DD, or "?"."""
     try:
         return f"{datetime.fromtimestamp(float(ts)):%Y-%m-%d}"
     except (TypeError, ValueError, OSError, OverflowError):
@@ -6127,18 +5615,19 @@ def _fmt_date(ts) -> str:
 
 
 def _rpad_mono(s: str, width: int) -> str:
-    """#307: right-align ``s`` to ``width`` using NBSP (U+00A0) padding so the alignment
-    survives inside a Telegram inline ``<code>`` block — a run of ordinary spaces can be
-    collapsed by the client, but NBSP is preserved and is one cell wide in a monospace font.
-    Used to line up the per-row stat columns in the /sessions list."""
+    """Right-align `s` to `width` using NBSP padding.
+
+    - the client may collapse ordinary spaces inside `<code>`
+    - NBSP is preserved and one cell wide in monospace
+    """
     return "\u00A0" * max(0, width - len(s)) + s
 
 
 def _fmt_tokens(n) -> str:
-    """Compact, Claude-Code-style token count: 12345 -> "12.3k", 1.2M, etc.
+    """Compact token count: 12345 becomes "12.3k".
 
-    Sub-1000 values are shown as-is; thousands/millions are abbreviated with one
-    decimal, dropping a trailing ".0" so it reads cleanly ("15k", not "15.0k").
+    - values under 1000 are shown as-is
+    - a trailing ".0" is dropped
     """
     try:
         n = int(n)
@@ -6152,8 +5641,11 @@ def _fmt_tokens(n) -> str:
 
 
 def _parse_token_amount(s: str):
-    """Parse a human token amount ('500k', '2m', '500000', '1.5M') → int, or None
-    if it is not a usable non-negative number. Underscores/commas/spaces ignored."""
+    """Parse a human token amount like '500k' into an int.
+
+    - returns `None` for anything not a non-negative number
+    - underscores, commas, and spaces are ignored
+    """
     s = (s or "").strip().lower().replace("_", "").replace(",", "").replace(" ", "")
     mult = 1
     if s.endswith("k"):
@@ -6168,8 +5660,10 @@ def _parse_token_amount(s: str):
 
 
 def _fmt_caps(rate, lang: str = "en") -> str:
-    """Compact rolling-cap display for the per-user views: the localized 'unlimited'
-    glyph when uncapped, else the present windows as 'd:500k w:2m'."""
+    """Compact rolling-cap display for per-user views.
+
+    - the unlimited glyph when uncapped, else 'd:500k w:2m'
+    """
     rate = rate or {}
     parts = []
     if rate.get("day") is not None:
@@ -6179,35 +5673,37 @@ def _fmt_caps(rate, lang: str = "en") -> str:
     return " ".join(parts) if parts else i18n.t("users.unlimited", lang)
 
 
-# The full per-user tool-cap universe (#131): every tool a user could use across
-# chat + code, in a stable order. The owner toggles which of these a user may use.
+# Full per-user tool-cap universe, in stable order.
+# - every tool usable across chat and code
+# - owner toggles which a user may use
 ALL_TOOLS: list[str] = list(engine.CHAT_TOOLS) + [
     t for t in engine.CODE_TOOLS if t not in engine.CHAT_TOOLS
 ]
 
 
 def _fmt_cap(cap, lang: str = "en") -> str:
-    """Tool-cap summary for the per-user card: localized 'all' when uncapped (None),
-    else 'N/total' allowed tools."""
+    """Tool-cap summary for the per-user card.
+
+    - localized 'all' when uncapped (`None`), else 'N/total'
+    """
     if cap is None:
         return i18n.t("usercard.cap_all", lang)
     return f"{len(cap)}/{len(ALL_TOOLS)}"
 
 
 def _tool_scope_label(tool: str, lang: str = "en") -> str:
-    """Which session types a tool applies to, shown on the toggle button: the web
-    tools run in CHAT and CODE; everything else is CODE only (needs a working dir)."""
+    """Session types a tool applies to, shown on its toggle.
+
+    - web tools: chat and code; the rest code only
+    """
     return i18n.t("tool.scope_both" if tool in engine.CHAT_TOOLS else "tool.scope_code", lang)
 
 
 def _cu(obj: object, *names: str):
-    """Read the first present field from a dict OR an attribute object.
+    """Read the first present field from a dict or object.
 
-    The SDK's get_context_usage() returns a ContextUsageResponse TypedDict
-    (a dict subclass), so its fields are dict keys, not attributes — a plain
-    getattr() would always miss them. This tolerates both shapes (and None):
-    for a dict we try keys, otherwise getattr, returning the first non-None
-    value found, or None if none of the names are present.
+    - SDK returns a TypedDict; `getattr` alone misses keys
+    - returns the first non-`None` value, else `None`
     """
     for name in names:
         value = obj.get(name) if isinstance(obj, dict) else getattr(obj, name, None)
@@ -6217,9 +5713,9 @@ def _cu(obj: object, *names: str):
 
 
 def _format_rate(rate: object, lang: str = "en") -> str:
-    """Render a RateLimitInfo snapshot into a compact (localized) status line.
+    """Render a `RateLimitInfo` snapshot as a compact localized status line.
 
-    Tolerates missing/None attributes; returns "" if nothing useful is present.
+    - tolerates missing attributes; returns an empty string if nothing useful
     """
     rtype = getattr(rate, "rate_limit_type", None)
     util = getattr(rate, "utilization", None)

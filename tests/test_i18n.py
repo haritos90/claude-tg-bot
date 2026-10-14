@@ -1,9 +1,8 @@
-"""Unit tests for the i18n localization layer (#63).
+"""Unit tests for the i18n localization layer.
 
-Covers the l10n table's integrity (every row has English; en/ru agree on
-placeholders and HTML tags), the t() lookup/format/fallback behaviour, locale
-normalization, the per-user cache, and the display helpers. Pure pytest — no
-async, no I/O.
+- catalog integrity: English present, placeholders and tags agree
+- `t()` lookup, format, fallback; locale normalization
+- per-user cache and display helpers; pure pytest
 """
 
 import re
@@ -19,7 +18,7 @@ def _placeholders(s: str) -> set:
 
 
 def _tags(s: str) -> list:
-    # Multiset of tag names (sorted) so a dropped/duplicated tag is caught.
+    # Sorted multiset of tag names catches dropped or duplicated tags.
     return sorted(t.lstrip("</").lower() for t in _TAG.findall(s))
 
 
@@ -47,9 +46,9 @@ def test_default_lang_is_supported():
 
 
 def test_every_row_renders_in_every_locale():
-    # Render each row in each locale with dummy values for its placeholders; this
-    # would catch e.g. a placeholder named like a t() parameter (collision) or a
-    # stray format field. None may raise.
+    # Render each row per locale with dummy placeholder values.
+    # - catches placeholder names colliding with `t()` parameters
+    # - catches stray format fields; none may raise
     for key, row in i18n.CATALOG.items():
         kwargs = {name: "X" for name in _placeholders(row["en"])}
         for lang in row:
@@ -58,8 +57,7 @@ def test_every_row_renders_in_every_locale():
 
 
 def test_lang_placeholder_does_not_collide_with_param():
-    # A catalog placeholder supplied via kwargs must not clash with t()'s own
-    # positional-only `lang` parameter (regression: settings.header used {lang}).
+    # Catalog placeholders must not clash with positional-only `lang`.
     out = i18n.t("settings.header", "ru", mode="код", model="opus", perm_line="",
                  usage="footer", stream="вкл", memory="выкл", drafts="вкл",
                  language="Русский")
@@ -69,13 +67,13 @@ def test_lang_placeholder_does_not_collide_with_param():
 def test_t_basic_and_format():
     assert i18n.t("common.error", "en") == "Error."
     assert i18n.t("common.error", "ru") == "Ошибка."
-    # kwargs are formatted into the chosen locale (Russian text + the value).
+    # Kwargs are formatted into the chosen locale.
     msg = i18n.t("session.clear_error", "ru", err="boom")
     assert "сесси" in msg and "boom" in msg
 
 
 def test_t_falls_back_to_english_for_missing_locale():
-    # An unsupported locale falls back to the English column, never crashes.
+    # An unsupported locale falls back to English, never crashes.
     assert i18n.t("common.error", "de") == "Error."
 
 
@@ -84,7 +82,7 @@ def test_t_unknown_key_returns_key():
 
 
 def test_t_bad_format_args_do_not_crash():
-    # Missing a required placeholder returns the unformatted text, not an error.
+    # A missing required placeholder returns unformatted text, not an error.
     out = i18n.t("model.set", "en")  # expects {model} and {defer}
     assert isinstance(out, str) and out
 
@@ -93,7 +91,7 @@ def test_normalize_lang():
     assert i18n.normalize_lang("ru") == "ru"
     assert i18n.normalize_lang("ru-RU") == "ru"
     assert i18n.normalize_lang("en-US") == "en"
-    assert i18n.normalize_lang("de") == "en"  # unsupported -> default
+    assert i18n.normalize_lang("de") == "en"  # unsupported falls back to default
     assert i18n.normalize_lang(None) == "en"
     assert i18n.normalize_lang("") == "en"
 
@@ -105,7 +103,7 @@ def test_user_lang_cache():
     assert i18n.cached_lang(uid) == i18n.DEFAULT_LANG  # default before resolution
     i18n.remember_lang(uid, "ru")
     assert i18n.has_lang(uid) and i18n.cached_lang(uid) == "ru"
-    # An invalid locale is coerced to the default rather than stored verbatim.
+    # An invalid locale is coerced to the default.
     i18n.remember_lang(uid, "zz")
     assert i18n.cached_lang(uid) == i18n.DEFAULT_LANG
     i18n.forget_lang(uid)
@@ -117,13 +115,14 @@ def test_display_helpers():
     assert i18n.mode_word("code", "ru") == "код"
     assert i18n.mode_word("chat", "ru") == "чат"
     assert i18n.lang_name("ru") == "Русский"
-    assert i18n.lang_name("xx") == "xx"  # unknown code -> code itself
+    assert i18n.lang_name("xx") == "xx"  # unknown code returns the code itself
 
 
 def test_stream_rotation_words_parity_across_locales():
-    """#316/#319: the rotating <tg-thinking> gerund subsets must have the SAME count in every
-    locale (thinking_words shipped once as 17 en vs 12 ru with no test). Pin equal length per
-    subset so neither drifts: thinking_words == 30, searching_words == 16."""
+    """Rotating thinking-word subsets have equal counts in every locale.
+
+    - thinking_words is 30, searching_words is 16
+    """
     for key, expect in (("stream.thinking_words", 30), ("stream.searching_words", 16)):
         row = i18n.CATALOG[key]
         counts = {lang: len([w for w in text.split(",") if w.strip()])
@@ -133,10 +132,12 @@ def test_stream_rotation_words_parity_across_locales():
 
 
 def test_every_key_used_in_code_exists():
-    """#423: a key the code looks up but the catalog lacks renders as the raw key (t() never
-    crashes), so a missing row ships silently — the Admin → CLI page once showed
-    ``admin.cli_btn``. Every literal ``i18n.t("…")`` / ``i18n.maybe_t("…")`` key in live code
-    (comment-only lines skipped) must be a catalog row."""
+    """Every literal i18n key in code must be cataloged.
+
+    - a missing key renders raw; `t()` never crashes
+    - covers `i18n.t` and `i18n.maybe_t` keys
+    - comment-only lines are skipped
+    """
     import pathlib
     pat = re.compile(r'i18n\.(?:t|maybe_t)\(\s*"([a-z0-9_.]+)"')
     missing = set()

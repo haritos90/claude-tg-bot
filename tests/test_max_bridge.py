@@ -1,6 +1,10 @@
-"""#434: the MAX transport — id namespace, HTML conversion, the aiogram-session translator
-(with the no-streaming "Thinking…" placeholder), call routing, update conversion, and the
-owner-routed permission prompt."""
+"""Tests for the MAX transport.
+
+- id namespace and HTML conversion
+- aiogram-session translator with "Thinking…" placeholder
+- call routing and update conversion
+- owner-routed permission prompt
+"""
 
 from __future__ import annotations
 
@@ -25,7 +29,7 @@ from app.max.poller import MaxPoller
 from app.telegram.rich_message import SendRichMessage, SendRichMessageDraft
 
 
-# ----------------------------------------------------------------------------- fakes
+# ---- fakes ----
 class FakeApi:
     def __init__(self):
         self.calls: list[tuple] = []
@@ -97,7 +101,7 @@ def _bot(session):
 
 
 def _rig(fail_html_once: bool = False):
-    """(FakeApi, MaxSession, Bot) wired together."""
+    """FakeApi, MaxSession and Bot wired together."""
     api = FakeApi()
     api.fail_html_once = fail_html_once
     ms = MaxSession(api)
@@ -107,7 +111,7 @@ def _rig(fail_html_once: bool = False):
 UID = to_internal(777)
 
 
-# ----------------------------------------------------------------------------- ids
+# ---- ids ----
 def test_id_namespace_round_trip():
     assert to_internal(5) == MAX_ID_OFFSET + 5
     assert is_internal_max(to_internal(5)) and not is_internal_max(2859339)
@@ -130,7 +134,7 @@ def test_file_registry_path_round_trip():
     assert f.by_path(f"https://api.telegram.org/file/bot1:x/{path}").url == "https://cdn/x.pdf"
 
 
-# ----------------------------------------------------------------------------- html
+# ---- html ----
 def test_tg_html_to_max_drops_what_max_lacks():
     src = ('<b>a</b> <tg-spoiler>s</tg-spoiler> <blockquote expandable>q</blockquote> '
            '<pre><code class="language-py">x = 1</code></pre> <tg-emoji emoji-id="5">🙂</tg-emoji>'
@@ -158,7 +162,7 @@ def test_keyboard_to_max_maps_callback_and_url_buttons():
     assert mhtml.keyboard_to_max(None) is None
 
 
-# ----------------------------------------------------------------------------- bridge
+# ---- bridge ----
 def test_send_message_translates_to_post_with_html():
     api, ms, bot = _rig()
 
@@ -216,7 +220,7 @@ def test_edit_delete_and_callback_answer():
     kinds = api.kinds()
     assert kinds == ["send", "edit", "edit", "answer", "delete"]
     assert api.calls[0][2]["attachments"][0]["type"] == "inline_keyboard"
-    assert api.calls[1][2] == {"text": "two", "format": "html", "attachments": []}   # edit drops kb
+    assert api.calls[1][2] == {"text": "two", "format": "html", "attachments": []}   # edit drops keyboard
     assert api.calls[2][2]["text"] == "two" and api.calls[2][2]["attachments"][0]["type"] == "inline_keyboard"
     assert api.calls[3][1:] == ("cb-1", "ok")
     assert api.calls[4][1] == "mid.1"
@@ -251,8 +255,9 @@ def test_set_commands_only_default_scope_and_capped():
         await bot(SetMyCommands(commands=cmds))
         await bot(SetMyCommands(commands=cmds, language_code="ru"))
     asyncio.run(go())
-    # MAX has one global list: the default-scope call registers the shared menu from the
-    # command registry (not the caller's trio), owner commands excluded, ≤32.
+    # MAX has one global command list.
+    # - default-scope call registers the shared registry menu
+    # - owner commands excluded, at most 32
     from app.telegram import commands
     assert api.kinds() == ["commands"]
     names = [c["name"] for c in api.calls[0][1]]
@@ -273,7 +278,7 @@ def test_get_me_maps_bot_identity():
     assert me.id == to_internal(42) and me.username == "bot_max" and ms.bot_user["user_id"] == 42
 
 
-# ----------------------------------------------------------------------------- routing
+# ---- routing ----
 def test_routing_session_picks_platform_by_address():
     tg = RecordingSession()
     api = FakeApi()
@@ -294,7 +299,7 @@ def test_routing_session_picks_platform_by_address():
     assert RoutingSession(tg, None).route(SendMessage(chat_id=UID, text="x")) == "tg"
 
 
-# ----------------------------------------------------------------------------- poller
+# ---- poller ----
 def _poller():
     api = FakeApi()
     ms = MaxSession(api)
@@ -348,7 +353,7 @@ def test_message_created_attachments_map_to_photo_document_voice():
 
 
 def test_voice_message_bytes_download_through_the_routing_session():
-    """A MAX voice note reaches the shared voice handler as bytes."""
+    """A MAX voice note reaches the voice handler as bytes."""
     from aiogram.types import Voice
     p, ms = _poller()
     upd = p.to_updates({"update_type": "message_created", "message": {
@@ -366,7 +371,7 @@ def test_voice_message_bytes_download_through_the_routing_session():
 
 
 def test_rich_map_block_is_refused_so_the_reply_interleaves():
-    """No rich blocks on MAX: a map in a rich message is refused; pins go as locations."""
+    """A rich map block is refused on MAX; pins interleave."""
     api, ms, bot = _rig()
     md = 'Here:\n\n<tg-map lat="55.750000" long="37.620000" zoom="15"/>\n\nenjoy'
     with pytest.raises(TelegramBadRequest):
@@ -426,7 +431,7 @@ def test_updates_validate_as_aiogram_objects():
     assert u.message.chat.type == "private" and u.message.from_user.id == UID
 
 
-# ----------------------------------------------------------------------------- gate
+# ---- gate ----
 def test_permission_prompt_goes_to_owner_for_foreign_session():
     class FakeBot:
         def __init__(self):

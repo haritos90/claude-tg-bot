@@ -1,15 +1,8 @@
-"""Telegram Bot API 10.1 ``sendRichMessage`` binding (#164 — native tables).
+"""Binding for Telegram's ``sendRichMessage`` Bot API method.
 
-Bot API 10.1 (2026-06-11) added ``sendRichMessage``, which renders rich content
-(tables, headings, nested lists, …) that the classic ``parse_mode=HTML`` path
-cannot. aiogram 3.28 ships no binding for it yet, so we declare the method by
-hand — a ``TelegramMethod`` is just a pydantic model with ``__api_method__`` /
-``__returning__``, routed through the bot's own (proxy-aware) session.
-
-We always pass the ``rich_message`` as an ``InputRichMessage`` in its ``{"html":
-…}`` form — the docs require exactly one of ``html`` / ``markdown``. The HTML may
-contain ``<table bordered striped>…</table>`` with ``<th>``/``<td>``, ``align``,
-``colspan``/``rowspan`` and ``<caption>`` (see markup.table_to_rich_html).
+- aiogram ships no binding; declared by hand
+- ``rich_message`` is always sent in ``html`` form
+- HTML may contain tables with spans and captions
 """
 
 from __future__ import annotations
@@ -21,12 +14,10 @@ from aiogram.types import Message
 
 
 class SendRichMessage(TelegramMethod[Message]):
-    """Send a rich message (Bot API 10.1). On success the sent Message is returned.
+    """Send a rich message; returns the sent Message.
 
-    Only the fields we use are declared; all are optional except ``chat_id`` and
-    ``rich_message``. ``rich_message`` is an InputRichMessage dict, e.g.
-    ``{"html": "<table>…</table>"}`` or ``{"markdown": "# …"}``. ``reply_markup``
-    is supported (an inline keyboard), so menu screens can be rich too (#172).
+    - ``rich_message`` is an ``InputRichMessage`` dict (``html`` or ``markdown``)
+    - ``reply_markup`` supports an inline keyboard
     """
 
     __returning__ = Message
@@ -41,15 +32,13 @@ class SendRichMessage(TelegramMethod[Message]):
 
 
 class EditRichMessage(TelegramMethod[Union[Message, bool]]):
-    """Edit an existing message's content to a rich message in place (Bot API 10.1
-    added the ``rich_message`` parameter to ``editMessageText``). This lets inline-
-    keyboard menus (settings hub, user cards, session menus) render with the SAME
-    native rich font as command replies and streamed answers (#173), instead of the
-    classic ``parse_mode="HTML"`` path used by ``Message.edit_text``.
+    """Edit a message in place into a rich message.
 
-    ``rich_message`` is an InputRichMessage dict (``{"html": …}`` here, since menu
-    text is authored as Telegram HTML). ``reply_markup`` re-attaches the inline
-    keyboard. Returns the edited Message, or ``True`` for an inline message."""
+    - Menus render with the same rich font as replies
+    - ``rich_message`` is an ``InputRichMessage`` dict, here ``html``
+    - ``reply_markup`` re-attaches the inline keyboard
+    - Returns edited Message, or ``True`` for inline
+    """
 
     __returning__ = Union[Message, bool]
     __api_method__ = "editMessageText"
@@ -62,10 +51,12 @@ class EditRichMessage(TelegramMethod[Union[Message, bool]]):
 
 
 class SendRichMessageDraft(TelegramMethod[bool]):
-    """Stream a PARTIAL rich message while generating (#172, Bot API 10.1). The draft
-    is ephemeral (~30s preview); updates that reuse the same ``draft_id`` are animated
-    by the client — so the reply streams ALREADY FORMATTED. Persist the final text with
-    a normal ``sendRichMessage`` once done. Private chats only. Returns True."""
+    """Stream a partial rich message draft while generating.
+
+    - Draft is ephemeral, about 30 seconds of preview
+    - Updates reusing the same ``draft_id`` are animated
+    - Persist final text via ``sendRichMessage``; private chats only
+    """
 
     __returning__ = bool
     __api_method__ = "sendRichMessageDraft"
@@ -74,16 +65,17 @@ class SendRichMessageDraft(TelegramMethod[bool]):
     draft_id: int
     rich_message: dict[str, Any]
     message_thread_id: int | None = None
-    # #431: Bot API 10.3 — the client's stop button on the draft (`stopped_message_generation`
-    # update on press) and whether the draft stays on screen after it.
+    # Client stop button on a draft sends a stop update.
+    # - Also controls whether the draft stays on screen
     can_stop: bool | None = None
     keep_on_stop: bool | None = None
 
 
 def stopped_generation_of(update) -> tuple[int, int] | None:
-    """#431: ``(chat_id, draft_id)`` of a Bot API 10.3 ``stopped_message_generation`` update —
-    read from the raw fields aiogram keeps for an update type it does not know yet — or None
-    for any other update."""
+    """Return the stopped-generation update's ``(chat_id, draft_id)``, else None.
+
+    - Read from raw fields aiogram keeps for unknown updates
+    """
     extra = getattr(update, "model_extra", None) or {}
     raw = extra.get("stopped_message_generation")
     if not isinstance(raw, dict):

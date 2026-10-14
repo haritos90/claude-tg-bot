@@ -1,20 +1,11 @@
 #!/usr/bin/env python3
-"""Seccomp BPF generator (#119e) — shrink the jail's kernel attack surface.
+"""Seccomp BPF generator shrinking the jail's kernel attack surface.
 
-bwrap applies a classic-BPF seccomp filter from a file descriptor (``--seccomp FD``).
-This emits such a program: a small DENYLIST that returns EPERM for a curated set of
-rarely-needed, high-blast-radius syscalls (module load, kexec, ptrace, bpf, key
-management, mount, time-set, …). It is a DENYLIST (default = allow) precisely so it
-cannot break ordinary code work (node/git/python/gcc use none of these); the goal is
-to lower the residual userns/kernel-escape risk, not to allowlist syscalls.
-
-Output is the raw ``struct sock_filter`` array (8 bytes each: ``<HBBI``) that bwrap
-reads from the fd, computing the instruction count from the file size — exactly what
-``seccomp(2)`` expects. x86_64 only; on any other arch this writes NOTHING and exits 0
-(the launcher then simply skips ``--seccomp``), so the filter never mis-fires on an
-arch whose syscall numbers differ.
-
-Usage: make-seccomp.py <out-path>   (writes the blob; prints a one-line summary)
+- denylist returning EPERM for rarely needed risky syscalls
+- default allow, so ordinary dev tools keep working
+- emits raw `struct sock_filter` array for bwrap `--seccomp`
+- x86_64 only; other arches write nothing and exit 0
+- usage: `make-seccomp.py <out-path>`
 """
 
 import contextlib
@@ -23,7 +14,7 @@ import platform
 import struct
 import sys
 
-# BPF opcodes (linux/bpf_common.h) and seccomp ABI constants (linux/seccomp.h).
+# BPF opcodes and seccomp ABI constants.
 BPF_LD, BPF_W, BPF_ABS = 0x00, 0x00, 0x20
 BPF_JMP, BPF_JEQ, BPF_K = 0x05, 0x10, 0x00
 BPF_RET = 0x06
@@ -31,11 +22,12 @@ AUDIT_ARCH_X86_64 = 0xC000003E
 SECCOMP_RET_ALLOW = 0x7FFF0000
 SECCOMP_RET_ERRNO = 0x00050000
 EPERM = 1
-# Offsets into struct seccomp_data: nr (the syscall number) at 0, arch at 4.
+# Offsets in `struct seccomp_data`: nr at 0, arch at 4.
 OFF_NR, OFF_ARCH = 0, 4
 
-# x86_64 syscall numbers to refuse. Each is something a sandboxed dev workload never
-# legitimately needs but which materially widens the host attack surface if allowed.
+# x86_64 syscall numbers to refuse.
+# - never needed by dev workloads
+# - each materially widens the host attack surface
 DENY_X86_64 = {
     101: "ptrace", 155: "pivot_root", 156: "_sysctl",
     159: "adjtimex", 163: "acct", 164: "settimeofday",
@@ -58,12 +50,13 @@ def _jeq(k, jt, jf):
 
 
 def build(deny) -> bytes:
-    """Assemble: verify arch == x86_64 (else ALLOW), then a per-syscall JEQ chain
-    where a MATCH jumps to DENY and a miss falls through to the next check; after the
-    last check the program falls through to ALLOW. ALLOW is therefore the fall-through
-    sink and DENY is reached ONLY by an explicit jump — get this order wrong (DENY as
-    the fall-through) and every non-denied syscall returns EPERM and the process dies.
-    Jump offsets are PC-relative, counted from the NEXT instruction."""
+    """Assemble the filter: arch check, JEQ chain, ALLOW, DENY.
+
+    - a match jumps to DENY; a miss falls through
+    - ALLOW must be the fall-through sink, DENY jump-only
+    - wrong order makes every syscall return EPERM
+    - jump offsets are PC-relative from the next instruction
+    """
     nrs = sorted(deny)
     m = len(nrs)
     # Layout: [0]=LD arch [1]=JEQ x86_64 [2]=LD nr [3..2+m]=checks [3+m]=ALLOW [4+m]=DENY
@@ -71,12 +64,12 @@ def build(deny) -> bytes:
     deny_idx = 4 + m
     prog = bytearray()
     prog += _stmt(BPF_LD | BPF_W | BPF_ABS, OFF_ARCH)
-    # arch != x86_64 → fall through to ALLOW (we only know x86_64 numbers); else continue.
+    # Other arch: fall through to ALLOW (x86_64 numbers only).
     prog += _jeq(AUDIT_ARCH_X86_64, 0, allow_idx - 2)
     prog += _stmt(BPF_LD | BPF_W | BPF_ABS, OFF_NR)
     for i, nr in enumerate(nrs):
         k = 3 + i                                   # this instruction's index
-        prog += _jeq(nr, deny_idx - (k + 1), 0)     # match → DENY, miss → next check
+        prog += _jeq(nr, deny_idx - (k + 1), 0)     # match: DENY, miss: next check
     prog += _stmt(BPF_RET, SECCOMP_RET_ALLOW)           # ALLOW (fall-through sink)
     prog += _stmt(BPF_RET, SECCOMP_RET_ERRNO | EPERM)   # DENY (jumped-to only)
     return bytes(prog)
@@ -89,19 +82,17 @@ def main() -> int:
     out = sys.argv[1]
     mach = platform.machine()
     if mach not in ("x86_64", "amd64"):
-        # #195: the DENY table holds x86_64 syscall numbers only, so on another arch we
-        # emit nothing — but a STALE blob from a previous x86 run would still be on disk,
-        # and bot.py forwards any pre-existing file (os.path.exists), applying an
-        # arch-mismatched filter. Remove it so a stale blob can never be applied.
+        # Remove a stale blob on non-x86_64 hosts.
+        # - the launcher forwards any existing file
+        # - an arch-mismatched filter must never be applied
         with contextlib.suppress(OSError):
             os.remove(out)
         sys.stderr.write(f"[seccomp] arch {mach!r} unsupported — skipping (no filter; "
                          f"removed any stale blob at {out})\n")
         return 0
     blob = build(DENY_X86_64)
-    # #195: write atomically (temp in the same dir + os.replace) so a crash mid-write can
-    # never leave a TRUNCATED program that bwrap would load as malformed. os.replace is
-    # atomic within a filesystem.
+    # Write atomically: temp file in same dir, then `os.replace`.
+    # - a crash can't leave a truncated program for bwrap
     tmp = f"{out}.tmp.{os.getpid()}"
     with open(tmp, "wb") as fh:
         fh.write(blob)

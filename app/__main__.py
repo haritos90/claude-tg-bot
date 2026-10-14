@@ -1,8 +1,4 @@
-"""Entrypoint: ``python -m app`` (replaces ``python bot.py``, #302).
-
-Keeps the bootstrap logic in ``app.bot.main()``; this module only runs it under
-asyncio. The systemd unit (``deploy/tg-bot.service``) invokes this.
-"""
+"""Entrypoint for `python -m app`; runs `app.bot.main()` under asyncio."""
 import asyncio
 
 from app.bot import main

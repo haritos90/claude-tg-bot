@@ -1,9 +1,7 @@
-"""Allowlist-based access control middleware for aiogram.
+"""Allowlist access-control middleware for aiogram.
 
-Drops every incoming update whose originating user is not permitted by the
-configured allowlist. Works for both ``Message`` and ``CallbackQuery`` events
-(and anything else exposing ``from_user``), and fails closed (drops) for any
-update type without an identifiable user.
+- Drops updates from users the allowlist denies
+- Fails closed when no user is identifiable
 """
 
 from __future__ import annotations
@@ -22,15 +20,11 @@ from app import i18n
 from app import REPO_ROOT
 from app.telegram import markup
 
-# #328: maintenance freeze. While the sentinel file exists, the bot replies a "back soon" stub
-# to every allowed user and DROPS the update (no handler runs → no new session/turn data is
-# created), so the dataset stays stable for a migration. Toggled LIVE (no restart) via
-# `touch`/`rm` of the file; checked per-update (a cheap stat).
-# #338: default to an ABSOLUTE path under the repo root so the freeze is found regardless of
-# the process cwd. systemd sets WorkingDirectory to the repo root (so the old relative
-# "MAINTENANCE" resolved correctly there), but a dev run from another cwd would silently stat
-# the wrong path. REPO_ROOT is that same directory, so the on-disk path is unchanged.
-# Override with MAINTENANCE_FILE (absolute or relative).
+# Maintenance freeze: sentinel file makes the bot reply a stub.
+# - Updates are dropped while the file exists
+# - Toggled live with `touch`/`rm`, checked per update
+# - Absolute path under repo root, independent of cwd
+# - Override with `MAINTENANCE_FILE`
 _MAINTENANCE_SENTINEL = os.environ.get("MAINTENANCE_FILE") or str(REPO_ROOT / "MAINTENANCE")
 
 
@@ -42,32 +36,28 @@ def maintenance_active() -> bool:
 
 
 class AllowlistMiddleware(BaseMiddleware):
-    """Reject any update that is not permitted by the allowlist.
+    """Drop updates from users the allowlist denies.
 
-    Registered as an outer middleware on both ``dp.message`` and
-    ``dp.callback_query``. If the event's user is not allowed, the handler
-    chain is short-circuited (returns ``None``) so no downstream handler ever
-    sees the update.
+    - Outer middleware on messages and callback queries
+    - Short-circuits so no handler sees the update
     """
 
     def __init__(self, allowlist: Any, owner_id: Optional[int] = None,
                  notify_owner: bool = True) -> None:
         super().__init__()
         self.allowlist = allowlist
-        # #277: so the owner can add someone whose numeric id they don't have (only a
-        # phone number / a name), an UNKNOWN user's first attempt notifies the owner with
-        # the id + name + one-tap Allow buttons. Throttled per-user so it can't be spammed.
+        # An unknown user's first attempt notifies the owner.
+        # - Throttled per user to prevent spam
         self.owner_id = owner_id
         self.notify_owner = notify_owner
         self._notified: dict[int, float] = {}
-        self._notify_window = 6 * 3600  # at most one owner ping per user per 6h
+        self._notify_window = 6 * 3600  # At most one ping per 6h
 
     @staticmethod
     def _extract(event: TelegramObject) -> tuple[Optional[int], Optional[str]]:
         """Best-effort extraction of the acting user's id and username.
 
-        Returns ``(None, None)`` when the event has no associated user (e.g.
-        service messages, channel posts, or update types we do not handle).
+        - Returns `(None, None)` when the event has no user
         """
         from_user = getattr(event, "from_user", None)
         if from_user is None:
@@ -82,17 +72,16 @@ class AllowlistMiddleware(BaseMiddleware):
     ) -> Any:
         uid, uname = self._extract(event)
         if uid is None or not self.allowlist.is_allowed(uid, uname):
-            # Drop the update: do not invoke the downstream handler.
+            # Drop the update; skip downstream handlers.
             with contextlib.suppress(Exception):
                 await self._maybe_notify_owner(event, uid, uname)
             return None
-        # #328: maintenance freeze — reply a stub and DROP the update (no handler → no new
-        # session/turn data), keeping the dataset stable for a migration.
+        # Maintenance freeze: reply with a stub, drop update.
         if maintenance_active():
             with contextlib.suppress(Exception):
                 await self._reply_maintenance(event, uid)
             return None
-        # Best-effort pin of the latest known username for this user.
+        # Best-effort pin of the user's latest username.
         try:
             self.allowlist.pin(uid, uname)
         except Exception:
@@ -100,23 +89,26 @@ class AllowlistMiddleware(BaseMiddleware):
         return await handler(event, data)
 
     async def _reply_maintenance(self, event: TelegramObject, uid: Optional[int]) -> None:
-        """#328: tell an allowed user the bot is briefly down for maintenance. A CallbackQuery
-        (button tap) gets a toast; a Message gets a reply."""
+        """Tell an allowed user the bot is under maintenance.
+
+        - Callback queries get a toast; messages get a reply
+        """
         lang = i18n.cached_lang(uid) if uid is not None else i18n.DEFAULT_LANG
         text = i18n.t("maintenance.notice", lang)
-        if getattr(event, "data", None) is not None:      # CallbackQuery → toast
+        if getattr(event, "data", None) is not None:      # Callback query gets a toast
             await event.answer(text, show_alert=True)
-        else:                                             # Message → reply
+        else:                                             # Message gets a reply
             await event.answer(text)
 
     async def _maybe_notify_owner(self, event: TelegramObject, uid: Optional[int],
                                   uname: Optional[str]) -> None:
-        """#277: ping the owner that an UNKNOWN user tried to use the bot, with the user's
-        numeric id + name and one-tap Allow buttons — the way to grant access to someone
-        whose id you don't know (you only have their phone/name): they tap the bot, you
-        allow from the notice. Only for real Message attempts; throttled per user."""
-        # Only for a real text message attempt (a /start or any typed line) — not
-        # callbacks/service updates. Duck-typed (`.text`) so it's unit-testable.
+        """Notify the owner that an unknown user tried the bot.
+
+        - Includes id, name, and one-tap Allow buttons
+        - Only for text messages; throttled per user
+        """
+        # Only text message attempts, not callbacks.
+        # - Duck-typed on `.text` for unit tests
         if (not self.notify_owner or self.owner_id is None or uid is None
                 or uid == self.owner_id or not getattr(event, "text", None)):
             return
@@ -124,9 +116,7 @@ class AllowlistMiddleware(BaseMiddleware):
         last = self._notified.get(uid)
         if last is not None and (now - last) < self._notify_window:
             return
-        # #290: prune stale entries so _notified can't grow unbounded on a flood of distinct
-        # unknown ids — anything older than the throttle window is safe to forget (its next
-        # attempt would re-notify anyway).
+        # Prune stale entries so `_notified` stays bounded.
         if len(self._notified) > 256:
             cutoff = now - self._notify_window
             for k in [k for k, t in self._notified.items() if t < cutoff]:
@@ -150,7 +140,7 @@ class AllowlistMiddleware(BaseMiddleware):
                                  callback_data=f"req:ac:{uid}"),
         ]])
         with contextlib.suppress(Exception):
-            # #277: silent — an access request shouldn't buzz the owner's phone.
+            # Silent, so access requests don't buzz the owner.
             await bot.send_message(self.owner_id, text, reply_markup=kb,
                                    parse_mode="HTML", disable_notification=True)
 
@@ -158,13 +148,9 @@ class AllowlistMiddleware(BaseMiddleware):
 class LanguageMiddleware(BaseMiddleware):
     """Resolve and cache each allowed user's interface locale.
 
-    Registered as an outer middleware (after the allowlist) on both ``dp.message``
-    and ``dp.callback_query``. On a user's first update this process, it reads any
-    explicit choice from the DB; with none, it auto-detects from the Telegram
-    client ``language_code`` (ru -> Russian, anything else -> English) without
-    persisting — so the locale tracks the client until the user picks one via
-    /language. The resolved value is cached in ``i18n`` so the hot path never hits
-    the DB, and exposed to handlers as ``data["lang"]``.
+    - An explicit DB choice wins
+    - Otherwise auto-detect from client `language_code`, unpersisted
+    - Exposed to handlers as `data["lang"]`
     """
 
     async def __call__(

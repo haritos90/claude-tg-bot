@@ -1,10 +1,8 @@
-"""Subscription rate-limit windows: pure formatting helpers + the account-usage fetch.
+"""Subscription rate-limit windows: formatting helpers and usage fetch.
 
-The formatters (``window_str`` / ``footer_line`` / ``pinned_text`` / ``_bar`` / …)
-are PURE (no I/O; ``time.time()`` only for reset countdowns). The one network
-function is :func:`fetch_account_usage` (#135) — it GETs the account usage endpoint
-the Claude Code ``/usage`` uses, which reports the REAL per-window % even far from a
-limit (the SDK ``rate_limit_event`` only sends ``utilization`` as you approach one).
+- Formatters are pure; only reset countdowns read the clock
+- `fetch_account_usage` is the only network call
+- Endpoint reports real percent even far from limit
 """
 
 import asyncio
@@ -18,33 +16,27 @@ from types import SimpleNamespace
 
 from app import i18n
 
-# Account usage endpoint (the source Claude Code's /usage reads). Authenticated with
-# the subscription OAuth bearer from ~/.claude/.credentials.json + the OAuth beta
-# header — NOT an API key (subscription billing is preserved; this is a read-only GET).
+# Account usage endpoint, the source Claude Code's /usage reads.
+# - Auth is the subscription OAuth bearer, not an API key
+# - Read-only GET
 _USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 _OAUTH_BETA = "oauth-2025-04-20"
 _DEFAULT_CREDS = "~/.claude/.credentials.json"
-# Windows we surface, in the response. The endpoint reports `utilization` as a
-# PERCENT (0..100) and `resets_at` as an ISO-8601 string — both normalized below to
-# the RateLimitInfo shape the formatters expect (fraction 0..1 + epoch seconds).
-# #419: the subscription has exactly TWO limits — the ~5-hour window and the weekly one. The
-# per-model weekly windows (seven_day_opus / seven_day_sonnet) and "overage" were transitional
-# and are no longer surfaced, wherever they come from (account payload, SDK rate events, or a
-# snapshot persisted before). was:
-#   _ACCOUNT_WINDOWS = ("five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet", "overage")
-#   (#415 briefly took every window the payload reported)
-# decision-23: the two window names are the one usage-side hardcode — a window the endpoint adds
-# later stays hidden until it is listed here, preferred over showing dead transitional windows.
+# Windows surfaced from the response: exactly two subscription limits.
+# - The roughly 5-hour window and the weekly one
+# - Payload gives percent 0..100 and ISO reset times
+# - Normalized to fraction 0..1 and epoch seconds
+# - A window added later stays hidden until listed
 ACCOUNT_WINDOWS: tuple[str, ...] = ("five_hour", "seven_day")
 
 
 def keep_window(key) -> bool:
-    """#419: True for one of the two subscription windows the bot tracks."""
+    """True for one of the two tracked subscription windows."""
     return str(key) in ACCOUNT_WINDOWS
 
 
 def _parse_iso_epoch(s):
-    """ISO-8601 (e.g. '2026-06-16T18:30:00.74+00:00') → epoch seconds, or None."""
+    """ISO-8601 timestamp to epoch seconds, or None."""
     try:
         return int(datetime.fromisoformat(str(s)).timestamp())
     except (TypeError, ValueError):
@@ -52,8 +44,10 @@ def _parse_iso_epoch(s):
 
 
 def _status_for(frac) -> str:
-    """Map a used FRACTION to the same status vocabulary the SDK events use, so the
-    formatter renders the reset countdown when high (≥80%) / limited (≥100%)."""
+    """Map a used fraction to the SDK status vocabulary.
+
+    - Reset countdown renders when high (80%) or limited (100%)
+    """
     if frac is None:
         return "allowed"
     if frac >= 1.0:
@@ -64,9 +58,10 @@ def _status_for(frac) -> str:
 
 
 def _fetch_account_usage_sync(creds_path: str, timeout: float):
-    """Blocking GET of the usage endpoint. Returns the parsed JSON dict, or None on
-    any failure (missing/garbled creds, non-200, network). Never raises; never logs
-    the token."""
+    """Blocking GET of usage endpoint; returns parsed JSON or None.
+
+    - Never raises and never logs the token
+    """
     try:
         with open(os.path.expanduser(creds_path), encoding="utf-8") as fh:
             tok = json.load(fh)["claudeAiOauth"]["accessToken"]
@@ -92,13 +87,16 @@ def _fetch_account_usage_sync(creds_path: str, timeout: float):
 
 
 def normalize_account_usage(data) -> dict:
-    """Normalize the raw /api/oauth/usage payload into the ``{window: info}`` shape
-    the formatters consume: ``utilization`` as a 0..1 FRACTION (API sends 0..100),
-    ``resets_at`` as epoch seconds (API sends ISO). Drops windows with no number."""
+    """Normalize the raw usage payload into the `{window: info}` shape.
+
+    - `utilization` becomes a 0..1 fraction (API sends 0..100)
+    - `resets_at` becomes epoch seconds (API sends ISO)
+    - Drops windows with no number
+    """
     out: dict = {}
     if not isinstance(data, dict):
         return out
-    # #419: only the two subscription windows (was `for key in _ACCOUNT_WINDOWS`).
+    # Only the two subscription windows are read.
     for key in ACCOUNT_WINDOWS:
         entry = data.get(key)
         if not isinstance(entry, dict):
@@ -120,23 +118,22 @@ def normalize_account_usage(data) -> dict:
 
 
 async def fetch_account_usage(creds_path: str = _DEFAULT_CREDS, timeout: float = 15.0):
-    """Fetch the REAL per-window usage from the account endpoint (#135), normalized to
-    the RateLimitInfo shape (``utilization`` 0..1, ``resets_at`` epoch). Returns the
-    ``{window: info}`` dict, or None on any failure — so the caller keeps its prior
-    snapshot. Runs the blocking HTTP in a thread so the event loop is never stalled."""
+    """Fetch normalized per-window usage from the account endpoint.
+
+    - Returns None on any failure, so caller keeps prior snapshot
+    - Runs blocking HTTP in a thread
+    """
     data = await asyncio.to_thread(_fetch_account_usage_sync, creds_path, timeout)
     out = normalize_account_usage(data)
     return out or None
 
-# #415: window labels are DERIVED from the key (five_hour → "5h", seven_day_<x> → "7d <X>"),
-# so a per-model window for a new family needs no entry here. was a fixed map:
-#   LABELS = {"five_hour": "5h", "seven_day": "7d", "seven_day_opus": "7d Opus",
-#             "seven_day_sonnet": "7d Sonnet", "overage": "overage"}
+# Window labels derive from the key, not a fixed map.
+# - `five_hour` gives '5h'; `seven_day_<x>` gives '7d <X>'
 _FIXED_LABELS = {"five_hour": "5h", "seven_day": "7d"}
 
 
 def window_label(key: str | None) -> str:
-    """Language-neutral label for a usage window key (#415)."""
+    """Language-neutral label for a usage window key."""
     if not key:
         return "?"
     if key in _FIXED_LABELS:
@@ -146,19 +143,15 @@ def window_label(key: str | None) -> str:
     return key.replace("_", " ")
 
 
-# Deterministic display order: the account-wide windows first; every other window the API
-# reports (per-model weekly windows, extra usage, …) follows in the order it arrived
-# (_ordered_present). #415: was a fixed tuple that also named the per-model windows:
-#   ("five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet", "overage")
+# Display order: account-wide windows first, others in arrival order.
 WINDOW_ORDER = (
     "five_hour",
     "seven_day",
 )
 
-# Friendly label shown when the API does not send a numeric utilization (it only
-# does so as you approach a window; far from the limit it sends status="allowed"
-# with utilization=null). Better than a bare "(n/a)". Maps the API status to a
-# localized l10n key; the text lives in the i18n table.
+# Friendly label when the API sends no numeric utilization.
+# - Number sent only near a limit; else status 'allowed'
+# - Maps API status to a localized l10n key
 _STATUS_KEY = {
     "allowed": "usage.status.ok",
     "allowed_warning": "usage.status.high",
@@ -167,7 +160,7 @@ _STATUS_KEY = {
 
 
 def _bar(used_fraction: float, width: int = 8) -> str:
-    """Render a small progress bar for a used fraction in [0, 1]."""
+    """Render a small progress bar for a used fraction."""
     try:
         frac = float(used_fraction)
     except (TypeError, ValueError):
@@ -185,9 +178,9 @@ def _bar(used_fraction: float, width: int = 8) -> str:
 
 
 def _reset_in(resets_at, lang: str = "en") -> str:
-    """Compact 'time until reset' string, e.g. '2h13m', '45m', '<1m'.
+    """Compact time-until-reset string, e.g. '2h13m', '45m', '<1m'.
 
-    Returns "" when there is nothing useful to show or on bad input.
+    - Returns empty string when nothing useful or input is bad
     """
     if resets_at is None:
         return ""
@@ -209,7 +202,7 @@ def _reset_in(resets_at, lang: str = "en") -> str:
 def window_str(info, lang: str = "en") -> str:
     """One-line description of a single rate-limit window.
 
-    Returns "" when there is nothing useful to show.
+    - Returns empty string when nothing useful to show
     """
     if info is None:
         return ""
@@ -218,12 +211,11 @@ def window_str(info, lang: str = "en") -> str:
     resets_at = getattr(info, "resets_at", None)
     status = getattr(info, "status", None)
 
-    # "overage" is a real English word (translatable); the others are
-    # language-neutral abbreviations / model names kept verbatim.
+    # 'overage' is translatable; other labels are language-neutral and verbatim.
     if rate_limit_type == "overage":
         label = i18n.t("usage.label.overage", lang)
     else:
-        label = window_label(rate_limit_type)  # #415: was LABELS.get(...)
+        label = window_label(rate_limit_type)
 
     util = None
     if utilization is not None:
@@ -233,28 +225,24 @@ def window_str(info, lang: str = "en") -> str:
             util = None
 
     if util is not None:
-        # The API gave a real fraction consumed -> show a bar and "% left".
+        # API gave a real fraction: show bar and percent left.
         left = (1 - util) * 100
         out = f"{label} {_bar(util)} {i18n.t('usage.left', lang, pct=f'{left:.0f}')}"
     else:
-        # No number yet (typical when the window is far from full): show the
-        # window status instead of a meaningless "(n/a)".
+        # No number yet: show window status instead of '(n/a)'.
         key = _STATUS_KEY.get(str(status))
         if key:
             body = i18n.t(key, lang)
         elif status:
-            # #135/#137: an unknown-but-present status used to fall back to
-            # "OK" — which over-asserts (we'd show "5h OK" for a state we don't
-            # actually understand). Show a neutral marker; only an explicit
-            # 'allowed' (via _STATUS_KEY) ever renders "OK".
+            # Unknown status shows a neutral marker, never 'OK'.
+            # - Only an explicit 'allowed' renders 'OK'
             body = i18n.t("usage.status.unknown", lang)
         else:
             body = ""
         out = f"{label} {body}".strip()
 
-    # The reset countdown only matters when usage is actually constrained — show
-    # it when we have a real % or the window is warning/limited, but NOT for a
-    # plain "OK" (when there is plenty left the countdown is just noise).
+    # Show reset countdown only when usage is constrained.
+    # - Real percent or warning/limited status; not plain 'OK'
     show_reset = util is not None or str(status) in ("allowed_warning", "rejected")
     if show_reset:
         r = _reset_in(resets_at, lang)
@@ -264,12 +252,12 @@ def window_str(info, lang: str = "en") -> str:
 
 
 def ordered_windows(rate_by_type: dict):
-    """#415: public alias of _ordered_present — (key, info) for every present window."""
+    """Public alias of `_ordered_present`: present (key, info) pairs."""
     return _ordered_present(rate_by_type)
 
 
 def _ordered_present(rate_by_type: dict):
-    """Yield (key, info) pairs for present windows in deterministic order."""
+    """Yield (key, info) pairs for present windows in order."""
     if not rate_by_type:
         return
     seen = set()
@@ -277,20 +265,22 @@ def _ordered_present(rate_by_type: dict):
         if key in rate_by_type and rate_by_type[key] is not None:
             seen.add(key)
             yield key, rate_by_type[key]
-    # #419: nothing beyond the two subscription windows (was: any unexpected key after them).
+    # Nothing beyond the two subscription windows.
 
 
 def footer_line(rate_by_type: dict, lang: str = "en", sep: str = " · ") -> str:
-    """Short summary, preferring 5h then a 7d window. "" if none. ``sep`` joins the
-    windows — default " · " (one line); pass "\\n" for the owner's 2-line 5h/7d
-    display (#169)."""
+    """Short summary, preferring 5h then a 7d window.
+
+    - Empty string if none
+    - `sep` joins the windows; default is ' · '
+    """
     if not rate_by_type:
         return ""
 
     keys: list[str] = []
     if rate_by_type.get("five_hour") is not None:
         keys.append("five_hour")
-    # #419: the weekly window only (was: seven_day, else seven_day_opus / seven_day_sonnet).
+    # Weekly window only.
     if rate_by_type.get("seven_day") is not None:
         keys.append("seven_day")
 

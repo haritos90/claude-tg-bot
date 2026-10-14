@@ -1,10 +1,7 @@
 """Entrypoint for the private Telegram bot.
 
-Wires together configuration, the SQLite store, the access-control
-middleware, the permission gate, the per-thread session manager and the
-aiogram router, then runs long polling until interrupted.
-
-Run with:  python bot.py   (from the project directory, with a .env present)
+- Wires config, store, middleware, gate, sessions, router
+- Runs long polling until interrupted
 """
 
 import asyncio
@@ -12,10 +9,8 @@ import contextlib
 import datetime
 import logging
 import os
-# import shutil  # #412: unused after the CLI staging moved to app.core.cli_update
 import subprocess
 import sys
-# from pathlib import Path  # #302: unused after deploy/ paths moved to app.DEPLOY_DIR
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
@@ -26,9 +21,9 @@ from app.config import load_settings
 from app.storage.db import (init_db, close_db, migrate_workdirs_to_sid,
                             migrate_workdirs_to_ulid, migrate_model_ids_to_aliases,
                             migrate_sessions_to_ulid, load_sid_cache, sandbox_uid_collisions)
-from app.core import models  # #411: the model catalog the CLI reports
-from app.core import cli_update  # #412: stage / update the Claude Code CLI
-from app.telegram.rich_message import stopped_generation_of  # #431 (experimental)
+from app.core import models  # Model catalog the CLI reports
+from app.core import cli_update  # Stage and update the CLI
+from app.telegram.rich_message import stopped_generation_of
 from app.access.allowlist import Allowlist
 from app.access.access import AllowlistMiddleware, LanguageMiddleware
 from app.access.permissions import PermissionGate
@@ -36,25 +31,28 @@ from app.core.sessions import SessionManager
 from app.telegram.handlers import build_router, setup_commands
 from app import watchdog
 from app import i18n
-from app import DEPLOY_DIR  # repo-root deploy/ scripts (#302: bot.py moved into the package)
+from app import DEPLOY_DIR  # Repo-root `deploy/` scripts
 
 logger = logging.getLogger("bot")
 
 
 def _configure_logging() -> None:
-    """Send structured logs to stdout (visible in journald / docker logs)."""
+    """Send structured logs to stdout."""
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
         stream=sys.stdout,
     )
-    # aiogram is fairly chatty at DEBUG; keep it at INFO.
+    # aiogram is chatty at DEBUG; keep INFO.
     logging.getLogger("aiogram.event").setLevel(logging.WARNING)
 
 
 async def main() -> None:
-    """Build every component and start polling. Cleans up on shutdown."""
+    """Build every component and start polling.
+
+    - Cleans up on shutdown
+    """
     _configure_logging()
 
     settings = load_settings()
@@ -66,75 +64,67 @@ async def main() -> None:
         settings.db_path,
     )
 
-    # Persistent per-thread state. init_db expects a string path.
+    # Persistent per-thread state; `init_db` expects a string path.
     await init_db(str(settings.db_path))
     logger.info("Database initialised at %s", settings.db_path)
 
-    # #411: restore the last model catalog the CLI reported (the /model picker reads it before
-    # the first client of this run connects), then — ONCE per database — turn the concrete ids
-    # the old picker stored (claude-opus-4-8 …) into their family alias (opus …), which the CLI
-    # resolves to the newest model of the family. Never blocks startup.
+    # Restore the CLI's last-reported model catalog.
+    # - Picker reads it before the first client connects
+    # - Once per database: concrete model ids become family aliases
+    # - Never blocks startup
     with contextlib.suppress(Exception):
         await models.load()
     with contextlib.suppress(Exception):
         n = await migrate_model_ids_to_aliases(models.family_alias)
         if n:
-            logger.info("Moved %d stored model id(s) onto CLI family aliases (#411)", n)
+            logger.info("Moved %d stored model id(s) onto CLI family aliases", n)
 
-    # #140: one-time, idempotent rename of per-session workdirs from the raw
-    # numeric thread_id to the stable public sid. Runs every startup (a no-op
-    # once migrated); a hiccup here must never block the bot from starting.
+    # Idempotent rename of workdirs from thread id to sid.
+    # - Runs every startup; failure must not block start
     with contextlib.suppress(Exception):
         n = await migrate_workdirs_to_sid(str(settings.base_workdir))
         if n:
-            logger.info("Migrated %d session workdir(s) to sid-based names (#140)", n)
+            logger.info("Migrated %d session workdir(s) to sid-based names", n)
 
-    # #327 (decoupled): backfill a stored PUBLIC ULID id for each session — DB-ONLY. The workdir /
-    # transcript / jail-uid stay on the stable 6-hex session_sid, so the filesystem is NEVER touched
-    # and `resume` can't break. Idempotent + run-once. Then load the thread_id->ULID cache that
-    # session_pubid() reads on the hot path.
+    # Backfill a stored public ULID for each session.
+    # - DB-only: workdir, transcript and jail uid stay on `session_sid`
+    # - Idempotent; then load the thread-to-ULID cache
     with contextlib.suppress(Exception):
         n = await migrate_sessions_to_ulid(str(settings.base_workdir))
         if n:
-            logger.info("Backfilled %d session(s) with a public ULID id (#327)", n)
+            logger.info("Backfilled %d session(s) with a public ULID id", n)
     with contextlib.suppress(Exception):
         await load_sid_cache()
 
-    # #332: rename per-session workdirs from the legacy 6-hex sid to the PUBLIC ULID
-    # (collision-safe, matches the UI id). Re-encodes the nested transcripts + re-keys the
-    # per-session uids so `resume` and uids survive the rename. Idempotent; runs AFTER the
-    # ULID backfill + cache so every thread has its sid. A hiccup must never block startup.
+    # Rename workdirs from legacy sid to the public ULID.
+    # - Re-encodes transcripts and re-keys uids so `resume` survives
+    # - Idempotent; runs after the ULID backfill and cache
+    # - Failure must not block startup
     with contextlib.suppress(Exception):
         n = await migrate_workdirs_to_ulid(str(settings.base_workdir))
         if n:
-            logger.info("Migrated %d session workdir(s) to ULID names (#332)", n)
+            logger.info("Migrated %d session workdir(s) to ULID names", n)
 
-    # #221 doctor: scan on-disk session workdirs for any host uid shared by >1 session
-    # (a per-session isolation break). With the uid registry this is always empty; it
-    # surfaces a PRE-#221 collision not yet healed (heals on the sessions' next turn).
-    # Filesystem-only → safe here; the owner is alerted after the bot connects (below).
+    # Doctor: scan workdirs for a host uid shared by sessions.
+    # - Always empty with the uid registry, barring unhealed old collisions
+    # - Filesystem-only; owner is alerted after the bot connects
     uid_collisions: dict[int, list[str]] = {}
     with contextlib.suppress(Exception):
         uid_collisions = sandbox_uid_collisions(str(settings.base_workdir))
         if uid_collisions:
             logger.warning(
-                "#221: %d sandbox uid collision(s) on disk: %s — affected sessions "
+                "%d sandbox uid collision(s) on disk: %s — affected sessions "
                 "self-heal (re-chown to a registry uid) on their next turn.",
                 len(uid_collisions),
                 "; ".join(f"uid {u}: {','.join(s)}" for u, s in uid_collisions.items()),
             )
         else:
-            logger.info("#221: sandbox uid check clean (no host uid shared across sessions)")
+            logger.info("sandbox uid check clean (no host uid shared across sessions)")
 
-    # The bot uses HTML parse mode by default; the markup helpers emit HTML.
-    # #434: one Bot for two platforms. Its session routes each API call by chat id: Telegram
-    # by default, MAX for ids in the MAX namespace. Everything downstream (handlers, streamer,
-    # gate, sessions) keeps holding this single Bot and never learns which platform it talks to.
-    # was (replaced for #434):
-    # bot = Bot(
-    #     token=settings.bot_token,
-    #     default=DefaultBotProperties(parse_mode="HTML"),
-    # )
+    # One `Bot` serves two platforms.
+    # - Its session routes by chat id: Telegram, or MAX namespace
+    # - Downstream code never learns which platform it talks to
+    # - HTML parse mode is the default
     tg_session = AiohttpSession()
     max_api = max_bridge = None
     if settings.max_bot_token:
@@ -153,82 +143,78 @@ async def main() -> None:
     )
     dp = Dispatcher()
 
-    # JSON-backed allowlist with the owner always allowed.
+    # JSON-backed allowlist; the owner is always allowed.
     allowlist = Allowlist(settings.allowlist_path, settings.owner_id)
 
-    # Core components, all sharing the single Bot instance. The session manager
-    # gets the allowlist so it can resolve per-user GLOBAL MEMORY at build time.
-    # #434: tool approvals are an owner action, so the Allow/Deny prompt of a non-owner's
-    # code session (a MAX user, or a Telegram guest) is posted to the owner's chat.
-    gate = PermissionGate(bot, owner_id=settings.owner_id)  # was: PermissionGate(bot)
+    # Core components share the single `Bot` instance.
+    # - Session manager gets the allowlist for per-user global memory
+    # - Non-owner code-session approvals are posted to the owner's chat
+    gate = PermissionGate(bot, owner_id=settings.owner_id)
     sessions = SessionManager(bot, settings, gate, allowlist)
 
-    # Best-effort restore of usage mode, the persisted rate snapshot and the
-    # pinned message id. A fresh database must not block startup.
+    # Best-effort restore of usage mode, rate snapshot, pinned message id.
+    # - A fresh database must not block startup
     with contextlib.suppress(Exception):
         await sessions.load_persisted()
 
-    # #135: start polling the account usage endpoint so the footer / pinned / status
-    # show the REAL subscription % even when idle (the SDK rate-events only report it
-    # near a limit). Best-effort; the poller swallows its own errors.
+    # Poll the account usage endpoint for real subscription percent.
+    # - SDK rate events only report near a limit
+    # - Best-effort; the poller swallows its own errors
     with contextlib.suppress(Exception):
         sessions.start_usage_poller()
 
-    # #179: start the idle-client reaper so idle sessions release their ~400 MB
-    # claude subprocess (history persists on disk; resume rebuilds on next message).
+    # Start the idle-client reaper.
+    # - Idle sessions release their ~400 MB subprocess
+    # - History persists on disk; next message resumes
     with contextlib.suppress(Exception):
         sessions.start_reaper()
 
-    # #178: start the archive-retention purger (deletes deleted-session bundles older
-    # than the configured retention; runs at startup + daily). Best-effort.
+    # Start the archive-retention purger.
+    # - Deletes archived bundles older than retention
+    # - Runs at startup and daily; best-effort
     with contextlib.suppress(Exception):
         sessions.start_archive_purger()
 
-    # #188: start the recurring-schedule runner (fires due /schedule prompts into their
-    # sessions). Best-effort; the loop swallows its own errors.
+    # Start the recurring-schedule runner.
+    # - Fires due schedule prompts into their sessions
+    # - Best-effort; the loop swallows its own errors
     with contextlib.suppress(Exception):
         sessions.start_scheduler()
 
-    # #191: start the proactive OAuth token refresher so the on-disk subscription token
-    # is renewed before its ~8h expiry — a turn after a long idle gap never 401s on a
-    # stale token (the reaper kills the subprocess but never rotates the credential).
-    # Best-effort + fail-soft; disable with OAUTH_REFRESH=0.
+    # Start the proactive OAuth token refresher.
+    # - Renews the token before its ~8h expiry
+    # - Avoids a 401 after a long idle gap
+    # - Fail-soft; disable with `OAUTH_REFRESH=0`
     with contextlib.suppress(Exception):
         sessions.start_token_refresher()
 
-    # #412: keep the Claude Code CLI current — run `claude update` and re-stage the jail copy
-    # (#423: once a day at CLI_UPDATE_AT_UTC, default 12:00 UTC, owner-adjustable in /settings →
-    # Admin, "off" = never; was the CLI_UPDATE_INTERVAL_HOURS cadence), so new models (read from
-    # the CLI itself, #411) arrive with no bot change or restart; clients move to a new binary
-    # between replies.
+    # Keep the Claude Code CLI current.
+    # - Runs `claude update` and re-stages the jail copy
+    # - Daily at `CLI_UPDATE_AT_UTC` (default 12:00); off disables
+    # - New models arrive without a bot change or restart
+    # - Clients move to the new binary between replies
     with contextlib.suppress(Exception):
         sessions.start_cli_updater()
 
-    # #413: name-or-dispose sweep over every DM user's sessions — a session left on the
-    # "Not named yet" placeholder is either named (by the auto-name priority) or, when it holds
-    # nothing to name it by, archived. Runs shortly after startup, then daily.
+    # Name-or-dispose sweep over every DM user's sessions.
+    # - Unnamed placeholder sessions get named, or archived if empty
+    # - Runs shortly after startup, then daily
     with contextlib.suppress(Exception):
         sessions.start_untitled_sweeper()
 
-    # #196: Mark the service "up" to systemd IMMEDIATELY (sd_notify READY=1) and start the
-    # watchdog BEFORE any network I/O AND before the (local-only) sandbox setup below —
-    # so a slow box's seccomp-compile / egress-firewall steps can't delay READY and trip a
-    # Type=notify start-timeout (#158). Everything before this point is local + non-blocking
-    # (the pollers are background tasks). The watchdog still pings WATCHDOG=1 only after a
-    # successful get_me, well within WatchdogSec. No-op when not under systemd.
-    # (#158 invariant preserved: still NO synchronous network I/O before this line.)
-    # #234: this init is the finally's guard. The watchdog TASK is created as the FIRST
-    # statement inside the try below (it used to be created right here, OUTSIDE the try,
-    # so a raise during the sandbox setup that follows could leak it). watchdog.ready()
-    # stays here — before the local sandbox setup — so that setup can't delay READY.
+    # Signal READY and start watchdog before any network I/O.
+    # - Also precedes sandbox setup so slow steps cannot delay READY
+    # - Watchdog pings `WATCHDOG=1` only after a successful `get_me`
+    # - Watchdog task is created first inside the try
+    # - No-op when not under systemd
     wd_task: asyncio.Task | None = None
-    max_task: asyncio.Task | None = None   # #434
+    max_task: asyncio.Task | None = None
     watchdog.ready()
 
-    # #119b: when the credential broker is enabled, run it as a host sidecar so the
-    # subscription token can stay OUT of every session jail (the jail gets a dummy token
-    # + ANTHROPIC_BASE_URL pointing here; the broker injects the real bearer). Off by
-    # default; the broker self-refuses to start if an API key is in the env (P0).
+    # Run the credential broker as a host sidecar.
+    # - Keeps the subscription token out of session jails
+    # - Jail gets a dummy token and broker base URL
+    # - Off by default; refuses to start with an API key
     broker_proc: subprocess.Popen | None = None
     if getattr(settings, "cred_broker", False):
         with contextlib.suppress(Exception):
@@ -236,78 +222,57 @@ async def main() -> None:
                           if k not in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")}
             broker_proc = subprocess.Popen(
                 [sys.executable,
-                 # was: Path(__file__).resolve().parent / "deploy" / "cred-broker.py" (#302)
                  str(DEPLOY_DIR / "cred-broker.py"),
                  "--port", str(settings.cred_broker_port)],
                 env=broker_env,
             )
-            logger.info("Credential broker (#119b) started on 127.0.0.1:%s",
+            logger.info("Credential broker started on 127.0.0.1:%s",
                         settings.cred_broker_port)
 
-    # was: _deploy = Path(__file__).resolve().parent / "deploy" (#302: bot.py moved into app/)
     _deploy = DEPLOY_DIR
 
-    # #119e: compile the seccomp denylist BPF once at startup (x86_64 only — make-seccomp.py
-    # no-ops on other arches). The engine points bwrap's --seccomp fd at this file per jail.
+    # Compile the seccomp denylist BPF once at startup.
+    # - x86_64 only; the script no-ops elsewhere
+    # - Engine points bwrap's `--seccomp` fd at this file
     if getattr(settings, "sandbox_seccomp", False) and settings.sandbox_seccomp_path:
         with contextlib.suppress(Exception):
-            # #196: off the event loop so a slow compile can't block the loop. Runs
-            # post-READY (#234: now also pre-watchdog-task; READY=1 is already sent so a
-            # slow compile can't trip the start-timeout regardless).
+            # Compile runs off the event loop, after READY.
+            # - A slow compile cannot block the loop or start-timeout
             await asyncio.to_thread(
                 subprocess.run,
                 [sys.executable, str(_deploy / "make-seccomp.py"),
                  settings.sandbox_seccomp_path], check=False, timeout=30)
             if os.path.exists(settings.sandbox_seccomp_path):
-                logger.info("Seccomp filter (#119e) compiled at %s",
+                logger.info("Seccomp filter compiled at %s",
                             settings.sandbox_seccomp_path)
 
-    # #119: when per-session uid is on, the jail runs as a non-root uid that can't reach
-    # ~/.local/bin/claude (/root is 0700). Stage the (self-contained) binary world-readably
-    # at /usr/local/bin/claude so the jail (which binds /usr) can exec it. Refresh only on
-    # a version change (a marker records the resolved source path).
-    # #412: the same copy also runs after every periodic `claude update` (cli_update, driven by
-    # SessionManager.start_cli_updater), so the jails follow CLI updates without a restart.
-    # was (inline here — moved to cli_update.stage for reuse by the updater):
-    #     with contextlib.suppress(Exception):
-    #         src = os.path.realpath(shutil.which("claude")
-    #                                or os.path.expanduser("~/.local/bin/claude"))
-    #         dst, marker = "/usr/local/bin/claude", "/usr/local/bin/claude.src"
-    #         cur = ""
-    #         if os.path.exists(marker):
-    #             with open(marker, encoding="utf-8") as fh:
-    #                 cur = fh.read().strip()
-    #         if src and os.path.exists(src) and (cur != src or not os.path.exists(dst)):
-    #             tmp = dst + ".tmp"
-    #             shutil.copy2(src, tmp)
-    #             os.chmod(tmp, 0o755)
-    #             os.replace(tmp, dst)
-    #             with open(marker, "w", encoding="utf-8") as fh:
-    #                 fh.write(src)
-    #             logger.info("Staged sandbox claude binary at %s (from %s)", dst, src)
+    # Stage the self-contained `claude` binary world-readably.
+    # - Per-session uid cannot reach root's `~/.local/bin/claude`
+    # - Jail binds `/usr`, so it execs `/usr/local/bin/claude`
+    # - `cli_update` also restages after each CLI update
     if getattr(settings, "sandbox_per_session_uid", False):
         with contextlib.suppress(Exception):
             await asyncio.to_thread(cli_update.stage)
 
-    # #119c: when egress filtering is on, set up the cgroup-scoped firewall once (fully
-    # reverted on shutdown) and run the CONNECT allowlist proxy as a host sidecar. The
-    # firewall match is scoped to the sandbox cgroup, so it can never affect SSH / the bot.
+    # Egress filtering: cgroup-scoped firewall plus CONNECT proxy sidecar.
+    # - Set up once; fully reverted on shutdown
+    # - Rule is cgroup-scoped, so SSH and the bot are unaffected
     egress_proc: subprocess.Popen | None = None
     if getattr(settings, "sandbox_egress", False):
         with contextlib.suppress(Exception):
-            # #196: off the event loop (post-READY); capture the result so a FAILED setup
-            # (e.g. nf_conntrack not loaded → rule insert fails) is logged loudly instead of
-            # silently leaving egress unenforced. The script self-verifies with `iptables -C`
-            # and exits non-zero if the rule did not land.
+            # Setup runs off the event loop, post-READY.
+            # - Result is captured so failure is logged loudly
+            # - Example: `nf_conntrack` not loaded, rule insert fails
+            # - Script self-verifies with `iptables -C`
             _eg = await asyncio.to_thread(
                 subprocess.run,
                 ["bash", str(_deploy / "egress-setup.sh"),
                  str(settings.cred_broker_port), str(settings.egress_proxy_port)],
                 check=False, timeout=30, capture_output=True, text=True)
             if _eg.returncode == 0:
-                logger.info("Egress allowlist (#119c) firewall set up (cgroup-scoped)")
+                logger.info("Egress allowlist firewall set up (cgroup-scoped)")
             else:
-                logger.error("Egress allowlist (#119c) setup FAILED (rc=%s) — egress is NOT "
+                logger.error("Egress allowlist setup FAILED (rc=%s) — egress is NOT "
                              "enforced; sessions fail closed at the jail cgroup-join guard. %s",
                              _eg.returncode, (_eg.stderr or "").strip()[-300:])
         with contextlib.suppress(Exception):
@@ -321,28 +286,28 @@ async def main() -> None:
                  "--port", str(settings.egress_proxy_port)],
                 env=proxy_env,
             )
-            logger.info("Egress proxy (#119c) started on 127.0.0.1:%s",
+            logger.info("Egress proxy started on 127.0.0.1:%s",
                         settings.egress_proxy_port)
 
     router = build_router(settings, sessions, gate, bot, allowlist)
     dp.include_router(router)
 
-    # Allowlist access enforced as an OUTER middleware so unauthorized
-    # updates never reach filters or handlers.
-    allowlist_mw = AllowlistMiddleware(allowlist, owner_id=settings.owner_id)  # #277
+    # Allowlist enforced as an outer middleware.
+    # - Unauthorized updates never reach filters or handlers
+    allowlist_mw = AllowlistMiddleware(allowlist, owner_id=settings.owner_id)
     dp.message.outer_middleware(allowlist_mw)
     dp.callback_query.outer_middleware(allowlist_mw)
 
-    # After access: resolve each allowed user's interface locale (auto-detected
-    # from the Telegram client language, overridable via /language).
+    # After access: resolve each user's interface locale.
+    # - Auto-detected from client language; `/language` overrides
     language_mw = LanguageMiddleware()
     dp.message.outer_middleware(language_mw)
     dp.callback_query.outer_middleware(language_mw)
 
-    # #431 (experimental): the draft push button. aiogram 3.28 does not know the Bot API 10.3
-    # `stopped_message_generation` update (it would drop it as an unknown type), so it is read
-    # here from the raw update and handed to the session manager. Harmless for anyone else: it
-    # only acts on a live reply draft of that same chat.
+    # Experimental draft push button, handled outside aiogram.
+    # - aiogram drops this Bot API 10.3 update type
+    # - Read from the raw update, passed to session manager
+    # - Only acts on a live reply draft in that chat
     async def _push_mw(handler, event, data):
         info = stopped_generation_of(event)
         if info is None:
@@ -354,19 +319,16 @@ async def main() -> None:
     dp.update.outer_middleware(_push_mw)
 
     try:
-        # #196/#234: watchdog.ready() (READY=1) is sent ABOVE, before the local sandbox
-        # setup, so that setup can't delay READY. The watchdog TASK is created HERE — the
-        # first statement inside the try — so the finally reliably cancels it. Creating it
-        # is instant and non-blocking; it runs its own Telegram probe loop and pings
-        # WATCHDOG=1 only after a successful get_me (never during setup), so creating it
-        # just after the few seconds of sandbox setup is well within WatchdogSec. The
-        # watchdog governs ongoing reachability and force-restarts only after a PROLONGED
-        # outage, never a startup blip.
+        # Watchdog task is created first inside the try.
+        # - So the `finally` reliably cancels it
+        # - READY=1 was already sent, before sandbox setup
+        # - Watchdog pings only after a successful `get_me`
+        # - It force-restarts only after a prolonged outage
         wd_task = asyncio.create_task(watchdog.run(bot))
 
-        # Identify the bot (nice log + early bad-token detection). A network blip
-        # here is NOT fatal — polling retries on its own — but a real auth error
-        # (or any non-network failure) still propagates and stops the bot.
+        # Identify the bot; detect a bad token early.
+        # - A network blip is not fatal; polling retries
+        # - Real auth or other errors still propagate
         try:
             me = await bot.get_me(request_timeout=15)
             logger.info("Authorized as @%s (id=%s)", me.username, me.id)
@@ -376,12 +338,10 @@ async def main() -> None:
                 exc,
             )
 
-        # Populate the Telegram "/" command menu; best-effort AND time-bounded so a
-        # slow Telegram can't hang startup before polling begins. The owner also
-        # gets the owner-only admin commands in their private chat.
-        # #435: still best-effort, but a failure is LOGGED — a silent drift error hid the
-        # unrefreshed menus for months.
-        # was: with contextlib.suppress(Exception): await asyncio.wait_for(setup_commands(…), 30)
+        # Populate the Telegram command menu, best-effort and time-bounded.
+        # - A slow Telegram must not hang startup
+        # - Owner also gets owner-only commands in private chat
+        # - Failure is logged, not suppressed
         try:
             await asyncio.wait_for(
                 setup_commands(bot, owner_id=settings.owner_id), timeout=30
@@ -389,15 +349,14 @@ async def main() -> None:
         except Exception as exc:
             logger.warning("setup_commands failed; command menus not refreshed: %s", exc)
 
-        # #221: if the doctor found on-disk uid collisions, alert the owner now that the
-        # bot is connected (best-effort, post-READY — off the startup-critical path).
+        # Alert the owner of on-disk uid collisions once connected.
+        # - Best-effort, post-READY, off the startup-critical path
         if uid_collisions and settings.owner_id:
             detail = "; ".join(
                 f"uid {u}: {', '.join(s)}" for u, s in uid_collisions.items()
             )
-            # #221: stamp the check with a UTC time so a recurring alert can be told
-            # apart from an earlier one (e.g. a restart re-runs the doctor on the same
-            # not-yet-self-healed workdirs vs a genuinely new collision).
+            # Stamp the alert with a UTC time.
+            # - Distinguishes a restart re-run from a new collision
             ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
             with contextlib.suppress(Exception):
                 await bot.send_message(
@@ -406,8 +365,9 @@ async def main() -> None:
                            count=len(uid_collisions), detail=detail, ts=ts),
                 )
 
-        # #434: the MAX long-poller feeds the same dispatcher. Its failures only log and back
-        # off — a MAX outage must never take the Telegram side down.
+        # The MAX long-poller feeds the same dispatcher.
+        # - Its failures only log and back off
+        # - A MAX outage must never take Telegram down
         if max_bridge is not None:
             from app.max.poller import MaxPoller
             try:
@@ -416,46 +376,48 @@ async def main() -> None:
                 logger.info("MAX: authorized as @%s (id=%s)", max_me.get("username"),
                             max_me.get("user_id"))
             except Exception as exc:
-                # Not fatal (the poller retries); a wrong token or an untrusted CA shows here.
+                # Not fatal; the poller retries.
+                # - A wrong token or untrusted CA shows here
                 logger.warning("MAX: startup get_me failed (%s); polling will retry", exc)
             max_task = asyncio.create_task(MaxPoller(max_api, max_bridge, dp, bot).run())
 
-        # Only the update types we actually handle are requested from Telegram.
-        # #431: + stopped_message_generation (the experimental draft push button).
+        # Request only the update types we handle.
+        # - Includes `stopped_message_generation` for the draft button
         await dp.start_polling(
             bot,
             allowed_updates=["message", "callback_query", "stopped_message_generation"],
         )
     finally:
         logger.info("Shutting down...")
-        # Stop the watchdog first so it cannot ping systemd during teardown.
+        # Stop the watchdog first so it cannot ping systemd.
         if wd_task is not None:
             wd_task.cancel()
             with contextlib.suppress(BaseException):
                 await wd_task
-        if max_task is not None:   # #434: stop taking MAX updates before draining turns
+        if max_task is not None:   # Stop MAX updates before draining
             max_task.cancel()
             with contextlib.suppress(BaseException):
                 await max_task
-        # #325: GRACEFUL DRAIN first — stop starting new turns and wait for in-flight ones to
-        # finish, so a restart doesn't kill a turn mid-generation / tear its transcript (the
-        # #324 incident). Bounded (< TimeoutStopSec=60); needs KillMode=mixed in the unit so
-        # systemd's SIGTERM hits only this process, not the jailed `claude` children.
+        # Graceful drain first: stop new turns, await in-flight ones.
+        # - Avoids killing a turn mid-generation or tearing its transcript
+        # - Bounded below `TimeoutStopSec=60`
+        # - Needs `KillMode=mixed` so SIGTERM skips jailed children
         with contextlib.suppress(Exception):
             await sessions.drain(timeout=40.0)
-        # Disconnect live Claude sessions (cancel workers + close the claude CLI
-        # subprocesses) BEFORE closing the DB, so an in-flight turn's best-effort
-        # writes are not aimed at a closed connection. Best-effort: a teardown
-        # error must not mask the original shutdown reason.
+        # Disconnect live sessions before closing the DB.
+        # - Cancels workers and closes `claude` subprocesses
+        # - In-flight writes must not hit a closed connection
+        # - Best-effort: teardown errors must not mask the shutdown reason
         with contextlib.suppress(Exception):
             await sessions.aclose()
-        # #119b: stop the credential broker sidecar (if running).
+        # Stop the credential broker sidecar if running.
         if broker_proc is not None and broker_proc.poll() is None:
             with contextlib.suppress(Exception):
                 broker_proc.terminate()
                 broker_proc.wait(timeout=5)
-        # #119c: stop the egress proxy sidecar + REVERT the firewall (remove the cgroup
-        # jump + the SBX_EGRESS chain) so a stopped bot never leaves a dangling rule.
+        # Stop the egress proxy sidecar and revert the firewall.
+        # - Removes the cgroup jump and the `SBX_EGRESS` chain
+        # - A stopped bot never leaves a dangling rule
         if egress_proc is not None and egress_proc.poll() is None:
             with contextlib.suppress(Exception):
                 egress_proc.terminate()

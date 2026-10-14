@@ -1,20 +1,17 @@
-# Runtime dependencies — Python 3.11+
-# Setup:
-#   python3 -m venv .venv && . .venv/bin/activate
-#   pip install -r requirements/base.txt
-#
-# claude-agent-sdk drives the Claude Code CLI (`claude`), which must be installed and
-# logged in to a Claude Pro/Max subscription.
+# Runtime dependencies, Python 3.11+.
+# - Setup: create a venv, then pip install this file
+# - claude-agent-sdk drives the claude CLI
+# - CLI must be installed and logged in (Pro/Max)
 
 aiogram==3.28.2
-# #410: claude-agent-sdk 0.2.163 bundles CLI 2.1.286, which knows the Opus 5.5 /
-# Sonnet 5.5 ids; the sandboxed sessions run the host CLI staged at /usr/local/bin/claude.
+# claude-agent-sdk 0.2.163 bundles CLI 2.1.286 with new model ids.
+# - Sandboxed sessions run the host CLI at /usr/local/bin/claude
 claude-agent-sdk==0.2.163
 aiosqlite==0.22.1
 python-dotenv==1.2.2
-# Pillow: renders wide tables as PNG images.
+# Pillow renders wide tables as PNG images.
 Pillow==12.2.0
-# cairosvg: renders inline <svg> diagram as PNG images.
+# cairosvg renders inline SVG diagrams as PNG images.
 cairosvg==2.9.0
 
 # requirements/dev.txt and requirements/voice.txt are optional.

@@ -1,7 +1,6 @@
-# Optional dependency for local voice-note transcription.
-#   pip install -r requirements/voice.txt
-#
-# Also requires the ffmpeg system binary on PATH (Debian/Ubuntu: apt-get install ffmpeg)
-# to decode Telegram Opus/OGG voice notes to 16 kHz mono PCM.
+# Optional local voice-note transcription dependencies.
+# - Install with pip from this file
+# - Needs the ffmpeg binary on PATH
+# - Decodes Telegram Opus/OGG to 16 kHz mono PCM
 
 faster-whisper>=1.0,<2

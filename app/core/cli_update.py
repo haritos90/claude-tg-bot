@@ -1,22 +1,10 @@
-"""Keep the Claude Code CLI current (#412).
+"""Keep the Claude Code CLI current.
 
-A model release needs a CLI that knows the new model (its id and request shape), and the
-bot takes its model list from the CLI itself (``app/core/models.py``) — so the bot keeps the
-CLI current on its own instead of waiting for a manual update + restart:
-
-* :func:`update_and_stage` runs the host CLI's own updater (``claude update``), then
-  :func:`stage`;
-* :func:`stage` copies the host CLI to :data:`STAGED_PATH` — the binary a jail running under
-  a per-session NON-ROOT uid execs, since it cannot reach ``~/.local`` (``/root`` is 0700) —
-  whenever the host CLI's resolved version path changed since the last copy (a marker file
-  records it). The copy goes through a temp file + ``os.replace``, so a jail starting at that
-  moment execs either the old or the new binary, never a half-written one, and a running
-  client keeps the inode it started with until the reaper frees it.
-
-``SessionManager.start_cli_updater`` runs it once a day at ``CLI_UPDATE_AT_UTC`` (default 12:00
-UTC, owner-adjustable in /settings → Admin, "off" = never — #423; was the
-``CLI_UPDATE_INTERVAL_HOURS`` cadence) and then recycles idle clients onto the new binary.
-Everything here BLOCKS (subprocess + file copy) — call it through ``asyncio.to_thread``.
+- `update_and_stage` runs `claude update`, then `stage`
+- `stage` copies the CLI to `STAGED_PATH` for jails
+- Jail uid cannot read ~/.local, hence the copy
+- Copy is atomic via temp file and `os.replace`
+- Blocking: call through `asyncio.to_thread`
 """
 
 from __future__ import annotations
@@ -36,8 +24,10 @@ _UPDATE_TIMEOUT_SEC = 600
 
 
 def host_cli() -> str | None:
-    """The host CLI's RESOLVED path (``~/.local/bin/claude`` is a symlink into
-    ``~/.local/share/claude/versions/<ver>``), or None when no CLI is installed."""
+    """Host CLI's resolved path, or None if absent.
+
+    - `~/.local/bin/claude` symlinks into a versioned directory
+    """
     path = shutil.which("claude") or os.path.expanduser("~/.local/bin/claude")
     if not path or not os.path.exists(path):
         return None
@@ -45,8 +35,10 @@ def host_cli() -> str | None:
 
 
 def version_of(path: str | None) -> str:
-    """The CLI version at ``path`` — from the versioned file name when it carries one, else
-    from ``<path> --version``; "" when unknown."""
+    """CLI version at `path`, or empty if unknown.
+
+    - Parsed from file name, else `--version`
+    """
     if not path:
         return ""
     m = _VERSION_RE.search(os.path.basename(path))
@@ -62,7 +54,10 @@ def version_of(path: str | None) -> str:
 
 
 def staged_source(dst: str = STAGED_PATH) -> str:
-    """The host CLI path the staged copy was taken from ("" when never staged)."""
+    """Host CLI path the staged copy came from.
+
+    - Empty string when never staged
+    """
     try:
         with open(dst + ".src", encoding="utf-8") as fh:
             return fh.read().strip()
@@ -71,8 +66,11 @@ def staged_source(dst: str = STAGED_PATH) -> str:
 
 
 def stage(dst: str = STAGED_PATH) -> str | None:
-    """Copy the host CLI to ``dst`` when its resolved path changed since the last copy (or
-    ``dst`` is missing). Returns the source path when it copied, None when nothing changed."""
+    """Copy host CLI to `dst` if its path changed.
+
+    - Also copies when `dst` is missing
+    - Returns source path if copied, else None
+    """
     src = host_cli()
     if not src:
         return None
@@ -89,9 +87,11 @@ def stage(dst: str = STAGED_PATH) -> str | None:
 
 
 def run_update(timeout: float = _UPDATE_TIMEOUT_SEC) -> tuple[bool, str]:
-    """Run ``claude update`` (the CLI's own installer/updater — it only swaps the versioned
-    binary + symlink). Returns (succeeded, last output line). Never raises. The API-key
-    variables are stripped like for every spawned CLI (subscription only)."""
+    """Run `claude update`; return (succeeded, last output line).
+
+    - Never raises
+    - API-key variables are stripped (subscription only)
+    """
     exe = shutil.which("claude") or os.path.expanduser("~/.local/bin/claude")
     if not exe or not os.path.exists(exe):
         return False, "claude CLI not found"
@@ -102,7 +102,7 @@ def run_update(timeout: float = _UPDATE_TIMEOUT_SEC) -> tuple[bool, str]:
                            capture_output=True, text=True, timeout=timeout)
     except subprocess.TimeoutExpired:
         return False, f"timed out after {int(timeout)}s"
-    except Exception as exc:  # never let an updater hiccup escape into the loop
+    except Exception as exc:  # updater errors must not escape
         return False, f"{type(exc).__name__}: {exc}"
     lines = [ln.strip() for ln in ((r.stdout or "") + "\n" + (r.stderr or "")).splitlines()
              if ln.strip()]
@@ -111,11 +111,11 @@ def run_update(timeout: float = _UPDATE_TIMEOUT_SEC) -> tuple[bool, str]:
 
 @dataclass
 class UpdateResult:
-    ok: bool          # the updater exited cleanly
-    before: str       # host CLI version before the run
-    after: str        # host CLI version after the run
-    staged: bool      # the jail copy was refreshed
-    detail: str       # the updater's last output line
+    ok: bool          # updater exited cleanly
+    before: str       # host version before run
+    after: str        # host version after run
+    staged: bool      # jail copy was refreshed
+    detail: str       # updater's last output line
 
     @property
     def changed(self) -> bool:
@@ -123,9 +123,11 @@ class UpdateResult:
 
 
 def update_and_stage(stage_jail: bool = True) -> UpdateResult:
-    """One update round: ``claude update``, then re-stage the jail copy (when the jail uses
-    one). The stage step runs even when the updater failed, so a host CLI updated by other
-    means (an interactive ``claude`` session auto-updating) still reaches the jails."""
+    """Run one update round, then re-stage jail copy.
+
+    - Staging runs even if the updater failed
+    - Covers a host CLI updated by other means
+    """
     before = version_of(host_cli())
     ok, detail = run_update()
     after = version_of(host_cli())

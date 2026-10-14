@@ -1,31 +1,18 @@
-"""Localization (l10n) for the bot's OWN user-facing strings.
+"""Localization for the bot's own user-facing strings.
 
-English ("en") is the CANONICAL source locale (AGENTS.md golden rule #1): the
-English column must always be complete.
-Other locales are translation layers on top — adding a language is just adding a
-column to LANGUAGES and filling that column in CATALOG (missing entries fall back
-to English at lookup time, so a half-translated locale never crashes the bot).
-
-Scope is the bot's INTERFACE only — command replies, menus, buttons, errors,
-confirmations. Claude's actual answers are NOT translated here; the model already
-mirrors the user's language. Code, comments, docstrings and the docs stay
-English; the Russian text below is *data*, not source identifiers.
-
-The per-user choice (which column to use) is auto-detected from the Telegram
-client `language_code` on first contact, persisted in the DB, and overridable via
-/language or /settings. The resolved choice is cached here per user id so the hot
-path never hits the DB.
+- English is the canonical, always-complete locale
+- Missing entries in other locales fall back to English
+- Covers the interface only, not Claude's answers
+- Resolved per-user locale is cached to avoid DB hits
 """
 
 from __future__ import annotations
 
-# Canonical source locale; used as the fallback whenever a key lacks a
-# translation in the requested locale.
+# Canonical source locale and fallback for missing translations.
 DEFAULT_LANG = "en"
 
-# Supported locales -> their display name, each written in its own language
-# (shown in the /language picker). Extend this and add the matching column to
-# every CATALOG row to support another language.
+# Supported locales and their native display names.
+# - Add the matching column to every `CATALOG` row
 LANGUAGES: dict[str, str] = {
     "en": "English",
     "ru": "Русский",
@@ -33,50 +20,46 @@ LANGUAGES: dict[str, str] = {
 
 
 def normalize_lang(code: str | None) -> str:
-    """Map a Telegram `language_code` ('ru', 'ru-RU', 'en-US', None) to a
-    supported locale, falling back to DEFAULT_LANG for anything unknown."""
+    """Map a Telegram `language_code` to a supported locale."""
     if not code:
         return DEFAULT_LANG
     base = str(code).split("-", 1)[0].strip().lower()
     return base if base in LANGUAGES else DEFAULT_LANG
 
 
-# --------------------------------------------------------------------------- #
-# Per-user language cache (resolved once per user, by LanguageMiddleware).
-# --------------------------------------------------------------------------- #
+# Per-user language cache, resolved once by middleware.
 _user_lang: dict[int, str] = {}
 
 
 def has_lang(user_id: int) -> bool:
-    """True iff this user's locale has already been resolved this process."""
+    """True if this user's locale is already resolved."""
     return user_id in _user_lang
 
 
 def cached_lang(user_id: int) -> str:
-    """Return the user's resolved locale, or DEFAULT_LANG if not yet resolved."""
+    """Return the user's resolved locale, or the default."""
     return _user_lang.get(user_id, DEFAULT_LANG)
 
 
 def remember_lang(user_id: int, lang: str) -> None:
-    """Cache a user's locale (validated against LANGUAGES)."""
+    """Cache a user's locale, validated against `LANGUAGES`."""
     _user_lang[user_id] = lang if lang in LANGUAGES else DEFAULT_LANG
 
 
 def forget_lang(user_id: int) -> None:
-    """Drop a cached locale (e.g. after an explicit change forces a re-read)."""
+    """Drop a cached locale to force a re-read."""
     _user_lang.pop(user_id, None)
 
 
-# --------------------------------------------------------------------------- #
-# The l10n table. Rows = message keys; columns = languages. Every row MUST have
-# an "en" entry. HTML tags and {placeholders} must match across columns.
-# --------------------------------------------------------------------------- #
+# The l10n table: rows are keys, columns are languages.
+# - Every row needs an "en" entry
+# - HTML tags and placeholders must match across columns
 CATALOG: dict[str, dict[str, str]] = {
-    # -- common atoms ------------------------------------------------------- #
+    # -- common atoms --
     "common.error": {"en": "Error.", "ru": "Ошибка."},
     "common.switched": {"en": "Switched.", "ru": "Переключено."},
     "common.created": {"en": "Created.", "ru": "Создано."},
-    # #328: shown to users while the maintenance sentinel is up (data frozen for a migration).
+    # Shown to users while the maintenance sentinel is up.
     "maintenance.notice": {
         "en": "🛠 The service is updating and will be back in ~15 minutes. Your sessions and history are saved — please try again shortly.",
         "ru": "🛠 Сервис обновляется и вернётся примерно через 15 минут. Ваши сессии и история сохранены — попробуйте чуть позже.",
@@ -104,7 +87,7 @@ CATALOG: dict[str, dict[str, str]] = {
     "common.favorited": {"en": "⭐ Added to favorites.", "ru": "⭐ Добавлено в избранное."},
     "common.unfavorited": {"en": "Removed from favorites.", "ru": "Убрано из избранного."},
 
-    # -- generic buttons ---------------------------------------------------- #
+    # -- generic buttons --
     "btn.back": {"en": "◂ Back", "ru": "◂ Назад"},
     "btn.close": {"en": "✖ Close", "ru": "✖ Закрыть"},
     "btn.cancel": {"en": "✖ Cancel", "ru": "✖ Отмена"},
@@ -118,7 +101,7 @@ CATALOG: dict[str, dict[str, str]] = {
     "btn.downgrade_chat": {"en": "💬 Convert to chat", "ru": "💬 Сделать чатом"},
     "btn.code": {"en": "🟩 Code", "ru": "🟩 Код"},
     "btn.stop": {"en": "⏹ Stop", "ru": "⏹ Стоп"},
-    # -- /sessions per-session options menu + browser actions (#95) --------- #
+    # -- /sessions options menu and browser actions --
     "btn.switch": {"en": "✅ Switch", "ru": "✅ Переключиться"},
     "btn.recap": {"en": "📋 Recap", "ru": "📋 Сводка"},
     "btn.status": {"en": "ℹ️ Status", "ru": "ℹ️ Статус"},
@@ -128,12 +111,11 @@ CATALOG: dict[str, dict[str, str]] = {
     "btn.export_files": {"en": "📦 Export files", "ru": "📦 Экспорт файлов"},
     "btn.favorite": {"en": "⭐ Favorite", "ru": "⭐ В избранное"},
     "btn.unfavorite": {"en": "☆ Unfavorite", "ru": "☆ Из избранного"},
-    # #282: ➕ marks these as CREATE actions, distinct from a fresh session's name (an
-    # empty session is now "Untitled"/"Без названия", not "New chat" — no more collision).
+    # Plus sign marks create actions, unlike an untitled session.
     "btn.new_chat": {"en": "➕ New chat", "ru": "➕ Новый чат"},
     "btn.new_code": {"en": "➕ New code", "ru": "➕ Новый код"},
 
-    # -- session mode words / taglines -------------------------------------- #
+    # -- session mode words and taglines --
     "mode.word_chat": {"en": "chat", "ru": "чат"},
     "mode.word_code": {"en": "code", "ru": "код"},
     "mode.tagline_chat": {
@@ -146,17 +128,15 @@ CATALOG: dict[str, dict[str, str]] = {
         "ru": "{glyph} <b>Код</b> — агент Claude Code: запускает инструменты и "
               "правит файлы.{where}",
     },
-    # Terminal-style prompt line appended to the code tagline when a cwd is known.
+    # Terminal-style prompt line appended when a cwd is known.
     "mode.tagline_where": {
         "en": "\n<code>{cwd} $</code>",
         "ru": "\n<code>{cwd} $</code>",
     },
 
-    # -- /help, /start ------------------------------------------------------ #
-    # #148: /help is GENERATED from the command registry (commands.COMMANDS, grouped
-    # by help_group) so it can't drift from the menu. i18n carries only the intro
-    # blurb, the per-group headers, and the footer; the command lines come from the
-    # registry labels. (The old hand-written help.text command list is retired.)
+    # -- /help, /start --
+    # - Help is generated from the command registry
+    # - i18n holds only intro, group headers, and footer
     "help.intro": {
         "en": (
             "<b>Your personal Claude &amp; Claude Code in Telegram</b>\n"
@@ -204,7 +184,7 @@ CATALOG: dict[str, dict[str, str]] = {
     "help.group_meta": {"en": "<b>Meta</b>", "ru": "<b>Прочее</b>"},
     "help.group_owner": {"en": "<b>Owner</b>", "ru": "<b>Владелец</b>"},
 
-    # -- /language ---------------------------------------------------------- #
+    # -- /language --
     "lang.title": {
         "en": "🌐 <b>Language</b>\nCurrent: <b>{name}</b>\nTap to change:",
         "ru": "🌐 <b>Язык</b>\nТекущий: <b>{name}</b>\nНажмите, чтобы изменить:",
@@ -215,7 +195,7 @@ CATALOG: dict[str, dict[str, str]] = {
     },
     "lang.row": {"en": "🌐 Language: {name} ▸", "ru": "🌐 Язык: {name} ▸"},
 
-    # -- /settings ---------------------------------------------------------- #
+    # -- /settings --
     "settings.open_error": {
         "en": "Could not open settings: {err}",
         "ru": "Не удалось открыть настройки: {err}",
@@ -252,8 +232,7 @@ CATALOG: dict[str, dict[str, str]] = {
     "tool.scope_code": {"en": "code", "ru": "код"},
     "settings.row_users": {"en": "👥 Users ▸", "ru": "👥 Пользователи ▸"},
     "settings.row_admin": {"en": "👑 Admin ▸", "ru": "👑 Админ ▸"},
-    # #178 + owner Admin hub: the /settings → Admin sub-page (archive retention,
-    # global owner toggles, and user-management command launchers).
+    # The /settings Admin sub-page: retention, global toggles, user-management launchers.
     "admin.title": {"en": "👑 <b>Admin</b>\nOwner controls and archive retention.",
                     "ru": "👑 <b>Администрирование</b>\nНастройки владельца и хранение архивов."},
     "admin.retention": {"en": "🗄 Archive retention: {val} ▸",
@@ -271,7 +250,7 @@ CATALOG: dict[str, dict[str, str]] = {
     },
     "admin.gsl_saved": {"en": "✓ Global session limit: {val} per user.",
                         "ru": "✓ Глобальный лимит сессий: {val} на пользователя."},
-    # #261: global idle → fresh-session window (owner-set in Admin).
+    # Global idle window before a fresh session starts.
     "admin.idle_btn": {"en": "💤 New session after idle: {val} ▸",
                        "ru": "💤 Новая сессия после простоя: {val} ▸"},
     "admin.idle_title": {
@@ -284,7 +263,7 @@ CATALOG: dict[str, dict[str, str]] = {
     "admin.idle_off": {"en": "Off (never)", "ru": "Выкл (никогда)"},
     "admin.idle_mins": {"en": "{n} min", "ru": "{n} мин"},
     "admin.idle_hours": {"en": "{n} h", "ru": "{n} ч"},
-    # #412/#423: Admin → Claude Code CLI page (version, last check, daily update time, check now).
+    # Admin page for the Claude Code CLI: version, update schedule.
     "admin.cli_btn": {"en": "🔄 CLI update: {val} ▸", "ru": "🔄 Обновление CLI: {val} ▸"},
     "admin.cli_title": {
         "en": "🔄 <b>Claude Code CLI</b>\nVersion: <code>{ver}</code>\nLast check: {last}",
@@ -317,8 +296,8 @@ CATALOG: dict[str, dict[str, str]] = {
     "admin.ret_days": {"en": "{n} days", "ru": "{n} дн."},
     "admin.tog_codesplit": {"en": "🧩 Code split: {val}", "ru": "🧩 Разбивка кода: {val}"},
     "admin.tog_workingplate": {"en": "⏳ Working plate: {val}", "ru": "⏳ Плашка работы: {val}"},
-    "admin.name_codesplit": {"en": "🧩 Code split", "ru": "🧩 Разбивка кода"},          # #275
-    "admin.name_workingplate": {"en": "⏳ Working plate", "ru": "⏳ Плашка работы"},     # #275
+    "admin.name_codesplit": {"en": "🧩 Code split", "ru": "🧩 Разбивка кода"},
+    "admin.name_workingplate": {"en": "⏳ Working plate", "ru": "⏳ Плашка работы"},
     "admin.btn_allow": {"en": "➕ Allow", "ru": "➕ Разрешить"},
     "admin.btn_deny": {"en": "➖ Deny", "ru": "➖ Удалить"},
     "admin.btn_level": {"en": "🎚 Level", "ru": "🎚 Уровень"},
@@ -329,23 +308,23 @@ CATALOG: dict[str, dict[str, str]] = {
     "settings.saved": {"en": "✓ Saved", "ru": "✓ Сохранено"},
     "settings.row_perm": {"en": "🔐 Permissions: {val} ▸", "ru": "🔐 Права: {val} ▸"},
     "settings.row_usage": {"en": "📊 Usage: {val} ▸", "ru": "📊 Использование: {val} ▸"},
-    # #164: warm-cache post-reply note (delegated) + auto-compact (owner/hidden).
+    # Warm-cache post-reply note and auto-compact label.
     "settings.row_hot_cache_timer": {"en": "🔥 Warm-cache note: {val}", "ru": "🔥 Заметка о тёплом кэше: {val}"},
     "settings.row_auto_compact": {"en": "📦 Auto-compact: {val}", "ru": "📦 Автокомпакт: {val}"},
     "settings.row_ctx_status": {"en": "🧠 Live context size: {val}", "ru": "🧠 Размер контекста в плашке: {val}"},
-    # #229: live task-list card toggle (code sessions).
+    # Live task-list card toggle for code sessions.
     "settings.row_todo_card": {"en": "📋 Live task list: {val}", "ru": "📋 Живой список задач: {val}"},
     "stream.context": {"en": "🧠 context {n}", "ru": "🧠 контекст {n}"},
-    # #416: draft stand-in while a table is still being written (it enters the draft complete).
+    # Draft stand-in while a table is still being written.
     "stream.table_building": {"en": "📊 Building a table… {rows}", "ru": "📊 Собираю таблицу… {rows}"},
-    # #147: bare name for the usage-display picker title (sx: hub sub-page).
+    # Bare name for the usage-display picker title.
     "settings.usage_name": {"en": "📊 Usage display", "ru": "📊 Использование"},
-    # #141: header for the per-session Tools grid ported onto the sx: hub.
+    # Header for the per-session Tools grid.
     "settings.tools_title": {
         "en": "🧰 <b>Tools</b>\nToggle the tools this session may use.",
         "ru": "🧰 <b>Инструменты</b>\nВключите инструменты, доступные этой сессии.",
     },
-    # #151 access model (menu.md §4): owner option-admin page + access levels.
+    # Owner option-admin page and access levels.
     "settings.access_delegated": {"en": "Delegated", "ru": "Делегировано"},
     "settings.access_readonly": {"en": "Read-only", "ru": "Только чтение"},
     "settings.access_hidden": {"en": "Hidden", "ru": "Скрыто"},
@@ -366,20 +345,17 @@ CATALOG: dict[str, dict[str, str]] = {
         "ru": "Только чтение — владелец не делегировал вам эту настройку.",
     },
     "settings.row_streaming": {"en": "Streaming: {val}", "ru": "Стриминг: {val}"},
-    # #154: 🗄 is the canonical memory/context emoji (🧠 is reserved for MODEL).
-    # #428: the 1M-context row is retired (1M is the models' native window). was:
-    # "settings.row_memory": {"en": "🗄 1M context: {val}", "ru": "🗄 Контекст 1M: {val}"},
-    # #140-fix: dedicated max_turns label (was reusing settings.row_model, which
-    # rendered TWO "🧠 Model" rows in the registry-driven /settings hub).
+    # File cabinet emoji means memory/context; brain is for MODEL.
+    # - Dedicated max_turns label avoids duplicate "Model" rows
     "settings.row_maxturns": {"en": "🔁 Max turns: {val} ▸", "ru": "🔁 Лимит ходов: {val} ▸"},
-    # #138: sandbox is OWNER-ONLY and hidden from non-owners in /settings.
-    # #154: 🧪 is the canonical sandbox emoji (📦 is reserved for file export).
+    # Sandbox is owner-only and hidden from non-owners.
+    # - The test-tube emoji is canonical for sandbox
     "settings.row_sandbox": {"en": "🧪 Sandbox: {val} ▸", "ru": "🧪 Песочница: {val} ▸"},
-    # #138 PART 2: the registry-driven, scope-tabbed /settings hub.
+    # Registry-driven, scope-tabbed /settings hub.
     "settings.tab_session": {"en": "📍 This session", "ru": "📍 Эта сессия"},
     "settings.tab_user": {"en": "👤 My defaults", "ru": "👤 Мои умолчания"},
     "settings.tab_global": {"en": "🌍 Global", "ru": "🌍 Глобально"},
-    # Short source badges shown next to a resolved value (which scope supplies it).
+    # Short badges showing which scope supplies a value.
     "settings.badge_session": {"en": "this session", "ru": "эта сессия"},
     "settings.badge_user": {"en": "my default", "ru": "моё умолчание"},
     "settings.badge_global": {"en": "global default", "ru": "глобально"},
@@ -387,7 +363,7 @@ CATALOG: dict[str, dict[str, str]] = {
         "en": "⚙️ <b>Settings</b> · {tab}\nTap a setting to change it.",
         "ru": "⚙️ <b>Настройки</b> · {tab}\nНажмите настройку, чтобы изменить её.",
     },
-    # One hub row: name, resolved value, and the badge of its source scope.
+    # One hub row: name, resolved value, source badge.
     "settings.v2_row": {
         "en": "{name}: {val} · {badge} ▸",
         "ru": "{name}: {val} · {badge} ▸",
@@ -402,26 +378,12 @@ CATALOG: dict[str, dict[str, str]] = {
         "ru": "Недоступно.",
     },
 
-    # -- session create / switch / rename / delete -------------------------- #
-    # #415: {meta} = the session's model + effort line (session.card_meta), as the CLI reports.
-    # #424: the confirmation is ONLY the mode glyph + the model line ("💬 Opus 5.5 · medium").
-    # was:
-    #   "en": "Created {glyph} <b>{name}</b> and switched to it.\n{meta}\n{tagline}\n"
-    #         "Send a message to start · /rename to rename · /sessions to switch.",
-    #   "ru": "Создана {glyph} <b>{name}</b>, переключаемся на неё.\n{meta}\n{tagline}\n"
-    #         "Отправьте сообщение, чтобы начать · /rename — переименовать · "
-    #         "/sessions — переключиться.",
+    # -- session create, switch, rename, delete --
+    # - `{meta}` is the CLI's model and effort line
+    # - Confirmation is only glyph plus model line
     "session.created": {"en": "{glyph} {meta}", "ru": "{glyph} {meta}"},
-    # #422/#424: the model a session runs on with its version (CLI display name) and the effort
-    # (effort.level.* when translated) — the /new confirmation and the thinking-tag first line.
+    # Model with version plus effort, for /new and thinking tag.
     "session.model_line": {"en": "{model} · {effort}", "ru": "{model} · {effort}"},
-    # #143: session.new_pick is DEAD — the /new chat/code chooser was removed in
-    # #133 (every session is born a chat and is promotable via /code), and its
-    # on_new_cb handler is commented out. Row removed (restore alongside the chooser).
-    # "session.new_pick": {
-    #     "en": "Create a new session — pick the type ...:\n{tagline_chat}\n{tagline_code}",
-    #     "ru": "Создать новую сессию — выберите тип ...:\n{tagline_chat}\n{tagline_code}",
-    # },
     "session.renamed": {
         "en": "Session renamed to <b>{name}</b>.",
         "ru": "Сессия переименована в <b>{name}</b>.",
@@ -430,25 +392,20 @@ CATALOG: dict[str, dict[str, str]] = {
         "en": "✏️ Send the new session name (or /cancel).",
         "ru": "✏️ Отправьте новое имя сессии (или /cancel).",
     },
-    # #261: RESERVED — idle rotation is currently SILENT (an auto-notice reads as spam).
-    # Kept for if/when announcing the reset is wanted; not referenced by code right now.
+    # Reserved: idle rotation is silent, so this notice is unused.
     "session.idle_reset": {
         "en": "🆕 Started a fresh session — the previous one was idle for over {mins} min, "
               "so I'm not carrying its context. Files in the workdir are kept.",
         "ru": "🆕 Начал новую сессию — предыдущая простаивала больше {mins} мин, поэтому её "
               "контекст не переношу. Файлы в рабочей папке сохранены.",
     },
-    # #273: default names lead with "New …" so it's clear the session was just started
-    # and is empty (no auto-title yet — #260 renames it once it has a conversation).
-    # #282: a fresh, never-used session reads as a placeholder ("Untitled") — the mode
-    # glyph (💬/🟩) already conveys chat vs code, and #260 auto-names it once it has a
-    # conversation. Avoids colliding with the "➕ New chat/code" create buttons.
+    # Default names read "Untitled"; the mode glyph shows type.
+    # - Avoids colliding with the create buttons
     "session.default_name_chat": {"en": "Not named yet", "ru": "Пока без названия"},
     "session.default_name_code": {"en": "Not named yet", "ru": "Пока без названия"},
     "session.first_default": {"en": "Not named yet", "ru": "Пока без названия"},
-    # #413: placeholder names an untitled session wore under earlier defaults (#273/#282 renamed
-    # them) — never rendered; read by placeholder_session_names() so the untitled sweep still
-    # recognizes an old session that never got a real name. Pipe-separated.
+    # Legacy placeholder names of untitled sessions, pipe-separated.
+    # - Never rendered; read by `placeholder_session_names()`
     "session.legacy_default_names": {
         "en": "Chat session|Code session|Session 1|New chat|New code session|Untitled",
         "ru": "Чат-сессия|Код-сессия|Сессия 1|Новый чат|Новая код-сессия|Без названия",
@@ -473,19 +430,12 @@ CATALOG: dict[str, dict[str, str]] = {
         "en": "✅ Switched to {glyph} <b>{name}</b>",
         "ru": "✅ Переключено на {glyph} <b>{name}</b>",
     },
-    # #311: dropped the "· {reqs} msgs · {toks} tok" usage stats — the Sessions UI no
-    # longer shows per-session stats.
-    # #330: dropped {sid} + {date} too — the public id and creation date are card
-    # noise; the mode glyph already conveys the type. was:
-    #   "en": "<code>{sid}</code> · Model: <code>{model}</code> · {date}",
-    #   "ru": "<code>{sid}</code> · Модель: <code>{model}</code> · {date}",
-    # #331: show the reasoning-effort tier next to the model — a bare value (e.g.
-    # high / xhigh), no extra words.
+    # Session card shows the effort tier beside the model.
     "session.card_meta": {
         "en": "Model: <code>{model}</code> · Effort: <code>{effort}</code>",
         "ru": "Модель: <code>{model}</code> · Усилие: <code>{effort}</code>",
     },
-    # #415: the same line for a model that takes no effort level (the CLI lists none for it).
+    # Same line for a model that takes no effort level.
     "session.card_meta_model": {
         "en": "Model: <code>{model}</code>",
         "ru": "Модель: <code>{model}</code>",
@@ -501,28 +451,20 @@ CATALOG: dict[str, dict[str, str]] = {
         "ru": "Не удалось удалить эту сессию — возможно, она уже удалена.",
     },
 
-    # -- /sessions browser -------------------------------------------------- #
+    # -- /sessions browser --
     "sessions.head_dm": {"en": "🗂 <b>Your sessions</b>", "ru": "🗂 <b>Ваши сессии</b>"},
     "sessions.head_group": {"en": "🗂 <b>Topics</b>", "ru": "🗂 <b>Темы</b>"},
     "sessions.head_search": {"en": " · search “{kw}”", "ru": " · поиск «{kw}»"},
     "sessions.head_total": {"en": " · {total} total", "ru": " · всего {total}"},
-    "sessions.idle_rotated": {  # #271: passive note shown when /sessions auto-rotated
+    "sessions.idle_rotated": {  # passive note after auto-rotation
         "en": "🆕 <i>Started a fresh session after a break — your previous one is saved below.</i>",
         "ru": "🆕 <i>Начата новая сессия после перерыва — предыдущая сохранена ниже.</i>",
     },
     "sessions.row": {
-        # #136: dropped the leading <code>{sid}</code> — the public id is noise to
-        # the user; the list now leads with the icon + name.
-        # #211: dropped {mode}/{date} too — the icon already conveys the mode and the
-        # date is list noise. was: "{icon} <b>{name}</b> — {mode} · {date}{mark}"
+        # The list leads with icon and name only.
         "en": "{icon} <b>{name}</b>{mark}",
         "ru": "{icon} <b>{name}</b>{mark}",
     },
-    # #311: per-session usage stats removed from the Sessions list — key retired. was:
-    #   "sessions.row_stats": {
-    #       "en": "<code>{reqs} msg · {toks} tok · {units} u</code>",
-    #       "ru": "<code>{reqs} сооб · {toks} ток · {units} ед</code>",
-    #   },
     "sessions.options_header": {
         "en": "{glyph} <b>{name}</b> — choose an action:",
         "ru": "{glyph} <b>{name}</b> — выберите действие:",
@@ -537,16 +479,14 @@ CATALOG: dict[str, dict[str, str]] = {
         "ru": "🔍 Отправьте слово для поиска по вашим сессиям (или /cancel).",
     },
     "sessions.search_toast": {"en": "Type a keyword.", "ru": "Введите слово."},
-    # #322: a New-chat tap dismisses the browser; this toast confirms + nudges to just type.
+    # Toast after a New-chat tap nudges the user to type.
     "sessions.new_chat_toast": {
         "en": "✨ New chat — just type your question.",
         "ru": "✨ Новый чат — просто напишите вопрос.",
     },
 
-    # -- /mode -------------------------------------------------------------- #
-    # #220: mode.show / mode.hint_upgrade / mode.hint_downgrade removed — they were the
-    # pre-#218 "show current mode + how to switch" copy; /mode now toggles the type
-    # directly (#218a), so nothing rendered them (dead-key cleanup).
+    # -- /mode --
+    # - /mode toggles the type directly, so no hint rows
     "mode.upgraded": {
         "en": "{glyph} <b>Upgraded to a code session.</b>{defer}\n{tagline}",
         "ru": "{glyph} <b>Повышено до код-сессии.</b>{defer}\n{tagline}",
@@ -557,13 +497,8 @@ CATALOG: dict[str, dict[str, str]] = {
     },
     "mode.already": {"en": "Already a <b>{mode}</b> session.", "ru": "Уже <b>{mode}</b>-сессия."},
     "mode.switched_toast": {"en": "Now a {mode} session.", "ru": "Теперь {mode}-сессия."},
-    # #424: unused — the /new confirmation is the model line only. Kept for a revert:
-    # "session.upgrade_hint": {
-    #     "en": "💡 This is a chat. Need to run code or edit files? Upgrade with /code.",
-    #     "ru": "💡 Это чат. Нужно запускать код или править файлы? Повысьте через /code.",
-    # },
 
-    # -- /model ------------------------------------------------------------- #
+    # -- /model --
     "model.current": {
         "en": "Current model: <code>{model}</code>",
         "ru": "Текущая модель: <code>{model}</code>",
@@ -581,9 +516,8 @@ CATALOG: dict[str, dict[str, str]] = {
         "ru": " <i>(применится после завершения текущего запуска)</i>",
     },
 
-    # -- /effort ------------------------------------------------------------ #
-    # #415: the effort levels are the CLI's own list for the session's model ({levels}), never a
-    # fixed set here. was: "default (high)" / a hardcoded "low|medium|high|xhigh|max".
+    # -- /effort --
+    # - Levels are the CLI's list for the model
     "effort.default_label": {"en": "default ({level})", "ru": "по умолчанию ({level})"},
     "effort.show": {
         "en": "Reasoning effort: <b>{cur}</b>.\nSet with "
@@ -607,9 +541,9 @@ CATALOG: dict[str, dict[str, str]] = {
         "en": "<b>{model}</b> has no reasoning-effort levels.",
         "ru": "У <b>{model}</b> нет уровней глубины рассуждений.",
     },
-    # #415: OPPORTUNISTIC display names for effort levels — the level set itself comes from the
-    # CLI (supportedEffortLevels); a level the CLI reports that has no row here is shown under
-    # its own name (i18n.maybe_t). Adding a row only adds a translation, never a level.
+    # Opportunistic display names for effort levels.
+    # - The CLI supplies the level set
+    # - A level without a row shows its own name
     "effort.level.low": {"en": "low", "ru": "низкое"},
     "effort.level.medium": {"en": "medium", "ru": "среднее"},
     "effort.level.high": {"en": "high", "ru": "высокое"},
@@ -624,15 +558,15 @@ CATALOG: dict[str, dict[str, str]] = {
         "ru": "Глубина рассуждений: <b>{cur}</b>. Выберите:",
     },
 
-    # -- /files (read-only working-dir tree; #100) -------------------------- #
-    # #136: show the session NAME, not the host path (was <code>{dir}</code>).
+    # -- /files (read-only working-dir tree) --
+    # - Shows the session name, not the host path
     "files.header": {"en": "📂 <b>{name}</b>", "ru": "📂 <b>{name}</b>"},
     "files.empty": {
         "en": "📂 <b>{name}</b> — no files yet.",
         "ru": "📂 <b>{name}</b> — пока нет файлов.",
     },
 
-    # -- /export (zip the code-session working dir) ------------------------- #
+    # -- /export (zip the code-session working dir) --
     "export.empty": {
         "en": "📦 Nothing to export — the working directory is empty.",
         "ru": "📦 Нечего экспортировать — рабочая папка пуста.",
@@ -646,49 +580,14 @@ CATALOG: dict[str, dict[str, str]] = {
         "ru": "📦 Файлы рабочей папки.",
     },
 
-    # -- /sandbox (owner per-session isolation opt-out; #104) --------------- #
-    # #234: sandbox.show / sandbox.show_scoped / sandbox.set_on / sandbox.set_off are
-    # orphaned — they advertise the `/sandbox on|off` toggle retired in #231 (no live
-    # `.py` references; the handlers that used set_on/set_off are themselves commented
-    # out). Kept commented (not deleted) per the comment-out-with-task-ref rule; the live
-    # key is `sandbox.mandatory` below. Remove outright in a later cleanup if desired.
-    # "sandbox.show": {
-    #     "en": "🧪 Sandbox for this session: <b>{state}</b> · global SANDBOX_CODE: "
-    #           "<b>{glob}</b>.\n<code>/sandbox on|off</code> — run this code session "
-    #           "with or without isolation (owner test).",
-    #     "ru": "🧪 Песочница для этой сессии: <b>{state}</b> · глобально SANDBOX_CODE: "
-    #           "<b>{glob}</b>.\n<code>/sandbox on|off</code> — запускать эту код-сессию "
-    #           "с изоляцией или без (тест владельца).",
-    # },
-    # #138 PART 2: sandbox shown with its RESOLVED value + the scope badge that
-    # supplies it (replaces the confusing two-value sandbox.show line).
-    # "sandbox.show_scoped": {
-    #     "en": "🧪 Sandbox: <b>{state}</b> <i>({scope})</i>.\n"
-    #           "<code>/sandbox on|off</code> — run this code session with or without "
-    #           "isolation (owner test).",
-    #     "ru": "🧪 Песочница: <b>{state}</b> <i>({scope})</i>.\n"
-    #           "<code>/sandbox on|off</code> — запускать эту код-сессию с изоляцией "
-    #           "или без (тест владельца).",
-    # },
-    # #231: the sandbox is mandatory now; the toggle is retired.
+    # -- /sandbox --
+    # - Sandbox is mandatory; the toggle is retired
     "sandbox.mandatory": {
         "en": "🔒 The sandbox is <b>always on</b> for every session (chat and code) — it can't be turned off. Each session runs in its own isolated jail.",
         "ru": "🔒 Песочница <b>всегда включена</b> для каждой сессии (chat и code) — отключить нельзя. Каждая сессия работает в собственном изолированном джейле.",
     },
-    # #234: orphaned with the #231 toggle retirement (callers in handlers.py are
-    # commented out). Kept commented per the comment-out-with-task-ref rule.
-    # "sandbox.set_on": {
-    #     "en": "🧪 Sandbox <b>on</b> for this session — code runs isolated.{note}",
-    #     "ru": "🧪 Песочница <b>вкл</b> для этой сессии — код выполняется в изоляции.{note}",
-    # },
-    # "sandbox.set_off": {
-    #     "en": "🧪 Sandbox <b>off</b> for this session — code runs WITHOUT isolation "
-    #           "(owner test).{note}",
-    #     "ru": "🧪 Песочница <b>выкл</b> для этой сессии — код выполняется БЕЗ изоляции "
-    #           "(тест владельца).{note}",
-    # },
 
-    # -- /secret (per-session user-supplied service credentials; #119d) ----- #
+    # -- /secret (per-session service credentials) --
     "secret.help": {
         "en": "🔐 <b>Session secrets</b>\nStored: {names}\n\nSend <code>NAME=VALUE</code> "
               "to add one (e.g. <code>GH_TOKEN=ghp_xxx</code>), or <code>/cancel</code>.\n"
@@ -719,7 +618,7 @@ CATALOG: dict[str, dict[str, str]] = {
         "ru": "🔐 Не удалось разобрать. Отправьте <code>NAME=VALUE</code> — NAME из букв, "
               "цифр и подчёркиваний (напр. <code>GH_TOKEN</code>) — или <code>/secret clear</code>.",
     },
-    # #222: the detailed how-to behind the "How to use" button on the /secret prompt.
+    # Detailed how-to behind the "How to use" button on /secret.
     "secret.guide": {
         "en": (
             "🔐 <b>Session secrets — how to use</b>\n\n"
@@ -785,7 +684,7 @@ CATALOG: dict[str, dict[str, str]] = {
     },
     "secret.btn_guide": {"en": "📖 How to use", "ru": "📖 Как использовать"},
     "settings.row_secret": {"en": "🔐 Session secrets ▸", "ru": "🔐 Секреты сессии ▸"},
-    # -- /shell (shell-mode overlay; #224) ---------------------------------- #
+    # -- /shell (shell-mode overlay) --
     "shell.code_only": {
         "en": "⌨️ Shell mode is available in <b>code</b> sessions only.",
         "ru": "⌨️ Режим shell доступен только в <b>code</b>-сессиях.",
@@ -813,8 +712,8 @@ CATALOG: dict[str, dict[str, str]] = {
         "en": "<i>(command not found — you're in shell mode; send /shell to exit)</i>",
         "ru": "<i>(команда не найдена — вы в режиме shell; отправьте /shell для выхода)</i>",
     },
-    # #245 → #227b: line-interactive commands now work (input is forwarded). Only FULL-SCREEN
-    # TUIs (vim/top/…) can't render in a chat bubble, so those are refused.
+    # Line-interactive commands work.
+    # - Full-screen TUIs can't render in a bubble; refused
     "shell.interactive": {
         "en": "🖥 Full-screen programs (<code>vim</code>, <code>top</code>, <code>less</code>, "
               "<code>man</code>, …) can't render in a chat — they're not supported. Use a "
@@ -823,7 +722,7 @@ CATALOG: dict[str, dict[str, str]] = {
               "<code>man</code>, …) не отображаются в чате — не поддерживаются. Используй "
               "не-TUI вариант (например <code>cat</code> вместо <code>less</code>).",
     },
-    # #227b: a command paused for interactive input — the next message is forwarded to it.
+    # A command paused for input receives the next message.
     "shell.awaiting": {
         "en": "⌨️ <i>Waiting for input — use the keys below, or type to filter a list / send a "
               "line. (Typed key fallback: <code>.up</code> <code>.down</code> <code>.enter</code>, "
@@ -832,25 +731,25 @@ CATALOG: dict[str, dict[str, str]] = {
               "(Текстом тоже можно: <code>.up</code> <code>.down</code> <code>.enter</code>, "
               "цепочкой: <code>.down .enter</code>.) /shell — отмена.</i>",
     },
-    # #250: the persistent shell died while a program was awaiting input — the message was
-    # INPUT (not a command), so it is dropped (never run as a one-shot command) with this notice.
+    # The persistent shell died while awaiting input.
+    # - The message was input, so it is dropped
     "shell.ended": {
         "en": "⚠️ <i>The shell ended while a program was waiting for input, so your input "
               "was discarded (not run as a command). Re-run the command to continue.</i>",
         "ru": "⚠️ <i>Shell завершился, пока программа ждала ввод — ваш ввод отброшен (не "
               "выполнен как команда). Запустите команду заново, чтобы продолжить.</i>",
     },
-    # #221: startup owner alert when the uid doctor finds an on-disk collision.
+    # Startup owner alert when the uid doctor finds a collision.
     "admin.uid_collision_alert": {
-        "en": "⚠️ <b>Sandbox uid check (#221)</b> · <i>{ts}</i>\n{count} host uid(s) own more than one "
+        "en": "⚠️ <b>Sandbox uid check</b> · <i>{ts}</i>\n{count} host uid(s) own more than one "
               "session's files on disk — a per-session isolation gap. Usually transient: "
               "the affected sessions re-chown to a unique uid on their next turn.\n{detail}",
-        "ru": "⚠️ <b>Проверка uid песочниц (#221)</b> · <i>{ts}</i>\n{count} host-uid владеют файлами более "
+        "ru": "⚠️ <b>Проверка uid песочниц</b> · <i>{ts}</i>\n{count} host-uid владеют файлами более "
               "чем одной сессии на диске — брешь в изоляции сессий. Обычно временно: "
               "затронутые сессии перечоунятся на уникальный uid на следующем ходу.\n{detail}",
     },
 
-    # -- /maxturns ---------------------------------------------------------- #
+    # -- /maxturns --
     "maxturns.unlimited": {"en": "unlimited", "ru": "без ограничений"},
     "maxturns.show": {
         "en": "Max agentic turns: <b>{cur}</b>.\nSet with <code>/maxturns N</code> "
@@ -874,7 +773,7 @@ CATALOG: dict[str, dict[str, str]] = {
         "ru": "Макс. агентных ходов: <b>{n}</b>.{defer}",
     },
 
-    # -- /dirs -------------------------------------------------------------- #
+    # -- /dirs --
     "dirs.list": {
         "en": "<b>Extra code directories</b>\n{shown}\n\n"
               "<code>/dirs add &lt;path&gt;</code> · <code>/dirs clear</code> "
@@ -906,7 +805,7 @@ CATALOG: dict[str, dict[str, str]] = {
               "или <code>/dirs clear</code>.",
     },
 
-    # -- /fork -------------------------------------------------------------- #
+    # -- /fork --
     "fork.dm_only": {
         "en": "Forking is available for DM sessions.",
         "ru": "Форк доступен для сессий в личных сообщениях.",
@@ -927,47 +826,8 @@ CATALOG: dict[str, dict[str, str]] = {
               "ветку.",
     },
 
-    # -- /memory ------------------------------------------------------------ #
-    # #415: no model names baked in — {models} lists the models the 1M variant is enabled for
-    # (BIG_MEMORY_1M_MODELS, named via the CLI catalog). was: "active on <b>Opus</b> (auto-
-    # included on Max). On Sonnet 1M needs paid usage-credits and Haiku has no 1M, …".
-    # #428: /memory is retired — these rows are unused; kept for a revert.
-    # "memory.show": {
-    #     "en": "1M context: <b>{current}</b>.\nWhen <b>on</b>, this session requests "
-    #           "the <b>1M-token</b> context window via the model's [1m] variant — active "
-    #           "on <b>{models}</b>; on other models it has no effect. Your "
-    #           "conversation persists across restarts either way. Toggle with "
-    #           "<code>/memory on</code> / <code>/memory off</code>.",
-    #     "ru": "Контекст 1M: <b>{current}</b>.\nКогда <b>вкл</b>, эта сессия "
-    #           "запрашивает окно контекста на <b>1M токенов</b> через [1m]-вариант "
-    #           "модели — работает на <b>{models}</b>, на остальных моделях ни на что не "
-    #           "влияет. Разговор и так сохраняется между перезапусками. Переключение: "
-    #           "<code>/memory on</code> / <code>/memory off</code>.",
-    # },
-    # "memory.usage": {
-    #     "en": "Usage: <code>/memory on</code> or <code>/memory off</code>.",
-    #     "ru": "Использование: <code>/memory on</code> или <code>/memory off</code>.",
-    # },
-    # "memory.already": {
-    #     "en": "1M context is already <b>{state}</b>.",
-    #     "ru": "Контекст 1M уже <b>{state}</b>.",
-    # },
-    # "memory.on": {
-    #     "en": "1M context <b>on</b> — on <b>{models}</b> this session now uses the 1M-token "
-    #           "context window (on other models the context stays standard).{note}",
-    #     "ru": "Контекст 1M <b>вкл</b> — на <b>{models}</b> эта сессия теперь использует "
-    #           "окно контекста на 1M токенов (на остальных моделях контекст остаётся "
-    #           "стандартным).{note}",
-    # },
-    # "memory.off": {
-    #     "en": "1M context <b>off</b> — back to the standard context window.{note}",
-    #     "ru": "Контекст 1M <b>выкл</b> — назад к стандартному окну контекста.{note}",
-    # },
-    # # #352: session memory (agent-saved per-topic notes via the `remember` tool).
-    # "memory.notes": {
-    #     "en": "\n📝 Session memory: <b>{n}</b> chars saved by the agent (use /forget to clear).",
-    #     "ru": "\n📝 Память сессии: <b>{n}</b> символов сохранил агент (/forget — очистить).",
-    # },
+    # -- /memory --
+    # - /memory is retired; these rows are unused
     "forget.empty": {
         "en": "📝 Session memory is already empty — nothing to forget.",
         "ru": "📝 Память сессии уже пуста — забывать нечего.",
@@ -977,7 +837,7 @@ CATALOG: dict[str, dict[str, str]] = {
         "ru": "📝 Память сессии очищена (<b>{n}</b> символов).{note}",
     },
 
-    # -- /cwd --------------------------------------------------------------- #
+    # -- /cwd --
     "cwd.current": {
         "en": "Current working directory: <code>{cwd}</code>",
         "ru": "Текущая рабочая папка: <code>{cwd}</code>",
@@ -997,7 +857,7 @@ CATALOG: dict[str, dict[str, str]] = {
         "ru": "Рабочая папка (режим кода): <code>{cwd}</code>{defer}",
     },
 
-    # -- /permissions ------------------------------------------------------- #
+    # -- /permissions --
     "perm.current": {
         "en": "Current code-mode permissions: <b>{current}</b>",
         "ru": "Текущие права режима кода: <b>{current}</b>",
@@ -1028,9 +888,8 @@ CATALOG: dict[str, dict[str, str]] = {
         "en": "Permissions set to <b>{name}</b> — {help}.{note}",
         "ru": "Права установлены в <b>{name}</b> — {help}.{note}",
     },
-    # #223: "perm.help.ask" removed — "ask" is dropped; auto-edits is the floor now (the
-    # #119 sandbox makes per-tool prompting unnecessary). en was: "ask before every tool
-    # — Bash, Write, Edit, web (maximum oversight)".
+    # The "ask" permission is dropped; auto-edits is the floor.
+    # - The sandbox makes per-tool prompting unnecessary
     "perm.help.auto-edits": {
         "en": "default — auto-run edits & safe commands; ask only for push, destructive or web/outbound actions",
         "ru": "по умолчанию — авто-запуск правок и безопасных команд; спрашивать только push, разрушительные и сетевые действия",
@@ -1046,7 +905,7 @@ CATALOG: dict[str, dict[str, str]] = {
               "лимита; песочница всё равно ограничивает этим сеансом",
     },
 
-    # -- /auto -------------------------------------------------------------- #
+    # -- /auto --
     "auto.owner_only": {
         "en": "Only the owner can toggle auto mode.",
         "ru": "Переключать авто-режим может только владелец.",
@@ -1075,7 +934,7 @@ CATALOG: dict[str, dict[str, str]] = {
         "ru": "Авто-режим <b>выкл</b> — опасные инструменты снова спрашивают.{note}",
     },
 
-    # -- /usage ------------------------------------------------------------- #
+    # -- /usage --
     "usage.current": {
         "en": "Current usage display: <b>{current}</b>",
         "ru": "Текущий показ использования: <b>{current}</b>",
@@ -1086,8 +945,7 @@ CATALOG: dict[str, dict[str, str]] = {
         "en": "Unknown usage mode. Use one of: {names}",
         "ru": "Неизвестный режим использования. Используйте один из: {names}",
     },
-    # --- #164: /limits (own / account), /userstats table, working-plate line,
-    #     warm-cache note. ---
+    # -- /limits, /userstats table, working-plate line, warm-cache note --
     "limits.header": {"en": "📊 <b>Your limits</b>", "ru": "📊 <b>Ваши лимиты</b>"},
     "limits.today": {"en": "Last 5h", "ru": "За 5ч"},
     "limits.week": {"en": "This week", "ru": "За неделю"},
@@ -1099,7 +957,7 @@ CATALOG: dict[str, dict[str, str]] = {
         "en": "<i>Windows are rolling (trailing 5h / 7d, matching Anthropic's reset).</i>",
         "ru": "<i>Окна скользящие (последние 5ч / 7д, как сброс у Anthropic).</i>",
     },
-    # #419: usage and caps are tokens (input + output); the weighted-units note is retired.
+    # Usage and caps are tokens (input plus output).
     "limits.account_header": {
         "en": "📊 <b>Account usage</b> (subscription, owner)",
         "ru": "📊 <b>Использование аккаунта</b> (подписка, владелец)",
@@ -1113,7 +971,7 @@ CATALOG: dict[str, dict[str, str]] = {
     "userstats.col_total": {"en": "Total", "ru": "Всего"},
     "userstats.col_req": {"en": "Req", "ru": "Запр"},
     "userstats.col_last": {"en": "Last", "ru": "Актив."},
-    # #419: tokens only (input + output). The #293 weighted-units columns are retired.
+    # Tokens only (input plus output).
     "userstats.col_5h_tok": {"en": "5h tok", "ru": "5ч ток"},
     "userstats.col_wk_tok": {"en": "Wk tok", "ru": "Нед ток"},
     "userstats.col_tot_tok": {"en": "Tot tok", "ru": "Σ ток"},
@@ -1153,7 +1011,7 @@ CATALOG: dict[str, dict[str, str]] = {
         "ru": "показывать и строку, и закреплённое сообщение",
     },
 
-    # -- /codesplit (owner: each code block as its own message) ------------- #
+    # -- /codesplit (owner: each code block as own message) --
     "codesplit.owner_only": {
         "en": "Only the owner can change message formatting.",
         "ru": "Менять форматирование сообщений может только владелец.",
@@ -1174,7 +1032,7 @@ CATALOG: dict[str, dict[str, str]] = {
         "en": "🧩 Each code block as its own message: <b>{state}</b>.",
         "ru": "🧩 Каждый блок кода — отдельным сообщением: <b>{state}</b>.",
     },
-    # -- /workingplate (#175) ---------------------------------------------- #
+    # -- /workingplate --
     "workingplate.show": {
         "en": "⏳ \"Working…\" + ⏹ Stop plate: <b>{state}</b>.\n"
               "<b>on</b> — show the plate (with the Stop button + your limits/context) "
@@ -1191,7 +1049,7 @@ CATALOG: dict[str, dict[str, str]] = {
         "ru": "⏳ Плашка «Working…» + ⏹ Stop: <b>{state}</b>.",
     },
 
-    # -- /stop -------------------------------------------------------------- #
+    # -- /stop --
     "stop.error": {
         "en": "Error while stopping: {err}",
         "ru": "Ошибка при остановке: {err}",
@@ -1199,13 +1057,13 @@ CATALOG: dict[str, dict[str, str]] = {
     "stop.done": {"en": "Stopped. Queue cleared.", "ru": "Остановлено. Очередь очищена."},
     "stop.nothing": {"en": "Nothing to stop.", "ru": "Нечего останавливать."},
 
-    # -- /whoami ------------------------------------------------------------ #
+    # -- /whoami --
     "whoami": {
         "en": "Your id: <code>{uid}</code> · username: @{uname}",
         "ru": "Ваш id: <code>{uid}</code> · username: @{uname}",
     },
 
-    # -- /allow /deny /users ------------------------------------------------ #
+    # -- /allow /deny /users --
     "allow.need_arg": {
         "en": "Provide an id or username: <code>/allow 123456</code> or "
               "<code>/allow @user</code>",
@@ -1220,7 +1078,7 @@ CATALOG: dict[str, dict[str, str]] = {
         "en": "Send the numeric id or @username to revoke (or /cancel).",
         "ru": "Отправьте числовой id или @username для отзыва (или /cancel).",
     },
-    # -- /whois (owner: user -> sessions -> workdir -> transcript, #333) ------ #
+    # -- /whois (owner: user, sessions, workdir, transcript) --
     "whois.prompt": {
         "en": "🔎 Send a numeric user id to look up (or /cancel).",
         "ru": "🔎 Отправьте числовой id пользователя для поиска (или /cancel).",
@@ -1286,7 +1144,7 @@ CATALOG: dict[str, dict[str, str]] = {
         "en": "Not found in the allowlist: <code>{val}</code>.",
         "ru": "Не найдено в списке доступа: <code>{val}</code>.",
     },
-    # -- /level /expire /limit (owner access management; #102/#103/#105) ----- #
+    # -- /level /expire /limit (owner access management) --
     "level.prompt": {
         "en": "Send <code>&lt;id|@user&gt;</code> — I'll then offer chat/code — or "
               "<code>&lt;id|@user&gt; chat|code</code> directly. /cancel to stop.",
@@ -1343,7 +1201,7 @@ CATALOG: dict[str, dict[str, str]] = {
         "en": "Usage: <code>/limit &lt;id|@user&gt; &lt;tokens&gt; [day|week] | off</code> (default: day).",
         "ru": "Использование: <code>/limit &lt;id|@user&gt; &lt;токены&gt; [day|week] | off</code> (по умолчанию: day).",
     },
-    # #419: the cap is enforced in tokens (input + output); was weighted units (#165/#192).
+    # The cap is enforced in tokens (input plus output).
     "limit.set": {
         "en": "✅ <code>{val}</code> — <b>{window}</b> cap set to <b>{n}</b> tokens.",
         "ru": "✅ <code>{val}</code> — лимит на <b>{window}</b>: <b>{n}</b> токенов.",
@@ -1366,8 +1224,8 @@ CATALOG: dict[str, dict[str, str]] = {
     },
 
     "users.header": {"en": "<b>Allowed users</b>", "ru": "<b>Разрешённые пользователи</b>"},
-    # #272: the list now shows friendly name + @username (the numeric id moved to the
-    # per-user card). was: "Owner id: <code>{id}</code>" / "• <code>{id}</code>{uname} …".
+    # The list shows friendly name and @username.
+    # - The numeric id is on the user card
     "users.owner_id": {"en": "👑 <b>{who}</b>", "ru": "👑 <b>{who}</b>"},
     "users.ids": {"en": "Ids: {ids}", "ru": "Id: {ids}"},
     "users.ids_none": {"en": "Ids: (none)", "ru": "Id: (нет)"},
@@ -1381,7 +1239,7 @@ CATALOG: dict[str, dict[str, str]] = {
         "en": "<i>(no other users)</i>",
         "ru": "<i>(других пользователей нет)</i>",
     },
-    # #277: unknown-user access request → owner notice + one-tap grant.
+    # Unknown-user access request: owner notice with one-tap grant.
     "access.request_owner": {
         "en": "👤 <b>Access request</b>\n{who} (id <code>{id}</code>) tried to use the bot. Allow them?",
         "ru": "👤 <b>Запрос доступа</b>\n{who} (id <code>{id}</code>) пытается использовать бота. Разрешить?",
@@ -1393,15 +1251,15 @@ CATALOG: dict[str, dict[str, str]] = {
         "ru": "✅ Выдан доступ <code>{id}</code> — уровень <b>{level}</b>.",
     },
     "access.req_granted_toast": {"en": "Granted — {level}", "ru": "Доступ выдан — {level}"},
-    # #290: a stale Allow tap when the user is already allowed — don't silently re-set their
-    # level; tell the owner to change it from /users instead.
+    # Stale Allow tap for an already-allowed user.
+    # - Level is not reset; owner is pointed to /users
     "access.req_already": {
         "en": "ℹ️ <code>{id}</code> already has <b>{level}</b> access — change it from /users.",
         "ru": "ℹ️ <code>{id}</code> уже имеет доступ <b>{level}</b> — измените его в /users.",
     },
     "access.req_already_toast": {
         "en": "Already allowed — {level}", "ru": "Уже разрешён — {level}"},
-    # #286: exp/caps fold into {meta} — shown only when the user is actually limited/capped.
+    # Expiry and caps fold into `{meta}`, shown only when limited.
     "users.entry": {
         "en": "• {who} — <b>{level}</b>{meta}",
         "ru": "• {who} — <b>{level}</b>{meta}",
@@ -1423,7 +1281,7 @@ CATALOG: dict[str, dict[str, str]] = {
         "ru": "🔒 Лимит токенов исчерпан (<b>{used}/{grant}</b>). Попросите владельца пополнить через /limit.",
     },
 
-    # -- #120 rolling rate limits + per-user effort/permissions gates ------- #
+    # -- rolling rate limits and per-user effort/permissions gates --
     "access.rate_day_exceeded": {
         "en": "🔒 5-hour usage limit reached (<b>{used}/{cap}</b> tokens). It frees up as your last 5h of usage ages out.",
         "ru": "🔒 5-часовой лимит исчерпан (<b>{used}/{cap}</b> токенов). Освободится по мере устаревания последних 5 часов.",
@@ -1441,26 +1299,26 @@ CATALOG: dict[str, dict[str, str]] = {
         "ru": "Права применяются только к <b>код</b>-сессиям — веб-инструменты чата только для чтения и одобряются автоматически, гейтить нечего.",
     },
 
-    # -- /users list buttons + the per-user management card (#120) ---------- #
+    # -- /users list buttons and per-user management card --
     "users.tap_hint": {
         "en": "<i>Tap a user to manage memory, limits, effort, tools, expiry, and see usage.</i>",
         "ru": "<i>Нажмите на пользователя: память, лимиты, effort, инструменты, срок доступа и статистика.</i>",
     },
-    # #419: users.entry_usage (the weighted-units line above the tokens line) is retired.
-    "users.entry_usage_tok": {  # #303: the per-user tokens line (#308 NBSP-padded columns)
+    # The weighted-units usage line is retired.
+    "users.entry_usage_tok": {  # per-user tokens line, NBSP-padded columns
         "en": "<code>↳ tokens: 5h {day} · wk {week} · tot {total}</code>",
         "ru": "<code>↳ ток.: 5ч {day} · нед {week} · всего {total}</code>",
     },
     "users.btn_owner": {"en": "👑 You (owner)", "ru": "👑 Вы (владелец)"},
-    "users.btn_owner_bare": {"en": "Owner", "ru": "Владелец"},  # #272: owner label fallback
+    "users.btn_owner_bare": {"en": "Owner", "ru": "Владелец"},  # owner label fallback
     "users.btn_add": {"en": "➕ Add user", "ru": "➕ Добавить"},
     "users.btn_stats": {"en": "📊 Statistics", "ru": "📊 Статистика"},
     "users.btn_entry": {"en": "{who} · {level}", "ru": "{who} · {level}"},
     "users.btn_pending": {"en": "{who} · {level} (unpinned)", "ru": "{who} · {level} (не привязан)"},
     "usercard.title": {
-        # #308: {who} is now an interactive HTML link (friendly name + clickable @user/id),
-        # built and escaped in handlers — so NO <code> wrapper (it would kill the link) and
-        # the title is sent without re-escaping.
+        # `{who}` is an HTML link built and escaped in handlers.
+        # - No `<code>` wrapper, it would break the link
+        # - Title is sent without re-escaping
         "en": "<b>User</b> {who} {kind}",
         "ru": "<b>Пользователь</b> {who} {kind}",
     },
@@ -1489,15 +1347,15 @@ CATALOG: dict[str, dict[str, str]] = {
         "ru": "<i>Владелец всегда code и не истекает. Лимиты ниже — самоограничения для теста; сбросьте их, чтобы снова стать без лимитов.</i>",
     },
     "usercard.not_found": {"en": "User not found.", "ru": "Пользователь не найден."},
-    "usercard.btn_level": {"en": "Level: {level} ▸", "ru": "Уровень: {level} ▸"},  # #275: opens picker
-    # #154: 🗄 for memory/context (🧠 is reserved for MODEL across all surfaces).
+    "usercard.btn_level": {"en": "Level: {level} ▸", "ru": "Уровень: {level} ▸"},  # opens picker
+    # File cabinet emoji means memory/context; brain is for MODEL.
     "usercard.btn_memory": {"en": "🗄 Memory: {state}", "ru": "🗄 Память: {state}"},
     "usercard.btn_maxeffort": {"en": "⚡ Max effort: {state}", "ru": "⚡ Max effort: {state}"},
-    "usercard.pick_memory": {"en": "🗄 Global memory", "ru": "🗄 Глобальная память"},   # #275
-    "usercard.pick_maxeffort": {"en": "⚡ Max effort", "ru": "⚡ Max effort"},           # #275
-    "usercard.pick_level": {"en": "Access level", "ru": "Уровень доступа"},             # #275
+    "usercard.pick_memory": {"en": "🗄 Global memory", "ru": "🗄 Глобальная память"},
+    "usercard.pick_maxeffort": {"en": "⚡ Max effort", "ru": "⚡ Max effort"},
+    "usercard.pick_level": {"en": "Access level", "ru": "Уровень доступа"},
     "usercard.btn_tools": {"en": "🧰 Tools: {val}", "ru": "🧰 Инструменты: {val}"},
-    # #151: per-user access EXCEPTIONS (menu.md §3.4/§4).
+    # Per-user access exceptions.
     "usercard.btn_access": {"en": "🔑 Access", "ru": "🔑 Доступ"},
     "usercard.access_header": {
         "en": "🔑 <b>Access for</b> <code>{who}</code>\nPer-option access for this user "
@@ -1537,8 +1395,8 @@ CATALOG: dict[str, dict[str, str]] = {
         "en": "Send an expiry date <code>YYYY-MM-DD</code> (or <code>never</code>; /cancel).",
         "ru": "Отправьте дату окончания <code>ГГГГ-ММ-ДД</code> (или <code>never</code>; /cancel).",
     },
-    # #419: caps are compared against TOKENS (input + output) again — the #165/#192 weighted
-    # units are retired. #264: the short window is 5h (Anthropic's reset), not a day.
+    # Caps are compared against tokens (input plus output).
+    # - The short window is 5h, matching Anthropic's reset
     "usercard.prompt_day": {
         "en": "Send the 5-HOUR usage cap in <b>tokens</b> (input + output; e.g. <code>500k</code>, or <code>off</code>; /cancel).",
         "ru": "Отправьте 5-ЧАСОВОЙ лимит в <b>токенах</b> (ввод + вывод; напр. <code>500k</code>, или <code>off</code>; /cancel).",
@@ -1566,7 +1424,7 @@ CATALOG: dict[str, dict[str, str]] = {
     },
     "whoami.caps": {"en": "Limits: <b>{caps}</b>", "ru": "Лимиты: <b>{caps}</b>"},
 
-    # -- /status ------------------------------------------------------------ #
+    # -- /status --
     "status.header": {
         "en": "{glyph} <b>{name}</b> · <b>{mode}</b> session · <code>{sid}</code>",
         "ru": "{glyph} <b>{name}</b> · сессия <b>{mode}</b> · <code>{sid}</code>",
@@ -1582,15 +1440,10 @@ CATALOG: dict[str, dict[str, str]] = {
         "ru": "Показ использования: <b>{usage}</b>",
     },
     "status.streaming": {"en": "Streaming: <b>{state}</b>", "ru": "Стриминг: <b>{state}</b>"},
-    # #428: unused (the 1M toggle is retired). was:
-    # "status.big_memory": {"en": "1M context: <b>{state}</b>", "ru": "Контекст 1M: <b>{state}</b>"},
     "status.busy": {
         "en": "Busy: {busy}; queued: {queued}",
         "ru": "Занят: {busy}; в очереди: {queued}",
     },
-    # #170: native-checklist labels (the checkbox itself shows on/off).
-    # #428: unused (the 1M toggle is retired). was:
-    # "status.chk_bigmem": {"en": "1M context", "ru": "Контекст 1M"},
     "status.chk_busy": {"en": "Busy ({queued} queued)", "ru": "Занят (в очереди: {queued})"},
     "status.cache": {
         "en": "Cache window (5 min): ~{secs}s left",
@@ -1618,13 +1471,13 @@ CATALOG: dict[str, dict[str, str]] = {
         "ru": "Кэш: {read} чтение · {created} создание",
     },
     "status.cost": {"en": "Estimated cost: ${cost}", "ru": "Примерная стоимость: ${cost}"},
-    # /status rate-snapshot fallback labels (used when the multi-window block is empty).
+    # /status fallback labels when the multi-window block is empty.
     "status.rate_type": {"en": "type: {val}", "ru": "тип: {val}"},
     "status.rate_status": {"en": "status: {val}", "ru": "статус: {val}"},
     "status.rate_util": {"en": "utilization: {val}%", "ru": "загрузка: {val}%"},
     "status.rate_resets": {"en": "resets: {val}", "ru": "сброс: {val}"},
 
-    # -- /context ----------------------------------------------------------- #
+    # -- /context --
     "context.read_error": {
         "en": "Could not read context usage: <code>{err}</code>",
         "ru": "Не удалось прочитать использование контекста: <code>{err}</code>",
@@ -1644,9 +1497,8 @@ CATALOG: dict[str, dict[str, str]] = {
     },
     "context.usage": {"en": "Usage: <code>{pct}%</code>", "ru": "Заполнено: <code>{pct}%</code>"},
 
-    # -- /recap, /history --------------------------------------------------- #
-    # Model-facing instruction for the AI /recap (one-line session recap). Localized
-    # so the recap comes back in the user's UI language (the model mirrors it).
+    # -- /recap, /history --
+    # - Model-facing recap instruction, localized to the UI language
     "recap.prompt": {
         "en": "Recap our conversation so far in one short sentence.",
         "ru": "Кратко изложи нашу беседу одним коротким предложением.",
@@ -1655,9 +1507,8 @@ CATALOG: dict[str, dict[str, str]] = {
         "en": "No conversation logged yet in this session.",
         "ru": "В этой сессии ещё нет записанного разговора.",
     },
-    # #270: /recap on a session with no logged turns — don't burn a model turn producing a
-    # confused "we've never talked" recap. After a long idle gap a fresh session starts
-    # automatically, so the earlier conversation is likely a separate entry under /sessions.
+    # /recap with no logged turns skips the model call.
+    # - The earlier chat is likely a separate session
     "recap.empty_session": {
         "en": "🆕 Nothing to recap — this session has no earlier messages. After a long idle "
               "gap a fresh session starts automatically, so your previous conversation is "
@@ -1694,7 +1545,7 @@ CATALOG: dict[str, dict[str, str]] = {
         "ru": "Не удалось выгрузить расшифровку: {err}",
     },
 
-    # -- /stream ------------------------------------------------------------ #
+    # -- /stream --
     "stream.show": {
         "en": "Live streaming: <b>{current}</b>.",
         "ru": "Живой стриминг: <b>{current}</b>.",
@@ -1714,10 +1565,9 @@ CATALOG: dict[str, dict[str, str]] = {
               "сообщением.",
     },
 
-    # -- /close (frozen group path) + topic errors -------------------------- #
-    # #253: supergroup / forum-topic support is paused (rich-draft streaming does not work in
-    # supergroups — TEXTDRAFT_PEER_INVALID, #3/#39). The topic create/rename/close paths reply
-    # with this instead. Revive with the deferred #253 task.
+    # -- /close and topic errors --
+    # - Supergroup and forum-topic support is paused
+    # - Rich-draft streaming fails there with `TEXTDRAFT_PEER_INVALID`
     "topic.disabled": {
         "en": "🚧 Group (forum-topic) sessions are paused for now — please use this bot in a "
               "direct message (DM). Rich streaming isn't supported in supergroups yet.",
@@ -1764,16 +1614,10 @@ CATALOG: dict[str, dict[str, str]] = {
               "Подробности: {err}",
     },
 
-    # -- /queue ------------------------------------------------------------- #
-    # #236: ack shown when a message is accepted WHILE a turn is running (queued at
-    # the turn boundary, not injected mid-turn), and the backlog-cap rejection.
-    # #417: normally a message sent mid-reply goes INTO the running reply (no ack — like the
-    # CLI); this ack only covers the fallback before the run's client is live. No /queue any more.
-    # #427: unused — a message waiting behind the running reply is silent now. Kept for a revert:
-    # "queue.queued_ack": {
-    #     "en": "📥 Got it — I'll take this right after the current reply ({n} waiting).",
-    #     "ru": "📥 Принято — займусь этим сразу после текущего ответа (ждёт: {n}).",
-    # },
+    # -- /queue --
+    # - A message sent mid-reply goes into the running reply
+    # - The ack only covers the pre-client fallback
+    # - Waiting behind a running reply is silent
     "queue.full_reject": {
         "en": "⚠️ Too many queued ({n} max). Wait for the current reply, or /stop to interrupt.",
         "ru": "⚠️ Слишком много в очереди (макс. {n}). Дождитесь ответа или /stop, чтобы прервать.",
@@ -1795,17 +1639,17 @@ CATALOG: dict[str, dict[str, str]] = {
         "ru": "Не удалось очистить очередь: <code>{err}</code>",
     },
 
-    # -- ⏹ stop button / control message ------------------------------------ #
+    # -- stop button and control message --
     "stopbtn.stopping": {"en": "Stopping…", "ru": "Останавливаю…"},
     "stopbtn.nothing": {"en": "Nothing is running.", "ru": "Ничего не выполняется."},
     "stream.working": {"en": "⏳ <i>Working…</i>", "ru": "⏳ <i>Работаю…</i>"},
-    # #294: localize the animated <tg-thinking> placeholder + tool-phase labels to the
-    # user's language (was English-only). `thinking_words` is a comma-separated rotation
-    # list; the verbs feed tool_phase_label (emoji stays in code, verb is localized).
+    # Localized animated thinking placeholder and tool-phase labels.
+    # - `thinking_words` is a comma-separated rotation list
+    # - Verbs feed `tool_phase_label`; emoji stays in code
     "stream.thinking": {"en": "Thinking", "ru": "Думаю"},
     "stream.thinking_words": {
-        # #316: en/ru kept at the SAME count (30) — test_i18n enforces parity so a length
-        # mismatch (this shipped once as 17 vs 12) can't silently slip back in.
+        # Keep en and ru at the same count (30).
+        # - `test_i18n` enforces parity
         "en": "Thinking,Pondering,Ruminating,Cogitating,Mulling,Noodling,Percolating,"
               "Marinating,Deliberating,Contemplating,Brewing,Churning,Synthesizing,"
               "Reasoning,Considering,Puzzling,Untangling,Reflecting,Weighing,Analyzing,"
@@ -1817,9 +1661,8 @@ CATALOG: dict[str, dict[str, str]] = {
               "Перевариваю,Усваиваю,Распаковываю,Углубляюсь,Разбираюсь,Прокручиваю,"
               "Концентрируюсь,Изучаю,Рефлексирую,Структурирую",
     },
-    # #319: a SEARCH-themed gerund subset for the <tg-thinking> tag while a web search/fetch is
-    # in flight (rotated by _thinking_label(searching=True)) — so the animation reads as
-    # info-gathering, not generic "thinking". Same count en/ru (test_i18n enforces parity).
+    # Search-themed gerunds for the thinking tag during web search.
+    # - Same count en/ru; `test_i18n` enforces parity
     "stream.searching_words": {
         "en": "Searching,Looking it up,Digging,Researching,Gathering sources,Scanning,"
               "Browsing,Cross-checking,Fact-finding,Combing the web,Tracking it down,"
@@ -1839,39 +1682,38 @@ CATALOG: dict[str, dict[str, str]] = {
     "stream.verb_planning": {"en": "Planning", "ru": "Планирую"},
     "stream.verb_running": {"en": "Running", "ru": "Выполняю"},
     "stream.phase_running_any": {"en": "Running a command", "ru": "Выполняю команду"},
-    # #318/#319: the live web-research card. While the agent is still searching/reading it
-    # shows the in-progress header (stream.searching); once the turn finishes it flips to the
-    # done header (stream.sources_title). One resource per line (see sources_card_markdown).
+    # Live web-research card.
+    # - In-progress header while searching, done header after the turn
+    # - One resource per line
     "stream.searching": {"en": "🔎 Searching the web…", "ru": "🔎 Ищу в вебе…"},
     "stream.sources_title": {"en": "📚 Sources", "ru": "📚 Источники"},
     "stream.too_long": {
         "en": "📄 Response too long — sent as a file.",
         "ru": "📄 Ответ слишком длинный — отправлен файлом.",
     },
-    # #243: a >20-column table can't render as a native rich table, so it is sent as a PNG
-    # image; this note replaces the table in the rich-MARKDOWN body (so plain text, no HTML/
-    # markdown emphasis) and points at the image below.
+    # A table over 20 columns is sent as PNG.
+    # - This plain-text note replaces it in the markdown body
     "stream.wide_table": {
         "en": "📊 Table {n} ({cols} columns) — too wide to display inline; sent as an image below.",
         "ru": "📊 Таблица {n} ({cols} столбцов) — слишком широкая для встроенного показа; отправлена изображением ниже.",
     },
-    # #295: a chat reply's <svg> diagram is rasterized and sent as a photo; this note marks
-    # where it was, and svg_rendering is the transient draft placeholder while it streams.
+    # A reply's SVG diagram is rasterized, sent as photo.
+    # - The note marks its spot
+    # - `svg_rendering` is the draft placeholder
     "stream.svg_image": {
         "en": "🖼 Diagram — sent as an image below.",
         "ru": "🖼 Схема — отправлена изображением ниже.",
     },
     "stream.svg_rendering": {"en": "🖼 Rendering a diagram…", "ru": "🖼 Рисую схему…"},
-    # #344: a reply can place a point on the map — a fenced ```location block is pulled out and
-    # sent as a real Telegram map pin (sendLocation / sendVenue); this note marks where it was.
+    # A fenced location block becomes a real Telegram map pin.
+    # - This note marks where it was
     "stream.location": {
         "en": "📍 Location — sent on the map below.",
         "ru": "📍 Локация — отправлена на карте ниже.",
     },
-    # #373: the SYMMETRIC inbound path — the user drops a pin (or a named venue) from Telegram's
-    # attach menu and the coordinates are handed to the MODEL as a normal turn (plain text, not
-    # shown to the user; their own shared pin already sits in the chat). So "what's near here?" /
-    # "is this on my route?" just work. Kept English-only intent but localized like voice.model_note.
+    # Inbound location: a shared pin becomes a model turn.
+    # - Plain text, not shown to the user
+    # - Localized like `voice.model_note`
     "location.model_note": {
         "en": "[The user shared a location from Telegram. "
               "Coordinates: latitude {lat}, longitude {lon}.]",
@@ -1884,12 +1726,12 @@ CATALOG: dict[str, dict[str, str]] = {
         "ru": "[Пользователь отправил место из Telegram: {title} — {address}. "
               "Координаты: широта {lat}, долгота {lon}.]",
     },
-    # #229: header of the live task-list card ({n} total, {done} completed, {open} not done).
+    # Header of the live task-list card: total, completed, not done.
     "todo.card_header": {
         "en": "📋 {n} tasks ({done} done, {open} open)",
         "ru": "📋 {n} задач ({done} готово, {open} осталось)",
     },
-    # #188: recurring scheduled prompts.
+    # Recurring scheduled prompts.
     "schedule.usage": {
         "en": "⏰ <b>Schedule a recurring prompt</b>\nFormat: <code>/schedule &lt;when&gt; | &lt;prompt&gt;</code>\n"
               "Examples:\n• <code>/schedule every day at 9:00 | summarize my GitHub notifications</code>\n"
@@ -1941,7 +1783,7 @@ CATALOG: dict[str, dict[str, str]] = {
     "btn.sched_resume": {"en": "▶️ Resume", "ru": "▶️ Возобновить"},
     "btn.sched_delete": {"en": "🗑 Delete", "ru": "🗑 Удалить"},
 
-    # -- /retry ------------------------------------------------------------- #
+    # -- /retry --
     "retry.error": {
         "en": "Could not retry: <code>{err}</code>",
         "ru": "Не удалось повторить: <code>{err}</code>",
@@ -1949,7 +1791,7 @@ CATALOG: dict[str, dict[str, str]] = {
     "retry.ok": {"en": "Re-running the last prompt.", "ru": "Повторяю последний запрос."},
     "retry.nothing": {"en": "Nothing to retry yet.", "ru": "Пока нечего повторять."},
 
-    # -- text / attachments ------------------------------------------------- #
+    # -- text and attachments --
     "text.process_error": {
         "en": "Could not process the message: {err}",
         "ru": "Не удалось обработать сообщение: {err}",
@@ -1966,7 +1808,7 @@ CATALOG: dict[str, dict[str, str]] = {
         "en": "Could not download the file: {err}",
         "ru": "Не удалось скачать файл: {err}",
     },
-    # #187: outbox file send-back notices.
+    # Outbox file send-back notices.
     "outbox.too_big": {
         "en": "📎 Too large to send to chat: {names}. Use /export to download the workdir.",
         "ru": "📎 Слишком большие для отправки в чат: {names}. Используйте /export, чтобы скачать рабочую папку.",
@@ -2000,18 +1842,18 @@ CATALOG: dict[str, dict[str, str]] = {
         "en": "Here is a document. Summarize the key points.",
         "ru": "Вот документ. Кратко изложи ключевые моменты.",
     },
-    # #235: appended when an album exceeded the per-turn item cap.
+    # Appended when an album exceeded the per-turn item cap.
     "attach.album_dropped": {
         "en": "[{n} more file(s) in this album were skipped — over the limit]",
         "ru": "[ещё {n} файл(ов) из этого альбома пропущено — превышен лимит]",
     },
 
-    # -- voice notes (on_voice, #363) --------------------------------------- #
+    # -- voice notes --
     "voice.transcribing": {"en": "🎙 Transcribing…", "ru": "🎙 Расшифровываю…"},
     "voice.transcript_prefix": {"en": "🎙 <i>{text}</i>", "ru": "🎙 <i>{text}</i>"},
-    # PREPENDED to the transcript that goes to the MODEL (plain text — not shown to the
-    # user) so the agent KNOWS it was a voice note and doesn't guess / hedge about the
-    # medium ("looks like speech recognition"). The on-screen bubble stays clean.
+    # Prepended to the transcript sent to the model.
+    # - Hidden from the user
+    # - Tells the agent it was a voice note
     "voice.model_note": {
         "en": "[Voice message — automatic transcription below; it may contain "
               "speech-recognition errors, so interpret it by intent.]\n\n{text}",
@@ -2031,7 +1873,7 @@ CATALOG: dict[str, dict[str, str]] = {
         "ru": "🎙 Расшифровка голоса недоступна (нет ffmpeg или модели распознавания).",
     },
 
-    # -- permission gate (permissions.py) ----------------------------------- #
+    # -- permission gate --
     "permgate.allow_btn": {"en": "✅ Allow", "ru": "✅ Разрешить"},
     "permgate.deny_btn": {"en": "⛔ Deny", "ru": "⛔ Запретить"},
     "permgate.request": {
@@ -2039,7 +1881,7 @@ CATALOG: dict[str, dict[str, str]] = {
         "ru": "🔐 Запрос разрешения: <b>{tool}</b>",
     },
     "permgate.run_q": {"en": "Run this tool?", "ru": "Запустить этот инструмент?"},
-    # #434: shown when the prompt is relayed to the owner for another user's session.
+    # Shown when a prompt is relayed to the owner.
     "permgate.for_user": {
         "en": "👤 Session owner: <code>{uid}</code>",
         "ru": "👤 Владелец сессии: <code>{uid}</code>",
@@ -2067,7 +1909,7 @@ CATALOG: dict[str, dict[str, str]] = {
     },
     "permgate.processing_error": {"en": "Processing error.", "ru": "Ошибка обработки."},
 
-    # -- session manager notices (sessions.py) ------------------------------ #
+    # -- session manager notices --
     "session.not_initialized": {
         "en": "⚠️ Session not initialized.",
         "ru": "⚠️ Сессия не инициализирована.",
@@ -2077,16 +1919,15 @@ CATALOG: dict[str, dict[str, str]] = {
         "en": "⚠️ Internal error: {exc}",
         "ru": "⚠️ Внутренняя ошибка: {exc}",
     },
-    # #379: owner-only heads-up prepended above a reply a few days before the host login
-    # (OAuth refresh token) expires. Plain text (no tags) — it rides the same markdown
-    # render path as the model's answer.
+    # Owner-only heads-up above a reply before the host login expires.
+    # - Plain text; rides the markdown render path
     "session.login_expiry_warn": {
         "en": "⚠️ Server login expires in {days}d — re-login on the host with the claude CLI to avoid downtime.",
         "ru": "⚠️ Логин на сервере истекает через {days}д — перелогинься на хосте через claude CLI, чтобы не было простоя.",
     },
-    # #408: pushed to the owner when the token refresher keeps failing — the login died
-    # EARLY (revoked / rotated away), which the #379 deadline warning above cannot see.
-    # Until it is fixed every turn dies with a generic "server-side error".
+    # Pushed to the owner when token refresh keeps failing.
+    # - The login died early (revoked or rotated)
+    # - Until fixed, every turn fails with a server-side error
     "session.login_refresh_failed": {
         "en": "🔴 Server login is not refreshing ({status}, {fails} in a row). Turns will fail "
               "with a \"server-side error\" until you re-login on the host "
@@ -2104,7 +1945,7 @@ CATALOG: dict[str, dict[str, str]] = {
         "ru": "⏳ Сервер занят — ваш ход в очереди и начнётся, как только освободится слот.",
     },
 
-    # -- engine error events (engine.py emits a stable error_key) ------------ #
+    # -- engine error events (stable `error_key`) --
     "err.authentication_failed": {
         "en": "Authentication error. Check your subscription login "
               "(claude setup-token) and that ANTHROPIC_API_KEY is unset.",
@@ -2125,10 +1966,9 @@ CATALOG: dict[str, dict[str, str]] = {
         "en": "Invalid request to the model.",
         "ru": "Некорректный запрос к модели.",
     },
-    # #361: a model REFUSAL (stop_reason == "refusal") arrives from the API as an
-    # invalid_request; the engine (_refine_error) relabels it to one of these distinct
-    # keys so a safety refusal is never shown as the misleading "Invalid request to the
-    # model." A cyber-safeguard refusal (category "cyber") gets its own message.
+    # A model refusal arrives as invalid_request; the engine relabels it.
+    # - Distinct keys avoid the misleading "Invalid request" message
+    # - A cyber-safeguard refusal gets its own message
     "err.cyber_refusal": {
         "en": "The model declined this turn under its cybersecurity safeguards — a "
               "safety refusal, not a bug or a malformed request. Try a new session "
@@ -2149,9 +1989,8 @@ CATALOG: dict[str, dict[str, str]] = {
         "en": "Server-side error. Please try again.",
         "ru": "Ошибка на стороне сервера. Попробуйте ещё раз.",
     },
-    # #343: surfaced by the engine's time-to-first-token watchdog when the service emits no
-    # response within MODEL_FIRST_TOKEN_TIMEOUT_SEC (overloaded/unavailable), instead of
-    # leaving the user on an endless "thinking…" animation while the CLI silently retries.
+    # Time-to-first-token watchdog message, when the service emits nothing in time.
+    # - Avoids an endless thinking animation during silent CLI retries
     "err.service_unavailable": {
         "en": "The service is taking too long to respond — it may be temporarily "
               "overloaded or unavailable. Please try again.",
@@ -2169,12 +2008,11 @@ CATALOG: dict[str, dict[str, str]] = {
         "ru": "Ошибка выполнения: {detail}",
     },
 
-    # -- usage windows (usage.py) ------------------------------------------- #
+    # -- usage windows --
     "usage.status.ok": {"en": "OK", "ru": "OK"},
     "usage.status.high": {"en": "⚠ high", "ru": "⚠ высокое"},
     "usage.status.limited": {"en": "⛔ limited", "ru": "⛔ лимит"},
-    # #135/#137: neutral marker for a present-but-unrecognized window status — we no
-    # longer assert "OK" for a state we don't actually understand.
+    # Neutral marker for a present but unrecognized window status.
     "usage.status.unknown": {"en": "—", "ru": "—"},
     "usage.left": {"en": "{pct}% left", "ru": "осталось {pct}%"},
     "usage.resets": {"en": "resets {when}", "ru": "сброс через {when}"},
@@ -2185,96 +2023,21 @@ CATALOG: dict[str, dict[str, str]] = {
         "en": "📊 Subscription usage",
         "ru": "📊 Использование подписки",
     },
-    # Window labels (model names opus/sonnet stay English; only "overage" differs).
+    # Window labels; model names stay English, only "overage" differs.
     "usage.label.overage": {"en": "overage", "ru": "перерасход"},
 
-    # -- command-menu descriptions (setMyCommands) -------------------------- #
-    # #139: the command-menu descriptions are now the SINGLE SOURCE OF TRUTH in
-    # commands.py (the COMMANDS registry, Cmd.label["en"/"ru"]). The cmd.* rows
-    # below are SUPERSEDED for the menu and commented out (kept for audit/revert)
-    # so a command name + one-liner is defined exactly once per language. To edit
-    # a menu description, edit the matching Cmd.label in commands.py.
-    #
-    # was — replaced for #139 (now in commands.py COMMANDS registry). Note:
-    # cmd.stop / cmd.stream were stale (those handlers are commented out) and are
-    # intentionally NOT carried over; cmd.cwd / cmd.dirs / cmd.reset had no live
-    # handler and were dead — also dropped.
-    # "cmd.new": {"en": "➕ New chat session", "ru": "➕ Новая сессия (чат)"},
-    # "cmd.code": {"en": "🟩 Upgrade this session to code", "ru": "🟩 Повысить сессию до кода"},
-    # "cmd.chat": {"en": "💬 Downgrade this session to chat", "ru": "💬 Понизить сессию до чата"},
-    # "cmd.newchat": {"en": "💬 New chat session", "ru": "💬 Новая чат-сессия"},
-    # "cmd.newcode": {"en": "🟩 New code session", "ru": "🟩 Новая код-сессия"},
-    # "cmd.sessions": {
-    #     "en": "Browse / switch / delete sessions",
-    #     "ru": "Обзор / переключение / удаление сессий",
-    # },
-    # "cmd.rename": {"en": "Rename the current session", "ru": "Переименовать текущую сессию"},
-    # "cmd.status": {"en": "Current session info", "ru": "Сведения о текущей сессии"},
-    # "cmd.stop": {"en": "Stop the current reply", "ru": "Остановить текущий ответ"},
-    # "cmd.retry": {"en": "Re-run the last prompt", "ru": "Повторить последний запрос"},
-    # "cmd.clear": {"en": "Clear the session context", "ru": "Очистить контекст сессии"},
-    # "cmd.reset": {"en": "Clear the session context (alias of /clear)", "ru": "Очистить контекст (синоним /clear)"},
-    # "cmd.model": {
-    #     "en": "Switch model: opus | sonnet | haiku",
-    #     "ru": "Сменить модель: opus | sonnet | haiku",
-    # },
-    # "cmd.effort": {"en": "Reasoning depth: low … max", "ru": "Глубина рассуждений: low … max"},
-    # "cmd.fork": {
-    #     "en": "Branch this session into a new one",
-    #     "ru": "Ответвить эту сессию в новую",
-    # },
-    # "cmd.memory": {
-    #     "en": "1M context window (chat): on | off",
-    #     "ru": "Окно контекста 1M (чат): on | off",
-    # },
-    # "cmd.permissions": {
-    #     "en": "Code tool policy: ask | auto-edits | plan",
-    #     "ru": "Политика инструментов кода: ask | auto-edits | plan",
-    # },
-    # "cmd.cwd": {"en": "Working directory (code sessions)", "ru": "Рабочая папка (код-сессии)"},
-    # "cmd.dirs": {"en": "Extra code directories", "ru": "Доп. папки для кода"},
-    # "cmd.files": {"en": "Browse the working-dir tree (code)", "ru": "Дерево рабочей папки (код)"},
-    # "cmd.export": {"en": "Export working-dir files as .zip (code)", "ru": "Экспорт файлов рабочей папки (.zip, код)"},
-    # "cmd.sandbox": {"en": "Toggle this code session's sandbox (owner)", "ru": "Песочница код-сессии вкл/выкл (владелец)"},
-    # "cmd.maxturns": {"en": "Cap agentic turns (code)", "ru": "Лимит агентных ходов (код)"},
-    # "cmd.recap": {"en": "Show the last exchange", "ru": "Показать последний обмен"},
-    # "cmd.history": {
-    #     "en": "Export this session's transcript",
-    #     "ru": "Выгрузить расшифровку этой сессии",
-    # },
-    # "cmd.usage": {"en": "Subscription-usage display", "ru": "Показ использования подписки"},
-    # "cmd.context": {"en": "Context-window usage", "ru": "Использование окна контекста"},
-    # "cmd.queue": {"en": "Show the pending-prompt queue", "ru": "Показать очередь запросов"},
-    # "cmd.clearqueue": {"en": "Clear the pending queue", "ru": "Очистить очередь"},
-    # "cmd.stream": {"en": "Live streaming: on | off", "ru": "Живой стриминг: on | off"},
-    # "cmd.settings": {"en": "Open the settings menu", "ru": "Открыть меню настроек"},
-    # "cmd.tools": {"en": "Configure this session's tools", "ru": "Настроить инструменты сессии"},
-    # "cmd.language": {"en": "Choose the interface language", "ru": "Выбрать язык интерфейса"},
-    # "cmd.help": {"en": "Show help", "ru": "Показать справку"},
-    # "cmd.whoami": {"en": "Show your id and username", "ru": "Показать ваш id и username"},
-    # "cmd.auto": {
-    #     "en": "Run code tools without asking (owner)",
-    #     "ru": "Запускать инструменты кода без вопросов (владелец)",
-    # },
-    # "cmd.allow": {"en": "Allow a user (owner)", "ru": "Разрешить пользователя (владелец)"},
-    # "cmd.deny": {"en": "Remove a user (owner)", "ru": "Удалить пользователя (владелец)"},
-    # "cmd.users": {"en": "List allowed users (owner)", "ru": "Список пользователей (владелец)"},
-    # "cmd.level": {"en": "Set a user's access level (owner)", "ru": "Уровень доступа (владелец)"},
-    # "cmd.expire": {"en": "Set a user's access expiry (owner)", "ru": "Срок доступа (владелец)"},
-    # "cmd.limit": {"en": "Top up a user's token grant (owner)", "ru": "Пополнить лимит токенов (владелец)"},
+    # -- command-menu descriptions --
+    # - Menu descriptions live in the commands registry labels
+    # - Edit `Cmd.label` there, not here
 }
 
 
 def t(key: str, lang: str = DEFAULT_LANG, /, **kwargs) -> str:
-    """Look up `key` in the requested locale and format it with `kwargs`.
+    """Look up `key` for a locale and format with `kwargs`.
 
-    `lang` is positional-only so a catalog placeholder named ``{lang}`` (or any
-    other t-parameter name) can still be supplied via kwargs without colliding.
-
-    Falls back to the English column when the locale lacks the key, and to the
-    raw key when the key itself is unknown — so a missing translation degrades
-    gracefully (visible, never a crash). HTML tags and placeholders are part of
-    the stored value and must match across columns.
+    - `lang` is positional-only so `{lang}` can be a kwarg
+    - Falls back to English, then to the raw key
+    - HTML tags and placeholders must match across columns
     """
     row = CATALOG.get(key)
     if row is None:
@@ -2289,35 +2052,35 @@ def t(key: str, lang: str = DEFAULT_LANG, /, **kwargs) -> str:
     return text
 
 
-# --------------------------------------------------------------------------- #
-# Small display helpers (so on/off, yes/no and the mode word localize once).
-# --------------------------------------------------------------------------- #
+# Small display helpers: on/off, yes/no, mode word.
 def onoff(value: bool, lang: str = DEFAULT_LANG) -> str:
-    """Localized 'on'/'off' for a boolean."""
+    """Localized on/off for a boolean."""
     return t("common.on", lang) if value else t("common.off", lang)
 
 
 def yesno(value: bool, lang: str = DEFAULT_LANG) -> str:
-    """Localized 'yes'/'no' for a boolean."""
+    """Localized yes/no for a boolean."""
     return t("common.yes", lang) if value else t("common.no", lang)
 
 
 def mode_word(mode: str, lang: str = DEFAULT_LANG) -> str:
-    """Localized session-type word for display ('chat'/'code')."""
+    """Localized session-type word for display."""
     return t("mode.word_code" if mode == "code" else "mode.word_chat", lang)
 
 
 def maybe_t(key: str, lang: str = DEFAULT_LANG, fallback: str = "", /, **kwargs) -> str:
-    """#415: OPPORTUNISTIC translation — ``t(key)`` when the catalog has that row, else
-    ``fallback`` verbatim. For names that come from outside the bot (e.g. the CLI's effort
-    levels): a known name gets translated, an unknown one is shown as it came."""
+    """Translate `key` if the catalog has it, else `fallback`.
+
+    - For names that come from outside the bot
+    """
     return t(key, lang, **kwargs) if key in CATALOG else fallback
 
 
 def placeholder_session_names() -> set[str]:
-    """#413: every name a session carries while still untitled — the current default names in
-    every locale plus the legacy defaults — so the untitled sweep can tell an unnamed session
-    from one that already holds a real (auto) name."""
+    """Every name an untitled session may carry, in all locales.
+
+    - Includes legacy defaults so the untitled sweep recognizes them
+    """
     out: set[str] = set()
     for key in ("session.default_name_chat", "session.default_name_code",
                 "session.first_default"):
@@ -2328,5 +2091,5 @@ def placeholder_session_names() -> set[str]:
 
 
 def lang_name(lang: str) -> str:
-    """Display name of a locale (its own language), or the code if unknown."""
+    """Display name of a locale, or the code if unknown."""
     return LANGUAGES.get(lang, lang)

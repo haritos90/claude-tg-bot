@@ -1,9 +1,9 @@
-"""Unit tests for the db layer (#12).
+"""Unit tests for the db layer.
 
-Each test runs against a fresh temp SQLite file. We drive the async API with
-asyncio.run() inside sync test functions, resetting the module-level connection
-+ lock first so each test gets its own connection bound to its own event loop —
-this avoids needing pytest-asyncio (and the cross-loop lock reuse it would risk).
+- each test uses a fresh temp SQLite file
+- async API driven by `asyncio.run()` in sync tests
+- module-level connection and lock reset per test
+- avoids `pytest-asyncio` and cross-loop lock reuse
 """
 
 import asyncio
@@ -28,12 +28,9 @@ def test_allocate_dm_session_negative_key_and_mode():
         assert code < 0 and chat < 0 and code != chat
         sc, sh = await db.get_thread(code), await db.get_thread(chat)
         assert sc.mode == "code" and sh.mode == "chat"
-        # #140: per-session working dir is named by the public id, not the key.
-        # #181: nested layout — the cwd is <id>/work (state is the sibling).
-        # #332: that public id is the ULID (was the 6-hex session_sid).
-        # was: assert sc.cwd.endswith(str(code))                 # pre-#140
-        # was: assert sc.cwd.endswith(db.session_sid(code))       # pre-#181
-        # was: assert sc.cwd.endswith(db.session_sid(code)+"/work")  # pre-#332 (6-hex)
+        # Per-session working dir is named by the public id.
+        # - nested layout: cwd is `<id>/work`, state is the sibling
+        # - the public id is the ULID
         assert sc.cwd.endswith(db.session_pubid(code) + "/work")
         assert sh.cwd.endswith(db.session_pubid(chat) + "/work")
         await db.close_db()
@@ -42,22 +39,24 @@ def test_allocate_dm_session_negative_key_and_mode():
 
 
 def test_user_default_roundtrip_and_clear():
-    """#138 USER-scope storage: set/get a per-user default (JSON-encoded in kv),
-    None clears it, and a garbled value degrades to None."""
+    """User-scope storage: per-user default stored JSON-encoded in kv.
+
+    - `None` clears it; a garbled value degrades to `None`
+    """
     async def _t():
         await db.init_db(tempfile.mktemp(suffix=".db"))
         assert await db.get_user_default(7, "model") is None
         await db.set_user_default(7, "model", "claude-sonnet-4-6")
         assert await db.get_user_default(7, "model") == "claude-sonnet-4-6"
-        # Non-string JSON values round-trip too (bool/int).
+        # Non-string JSON values (bool, int) round-trip too.
         await db.set_user_default(7, "memory", True)
         assert await db.get_user_default(7, "memory") is True
         # Isolated per uid.
         assert await db.get_user_default(8, "model") is None
-        # Clearing deletes the row → back to None.
+        # Clearing deletes the row, giving `None`.
         await db.set_user_default(7, "model", None)
         assert await db.get_user_default(7, "model") is None
-        # Garbled raw value degrades to None.
+        # A garbled raw value degrades to `None`.
         await db.set_kv("user_default:7:bad", "{not json")
         assert await db.get_user_default(7, "bad") is None
         await db.close_db()
@@ -78,11 +77,12 @@ def test_stream_flag_persists():
 
 
 def test_session_name_auto_then_manual_pin(tmp_path):
-    # #260: a new session is auto-namable; the auto-namer (manual=False) writes the
-    # label and leaves name_auto on; a manual /rename (manual=True) pins the name and
-    # turns auto OFF, after which the auto-namer is a no-op.
+    # A new session is auto-namable.
+    # - auto-namer writes the label and keeps `name_auto` on
+    # - manual rename pins the name and turns auto off
+    # - afterwards the auto-namer is a no-op
     async def _t():
-        # #292: tmp_path (pytest auto-cleans) instead of tempfile.mktemp (leaks .db files).
+        # `tmp_path` auto-cleans, unlike `tempfile.mktemp` which leaks db files.
         await db.init_db(str(tmp_path / "names.db"))
         k = await db.allocate_dm_session(1, "s", "m", "/tmp", mode="code")
         st = await db.get_thread(k)
@@ -90,12 +90,12 @@ def test_session_name_auto_then_manual_pin(tmp_path):
         await db.set_session_name(k, "Auto title", manual=False)
         st = await db.get_thread(k)
         assert st.name == "Auto title" and st.name_auto is True
-        # #345: a LATER auto write (the agent's ai-title) overrides an earlier auto name
-        # (the #345 message fallback) while still auto — i.e. agent name > fallback.
+        # A later auto write overrides an earlier auto name.
+        # - agent title beats the message fallback
         await db.set_session_name(k, "Better auto title", manual=False)
         st = await db.get_thread(k)
         assert st.name == "Better auto title" and st.name_auto is True
-        await db.set_session_name(k, "My name")   # manual /rename (default)
+        await db.set_session_name(k, "My name")   # manual rename (default)
         st = await db.get_thread(k)
         assert st.name == "My name" and st.name_auto is False
         await db.set_session_name(k, "Late auto", manual=False)  # no-op once pinned
@@ -107,63 +107,61 @@ def test_session_name_auto_then_manual_pin(tmp_path):
 
 
 def test_browse_threads_surfaces_name_auto_for_gc_guard(tmp_path):
-    # #334: the empty-session GC (_gc_untitled_empties) spares a MANUALLY-renamed session via
-    # `r.get("name_auto", True)` — which only works if browse_threads actually RETURNS name_auto
-    # in its page dicts. It was SELECTed but dropped from the dict, so the guard always saw the
-    # default True and a renamed-but-empty session was wrongly reset + archived. Lock the field
-    # in, and mirror the GC's candidate predicate to prove the renamed session is now spared.
+    # The empty-session GC spares manually renamed sessions via `name_auto`.
+    # - works only if `browse_threads` returns `name_auto`
+    # - mirror the GC candidate predicate to prove it
     async def _t():
         await db.init_db(str(tmp_path / "gc.db"))
         uid = 5
         auto = await db.allocate_dm_session(uid, "Auto", "m", "/tmp", mode="chat")
         named = await db.allocate_dm_session(uid, "Auto2", "m", "/tmp", mode="chat")
-        await db.set_session_name(named, "My project")   # manual /rename → name_auto False
+        await db.set_session_name(named, "My project")   # manual rename: `name_auto` False
         page, _ = await db.browse_threads(uid, None, limit=100, offset=0)
         await db.close_db()
         return page, auto, named
     page, auto, named = _run(_t)
     by_id = {r["thread_id"]: r for r in page}
-    # The field is surfaced and reflects the manual rename (KeyError here pre-#334).
+    # The field is surfaced and reflects the manual rename.
     assert by_id[auto]["name_auto"] is True
     assert by_id[named]["name_auto"] is False
-    # The GC's candidate filter (handlers `_gc_untitled_empties`) now spares the renamed one.
-    keep = auto  # pretend `auto` is the current/target session, never a candidate
+    # The GC candidate filter now spares the renamed one.
+    keep = auto  # `auto` is current, never a candidate
     cands = {r["thread_id"] for r in page
              if r["thread_id"] != keep and r["thread_id"] < 0
              and not r.get("favorite") and r.get("name_auto", True)}
-    assert named not in cands   # manually-renamed empty session is NOT collected by the GC
-    assert auto not in cands    # the kept/current session is never a candidate either
+    assert named not in cands   # renamed empty session is not collected
+    assert auto not in cands    # kept session is never a candidate
 
 
 def test_browse_threads_orders_by_last_activity_not_creation(tmp_path):
-    # #364: writing in an existing session must float it back to the top. The list was
-    # ordered by created_at, so an OLD session you kept chatting in never moved up. Order
-    # by max(last_active, created_at): an active session sorts by last_active; a fresh /
-    # never-completed one (last_active=0) falls back to created_at.
+    # Writing in an existing session floats it to the top.
+    # - order by `max(last_active, created_at)`
+    # - never-completed session (`last_active=0`) uses `created_at`
     async def _t():
         await db.init_db(str(tmp_path / "order.db"))
         uid = 9
         a = await db.allocate_dm_session(uid, "Italy trip", "m", "/tmp", mode="chat")
         b = await db.allocate_dm_session(uid, "Groceries", "m", "/tmp", mode="chat")
         c = await db.allocate_dm_session(uid, "Fresh", "m", "/tmp", mode="chat")
-        # last_active is a wall-clock stamp; use values well past created_at (~now) so the
-        # override dominates. `a` was created FIRST but is active MOST recently → top.
+        # `last_active` is wall-clock; use values well past `created_at`.
+        # - `a` was created first but is active most recently: top
         await db.set_last_active(a, 9_000_000_100.0)
         await db.set_last_active(b, 9_000_000_050.0)
-        # `c` never completed a turn (last_active stays 0) → sorts by its own created_at,
-        # which is newest, yet it must land LAST because a/b have real activity.
+        # `c` never completed a turn, so it sorts by `created_at`.
+        # - it must land last: a and b have real activity
         page, _ = await db.browse_threads(uid, None, limit=100, offset=0)
         await db.close_db()
         return [r["thread_id"] for r in page], a, b, c
     order, a, b, c = _run(_t)
-    assert order == [a, b, c]   # most-recently-active first; never-active oldest
+    assert order == [a, b, c]   # most recently active first; never-active oldest
 
 
 def test_last_active_and_idle_rotation_keeps_messages(tmp_path):
-    # #261: last_active roundtrips; rotate_session_for_idle drops the resume ids but
-    # keeps the message log + cwd (unlike reset_thread, which wipes messages).
+    # `last_active` roundtrips; idle rotation drops resume ids.
+    # - keeps the message log and cwd
+    # - unlike `reset_thread`, which wipes messages
     async def _t():
-        # #292: tmp_path (pytest auto-cleans) instead of tempfile.mktemp (leaks .db files).
+        # `tmp_path` auto-cleans, unlike `tempfile.mktemp` which leaks db files.
         await db.init_db(str(tmp_path / "idle.db"))
         k = await db.allocate_dm_session(1, "s", "m", "/tmp/wd", mode="code")
         cwd_before = (await db.get_thread(k)).cwd
@@ -206,7 +204,7 @@ def test_rate_history_append_and_trim():
     async def _t():
         await db.init_db(tempfile.mktemp(suffix=".db"))
         await db.append_rate_history("seven_day", 0.5, "allowed")
-        await db.append_rate_history("seven_day", None, "allowed")  # None tolerated
+        await db.append_rate_history("seven_day", None, "allowed")  # `None` tolerated
         hist = await db.get_rate_history("seven_day")
         assert len(hist) == 2 and hist[0]["utilization"] == 0.5
         await db.close_db()
@@ -249,14 +247,14 @@ def test_delete_dm_session_scoped_and_clears_messages():
 
 
 def test_forward_migration_adds_columns_with_defaults():
-    # A db that predates the post-release columns (only the original minimal
-    # `threads` schema) must be migrated in place by init_db's guarded ALTER
-    # block — get_thread should then return the newer fields at their defaults.
+    # A pre-release db is migrated in place by `init_db`.
+    # - only the original minimal `threads` schema
+    # - `get_thread` then returns newer fields at defaults
     async def _t():
         import aiosqlite
 
         path = tempfile.mktemp(suffix=".db")
-        # Build a fresh db with ONLY the original minimal schema + one row.
+        # Build a fresh db with the original schema, one row.
         conn = await aiosqlite.connect(path)
         await conn.execute(
             "CREATE TABLE threads ("
@@ -271,12 +269,12 @@ def test_forward_migration_adds_columns_with_defaults():
         await conn.commit()
         await conn.close()
 
-        # Migrate the existing file and read the row back through get_thread.
+        # Migrate the existing file and read the row back.
         await db.init_db(path)
         st = await db.get_thread(-1)
         assert st is not None
-        # #278: the legacy/added 'default' permission mode is migrated to the acceptEdits
-        # baseline (so a code session auto-accepts file edits instead of prompting).
+        # Legacy `default` permission mode migrates to `acceptEdits`.
+        # - code sessions then auto-accept file edits
         assert st.permission_mode == "acceptEdits"
         assert st.big_memory is False
         assert st.stream_enabled is True
@@ -289,8 +287,8 @@ def test_forward_migration_adds_columns_with_defaults():
 
 
 def test_legacy_default_permission_mode_migrated_to_accept_edits(tmp_path):
-    # #278: a code session stored with the legacy 'default' (ask-for-EVERY-tool) is
-    # migrated to 'acceptEdits' on init, so file creation/edits stop prompting.
+    # A code session stored as legacy `default` migrates on init.
+    # - file creation and edits then stop prompting
     async def _t():
         path = str(tmp_path / "perm.db")
         await db.init_db(path)
@@ -300,7 +298,7 @@ def test_legacy_default_permission_mode_migrated_to_accept_edits(tmp_path):
         )
         await db._require_conn().commit()
         await db.close_db()
-        # Re-open → the data migration runs.
+        # Re-open: the data migration runs.
         await db.init_db(path)
         st = await db.get_thread(-9)
         assert st.permission_mode == "acceptEdits"
@@ -314,7 +312,7 @@ def test_favorite_flag_persists_and_sorts_first():
         await db.init_db(tempfile.mktemp(suffix=".db"))
         a = await db.allocate_dm_session(7, "old", "m", "/tmp/wd")
         b = await db.allocate_dm_session(7, "new", "m", "/tmp/wd")
-        # Default: not favorite; newest (b) listed first.
+        # Default: not favorite; newest listed first.
         rows, total = await db.browse_threads(7)
         assert total == 2 and rows[0]["thread_id"] == b
         assert rows[0]["favorite"] is False
@@ -329,9 +327,12 @@ def test_favorite_flag_persists_and_sorts_first():
 
 
 def test_usage_is_tokens_only_and_breakdown():
-    """#419 (was #165's weighted units): usage and the cap basis are input + output TOKENS —
-    no model weight, no cache multipliers — and the breakdown rolls up by the user's DM
-    chat_id. The retired "units" measure fails loudly instead of mis-summing."""
+    """Usage and cap basis are input plus output tokens.
+
+    - no model weight, no cache multipliers
+    - breakdown rolls up by the user's DM `chat_id`
+    - the retired "units" measure fails loudly
+    """
     import pytest
 
     async def _t():
@@ -345,7 +346,7 @@ def test_usage_is_tokens_only_and_breakdown():
              "cache_creation_input_tokens": 200, "cache_read_input_tokens": 10000},
             0.0, model="claude-opus-5-5", context_tokens=42000,
         )
-        assert await db.get_user_usage_window(uid) == 1100          # default = tokens
+        assert await db.get_user_usage_window(uid) == 1100          # default: tokens
         await db.add_usage(key, {"input_tokens": 10, "output_tokens": 0}, 0.0)
         assert await db.get_user_usage_window(uid) == 1110
         bd = await db.get_user_breakdown(uid)
@@ -360,23 +361,25 @@ def test_usage_is_tokens_only_and_breakdown():
 
 
 def test_usage_survives_session_delete(tmp_path):
-    """#309: a user's token usage must OUTLIVE deleting the session it was spent in —
-    it still feeds their lifetime totals + rolling-limit windows (keyed by chat_id), so
-    deleting a session can't silently shrink recorded spend or dodge the caps."""
+    """Token usage outlives deleting the session it was spent in.
+
+    - still feeds lifetime totals and rolling-limit windows
+    - keyed by `chat_id`, so deletion can't dodge caps
+    """
     async def _t():
-        # #337: tmp_path (pytest auto-cleans) instead of tempfile.mktemp (leaks .db files).
+        # `tmp_path` auto-cleans, unlike `tempfile.mktemp` which leaks db files.
         await db.init_db(str(tmp_path / "usage.db"))
         uid = 7
         key = await db.allocate_dm_session(uid, "s", "m", "/tmp", mode="code")
         await db.add_usage(key, {"input_tokens": 1000, "output_tokens": 100}, 0.0)
-        # Baseline: the spend is attributed to the user across all three aggregations.
+        # Baseline: spend counts for the user in all aggregations.
         assert await db.get_user_usage_window(uid, measure="raw") == 1100
         assert (await db.get_user_breakdown(uid))["total"] == 1100
         assert any(r["uid"] == uid for r in await db.get_all_users_breakdown())
         # Delete the session the usage was spent in.
         assert await db.delete_dm_session(uid, key) is True
-        assert await db.get_thread(key) is None            # session gone…
-        # …but the usage still counts toward the user's totals + rolling window.
+        assert await db.get_thread(key) is None            # session gone
+        # Usage still counts toward totals and the rolling window.
         assert await db.get_user_usage_window(uid, measure="raw") == 1100
         bd = await db.get_user_breakdown(uid)
         assert bd["total"] == 1100 and bd["requests"] == 1
@@ -387,22 +390,24 @@ def test_usage_survives_session_delete(tmp_path):
 
 
 def test_claim_session_uid_stable_and_collision_free():
-    """#221: the host-uid registry hands out the preferred hash uid when free, the SAME
-    uid on repeat (stability), a DIFFERENT uid when two sids' hashes collide, and reuses
-    a freed slot after release."""
+    """Host-uid registry: preferred hash uid, stable, collision-free.
+
+    - same uid on repeat; distinct uid on hash collision
+    - a freed slot is reused after release
+    """
     async def _t():
         await db.init_db(tempfile.mktemp(suffix=".db"))
         lo, hi = 700000, 700000 + 60000
-        # preferred free → returns preferred, and is STABLE across calls.
+        # Preferred is free: returned, and stable across calls.
         u1 = await db.claim_session_uid("aaaaaa", 700005, lo, hi)
         assert u1 == 700005
         assert await db.claim_session_uid("aaaaaa", 700005, lo, hi) == 700005
-        # DIFFERENT sids with the SAME preferred must each get a DISTINCT uid (probe).
+        # Different sids with the same preferred get distinct uids.
         u2 = await db.claim_session_uid("bbbbbb", 700005, lo, hi)
         u3 = await db.claim_session_uid("cccccc", 700005, lo, hi)
         assert len({u1, u2, u3}) == 3
         assert all(lo <= u < hi for u in (u2, u3))
-        # release frees u1's slot → the next colliding sid reuses it.
+        # Release frees a slot; the next colliding sid reuses it.
         await db.release_session_uid("aaaaaa")
         assert await db.claim_session_uid("dddddd", 700005, lo, hi) == 700005
         await db.close_db()
@@ -411,8 +416,10 @@ def test_claim_session_uid_stable_and_collision_free():
 
 
 def test_claim_session_uid_exhaustion_falls_back():
-    """#221: when the whole window is taken, fall back to the clamped preferred rather
-    than fail the session (collisions become possible again only here)."""
+    """A full window falls back to the clamped preferred uid.
+
+    - collisions become possible again only here
+    """
     async def _t():
         await db.init_db(tempfile.mktemp(suffix=".db"))
         lo, hi = 1000, 1002  # span = 2
@@ -426,33 +433,34 @@ def test_claim_session_uid_exhaustion_falls_back():
 
 
 def test_uid_collisions_pure():
-    """#221 doctor: group sids by uid, report only uids shared by >1 sid."""
+    """Doctor groups sids by uid, reporting only shared uids."""
     assert db._uid_collisions({"a": 700001, "b": 700002}) == {}
     assert db._uid_collisions({"a": 700001, "b": 700001, "c": 700002}) == {700001: ["a", "b"]}
     assert db._uid_collisions({}) == {}
-    # #232: uid 0 (root) is the no-jail / unassigned default, never a collision — even
-    # when shared by >1 sid it must be excluded (added in #231).
+    # uid 0 (root) is never a collision, even when shared.
     assert db._uid_collisions({"a": 0, "b": 0}) == {}
     assert db._uid_collisions({"a": 0, "b": 0, "c": 700001, "d": 700001}) == {700001: ["c", "d"]}
 
 
 def test_sandbox_uid_collisions_scan():
-    """#221 doctor: two work dirs sharing an owner are reported; dirs without a work
-    subdir and non-dir entries are skipped; a lone session is clean."""
+    """Doctor reports work dirs sharing an owner.
+
+    - dirs without `work` and non-dir entries are skipped
+    - a lone session is clean
+    """
     import os
 
     base = tempfile.mkdtemp()
     os.makedirs(os.path.join(base, "sidA", "work"))
-    os.makedirs(os.path.join(base, "sidB", "work"))  # same owner (test uid) → collide
-    os.makedirs(os.path.join(base, "sidC"))          # no work dir → skipped
+    os.makedirs(os.path.join(base, "sidB", "work"))  # same owner (test uid): collide
+    os.makedirs(os.path.join(base, "sidC"))          # no work dir: skipped
     with open(os.path.join(base, "loose.txt"), "w") as fh:
-        fh.write("x")                                # not a dir → skipped
-    # was: assert db.sandbox_uid_collisions(base) == {os.getuid(): ["sidA", "sidB"]}
-    #   — replaced for #232. The work dirs are owned by the test process's uid; under the
-    #   #231 root-exclusion that owner only counts as a collision when it is NON-root. On a
-    #   root host (this VPS runs as uid 0) the scan now correctly returns {}, so branch.
+        fh.write("x")                                # not a dir: skipped
+    # Work dirs belong to the test process uid.
+    # - a root owner is excluded: root hosts return `{}`
+    # - the assertion branches on root
     if os.getuid() == 0:
-        assert db.sandbox_uid_collisions(base) == {}     # root owner excluded (#231)
+        assert db.sandbox_uid_collisions(base) == {}     # root owner excluded
     else:
         assert db.sandbox_uid_collisions(base) == {os.getuid(): ["sidA", "sidB"]}
 
@@ -462,7 +470,7 @@ def test_sandbox_uid_collisions_scan():
 
 
 def test_user_last_active_roundtrip_default_zero():
-    # #329: per-USER idle clock (not per-session) — defaults to 0, set/get roundtrips durably.
+    # Per-user idle clock defaults to 0; set/get roundtrips durably.
     async def _t():
         await db.init_db(tempfile.mktemp(suffix=".db"))
         before = await db.get_user_last_active(777)
@@ -476,34 +484,35 @@ def test_user_last_active_roundtrip_default_zero():
 
 
 def test_new_ulid_format_uniqueness_and_time_sortable():
-    # #327: 26-char Crockford base32, collision-free, timestamp prefix monotonic (sortable).
+    # ULID: 26-char Crockford base32, collision-free, sortable timestamp prefix.
     ids = [db.new_ulid() for _ in range(64)]
     assert all(len(u) == 26 for u in ids)
     assert all(c in db._CROCKFORD for u in ids for c in u)
     assert len(set(ids)) == 64
     prefixes = [u[:10] for u in ids]                 # the 48-bit ms timestamp portion
-    assert prefixes == sorted(prefixes)              # generated in time order → non-decreasing
+    assert prefixes == sorted(prefixes)              # generated in time order: non-decreasing
 
 
 def test_session_sid_is_6hex_and_pubid_uses_cache():
-    # #327 (decoupled): session_sid is ALWAYS the stable 6-hex workdir id; session_pubid is the
-    # public ULID from the cache (falling back to the 6-hex id when not yet backfilled).
+    # `session_sid` is always the stable 6-hex id.
+    # - `session_pubid` is the public ULID from the cache
+    # - falls back to the 6-hex id when not backfilled
     db._SID_BY_THREAD.pop(-424242, None)
     wid = db.session_sid(-424242)
     assert len(wid) == 6 and all(c in "0123456789abcdef" for c in wid)
-    assert db.session_pubid(-424242) == wid  # uncached → falls back to the 6-hex id
+    assert db.session_pubid(-424242) == wid  # uncached: falls back to 6-hex id
     db._SID_BY_THREAD[-424242] = "01KVQGK3G01ZH0J9CQZBW3EFD3"
-    assert db.session_pubid(-424242) == "01KVQGK3G01ZH0J9CQZBW3EFD3"  # cached → ULID
-    assert db.session_sid(-424242) == wid  # session_sid stays the 6-hex id (never the cache)
+    assert db.session_pubid(-424242) == "01KVQGK3G01ZH0J9CQZBW3EFD3"  # cached: ULID
+    assert db.session_sid(-424242) == wid  # `session_sid` stays 6-hex, never the cache
     db._SID_BY_THREAD.pop(-424242, None)
 
 
 def test_allocate_names_workdir_by_ulid(tmp_path):
-    # #332: a new session's WORKDIR is named by the PUBLIC ULID (= the sid column = the id shown
-    # in the UI), NOT the legacy 6-hex session_sid. was: test_allocate_public_ulid_but_workdir_
-    # stays_6hex (the #327-decoupled, pre-#332 behaviour).
+    # A new session's workdir is named by the public ULID.
+    # - same as the `sid` column and the UI id
+    # - not the legacy 6-hex `session_sid`
     async def _t():
-        # #337: tmp_path (pytest auto-cleans) instead of tempfile.mktemp/mkdtemp (leaks).
+        # `tmp_path` auto-cleans, unlike `tempfile.mktemp` which leaks.
         await db.init_db(str(tmp_path / "alloc.db"))
         base = str(tmp_path / "base")
         key = await db.allocate_dm_session(7, "n", "opus", base, mode="code")
@@ -515,17 +524,18 @@ def test_allocate_names_workdir_by_ulid(tmp_path):
         return key, row["sid"], row["cwd"]
     key, sid, cwd = _run(_t)
     assert len(sid) == 26 and all(c in db._CROCKFORD for c in sid)  # public id = ULID
-    assert cwd.endswith(sid + "/work")                      # #332: workdir on the ULID
-    assert not cwd.endswith(db.session_sid(key) + "/work")  # NOT the legacy 6-hex
+    assert cwd.endswith(sid + "/work")                      # workdir on the ULID
+    assert not cwd.endswith(db.session_sid(key) + "/work")  # not the legacy 6-hex
     assert db._SID_BY_THREAD.get(key) == sid                # cached as the public id
     assert db.session_pubid(key) == sid
 
 
 def test_migrate_backfills_public_ulid_db_only_and_idempotent(tmp_path):
-    # #327 (decoupled): a legacy row (no stored sid) is backfilled with a public ULID — DB ONLY, the
-    # cwd/workdir is UNCHANGED. A 2nd run is a no-op.
+    # A legacy row with no sid gets a backfilled ULID.
+    # - database only; the cwd is unchanged
+    # - a second run is a no-op
     async def _t():
-        # #337: tmp_path (pytest auto-cleans) instead of tempfile.mktemp/mkdtemp (leaks).
+        # `tmp_path` auto-cleans, unlike `tempfile.mktemp` which leaks.
         await db.init_db(str(tmp_path / "backfill.db"))
         base = str(tmp_path / "base")
         key = await db.allocate_dm_session(7, "n", "opus", base, mode="chat")
@@ -547,26 +557,27 @@ def test_migrate_backfills_public_ulid_db_only_and_idempotent(tmp_path):
     key, n1, n2, sid, cwd, cwd_before = _run(_t)
     assert n1 == 1 and n2 == 0
     assert len(sid) == 26 and all(c in db._CROCKFORD for c in sid)  # backfilled public ULID
-    assert cwd == cwd_before  # cwd UNCHANGED — migrate_sessions_to_ulid is DB-only
-    # #332: the workdir is ULID-named at allocation; the DB-only ULID backfill never touches the
-    # cwd, so it still ends in the allocate-time ULID dir (a 26-char id).
+    assert cwd == cwd_before  # cwd unchanged: DB-only migration
+    # The workdir is ULID-named at allocation.
+    # - the DB-only backfill never touches cwd
+    # - cwd still ends in the 26-char ULID dir
     assert len(Path(cwd).parent.name) == 26
     assert db._SID_BY_THREAD.get(key) == sid
 
 
 def test_migrate_workdirs_to_ulid_renames_reencodes_rekeys_idempotent(tmp_path):
-    # #332: migrate_workdirs_to_ulid renames a legacy 6-hex workdir to the ULID, re-encodes the
-    # nested transcript dir (so `resume` survives), re-keys the session_uid registry, realigns
-    # cwd, SKIPS an already-ULID session, and is idempotent.
+    # Workdir migration renames legacy 6-hex dirs to the ULID.
+    # - re-encodes the transcript dir so `resume` survives
+    # - re-keys the `session_uid` registry and realigns cwd
+    # - skips already-ULID sessions; idempotent
     def _enc(p):
         return re.sub(r"[^A-Za-z0-9]", "-", str(p))
 
     async def _t():
-        # #337: tmp_path (pytest auto-cleans) instead of tempfile.mktemp/mkdtemp (leaks).
+        # `tmp_path` auto-cleans, unlike `tempfile.mktemp` which leaks.
         await db.init_db(str(tmp_path / "workdirs.db"))
         base = tmp_path / "base"
-        # A legacy session: allocate, then force its on-disk layout to the 6-hex name (simulating
-        # a pre-#332 session) and repoint cwd at it.
+        # A legacy session: allocate, force the 6-hex layout, repoint cwd.
         key = await db.allocate_dm_session(7, "n", "opus", str(base), mode="code")
         ulid = db.session_pubid(key)
         legacy = db._derive_sid(key)
@@ -579,12 +590,12 @@ def test_migrate_workdirs_to_ulid_renames_reencodes_rekeys_idempotent(tmp_path):
         await db._conn.execute("UPDATE threads SET cwd=? WHERE thread_id=?", (str(work), key))
         await db._conn.execute("INSERT INTO session_uid (sid, uid) VALUES (?,?)", (legacy, 700123))
         await db._conn.commit()
-        # An already-ULID session (born ULID-named per #332) must be left untouched.
+        # An already-ULID session must be left untouched.
         key2 = await db.allocate_dm_session(7, "m", "opus", str(base), mode="chat")
         cwd2_before = (await db.get_thread(key2)).cwd
 
         n1 = await db.migrate_workdirs_to_ulid(str(base))
-        n2 = await db.migrate_workdirs_to_ulid(str(base))   # idempotency
+        n2 = await db.migrate_workdirs_to_ulid(str(base))   # second run is a no-op
 
         st = await db.get_thread(key)
         new_uid = await (await db._conn.execute(
@@ -602,9 +613,9 @@ def test_migrate_workdirs_to_ulid_renames_reencodes_rekeys_idempotent(tmp_path):
             old_uid_gone=(old_uid is None), cwd2_same=(cwd2_after == cwd2_before))
 
     r = _run(_t)
-    assert r["n1"] == 1 and r["n2"] == 0            # migrated the legacy one; idempotent re-run
+    assert r["n1"] == 1 and r["n2"] == 0            # legacy one migrated; re-run idempotent
     assert r["cwd"] == r["expect"]                  # cwd realigned to the ULID path
-    assert r["new_work"] and r["old_gone"]          # dir renamed 6hex -> ULID
-    assert r["new_tx"]                              # transcript re-encoded under the ULID path
-    assert r["new_uid"] == 700123 and r["old_uid_gone"]  # session_uid re-keyed, old key dropped
-    assert r["cwd2_same"]                           # the already-ULID session was untouched
+    assert r["new_work"] and r["old_gone"]          # dir renamed from 6-hex to ULID
+    assert r["new_tx"]                              # transcript re-encoded under ULID path
+    assert r["new_uid"] == 700123 and r["old_uid_gone"]  # `session_uid` re-keyed, old key dropped
+    assert r["cwd2_same"]                           # already-ULID session untouched

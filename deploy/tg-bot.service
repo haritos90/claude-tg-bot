@@ -1,62 +1,42 @@
-# systemd unit for the Claude Telegram Bot — reliable 24/7 with auto-restart.
-#
-# Install (run as root; adjust paths/User to your install — the values below match
-# the reference deployment at /root/Projects/tgbot running as root):
-#   sudo cp deploy/tg-bot.service /etc/systemd/system/claude-tg-bot.service
-#   sudo systemctl daemon-reload
-#   pkill -f 'python -m app$'               # stop any manual copy (avoid a 409)
-#   sudo systemctl enable --now claude-tg-bot
-#   journalctl -u claude-tg-bot -f
-#
-# IMPORTANT: run as the SAME user that ran `claude setup-token`, so the service can
-# read the subscription credentials from that user's ~/.claude. Never set
-# ANTHROPIC_API_KEY here — this bot runs on the Pro/Max subscription.
-#
-# RESILIENCE (why this survives a Telegram outage like the one on 2026-06-16):
-#   * Restart=always + RestartSec=5      → respawns on ANY exit/crash, and on boot.
-#   * StartLimitIntervalSec=0            → never gives up restarting (a long outage
-#                                          just keeps retrying until the path is back).
-#   * Type=notify + WatchdogSec=180      → the in-app watchdog (watchdog.py) pings
-#                                          systemd ONLY after a successful Telegram
-#                                          probe; if the bot can't reach Telegram for
-#                                          ~3 min (connection dropped / poll wedged),
-#                                          the pings stop and systemd force-restarts it.
-# Optional belt-and-suspenders: a daily restart timer — see
-# deploy/claude-tg-bot-restart.{service,timer}.
+# Systemd unit for reliable 24/7 bot operation.
+# - Install by copying to /etc/systemd/system; adjust paths
+# - Run as the user that ran setup-token
+# - Never set ANTHROPIC_API_KEY; subscription billing only
+# - Restart=always, no start limit, 180s notify watchdog
 
 [Unit]
 Description=Claude Telegram Bot (private Telegram frontend to Claude / Claude Code)
 After=network-online.target
 Wants=network-online.target
-# Never stop auto-restarting, even after many rapid failures (survive long outages).
+# Never stop restarting, surviving long outages.
 StartLimitIntervalSec=0
 
 [Service]
 Type=notify
 NotifyAccess=main
-# Force a restart if the bot stops being able to reach Telegram for this long. The
-# app sends sd_notify(WATCHDOG=1) on each successful probe (watchdog.py); WatchdogSec
-# must be >= ~2x the probe cadence so a couple of misses fit the window.
+# Restart if Telegram is unreachable this long.
+# - App pings the watchdog after each successful probe
+# - Must be at least twice the probe cadence
 WatchdogSec=180
-# Generous start timeout — the bot sends READY=1 immediately (before any network
-# I/O), so this is only a backstop; a flaky link at startup must not cause a
-# start-timeout restart loop.
+# Generous start timeout; READY=1 is sent before network I/O.
+# - Flaky startup links must not cause restart loops
 TimeoutStartSec=300
 TimeoutStopSec=60
-# #325: on stop, SIGTERM only the MAIN process (the bot), NOT the whole control-group — so the
-# bot can gracefully DRAIN in-flight turns (let the jailed `claude` children finish) instead of
-# systemd killing them mid-turn (exit -15). systemd SIGKILLs any stragglers after TimeoutStopSec.
+# On stop, SIGTERM only the main bot process.
+# - Lets the bot drain in-flight turns gracefully
+# - Stragglers are SIGKILLed after TimeoutStopSec
 KillMode=mixed
 
 User=root
 WorkingDirectory=/root/Projects/tgbot
-# was: ExecStart=… /opt/claude-tg-bot/bot.py — #302: run the app package (python -m app);
-# WorkingDirectory (above) puts the repo root on sys.path so `app` is importable.
+# Run the app package via python -m app.
+# - WorkingDirectory puts the repo root on sys.path
 ExecStart=/root/Projects/tgbot/.venv/bin/python -m app
 
-# .env is read from WorkingDirectory by python-dotenv. systemd does NOT inherit a
-# login PATH/HOME — set them so the (bundled) claude CLI + its ~/.claude creds are
-# found. HOME must be the user that ran `claude setup-token`.
+# The .env file is read from WorkingDirectory by python-dotenv.
+# - Systemd inherits no login PATH or HOME
+# - Set them so the claude CLI and creds are found
+# - HOME must be the user that ran setup-token
 Environment=PYTHONUNBUFFERED=1
 Environment=HOME=/root
 Environment=PATH=/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
@@ -66,20 +46,10 @@ RestartSec=5
 # Raise if big code-mode runs get OOM-killed.
 MemoryMax=2G
 
-# --- optional hardening (defense-in-depth) --------------------------------- #
-# Enable incrementally and VERIFY a CODE-mode session still works afterwards — the
-# bubblewrap sandbox (SANDBOX_CODE) needs user namespaces. On this host `bwrap` is
-# NOT setuid and unprivileged userns is enabled, so NoNewPrivileges is safe; keep
-# ~/.claude writable for the subscription creds, and the workdir writable for bot.db
-# + per-session workdirs. Uncomment after testing.
-# NoNewPrivileges=true
-# ProtectSystem=strict
-# ProtectHome=read-only
-# ReadWritePaths=/root/Projects/tgbot /root/.claude
-# PrivateTmp=true
-# ProtectKernelTunables=true
-# ProtectControlGroups=true
-# RestrictSUIDSGID=true
+# Optional hardening; enable incrementally and verify code mode.
+# - Sandbox needs user namespaces; bwrap is not setuid
+# - Keep ~/.claude and workdirs writable
+# - Uncomment only after testing
 
 [Install]
 WantedBy=multi-user.target

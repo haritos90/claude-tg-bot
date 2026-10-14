@@ -1,5 +1,5 @@
-# Optional dependency for Development / CI dependencies.
-#   pip install -r requirements/dev.txt
+# Optional development and CI dependencies.
+# - Install with pip from this file
 
 pytest==8.3.4
 ruff

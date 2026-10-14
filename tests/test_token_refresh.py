@@ -1,8 +1,8 @@
-"""Tests for the proactive OAuth token refresher (#191).
+"""Tests for the proactive OAuth token refresher.
 
-The network call (`_refresh_sync`) is monkeypatched, so these never touch the real
-endpoint. They verify the merge/atomic-write, the skew gate, and the fail-soft
-contract (a bad refresh leaves the creds file untouched).
+- network call `_refresh_sync` is monkeypatched
+- covers merge/atomic-write, skew gate, fail-soft contract
+- a bad refresh leaves the creds file untouched
 """
 
 import asyncio
@@ -74,14 +74,14 @@ def test_no_refresh_token_skips(monkeypatch):
 
 def test_maybe_refresh_skew_gate(monkeypatch):
     path = tempfile.mktemp(suffix=".json")
-    # Token with 2h left, skew 1h → should SKIP (no network call).
+    # Token with 2h left, skew 1h: skipped, no network call.
     _write(path, {"accessToken": "OLD", "refreshToken": "R1",
                   "expiresAt": int((time.time() + 7200) * 1000)})
     monkeypatch.setattr(token_refresh, "_refresh_sync",
                         lambda rt, to: {"access_token": "NEW", "expires_in": 28800})
     out = asyncio.run(token_refresh.maybe_refresh(path=path, skew=3600))
     assert out.startswith("skip") and _read(path)["claudeAiOauth"]["accessToken"] == "OLD"
-    # force=True refreshes regardless.
+    # `force=True` refreshes regardless.
     out = asyncio.run(token_refresh.maybe_refresh(path=path, skew=3600, force=True))
     assert out.startswith("ok") and _read(path)["claudeAiOauth"]["accessToken"] == "NEW"
     os.remove(path)
@@ -92,8 +92,11 @@ def test_missing_file_failsoft():
 
 
 def test_maybe_refresh_via_given_executor(monkeypatch):
-    """#378: the blocking refresh runs on a caller-supplied executor (refresh_loop uses a
-    dedicated 1-thread pool so a wedged sweep can't starve the shared executor)."""
+    """Blocking refresh runs on a caller-supplied executor.
+
+    - `refresh_loop` uses a dedicated 1-thread pool
+    - a wedged sweep can't starve the shared executor
+    """
     path = tempfile.mktemp(suffix=".json")
     _write(path, {"accessToken": "OLD", "refreshToken": "R1", "expiresAt": 1000})
     monkeypatch.setattr(token_refresh, "_refresh_sync",
@@ -110,7 +113,7 @@ def test_maybe_refresh_via_given_executor(monkeypatch):
 
 
 async def _run_loop_briefly(**kwargs):
-    """Spin refresh_loop for a handful of fast sweeps, then cancel it cleanly."""
+    """Spin `refresh_loop` for a few fast sweeps, then cancel."""
     task = asyncio.create_task(token_refresh.refresh_loop(**kwargs))
     await asyncio.sleep(0.1)
     task.cancel()
@@ -119,14 +122,17 @@ async def _run_loop_briefly(**kwargs):
 
 
 def test_refresh_loop_bounds_a_wedged_sweep(monkeypatch, caplog):
-    """#378: a sweep that blocks past the deadline is abandoned and the loop keeps ticking
-    and logs it — the exact failure mode that once silenced the loop for hours."""
+    """A sweep blocking past the deadline is abandoned and logged.
+
+    - the loop keeps ticking
+    - guards the failure that once silenced the loop
+    """
     async def hang(**kw):
-        await asyncio.sleep(30)          # never returns within the deadline below
+        await asyncio.sleep(30)          # never returns within the deadline
         return "ok: refreshed"
     monkeypatch.setattr(token_refresh, "maybe_refresh", hang)
-    # #380: the FIRST timeout logs at INFO now (only a repeat escalates), so capture INFO
-    # to catch it regardless of how many sweeps the brief window happens to fit.
+    # First timeout logs at INFO; capture INFO to catch it.
+    # - independent of how many sweeps the window fits
     with caplog.at_level(logging.INFO, logger="token_refresh"):
         asyncio.run(_run_loop_briefly(interval=0.005, path="/nope",
                                       sweep_deadline=0.02, heartbeat_every=0))
@@ -134,8 +140,11 @@ def test_refresh_loop_bounds_a_wedged_sweep(monkeypatch, caplog):
 
 
 def test_refresh_loop_escalates_and_heartbeats(monkeypatch, caplog):
-    """#378: consecutive failures escalate to WARNING (with a re-login hint) and a liveness
-    heartbeat is emitted — so a stuck loop is distinguishable from a healthy idle one."""
+    """Consecutive failures escalate to WARNING with a re-login hint.
+
+    - a liveness heartbeat is emitted
+    - distinguishes a stuck loop from a healthy idle one
+    """
     async def fail(**kw):
         return "fail: refresh request rejected"
     monkeypatch.setattr(token_refresh, "maybe_refresh", fail)
@@ -148,8 +157,10 @@ def test_refresh_loop_escalates_and_heartbeats(monkeypatch, caplog):
 
 
 def test_login_seconds_left_reads_refresh_expiry():
-    """#379: login expiry comes from refreshTokenExpiresAt (the ~monthly deadline), NOT
-    the 8h access-token expiresAt."""
+    """Login expiry comes from `refreshTokenExpiresAt`, not access-token `expiresAt`.
+
+    - refresh deadline is monthly; access token lasts ~8h
+    """
     path = tempfile.mktemp(suffix=".json")
     exp = int((time.time() + 2 * 86400) * 1000)          # 2 days out
     _write(path, {"accessToken": "A", "refreshToken": "R", "expiresAt": 1000,
@@ -167,7 +178,7 @@ def test_login_seconds_left_absent_field_is_none():
 
 
 def test_login_warn_days_threshold_and_floor():
-    """#379: only within the window; floors so it never overstates the days left."""
+    """Warns only within the window; floors the days left."""
     day = 86400
     assert token_refresh.login_warn_days(5 * day, warn_days=3) is None    # outside window
     assert token_refresh.login_warn_days(2.7 * day, warn_days=3) == 2     # floors, not 3
@@ -177,20 +188,26 @@ def test_login_warn_days_threshold_and_floor():
 
 
 def test_login_warn_days_exact_boundary():
-    """#380: pin the strict `>` boundary so an off-by-one flip to `>=` is caught — exactly
-    warn_days out is still INSIDE the window, a hair past it is outside."""
+    """Pins the strict `>` boundary against an off-by-one `>=`.
+
+    - exactly warn_days out is inside the window
+    - a hair past it is outside
+    """
     day = 86400
-    assert token_refresh.login_warn_days(3 * day, warn_days=3) == 3        # exactly at edge → inside
-    assert token_refresh.login_warn_days(3 * day + 1, warn_days=3) is None  # just past → outside
+    assert token_refresh.login_warn_days(3 * day, warn_days=3) == 3        # exactly at edge: inside
+    assert token_refresh.login_warn_days(3 * day + 1, warn_days=3) is None  # just past: outside
 
 
 def test_refresh_loop_escalation_resets_on_success(monkeypatch, caplog):
-    """#380: a successful sweep resets the consecutive-failure counter, so escalation is
-    CONSECUTIVE-only — after fail,fail (→ one WARNING) an ok resets and the next fail is
-    INFO again, never a second WARNING."""
+    """A successful sweep resets the consecutive-failure counter.
+
+    - after fail, fail (one WARNING), an ok resets
+    - next fail is INFO again, never a second WARNING
+    """
     calls = {"n": 0}
-    # fail, fail, ok, fail, then ok forever — the ok tail adds no warnings, so the assertion
-    # does not depend on exactly how many sweeps the brief window fits (only that it runs 4+).
+    # Script: fail, fail, ok, fail, then ok forever.
+    # - the ok tail adds no warnings
+    # - assertion needs only that 4+ sweeps run
     script = ["fail: rejected", "fail: rejected", "ok: refreshed", "fail: rejected"]
 
     async def scripted(**kw):
@@ -204,22 +221,27 @@ def test_refresh_loop_escalation_resets_on_success(monkeypatch, caplog):
                                       sweep_deadline=1.0, heartbeat_every=0))
     assert calls["n"] >= 4                          # the whole script actually ran
     warns = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
-    # Only the 2nd of the first failure pair escalates; the ok resets fails to 0, so the 4th
-    # (a lone failure, fails == 1) stays INFO — exactly one WARNING total.
+    # Only the second of the first failure pair escalates.
+    # - the ok resets fails to 0
+    # - the lone 4th failure stays INFO: one WARNING total
     assert len(warns) == 1 and "2 consecutive" in warns[0]
 
 
 def test_refresh_loop_timeout_escalates_on_repeat(monkeypatch, caplog):
-    """#380/#385/#386: the SWEEP-TIMEOUT path escalates to WARNING on the 2nd consecutive timeout
-    (the first stays INFO), independently of the fail-status path; AND #385 recreates the single-
-    thread executor after each timeout so a permanent DNS/socket wedge self-heals — the wedged
-    worker is abandoned and the next sweep gets a live pool."""
+    """Sweep timeouts escalate to WARNING on the second consecutive one.
+
+    - first timeout stays INFO
+    - independent of the fail-status path
+    - executor is recreated after each timeout
+    - so a permanent DNS/socket wedge self-heals
+    """
     async def hang(**kw):
-        await asyncio.sleep(30)                 # never returns within the tiny deadline below
+        await asyncio.sleep(30)                 # never returns within the tiny deadline
         return "ok: refreshed"
     monkeypatch.setattr(token_refresh, "maybe_refresh", hang)
-    # #385/#386: record every ThreadPoolExecutor construction — startup makes one and each sweep
-    # timeout must REPLACE it. Delete the recreate in refresh_loop and made["n"] stays 1 → this fails.
+    # Record every `ThreadPoolExecutor` construction.
+    # - startup makes one; each sweep timeout must replace it
+    # - without the recreate, the count stays 1
     made = {"n": 0}
     real_pool = token_refresh.concurrent.futures.ThreadPoolExecutor
 
@@ -236,12 +258,15 @@ def test_refresh_loop_timeout_escalates_on_repeat(monkeypatch, caplog):
     assert any(lv == logging.INFO and "1 consecutive" in m for lv, m in timeouts)     # 1st: INFO
     warns = [m for lv, m in timeouts if lv == logging.WARNING]
     assert warns and "2 consecutive" in warns[0]                                      # 2nd: WARNING
-    assert made["n"] >= 2                       # #385: startup pool + at least one per-timeout recreate
+    assert made["n"] >= 2                       # startup pool plus per-timeout recreate
 
 
 def test_refresh_loop_broken_skip_counts_as_failure(monkeypatch, caplog):
-    """#385: a 'skip: creds unreadable' / 'skip: no refresh token' means the refresher is broken,
-    not idle — it escalates like a failure (does NOT reset the streak), unlike 'skip: Ns left'."""
+    """Unreadable creds or missing refresh token escalate like a failure.
+
+    - does not reset the streak, unlike 'skip: Ns left'
+    - means the refresher is broken, not idle
+    """
     async def broken(**kw):
         return "skip: creds unreadable"
     monkeypatch.setattr(token_refresh, "maybe_refresh", broken)
@@ -253,8 +278,11 @@ def test_refresh_loop_broken_skip_counts_as_failure(monkeypatch, caplog):
 
 
 def test_refresh_loop_alerts_owner_on_persistent_failure(monkeypatch):
-    """#408: a persistent failure reaches the owner (not just journald), repeats on the
-    configured cadence while broken, and is followed by an all-clear once it recovers."""
+    """A persistent failure reaches the owner, not just journald.
+
+    - repeats on the configured cadence while broken
+    - an all-clear follows recovery
+    """
     calls: list[tuple[str, int]] = []
 
     async def alert(status, fails):
@@ -264,7 +292,7 @@ def test_refresh_loop_alerts_owner_on_persistent_failure(monkeypatch):
 
     async def fail_then_ok(**kw):
         sweeps["n"] += 1
-        # Fail long enough to cross the threshold AND hit one repeat, then recover.
+        # Fail past the threshold and one repeat, then recover.
         return "fail: refresh request rejected" if sweeps["n"] <= 5 else "ok: refreshed"
 
     monkeypatch.setattr(token_refresh, "maybe_refresh", fail_then_ok)
@@ -274,14 +302,17 @@ def test_refresh_loop_alerts_owner_on_persistent_failure(monkeypatch):
                                   sweep_deadline=1.0, heartbeat_every=0, on_alert=alert))
     fired = [c for c in calls if c[0].startswith("fail")]
     assert fired, "no owner alert on a persistent refresh failure"
-    assert fired[0][1] == 2                       # first alert at the escalation threshold
-    assert [c[1] for c in fired] == [2, 4]        # then one repeat, not one per sweep
-    assert ("ok: recovered", 0) in calls          # all-clear after it starts working again
+    assert fired[0][1] == 2                       # first alert at escalation threshold
+    assert [c[1] for c in fired] == [2, 4]        # then one repeat, not per sweep
+    assert ("ok: recovered", 0) in calls          # all-clear after it recovers
 
 
 def test_refresh_loop_alerts_immediately_on_terminal_skip(monkeypatch):
-    """#408: 'no refresh token' can never self-heal, so it alerts on the FIRST sweep instead
-    of waiting out the streak that filters transient network failures."""
+    """'No refresh token' alerts on the first sweep.
+
+    - it can never self-heal
+    - no waiting out the transient-failure streak
+    """
     calls: list[tuple[str, int]] = []
 
     async def alert(status, fails):
@@ -298,8 +329,11 @@ def test_refresh_loop_alerts_immediately_on_terminal_skip(monkeypatch):
 
 
 def test_refresh_loop_stays_quiet_while_healthy(monkeypatch):
-    """#408: the alert hook must never fire on a healthy skip (token still fresh) — that is
-    the normal state ~27 sweeps out of 28 and would be pure spam."""
+    """The alert hook never fires on a healthy skip.
+
+    - token still fresh is the normal state
+    - firing would be pure spam
+    """
     calls: list[tuple[str, int]] = []
 
     async def alert(status, fails):

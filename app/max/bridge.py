@@ -1,28 +1,10 @@
-"""aiogram sessions that carry MAX traffic (#434).
+"""aiogram sessions that carry MAX traffic.
 
-aiogram routes EVERY Bot API call through ``bot.session`` (a ``BaseSession``) as a typed
-``TelegramMethod``. That is the one seam under all 326 KB of handlers, the streamer, the
-permission gate and the session manager — so instead of a second handler layer, the MAX
-transport is a session:
-
-* ``MaxSession`` translates the methods the bot actually uses (send/edit/delete message, rich
-  message, photo/document/location, callback answer, chat action, commands, get_me, get_file)
-  into MAX Platform API calls and returns real aiogram result objects (``Message``, ``File``,
-  ``User``), bound to the bot so shortcuts like ``sent.delete()`` keep working.
-* ``RoutingSession`` wraps the real Telegram session and a ``MaxSession``; each call is routed by
-  its ``chat_id`` (MAX ids live above ``ids.MAX_ID_OFFSET``), its ``callback_query_id`` /
-  ``file_id`` prefix (``max:``), or fans out (``setMyCommands``). Calls without any address —
-  ``getMe``, ``getUpdates`` — are Telegram's, so the watchdog and polling are untouched.
-
-No streaming on MAX. Telegram drafts (``sendMessageDraft`` / ``sendRichMessageDraft``) animate a
-partial reply; MAX has no such thing, and the design is deliberate: a MAX reply is sent only once
-it is complete. The FIRST draft for a chat posts one plain "Thinking…" placeholder message
-(whatever the draft said, tags stripped — the model line and the user's language come for free);
-every further draft is ignored; the next real message to that chat EDITS the placeholder into
-itself, so the user sees the indicator turn into the answer. A draft with empty text clears it.
-
-Unsupported methods (pin, forum topics, …) raise ``TelegramBadRequest`` so the callers' existing
-best-effort ``except`` paths engage exactly as they would on a Telegram error.
+- `MaxSession` translates Bot API methods into MAX API calls
+- `RoutingSession` routes by chat, callback, or file id
+- Addressless calls (`getMe`, `getUpdates`) stay on Telegram
+- No streaming: the first draft posts a "Thinking…" placeholder
+- Unsupported methods raise `TelegramBadRequest`
 """
 
 from __future__ import annotations
@@ -47,23 +29,23 @@ from app.telegram import markup
 
 logger = logging.getLogger(__name__)
 
-PLACEHOLDER_TTL = 15 * 60   # a "Thinking…" nobody replaced (crash mid-turn) is dropped, not reused
+PLACEHOLDER_TTL = 15 * 60   # stale placeholder is dropped, not reused
 _THINKING_PREFIX = "💭 "
 
 
 class MaxSession(BaseSession):
-    """The MAX translator. One per bot token; see the module docstring."""
+    """The MAX translator, one per bot token."""
 
     def __init__(self, api: MaxApi) -> None:
         super().__init__()
         self.api = api
         self.mids = MidRegistry()
         self.files = FileRegistry()
-        # internal user id → the MAX dialog chat_id (needed only for /chats/{id}/actions)
+        # Internal user id to MAX dialog chat_id, for chat actions.
         self.chat_of_user: dict[int, int] = {}
-        # internal chat id → (mid of the live "Thinking…" placeholder, monotonic ts)
+        # Internal chat id to (live placeholder mid, monotonic timestamp).
         self._placeholders: dict[int, tuple[str, float]] = {}
-        # mid → body last sent, so an edit that changes only the keyboard can re-send the text
+        # mid to last body sent, for keyboard-only edits.
         self._bodies: dict[str, dict] = {}
         self.bot_user: dict | None = None
         self._unsupported: set[str] = set()
@@ -86,7 +68,7 @@ class MaxSession(BaseSession):
             "getFile": self._get_file,
         }
 
-    # ------------------------------------------------------------------ BaseSession
+    # ---- BaseSession ----
     async def close(self) -> None:
         await self.api.close()
 
@@ -116,7 +98,7 @@ class MaxSession(BaseSession):
         async for chunk in self.api.download(rf.url, chunk_size=chunk_size):
             yield chunk
 
-    # ------------------------------------------------------------------ helpers
+    # ---- helpers ----
     @staticmethod
     def _parse_mode(bot, method) -> str | None:
         pm = getattr(method, "parse_mode", None)
@@ -125,7 +107,7 @@ class MaxSession(BaseSession):
         return pm
 
     def _html_of(self, bot, method, text: str | None) -> str:
-        """The message text as MAX HTML, whatever parse mode the caller asked for."""
+        """The message text as MAX HTML, whatever the parse mode."""
         if not text:
             return ""
         pm = (self._parse_mode(bot, method) or "").lower()
@@ -143,7 +125,7 @@ class MaxSession(BaseSession):
         return True if getattr(lp, "is_disabled", None) else None
 
     def _message(self, bot, chat_id: int, mid: str, text: str, kb: dict | None = None) -> Message:
-        """A synthetic aiogram ``Message`` for a message the bot just sent/edited."""
+        """A synthetic aiogram `Message` for a just-sent message."""
         me = self.bot_user or {}
         data = {
             "message_id": self.mids.int_of(mid),
@@ -158,8 +140,10 @@ class MaxSession(BaseSession):
 
     async def _post(self, chat_id: int, body: dict, *, notify: bool = True,
                     link_preview_disabled: bool | None = None) -> str:
-        """``POST /messages`` to a MAX user → the new mid. HTML the platform rejects is re-sent
-        as plain text rather than lost."""
+        """`POST /messages` to a MAX user, returning the new mid.
+
+        - HTML the platform rejects is re-sent as plain text
+        """
         if not notify:
             body = {**body, "notify": False}
         try:
@@ -205,9 +189,11 @@ class MaxSession(BaseSession):
     async def _deliver(self, bot, chat_id: int, html: str, kb: dict | None = None, *,
                        notify: bool = True, link_preview_disabled: bool | None = None,
                        media: list[dict] | None = None) -> Message:
-        """Send text (split to the 4000-char limit) plus optional media/keyboard. The live
-        "Thinking…" placeholder, if any, becomes the first part (media never edit in place:
-        the placeholder is removed first)."""
+        """Send text split to 4000 chars, plus media and keyboard.
+
+        - A live placeholder becomes the first part
+        - Media can't edit in place; placeholder removed
+        """
         chat_id = int(chat_id)
         chunks = mhtml.split_html(html) if html else [""]
         ph = self._take_placeholder(chat_id)
@@ -235,7 +221,7 @@ class MaxSession(BaseSession):
 
     @staticmethod
     async def _bytes_of(bot, obj) -> tuple[bytes, str]:
-        """(data, filename) of an aiogram ``InputFile``."""
+        """(data, filename) of an aiogram `InputFile`."""
         name = getattr(obj, "filename", None) or "file.bin"
         if hasattr(obj, "data"):
             return bytes(obj.data), name
@@ -246,7 +232,7 @@ class MaxSession(BaseSession):
             return bytes(buf), name
         raise TelegramBadRequest(method=None, message="MAX: unsupported media source")
 
-    # ------------------------------------------------------------------ methods
+    # ---- methods ----
     async def _send_message(self, bot, method) -> Message:
         return await self._deliver(
             bot, method.chat_id, self._html_of(bot, method, method.text),
@@ -273,12 +259,12 @@ class MaxSession(BaseSession):
         rich = getattr(method, "rich_message", None)
         raw = (rich.get("html") or rich.get("markdown") or "") if rich else (method.text or "")
         plain = mhtml.strip_tags(raw.replace("<br>", "\n").replace("<br/>", "\n")).strip()
-        if not plain:                                   # an empty draft = clear the indicator
+        if not plain:                                   # empty draft clears the indicator
             entry = self._placeholders.pop(chat_id, None)
             if entry:
                 await self._delete_quiet(entry[0])
             return True
-        if chat_id in self._placeholders:               # no streaming: later drafts are ignored
+        if chat_id in self._placeholders:               # later drafts are ignored
             return True
         mid = await self._post(chat_id, {"text": _THINKING_PREFIX + plain}, notify=False)
         self._placeholders[chat_id] = (mid, time.monotonic())
@@ -300,12 +286,12 @@ class MaxSession(BaseSession):
             html = self._html_of(bot, method, method.text)
         chunk = mhtml.split_html(html)[0] if html else ""
         kb = mhtml.keyboard_to_max(method.reply_markup)
-        # Telegram semantics: an edit without reply_markup drops the keyboard → `[]` clears.
+        # An edit without `reply_markup` drops the keyboard, so `[]` clears.
         body = {"text": chunk or None, "format": "html" if chunk else None,
                 "attachments": [kb] if kb else []}
         await self._edit(mid, body)
         entry = self._placeholders.get(int(method.chat_id))
-        if entry and entry[0] == mid:        # the caller edited the indicator itself
+        if entry and entry[0] == mid:        # caller edited the indicator itself
             self._placeholders.pop(int(method.chat_id), None)
         return self._message(bot, method.chat_id, mid, mhtml.strip_tags(chunk), kb)
 
@@ -337,12 +323,12 @@ class MaxSession(BaseSession):
         try:
             await self.api.answer_callback(cid, notification=text or None)
         except MaxApiError as exc:
-            # A late answer (the keyboard already replaced) is not worth a stack trace.
+            # A late answer after the keyboard changed is harmless.
             logger.debug("MAX: callback answer failed: %s", exc)
         return True
 
     async def _upload_input(self, bot, obj, kind: str) -> dict:
-        """An aiogram photo/document argument → a MAX attachment request."""
+        """Convert an aiogram photo/document argument to a MAX attachment request."""
         if isinstance(obj, str):
             if obj.startswith("http") and kind == "image":
                 return {"type": "image", "payload": {"url": obj}}
@@ -379,18 +365,16 @@ class MaxSession(BaseSession):
         return True
 
     async def _set_commands(self, bot, method) -> bool:
-        """MAX has ONE global command list (max 32): no per-chat scopes (so no chat-level /
-        code-level / owner menus) and no per-language lists. Telegram's default scope carries
-        only the everyday trio because code users get their full menu per chat; here that
-        per-user step cannot happen, so the default-scope call registers the whole shared
-        menu — every in-menu command except the owner block, which is Telegram-only — in
-        the registry's frequency order and the default language. Scoped and localized calls
-        are acknowledged and dropped."""
+        """Register the shared command menu on MAX's single global list.
+
+        - MAX has no per-chat scopes and no per-language lists
+        - The default-scope call registers every in-menu non-owner command
+        - Scoped and localized calls are acknowledged and dropped
+        """
         scope = getattr(method, "scope", None)
         if getattr(method, "language_code", None) or (
                 scope is not None and getattr(scope, "type", "default") != "default"):
             return True
-        # was: cmds = [{"name": c.command, "description": c.description} for c in method.commands]
         cmds = [{"name": slug, "description": desc} for slug, desc in max_command_list()]
         await self.api.patch_commands(cmds)
         return True
@@ -414,8 +398,10 @@ class MaxSession(BaseSession):
 
 
 def max_command_list(lang: str | None = None) -> list[tuple[str, str]]:
-    """(slug, description) for the MAX command list: the shared in-menu set from the command
-    registry (chat + code tiers, no owner commands), capped at the platform's 32."""
+    """(slug, description) pairs for the MAX command list.
+
+    - Shared in-menu commands, no owner ones, capped at 32
+    """
     from app import i18n
     from app.telegram import commands
 
@@ -435,8 +421,10 @@ def guess_mime(name: str | None) -> str | None:
 
 
 class RoutingSession(BaseSession):
-    """One ``bot.session`` for two platforms: Telegram by default, MAX for anything addressed
-    into the MAX id namespace. ``setMyCommands`` goes to both."""
+    """One `bot.session` for Telegram and MAX.
+
+    - MAX-namespace addresses go to MAX; `setMyCommands` goes to both
+    """
 
     def __init__(self, telegram: BaseSession, max_session: MaxSession | None) -> None:
         super().__init__(api=telegram.api, json_loads=telegram.json_loads,
@@ -476,7 +464,7 @@ class RoutingSession(BaseSession):
             result = await self.telegram.make_request(bot, method, timeout)
             try:
                 await self.max.make_request(bot, method, timeout)
-            except Exception as exc:        # MAX-side failure must not fail the Telegram call
+            except Exception as exc:        # MAX failure must not fail Telegram call
                 logger.warning("MAX: %s not applied: %s", method.__api_method__, exc)
             return result
         return await self.telegram.make_request(bot, method, timeout)

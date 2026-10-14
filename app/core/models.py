@@ -1,31 +1,10 @@
-"""Model + effort catalog taken from the Claude Code CLI (#411).
+"""Model and effort catalog taken from the Claude Code CLI.
 
-The bot hardcodes no model and no effort level. The deliberate exceptions, each recorded as
-a decision record: the ``max`` effort level is a separate per-user permission (decision-20,
-handlers._may_max_effort); the Fable family is withheld from everyone (decision-21,
-``_HIDDEN_FAMILIES``); a ``claude-`` prefix marks a pinned version id (decision-19,
-``_PINNED_PREFIX``). The context window is each model's own — no 1M switch, no family list
-(decision-26; it replaced the decision-22 list). Everything else comes from the CLI
-(decision-19):
-
-* the CLI's ``initialize`` response lists the models this account can pick — family aliases
-  (``opus``, ``sonnet``, ``fable``, ``haiku``, ``default``) plus pinned version ids
-  (``claude-opus-4-8`` …) — each with the concrete id it currently resolves to, a display
-  name and the effort levels it supports::
-
-      {"value": "opus", "resolvedModel": "claude-opus-5-5", "displayName": "Opus 5.5",
-       "supportsEffort": true, "supportedEffortLevels": ["low", "medium", …]}
-
-* the CLI's ``get_settings`` control request reports the effort a session ACTUALLY runs at
-  (``applied.effort``) — with no explicit level that is the model's own default (e.g. medium
-  for Opus 5.5), which :func:`note_applied` remembers per model.
-
-Sessions store and pass the ALIAS, so the CLI resolves it to the newest model of that family:
-a model release reaches every session with a CLI update (``cli_update``), no bot change.
-
-Both are captured from every client connect (``engine._ensure_client``) and persisted in kv
-(:func:`flush`, called by the reaper sweep) so menus have them right after a restart
-(:func:`load`). Before the very first capture the picker offers only the configured default.
+- Only hardcoded: max-effort permission, hidden families, pinned prefix
+- Aliases are stored; the CLI resolves the newest model
+- `initialize` lists models, resolved ids, supported effort levels
+- `get_settings` reports applied effort; default learned per model
+- Persisted in kv, so menus survive restarts
 """
 
 from __future__ import annotations
@@ -40,47 +19,46 @@ import tempfile
 
 logger = logging.getLogger("models")
 
-# A catalog value that is a pinned version id rather than a family alias. decision-19: the CLI's
-# catalog carries no alias/pinned flag; every concrete model id it lists starts with "claude-"
-# and no alias does, so the prefix is the one structural rule taken from the CLI's id scheme.
+# Prefix marking a pinned version id, not a family alias.
+# - The CLI catalog has no alias/pinned flag
+# - Concrete ids start with `claude-`; aliases never do
 _PINNED_PREFIX = "claude-"
-# What a model value may look like before any catalog is known (alias, id, [1m] suffix).
+# Possible model value shape before any catalog is known.
 _SANE_VALUE_RE = re.compile(r"^[a-z0-9][a-z0-9._\-]*(\[1m\])?$")
 _KV_CATALOG = "cli_model_catalog"
-# #420 / decision-21: model families withheld from EVERY user, the owner included — a named
-# exception to "nothing is hardcoded", like the max-effort grant (decision-20). Offering Fable is
-# a budget decision about the host's shared subscription (meant for hosts on a Max plan) that
-# needs its own per-user grant (#421); until that exists, nobody can pick it. A hidden family
-# never reaches the picker and cannot be stored; an alias that currently RESOLVES to one (e.g.
-# the CLI's "default", should it ever recommend Fable) is withheld as well, and a value stored
-# before the family was hidden runs as the default model (SessionManager._effective_settings).
+# Model families withheld from every user, owner included.
+# - Offering one needs a per-user grant that doesn't exist yet
+# - Hidden families never reach the picker or storage
+# - An alias resolving to a hidden family is withheld too
+# - Previously stored hidden values run as the default model
 _HIDDEN_FAMILIES: tuple[str, ...] = ("fable",)
 _KV_DEFAULTS = "cli_model_default_effort"
-# #426: where the stored catalog came from — "probe" (the host CLI with the account's real
-# credential) or "session" (a sandboxed client, whose CLI sees only the broker's dummy credential
-# and reports a reduced list: family names without versions, no pinned ids).
+# Source of the stored catalog: `probe` or `session`.
+# - Sandboxed CLIs see a dummy credential, reduced list
 _KV_SOURCE = "cli_model_catalog_src"
 
 _catalog: list[dict] = []
-# #426: True once the catalog came from the host-CLI probe — a session's reduced view then never
-# replaces it (capture).
+# True once the catalog came from the host-CLI probe.
+# - A session's reduced view then never replaces it
 _authoritative = False
-# lower-cased catalog value → the effort the CLI applies when none is set (None = the model
-# takes no effort level). Learned from get_settings (note_applied).
+# Lowercased model value to its default effort.
+# - None means the model takes no effort level
+# - Learned from `get_settings`
 _default_effort: dict[str, str | None] = {}
 _dirty = False
 
 
 def _picker_filter() -> tuple[str, ...]:
-    """MODEL_PICKER (comma-separated values) narrows which catalog rows the /model picker
-    offers — e.g. to keep a costlier family out of other users' reach. Empty (the default)
-    = every family alias the CLI offers."""
+    """MODEL_PICKER narrows which models the /model picker offers.
+
+    - Comma-separated values; empty means every CLI family alias
+    """
     raw = os.environ.get("MODEL_PICKER", "")
     return tuple(v.strip().lower() for v in re.split(r"[,\s]+", raw) if v.strip())
 
 
 def _clean(rows) -> list[dict]:
-    """Keep only well-formed rows (a dict with a non-empty string ``value``)."""
+    """Keep only well-formed rows with a non-empty `value`."""
     out: list[dict] = []
     for r in rows or ():
         if isinstance(r, dict) and isinstance(r.get("value"), str) and r["value"].strip():
@@ -89,16 +67,13 @@ def _clean(rows) -> list[dict]:
 
 
 def capture(server_info, authoritative: bool = False) -> bool:
-    """Adopt the ``models`` list from a client's initialize response (``get_server_info()``).
-    Returns True when it changed the catalog (marked for :func:`flush`). An empty or absent
-    list never wipes a known catalog — an older CLI may simply not report one.
+    """Adopt the models list from a client's initialize response.
 
-    #426: ``authoritative`` marks the host-CLI probe (:func:`probe`), whose CLI holds the
-    account's real credential. A sandboxed session's CLI sees only the broker's dummy credential
-    and reports a reduced list (family names without versions, no pinned ids), so a session
-    capture only fills in until the first probe result and never replaces it — the two views
-    used to overwrite each other on every connect (labels flipping between "Opus" and
-    "Opus 5.5")."""
+    - Returns True when the catalog changed
+    - An empty list never wipes a known catalog
+    - `authoritative` marks the host-CLI probe, which sees real credentials
+    - Session captures only fill in until a probe result arrives
+    """
     global _catalog, _dirty, _authoritative
     rows = _clean((server_info or {}).get("models") if isinstance(server_info, dict) else None)
     if not rows:
@@ -107,7 +82,6 @@ def capture(server_info, authoritative: bool = False) -> bool:
         return False
     if rows == _catalog and _authoritative == bool(authoritative):
         return False
-    # was (#411): if not rows or rows == _catalog: return False — then adopt unconditionally
     _catalog = rows
     _authoritative = _authoritative or bool(authoritative)
     _dirty = True
@@ -117,9 +91,11 @@ def capture(server_info, authoritative: bool = False) -> bool:
 
 
 def note_applied(value: str | None, applied, explicit_effort: str | None) -> None:
-    """Learn a model's DEFAULT effort from a session's ``get_settings`` ``applied`` block: with
-    no explicit level set, ``applied.effort`` is what the CLI picks for that model (None when
-    the model takes no effort level). A session with an explicit level teaches nothing."""
+    """Learn a model's default effort from `get_settings`.
+
+    - Only valid when the session set no explicit level
+    - None when the model takes no effort level
+    """
     global _dirty
     if explicit_effort or not value or not isinstance(applied, dict) or "effort" not in applied:
         return
@@ -132,9 +108,9 @@ def note_applied(value: str | None, applied, explicit_effort: str | None) -> Non
 
 
 async def load() -> None:
-    """Load the last persisted catalog + learned defaults from kv (startup)."""
+    """Load the persisted catalog and learned defaults at startup."""
     global _catalog, _default_effort, _authoritative
-    from app.storage import db  # lazy: keeps this module importable without a db
+    from app.storage import db  # lazy: keeps module importable without db
     raw = await db.get_kv(_KV_CATALOG)
     if raw:
         try:
@@ -143,7 +119,7 @@ async def load() -> None:
             rows = []
         if rows and not _catalog:
             _catalog = rows
-            # #426: a probe catalog stays authoritative across restarts.
+            # A probe catalog stays authoritative across restarts.
             _authoritative = (await db.get_kv(_KV_SOURCE)) == "probe"
     raw = await db.get_kv(_KV_DEFAULTS)
     if raw:
@@ -157,19 +133,19 @@ async def load() -> None:
 
 
 async def flush() -> None:
-    """Persist the catalog + learned defaults if they changed since the last flush."""
+    """Persist the catalog and learned defaults if changed."""
     global _dirty
     if not _dirty:
         return
     from app.storage import db
     await db.set_kv(_KV_CATALOG, json.dumps(_catalog, ensure_ascii=False))
-    await db.set_kv(_KV_SOURCE, "probe" if _authoritative else "session")  # #426
+    await db.set_kv(_KV_SOURCE, "probe" if _authoritative else "session")
     await db.set_kv(_KV_DEFAULTS, json.dumps(_default_effort, ensure_ascii=False))
     _dirty = False
 
 
 def entries() -> list[dict]:
-    """The current catalog rows (CLI order); [] before the first capture."""
+    """Return catalog rows in CLI order; empty before first capture."""
     return list(_catalog)
 
 
@@ -184,19 +160,20 @@ def _row(value: str | None) -> dict | None:
 
 
 def is_pinned(value: str | None) -> bool:
-    """True for a pinned version id (``claude-opus-4-8``) rather than a family alias."""
+    """True for a pinned version id, not a family alias."""
     return bool(value) and str(value).lower().startswith(_PINNED_PREFIX)
 
 
 def _is_alias(row: dict) -> bool:
-    # was: return not row["value"].lower().startswith(_PINNED_PREFIX)  — #422: via is_pinned
     return not is_pinned(row["value"])
 
 
 def _id_version(model_id: str | None) -> str:
-    """#426: the version a concrete id carries — ``claude-opus-5-5`` → ``5.5``,
-    ``claude-haiku-4-5-20251001`` → ``4.5`` (a date suffix is dropped), ``claude-3-5-sonnet-…``
-    → ``3.5``; "" for an alias or an id without one."""
+    """Return the version a concrete model id carries.
+
+    - `claude-opus-5-5` gives `5.5`; date suffixes are dropped
+    - Empty string for an alias or versionless id
+    """
     if not is_pinned(model_id):
         return ""
     toks = str(model_id).lower().split("[", 1)[0].split("-")[1:]
@@ -204,9 +181,11 @@ def _id_version(model_id: str | None) -> str:
 
 
 def _display_name(row: dict) -> str:
-    """#426: a row's display name. When the CLI names only the family ("Opus" — the reduced
-    catalog a sandboxed CLI reports), the version comes from the id it resolves to
-    ("Opus 5.5"); a name that is not the family (the CLI's "Default (recommended)") stays."""
+    """Return a row's display name, adding the version if missing.
+
+    - A family-only name takes its version from the resolved id
+    - Other names, like the default row, stay unchanged
+    """
     name = str(row.get("displayName") or "")
     rid = str(row.get("resolvedModel") or "").lower()
     if name and not any(ch.isdigit() for ch in name) and name.lower() in rid:
@@ -217,8 +196,10 @@ def _display_name(row: dict) -> str:
 
 
 def is_hidden(value: str | None) -> bool:
-    """#420: True when ``value`` — or what the catalog says it resolves to — belongs to a
-    withheld family."""
+    """True when the value belongs to a withheld family.
+
+    - Also true when its catalog resolution is withheld
+    """
     if not value:
         return False
     row = _row(value)
@@ -227,12 +208,14 @@ def is_hidden(value: str | None) -> bool:
 
 
 def picker_values(fallback: tuple[str, ...] = ()) -> list[str]:
-    """Values the /model picker offers: the CLI's aliases — its own ``default`` row (the model
-    Claude Code recommends for the account) and the family aliases — in CLI order, pinned
-    version ids and disabled rows left out, optionally narrowed by MODEL_PICKER. Before any
-    catalog is known: just ``fallback`` (the configured default model)."""
+    """Return the model values the /model picker offers.
+
+    - CLI order; pinned ids and disabled rows are left out
+    - Narrowed by MODEL_PICKER when set
+    - Before any catalog is known: only `fallback`
+    """
     vals = [r["value"] for r in _catalog
-            if _is_alias(r) and not r.get("disabled") and not is_hidden(r["value"])]  # #420
+            if _is_alias(r) and not r.get("disabled") and not is_hidden(r["value"])]
     if not vals:
         return [v for v in fallback if v]
     only = _picker_filter()
@@ -242,10 +225,12 @@ def picker_values(fallback: tuple[str, ...] = ()) -> list[str]:
 
 
 def is_selectable(value: str | None) -> bool:
-    """True for a value the bot may store as a session model: any non-disabled catalog row
-    (alias or pinned id). Before any catalog is known, any well-formed value (the CLI is the
-    judge on the next turn)."""
-    if not value or is_hidden(value):  # #420: a withheld family is never selectable
+    """True for a value storable as a session model.
+
+    - Any non-disabled catalog row, alias or pinned id
+    - Without a catalog, any well-formed value passes
+    """
+    if not value or is_hidden(value):  # withheld family is never selectable
         return False
     row = _row(value)
     if row is not None:
@@ -254,20 +239,24 @@ def is_selectable(value: str | None) -> bool:
 
 
 def match(arg: str | None) -> str | None:
-    """Resolve a typed ``/model <arg>`` to the value to store (catalog spelling), or None.
-    Accepts a family alias or a pinned id the CLI lists, case-insensitively."""
+    """Resolve a typed /model argument to its stored value.
+
+    - Case-insensitive; returns catalog spelling, or None
+    """
     if not arg:
         return None
     row = _row(arg.strip())
     if row is not None:
-        return None if (row.get("disabled") or is_hidden(row["value"])) else row["value"]  # #420
+        return None if (row.get("disabled") or is_hidden(row["value"])) else row["value"]
     low = arg.strip().lower()
     return low if is_selectable(low) else None
 
 
 def resolve(value: str | None) -> str | None:
-    """The concrete model id a stored value currently runs as (``opus`` → ``claude-opus-5-5``),
-    or the value itself when the catalog doesn't know it (a pinned id resolves to itself)."""
+    """Return the concrete model id a stored value runs as.
+
+    - Falls back to the value itself when unknown
+    """
     row = _row(value)
     if row is not None and row.get("resolvedModel"):
         return row["resolvedModel"]
@@ -275,34 +264,36 @@ def resolve(value: str | None) -> str | None:
 
 
 def label(value: str | None) -> str:
-    """Menu label for a stored value: the display name of what a family alias resolves to
-    right now (``opus`` → ``Opus 5.5``, ``Opus 6`` after the next release), ``📌`` + the name
-    for a pinned version id (it never moves), else the raw value. Short on purpose — picker
-    buttons sit three to a row."""
+    """Return the menu label for a stored value.
+
+    - Alias shows its resolved display name
+    - Pinned id gets a pin prefix
+    - Kept short: picker buttons sit three per row
+    """
     if not value:
         return ""
     row = _row(value)
     if row is None or not row.get("displayName"):
         return value
-    # #426: via _display_name (was row["displayName"] as is).
     if not _is_alias(row):
         return f"📌 {_display_name(row)}"
     return _display_name(row)
 
 
 def runs_as_label(value: str | None, resolved: str | None = None) -> str:
-    """#422: the display name of the model a value actually runs as — "Opus 5.5" for ``opus``
-    AND for the CLI's ``default`` while that resolves to Opus 5.5. ``resolved`` is the concrete
-    id the CLI reported for the session (get_settings), else the catalog's resolution. The name
-    comes from the family alias row whose alias appears in the resolved id, so no family is
-    named here; a pinned id uses its own row. Falls back to :func:`label`."""
+    """Display name of the model a value runs as.
+
+    - `resolved` is the CLI-reported id, else the catalog's
+    - Name comes from the family alias row matching the id
+    - Falls back to `label`
+    """
     rid = (resolved or resolve(value) or "").lower().split("[", 1)[0]  # drop a [1m] suffix
     if rid:
         for r in _catalog:
             if (_is_alias(r) and r.get("displayName")
                     and str(r.get("resolvedModel") or "").lower() == rid
                     and r["value"].lower() in rid):
-                return _display_name(r)  # #426 (was str(r["displayName"]))
+                return _display_name(r)
         row = _row(rid)
         if row is not None and row.get("displayName"):
             return label(row["value"])
@@ -310,8 +301,11 @@ def runs_as_label(value: str | None, resolved: str | None = None) -> str:
 
 
 def effort_levels(value: str | None) -> list[str]:
-    """Effort levels the CLI lists for a model value (its ``supportedEffortLevels``); [] when
-    the model takes none. For a value the catalog doesn't know: the union over the catalog."""
+    """Return the effort levels the CLI lists for a model.
+
+    - Empty when the model takes none
+    - Unknown value: union over the whole catalog
+    """
     row = _row(value)
     if row is not None:
         lv = row.get("supportedEffortLevels") if row.get("supportsEffort", True) else None
@@ -320,7 +314,7 @@ def effort_levels(value: str | None) -> list[str]:
 
 
 def all_effort_levels() -> list[str]:
-    """Every effort level any catalog model supports, in first-seen order."""
+    """Return every effort level any model supports, first-seen order."""
     out: list[str] = []
     for r in _catalog:
         for x in r.get("supportedEffortLevels") or []:
@@ -330,10 +324,12 @@ def all_effort_levels() -> list[str]:
 
 
 def effort_below_max(value: str | None) -> str | None:
-    """#420 / decision-20: the level just under ``max`` in the CLI's list for this model (what
-    a user without the max grant is stepped down to); None when the model has no such level,
-    i.e. fall back to the model's default. ``max`` is the one effort name the bot knows, because
-    it is a permission, not a model property."""
+    """Return the effort level just below `max` for a model.
+
+    - Used to step down users without the max grant
+    - None means fall back to the model's default
+    - `max` is a permission, so the bot knows its name
+    """
     levels = effort_levels(value)
     if "max" in levels:
         i = levels.index("max")
@@ -342,23 +338,30 @@ def effort_below_max(value: str | None) -> str | None:
 
 
 def default_effort(value: str | None) -> str | None:
-    """The effort the CLI applies to a model when none is set — as last learned from a
-    session on it (note_applied); None when unknown or when the model takes none."""
+    """Return the effort the CLI applies when none is set.
+
+    - As last learned from a session; None if unknown
+    """
     return _default_effort.get((value or "").lower())
 
 
 def effective_effort(value: str | None, explicit: str | None) -> str | None:
-    """The effort a session runs at: its explicit level, else the model's learned default.
-    None when the model takes no effort level (or nothing is known yet)."""
+    """Return the effort a session runs at.
+
+    - Explicit level first, else the model's learned default
+    - None when the model takes no effort level
+    """
     if not effort_levels(value) and _row(value) is not None:
         return None
     return explicit or default_effort(value)
 
 
 def family_alias(model_id: str | None) -> str | None:
-    """The family alias a pinned ``claude-…`` id belongs to (``claude-opus-4-8`` → ``opus``,
-    ``claude-3-5-sonnet-20241022`` → ``sonnet``): its first word token. Validated against the
-    catalog's aliases when one is known; None for anything that is not a pinned id."""
+    """Return the family alias a pinned id belongs to.
+
+    - Uses the first alphabetic token of the id
+    - Validated against catalog aliases when known; else None
+    """
     if not model_id or not model_id.lower().startswith(_PINNED_PREFIX):
         return None
     fam = next((tok for tok in model_id.lower().split("[", 1)[0].split("-")[1:]
@@ -372,12 +375,13 @@ def family_alias(model_id: str | None) -> str | None:
 
 
 async def probe(cli_path: str | None, timeout: float = 60.0) -> bool:
-    """Read the catalog — and every family's default effort — straight from the CLI with a
-    throwaway client, so menus are right before the first user turn (startup, and after every
-    CLI update). No prompt is sent: ``initialize`` (the model list) plus, per alias, a
-    ``set_model`` + ``get_settings`` pair — local control requests, no API call, no tokens.
-    Runs the given (host) CLI with the bot's own environment minus the API-key variables
-    (subscription only) and no settings sources. Returns True when a catalog was read."""
+    """Read the catalog and default efforts from the host CLI.
+
+    - Uses a throwaway client so menus are right pre-turn
+    - Runs at startup and after every CLI update
+    - Local control requests only: no prompt, no tokens
+    - Environment drops API-key variables; returns True if read
+    """
     from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient  # lazy: heavy import
     if not cli_path or not os.path.exists(cli_path):
         return False
@@ -390,7 +394,7 @@ async def probe(cli_path: str | None, timeout: float = 60.0) -> bool:
         env=env))
     try:
         await asyncio.wait_for(client.connect(), timeout)
-        capture(await client.get_server_info(), authoritative=True)  # #426: the account's view
+        capture(await client.get_server_info(), authoritative=True)  # probe sees the real credential
         query = client._query
         for row in list(_catalog):
             if not _is_alias(row) or row.get("disabled"):

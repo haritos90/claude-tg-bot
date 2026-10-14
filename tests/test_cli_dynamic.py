@@ -1,8 +1,11 @@
-"""Tests for the CLI-driven model/effort catalog (#411/#415), the CLI auto-update (#412) and its
-daily schedule with graceful client recycling (#423), the untitled-session naming (#413),
-follow-up injection (#417), the single-message rich commit (#418), the opt-in draft table hold
-(#416), the withheld model family (#420) and the thinking-tag model line (#422). Pure pytest —
-fakes only, no network/CLI."""
+"""Tests for CLI-driven catalog, update, naming, and streaming features.
+
+- model/effort catalog; daily CLI update with graceful recycling
+- untitled-session naming and follow-up injection
+- single-message rich commit and opt-in draft table hold
+- withheld model family and thinking-tag model line
+- pure pytest: fakes only, no network or CLI
+"""
 
 import asyncio
 import contextlib
@@ -34,7 +37,7 @@ CATALOG = [
 
 @pytest.fixture(autouse=True)
 def _fresh_catalog(monkeypatch):
-    """Every test starts from an empty catalog and leaves none behind."""
+    """Every test starts from an empty catalog and leaves none."""
     monkeypatch.setattr(models, "_catalog", [])
     monkeypatch.setattr(models, "_authoritative", False)
     monkeypatch.setattr(models, "_default_effort", {})
@@ -42,18 +45,18 @@ def _fresh_catalog(monkeypatch):
     monkeypatch.delenv("MODEL_PICKER", raising=False)
 
 
-# --- #411 / #415: the catalog --------------------------------------------------------- #
+# ---- the model catalog ----
 
 def test_capture_adopts_catalog_and_ignores_empty():
     assert models.capture({"models": CATALOG}) is True
-    assert models.capture({"models": CATALOG}) is False          # unchanged → no-op
+    assert models.capture({"models": CATALOG}) is False          # unchanged: no-op
     assert models.capture({"models": []}) is False               # an empty list never wipes it
     assert models.capture(None) is False
     assert [r["value"] for r in models.entries()] == [r["value"] for r in CATALOG]
 
 
 def test_picker_lists_aliases_only_and_honours_model_picker(monkeypatch):
-    assert models.picker_values(fallback=("opus",)) == ["opus"]  # no catalog → the fallback only
+    assert models.picker_values(fallback=("opus",)) == ["opus"]  # no catalog: the fallback only
     models.capture({"models": CATALOG})
     assert models.picker_values() == ["default", "opus", "sonnet", "haiku"]  # no pinned ids
     monkeypatch.setenv("MODEL_PICKER", "opus, sonnet")
@@ -67,7 +70,7 @@ def test_match_resolve_label_and_selectable():
     assert models.match("claude-opus-4-8") == "claude-opus-4-8"
     assert models.match("gpt-5") is None                          # not offered by the CLI
     assert models.resolve("opus") == "claude-opus-5-5"
-    assert models.resolve("claude-x-1") == "claude-x-1"           # unknown → itself
+    assert models.resolve("claude-x-1") == "claude-x-1"           # unknown: itself
     assert models.label("opus") == "Opus 5.5"
     assert models.label("claude-opus-4-8") == "📌 Opus 4.8"       # pinned ids are marked
     assert models.is_selectable("sonnet") and not models.is_selectable("nope")
@@ -87,7 +90,7 @@ def test_effort_levels_defaults_and_effective_effort():
     assert models.effective_effort("haiku", "max") is None        # model without effort
 
 
-# --- #420: the withheld family and the max step-down ----------------------------------- #
+# ---- withheld family and max step-down ----
 
 WITHHELD = [
     {"value": "fable", "resolvedModel": "claude-fable-5-1", "displayName": "Fable 5.1",
@@ -170,10 +173,10 @@ def test_migrate_model_ids_to_aliases_runs_once(tmp_path):
 
 def test_maybe_t_is_opportunistic():
     assert i18n.maybe_t("effort.level.medium", "ru", "medium") == i18n.CATALOG["effort.level.medium"]["ru"]
-    assert i18n.maybe_t("effort.level.turbo", "ru", "turbo") == "turbo"   # unknown → as given
+    assert i18n.maybe_t("effort.level.turbo", "ru", "turbo") == "turbo"   # unknown: as given
 
 
-# --- #412: CLI update + stage ---------------------------------------------------------- #
+# ---- CLI update and stage ----
 
 def _fake_cli(tmp_path, version, script_body="exit 0"):
     vdir = tmp_path / "versions"
@@ -193,10 +196,10 @@ def test_stage_copies_only_on_change(tmp_path, monkeypatch):
     monkeypatch.setattr(cli_update.shutil, "which", lambda name: link)
     dst = str(tmp_path / "staged-claude")
     assert cli_update.stage(dst).endswith("2.1.288")
-    assert cli_update.stage(dst) is None                          # same source → no copy
+    assert cli_update.stage(dst) is None                          # same source: no copy
     assert cli_update.version_of(cli_update.staged_source(dst)) == "2.1.288"
     _fake_cli(tmp_path, "2.1.290")
-    assert cli_update.stage(dst).endswith("2.1.290")              # host moved → re-staged
+    assert cli_update.stage(dst).endswith("2.1.290")              # host moved: re-staged
     assert os.access(dst, os.X_OK)
 
 
@@ -210,7 +213,7 @@ def test_update_and_stage_reports_versions(tmp_path, monkeypatch):
     assert "up to date" in res.detail
 
 
-# --- #413: naming tiers + untitled sweep ---------------------------------------------- #
+# ---- naming tiers and untitled sweep ----
 
 def test_first_words_and_reply_topic():
     assert sessions._first_words("u up?") == "u up?"
@@ -282,8 +285,8 @@ def test_tidy_untitled_names_probe_and_archives_empty(monkeypatch):
     monkeypatch.setattr(sm, "_derive_session_name", _derive)
     monkeypatch.setattr(sm, "dispose_dm_session", _dispose)
     n, d = asyncio.run(sm.tidy_untitled(7, keep=-1))
-    assert named == [(-2, "u up?", False)]                        # used → named by its words
-    assert disposed == [-3]                                       # never used → archived (#307)
+    assert named == [(-2, "u up?", False)]                        # used: named by its words
+    assert disposed == [-3]                                       # never used: archived
     assert (n, d) == (1, 1)                                       # -4 named, -5 pinned: untouched
 
 
@@ -313,7 +316,7 @@ def test_tidy_untitled_never_archives_on_read_error(monkeypatch):
     assert asyncio.run(sm.tidy_untitled(7, keep=-1)) == (0, 0) and disposed == []
 
 
-# --- #417: follow-up injection --------------------------------------------------------- #
+# ---- follow-up injection ----
 
 def test_inject_requires_active_turn_with_state_events():
     s = engine.ClaudeSession("chat", "opus", None)
@@ -323,7 +326,7 @@ def test_inject_requires_active_turn_with_state_events():
         sent.append(prompt)
 
     s._send_query = _send
-    assert asyncio.run(s.inject("more")) is False                 # no client / no turn
+    assert asyncio.run(s.inject("more")) is False                 # no client or no turn
     s.client = object()
     s._turn_active = True
     assert asyncio.run(s.inject("more")) is False                 # CLI streams no state events
@@ -417,7 +420,7 @@ def test_handle_text_injects_into_running_turn(monkeypatch):
     assert logged == [("user", "and also this")] and rec.queue.empty()
 
 
-# --- #418: one rich message ------------------------------------------------------------ #
+# ---- one rich message ----
 
 class _RichBot:
     def __init__(self, fail=False):
@@ -464,7 +467,7 @@ def test_commit_rich_embedded_reports_failure_for_fallback(monkeypatch):
         f"x{markup.SVG_TOKEN}", [], ["<svg/>"], [], "", silent=True)) is False
 
 
-# --- #416: opt-in draft table hold ----------------------------------------------------- #
+# ---- opt-in draft table hold ----
 
 @pytest.mark.parametrize("text,body,rows", [
     ("Intro\n\n| a | b |\n|---|---|\n| 1 | 2 |\n| 3 |", "Intro\n", 1),
@@ -485,7 +488,7 @@ def test_hold_open_table_leaves_closed_or_non_tables(text):
     assert markup.hold_open_table(text) == (text, None)
 
 
-# --- #419: exactly the two subscription windows ----------------------------------------- #
+# ---- exactly the two subscription windows ----
 
 def test_only_the_two_subscription_windows_are_tracked():
     out = usage.normalize_account_usage({
@@ -502,7 +505,7 @@ def test_only_the_two_subscription_windows_are_tracked():
 
 
 def test_tidy_untitled_reads_every_page(monkeypatch):
-    """An old leftover sits beyond the first 100 (most recent) sessions — it must still be seen."""
+    """A leftover beyond the 100 newest sessions must be seen."""
     sm = sessions.SessionManager(bot=SimpleNamespace(), settings=SimpleNamespace(),
                                  gate=SimpleNamespace())
     rows = [{"thread_id": -(i + 1), "name": f"Topic {i}", "name_auto": True} for i in range(150)]
@@ -532,7 +535,7 @@ def test_tidy_untitled_reads_every_page(monkeypatch):
     assert calls == [0, 100] and named == [-141]
 
 
-# --- #422: the model line in the thinking indicator ------------------------------------- #
+# ---- model line in thinking indicator ----
 
 def test_runs_as_label_names_the_resolved_model():
     assert models.runs_as_label("opus") == "opus"                 # no catalog: the value
@@ -596,7 +599,7 @@ def test_start_retries_a_draft_rejected_with_the_model_line():
     assert len(s.bot.methods) == 1 and "<br>" not in s.bot.methods[0].rich_message["html"]
 
 
-# --- #423: daily CLI update at a fixed UTC time, graceful recycle ------------------------ #
+# ---- daily CLI update, graceful recycle ----
 
 def _utc(*a):
     return datetime(*a, tzinfo=timezone.utc).timestamp()
@@ -677,11 +680,11 @@ def test_cli_update_recycles_idle_clients_and_never_a_busy_one(monkeypatch):
         return res, during
     res, during = asyncio.run(_t())
     assert res.changed and during == ["idle"]                     # the reply is never cut
-    assert closed == ["idle", "busy"]                             # …it moves once it is idle
+    assert closed == ["idle", "busy"]                             # it moves once idle
     assert sm._records[-1].session is None and sm._records[-3].session is not None
 
 
-# --- #424: the /new confirmation -------------------------------------------------------- #
+# ---- the `/new` confirmation ----
 
 def test_new_session_confirmation_is_the_glyph_and_model_line_only():
     for lang in ("en", "ru"):
@@ -691,9 +694,9 @@ def test_new_session_confirmation_is_the_glyph_and_model_line_only():
                       tagline="t") == "💬 Opus 5.5 · medium"
 
 
-# --- #426: the probe's catalog wins over a sandboxed session's reduced view -------------- #
+# ---- probe catalog beats a sandboxed session's view ----
 
-# What a sandboxed CLI (broker dummy credential) reports: family names, versions only in prose.
+# A sandboxed CLI reports family names, versions only in prose.
 REDUCED = [
     {"value": "default", "resolvedModel": "claude-opus-5-5", "displayName": "Default (recommended)",
      "description": "Opus 5.5 · Best for everyday, complex tasks"},
@@ -737,7 +740,7 @@ def test_family_only_names_get_the_version_from_the_resolved_id():
     assert models.runs_as_label("default") == "Opus 5.5"
 
 
-# --- #430: the thinking-phase draft-release cycle (experimental) ------------------------ #
+# ---- thinking-phase draft-release cycle ----
 
 class _ReleaseBot:
     def __init__(self):
@@ -805,7 +808,7 @@ def test_release_period_scope(monkeypatch):
     assert streamer.draft_release_period(5, 5) == 0.0
 
 
-# --- #431: the draft push button (experimental) ----------------------------------------- #
+# ---- the draft push button ----
 
 def test_push_button_rides_on_the_drafts():
     bot = _ReleaseBot()
@@ -852,7 +855,7 @@ def test_stopped_generation_is_read_from_the_raw_update():
 
 def test_push_scope_and_release_withdrawn(monkeypatch):
     if "DRAFT_RELEASE" not in os.environ:
-        assert streamer.draft_release_period(5, 5) == 0.0        # #431: off by default now
+        assert streamer.draft_release_period(5, 5) == 0.0        # off by default
     if "DRAFT_PUSH" not in os.environ:
         assert streamer.draft_push_enabled(6, 5)                 # released to every user
     monkeypatch.setattr(streamer, "_DRAFT_PUSH_SCOPE", "owner")
@@ -863,7 +866,7 @@ def test_push_scope_and_release_withdrawn(monkeypatch):
     assert not streamer.draft_push_enabled(5, 5)
 
 
-# --- #432: a press with no held message means stop --------------------------------------- #
+# ---- a press with no held message means stop ----
 
 def test_push_without_a_message_stops_the_reply(monkeypatch):
     monkeypatch.setattr(sessions, "_PUSH_STOP_WAIT_SECS", 0)

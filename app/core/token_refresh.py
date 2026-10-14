@@ -1,27 +1,10 @@
-"""Proactive OAuth token refresh (#191) — keep ``~/.claude/.credentials.json`` fresh.
+"""Proactively refreshes the OAuth token in the credentials file.
 
-The subscription OAuth ACCESS token has a hard ~8 h life (``expiresAt``). Nothing in
-the running bot rotates it: the idle reaper kills the ``claude`` subprocess within
-minutes, and a freshly-spawned one just re-reads the SAME on-disk token — so after an
-idle gap longer than the token life (e.g. overnight) every turn 401s until a manual
-re-login. This module owns the OAuth ``refresh_token -> access_token`` exchange (the
-piece the #119 broker will eventually subsume) and rewrites the creds file ATOMICALLY
-before the token expires, so a turn after any idle gap gets a valid bearer with no
-re-login.
-
-P0 (subscription billing): this is pure OAuth — the refresh grant sends only the
-``refresh_token`` + the PUBLIC Claude Code ``client_id`` (a PKCE public client, no
-secret) and stores the returned OAuth tokens. It NEVER writes an ``ANTHROPIC_API_KEY``
-/ ``ANTHROPIC_AUTH_TOKEN``, so billing stays on the subscription.
-
-Fail-soft: every error leaves the existing creds UNTOUCHED — the bot then behaves
-exactly as before (the engine self-heal on a 401, or a manual re-login). Token
-material is never logged.
-
-The endpoint + client_id below are the values the bundled ``claude`` CLI itself uses
-(``platform.claude.com`` + the public Claude Code client id); if Anthropic ever
-rotates them, refreshes start returning "fail" and the bot falls back to today's
-behaviour — nothing breaks.
+- Access token lives about 8 hours
+- Idle-reaped `claude` respawns would reread a stale token
+- Rewrites the creds file atomically before expiry
+- Sends only `refresh_token` and public `client_id`; never API keys
+- Fail-soft: errors leave creds untouched; tokens never logged
 """
 
 import asyncio
@@ -33,11 +16,11 @@ import os
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Awaitable, Callable   # #408: typing for the alert hook
+from collections.abc import Awaitable, Callable
 
 logger = logging.getLogger("token_refresh")
 
-# OAuth token endpoint + public client id, as used by the `claude` CLI itself.
+# OAuth endpoint and public client id used by `claude`.
 _TOKEN_URL = "https://platform.claude.com/v1/oauth/token"
 _CLIENT_ID = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
 _DEFAULT_CREDS = "~/.claude/.credentials.json"
@@ -50,41 +33,35 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-# Tunables (.env, optional). Token lives ~8 h; renewing when <1 h remains, swept every
-# 30 min, renews it well before any idle gap can outlast it (and one missed sweep still
-# has hours of margin).
+# Token lives ~8 h; renew under 1 h left.
+# - Swept every 30 min; one miss is safe
 DEFAULT_SKEW_SECONDS = _env_int("OAUTH_REFRESH_SKEW_SEC", 3600)
 DEFAULT_INTERVAL_SECONDS = _env_int("OAUTH_REFRESH_INTERVAL_SEC", 1800)
 
-# #378: a single sweep must never silently park the loop. urllib's socket timeout does
-# NOT cover DNS resolution (getaddrinfo runs before the socket timeout is armed), so a
-# wedged resolver once parked a sweep for hours with zero further log output. Bound every
-# sweep at the asyncio layer (a timed-out blocking call is abandoned on a dedicated
-# 1-thread pool, never the shared executor) and emit a liveness heartbeat every Nth sweep
-# so a STOPPED loop shows up as a gap instead of looking identical to a healthy idle one.
+# Bound every sweep so the loop cannot park.
+# - urllib socket timeout does not cover DNS resolution
+# - Abandoned blocking calls go to a dedicated 1-thread pool
+# - Heartbeat every Nth sweep makes a stopped loop visible
 DEFAULT_SWEEP_DEADLINE_SECONDS = _env_int("OAUTH_REFRESH_SWEEP_DEADLINE_SEC", 120)
-DEFAULT_HEARTBEAT_EVERY = _env_int("OAUTH_REFRESH_HEARTBEAT_EVERY", 6)  # ~every 3 h at 30-min sweeps
+DEFAULT_HEARTBEAT_EVERY = _env_int("OAUTH_REFRESH_HEARTBEAT_EVERY", 6)  # about every 3 hours
 
-# #379: login-expiry heads-up. The OAuth *refresh* token (the login) has a hard ~monthly
-# life (`refreshTokenExpiresAt`); the refresher above only renews the 8 h access token, so
-# the login still expires and needs a manual `claude` re-login. Warn the owner when the
-# login is within this many days of that deadline.
+# Warn the owner when the login nears its deadline.
+# - Refresh token expires roughly monthly (`refreshTokenExpiresAt`)
+# - Refresher renews only the access token
+# - Expiry then needs a manual `claude` re-login
 LOGIN_EXPIRY_WARN_DAYS = _env_int("LOGIN_EXPIRY_WARN_DAYS", 3)
 
-# #408: the #379 heads-up above fires off `refreshTokenExpiresAt` — the NOMINAL deadline —
-# so a refresh token that dies EARLY (revoked server-side, or rotated out from under us by a
-# second `claude` on the host) never trips it. That failure is only visible as a journald
-# WARNING, which nobody reads; meanwhile every turn fails with a generic "server-side error"
-# that points at Anthropic instead of at the host login. So the refresher also PUSHES an
-# alert to the owner once the failure looks persistent, and again every N sweeps while it
-# stays broken, plus a one-line all-clear when it recovers.
-ALERT_AFTER_FAILS = _env_int("OAUTH_ALERT_AFTER_FAILS", 2)          # same point the log escalates
-ALERT_REPEAT_SWEEPS = _env_int("OAUTH_ALERT_REPEAT_SWEEPS", 12)     # ~every 6 h at 30-min sweeps
+# Push an owner alert when refresh failure looks persistent.
+# - Early-dead tokens (revoked, rotated) never trip the nominal-deadline warning
+# - Turns then fail with a generic server-side error
+# - Repeats every N sweeps while broken
+# - Sends an all-clear on recovery
+ALERT_AFTER_FAILS = _env_int("OAUTH_ALERT_AFTER_FAILS", 2)          # same threshold as log escalation
+ALERT_REPEAT_SWEEPS = _env_int("OAUTH_ALERT_REPEAT_SWEEPS", 12)     # about every 6 hours
 
 
 def _read_creds(path: str):
-    """Load the WHOLE credentials JSON (so we can rewrite it intact). Returns the dict
-    or None on any read/parse failure."""
+    """Load the whole credentials JSON, or None on failure."""
     try:
         with open(os.path.expanduser(path), encoding="utf-8") as fh:
             data = json.load(fh)
@@ -94,7 +71,7 @@ def _read_creds(path: str):
 
 
 def _seconds_left(oauth) -> float | None:
-    """Seconds until the access token expires, from ``expiresAt`` (epoch MILLIS)."""
+    """Seconds until the access token expires, from epoch-millis `expiresAt`."""
     exp = oauth.get("expiresAt") if isinstance(oauth, dict) else None
     try:
         return float(exp) / 1000.0 - time.time()
@@ -103,10 +80,11 @@ def _seconds_left(oauth) -> float | None:
 
 
 def login_seconds_left(path: str = _DEFAULT_CREDS) -> float | None:
-    """#379: seconds until the *login itself* expires, from ``refreshTokenExpiresAt``
-    (epoch MILLIS) — the hard ~monthly deadline after which the OAuth refresh token is dead
-    and a manual ``claude`` re-login is required (the refresher renews only the 8 h access
-    token, never the refresh token). None if the field is absent/unreadable."""
+    """Seconds until the login itself expires, or None.
+
+    - Read from epoch-millis `refreshTokenExpiresAt`
+    - After it, a manual `claude` re-login is required
+    """
     creds = _read_creds(path)
     oauth = creds.get("claudeAiOauth") if isinstance(creds, dict) else None
     exp = oauth.get("refreshTokenExpiresAt") if isinstance(oauth, dict) else None
@@ -118,19 +96,21 @@ def login_seconds_left(path: str = _DEFAULT_CREDS) -> float | None:
 
 def login_warn_days(seconds_left: float | None,
                     warn_days: int = LOGIN_EXPIRY_WARN_DAYS) -> int | None:
-    """#379: whole days to show in a login-expiry warning when the login is within
-    ``warn_days`` of expiry, else None. Floors (never overstates the time left) with a
-    floor of 1, which also covers an already-expired login. Pure — the caller owns the
-    once-per-day throttle + i18n."""
+    """Whole days for a login-expiry warning, else None.
+
+    - Floors, with a minimum of 1 (covers expired)
+    - Pure; caller owns throttle and i18n
+    """
     if seconds_left is None or seconds_left > warn_days * 86400:
         return None
     return max(1, int(seconds_left // 86400))
 
 
 def _refresh_sync(refresh_token: str, timeout: float):
-    """Blocking POST of the refresh-token grant. Returns the parsed token response
-    (``access_token`` / ``refresh_token`` / ``expires_in``) or None on any failure.
-    Never raises; never logs the tokens."""
+    """Blocking POST of the refresh-token grant; None on failure.
+
+    - Never raises; never logs tokens
+    """
     body = json.dumps({
         "grant_type": "refresh_token",
         "refresh_token": refresh_token,
@@ -155,9 +135,12 @@ def _refresh_sync(refresh_token: str, timeout: float):
 
 
 def _write_creds_atomic(path: str, data: dict) -> bool:
-    """Write the creds JSON atomically: a temp file in the SAME dir (0600) + an atomic
-    ``os.replace``, so a concurrent reader (a spawning ``claude``) never sees a partial
-    or world-readable file. Returns True on success; leaves no temp on failure."""
+    """Atomically write creds JSON via a same-directory temp file.
+
+    - Temp file is 0600, swapped in with `os.replace`
+    - Readers never see a partial file
+    - Returns True on success; no temp left on failure
+    """
     full = os.path.expanduser(path)
     tmp = f"{full}.tmp"
     try:
@@ -173,9 +156,11 @@ def _write_creds_atomic(path: str, data: dict) -> bool:
 
 
 def refresh_now_sync(path: str = _DEFAULT_CREDS, timeout: float = 20.0) -> str:
-    """UNCONDITIONALLY refresh the access token from the stored refresh token and
-    rewrite the creds file. Returns a short status string for logging. Fail-soft: on
-    any error the existing file is left untouched. Never logs token material."""
+    """Unconditionally refresh the access token and rewrite creds.
+
+    - Returns a short status string for logging
+    - Fail-soft: errors leave the file untouched
+    """
     creds = _read_creds(path)
     if creds is None:
         return "skip: creds unreadable"
@@ -185,8 +170,8 @@ def refresh_now_sync(path: str = _DEFAULT_CREDS, timeout: float = 20.0) -> str:
     resp = _refresh_sync(oauth["refreshToken"], timeout)
     if not resp or not resp.get("access_token"):
         return "fail: refresh request rejected"
-    # Merge the new tokens INTO the existing blob, preserving scopes / subscriptionType
-    # / rateLimitTier the response doesn't echo back.
+    # Merge new tokens into the existing blob.
+    # - Preserves scopes, subscriptionType, rateLimitTier the response omits
     oauth["accessToken"] = resp["access_token"]
     if resp.get("refresh_token"):
         oauth["refreshToken"] = resp["refresh_token"]   # refresh tokens may rotate
@@ -205,12 +190,12 @@ def refresh_now_sync(path: str = _DEFAULT_CREDS, timeout: float = 20.0) -> str:
 async def maybe_refresh(path: str = _DEFAULT_CREDS, skew: float = DEFAULT_SKEW_SECONDS,
                         timeout: float = 20.0, force: bool = False,
                         executor: "concurrent.futures.Executor | None" = None) -> str:
-    """Refresh only if the access token expires within ``skew`` seconds (or ``force``).
-    Runs the blocking HTTP + file I/O in a thread. Returns a status string.
+    """Refresh only if the token expires within `skew` seconds.
 
-    #378: when ``executor`` is given the blocking refresh runs there instead of the
-    default thread pool, so a sweep abandoned by ``refresh_loop``'s ``wait_for`` (a wedged
-    DNS/socket call) can't starve the shared executor the rest of the app depends on."""
+    - `force` bypasses the check; returns a status string
+    - Blocking work runs in a thread
+    - Optional `executor` keeps wedged calls off shared pool
+    """
     creds = _read_creds(path)
     if creds is None:
         return "skip: creds unreadable"
@@ -229,105 +214,77 @@ async def refresh_loop(interval: float = DEFAULT_INTERVAL_SECONDS,
                        sweep_deadline: float = DEFAULT_SWEEP_DEADLINE_SECONDS,
                        heartbeat_every: int = DEFAULT_HEARTBEAT_EVERY,
                        on_alert: "Callable[[str, int], Awaitable[None]] | None" = None) -> None:
-    """Background loop (#191): every ``interval`` seconds, refresh the OAuth token if
-    it is within ``skew`` of expiry. Started next to the usage poller / reaper and
-    cancelled on shutdown. Self-contained + fail-soft — a bad sweep only logs.
+    """Background loop refreshing the OAuth token before expiry.
 
-    #378 hardening (after a loop that went silent for hours): every sweep is bounded by
-    ``sweep_deadline`` so a wedged DNS/socket call can't park the loop; a liveness
-    heartbeat is logged every ``heartbeat_every`` sweeps so a STOPPED loop is a visible
-    gap (not indistinguishable from a healthy idle one — a no-op sweep is otherwise
-    silent); and consecutive failures escalate to WARNING (a revoked refresh_token that
-    needs a manual re-login stops being an easy-to-miss INFO)."""
+    - Runs every `interval` seconds; cancelled on shutdown
+    - Each sweep is bounded by `sweep_deadline`
+    - Heartbeat every `heartbeat_every` sweeps exposes a stopped loop
+    - Consecutive failures escalate to WARNING
+    """
     logger.info("token refresh: sweep every %ds, renew when <%ds left (deadline %ds)",
                 int(interval), int(skew), int(sweep_deadline))
-    # #378: dedicated 1-thread pool for the blocking refresh — a sweep abandoned by
-    # wait_for leaves at most ONE stuck thread here, never in the shared default executor.
-    # #380/#385: while that thread stays blocked (a DNS/socket wedge), each later sweep queues
-    # behind it and also times out. A TRANSIENT wedge self-heals once the resolver returns; a
-    # PERMANENT one would occupy the sole worker forever (the token would never refresh again,
-    # yet the heartbeat would still log "alive"), so #385 REPLACES the pool on every timeout
-    # (see the TimeoutError handler) — freeing a live worker and dropping the queued backlog.
+    # Dedicated 1-thread pool for the blocking refresh.
+    # - A timed-out sweep strands at most one thread
+    # - Pool is replaced on every timeout
+    # - Otherwise a permanent wedge would block refreshes forever
     executor = concurrent.futures.ThreadPoolExecutor(
         max_workers=1, thread_name_prefix="oauth-refresh")
-    fails = 0          # consecutive failed sweeps (a revoked refresh_token → re-login)
-    sweeps = 0         # for the liveness heartbeat
+    fails = 0          # consecutive failed sweeps
+    sweeps = 0         # liveness heartbeat counter
     status = "startup"
-    alerted = False    # #408: an owner alert is outstanding → send the all-clear on recovery
-    # was (#191) — replaced for #378 (no per-sweep deadline, no heartbeat, silent on skip;
-    # a wedged sweep parked the loop with zero further output):
-    #   while True:
-    #       try:
-    #           status = await maybe_refresh(path=path, skew=skew)
-    #           if not status.startswith("skip"):
-    #               logger.info("token refresh: %s", status)
-    #       except asyncio.CancelledError:
-    #           break
-    #       except Exception:
-    #           logger.warning("token refresh sweep failed", exc_info=True)
-    #       try:
-    #           await asyncio.sleep(interval)
-    #       except asyncio.CancelledError:
-    #           break
+    alerted = False    # owner alert outstanding; send all-clear
     try:
         while True:
             try:
                 status = await asyncio.wait_for(
                     maybe_refresh(path=path, skew=skew, executor=executor),
                     timeout=sweep_deadline)
-                # #385: "skip: Ns left" is the only HEALTHY skip (token still fresh) — it resets
-                # the streak. "skip: creds unreadable" / "skip: no refresh token" mean the
-                # refresher is NON-FUNCTIONAL, not idle, so treat them as failures (escalate, do
-                # not reset). Was: every "skip" hit the else branch → silent AND reset fails, so a
-                # broken creds file never escalated and a transient one reset an in-flight streak.
+                # Only the "skip: Ns left" case is healthy.
+                # - Healthy skip resets the failure streak
+                # - Unreadable creds or no refresh token mean broken refresher
+                # - Treat those as failures and escalate
                 healthy_skip = status.startswith("skip") and status.endswith("left")
                 if status.startswith("fail") or (status.startswith("skip") and not healthy_skip):
                     fails += 1
-                    # A revoked/rotated refresh_token (or an unreadable creds file) fails every
-                    # sweep — say so LOUDLY after the first repeat instead of an easy-to-miss INFO.
+                    # Repeated failures log loudly, not as easy-to-miss INFO.
+                    # - Cause: revoked or rotated refresh token, or unreadable creds
                     level = logging.WARNING if fails >= 2 else logging.INFO
                     logger.log(level, "token refresh: %s (%d consecutive%s)", status, fails,
                                "; manual re-login likely needed" if fails >= 2 else "")
                 else:
                     if status.startswith("ok"):
-                        logger.info("token refresh: %s", status)   # an actual "ok: refreshed"
+                        logger.info("token refresh: %s", status)   # an actual refresh
                     fails = 0
             except asyncio.TimeoutError:
                 fails += 1
                 status = "fail: sweep timed out"
-                # #380: match the fail-status path above — a single >deadline stall is INFO
-                # (a transient blip), and only a REPEAT (a persistent DNS/socket wedge)
-                # escalates to WARNING. Was: unconditional logger.warning — replaced for #380.
+                # A single timeout is INFO; only a repeat warns.
+                # - A repeat suggests a persistent DNS or socket wedge
                 level = logging.WARNING if fails >= 2 else logging.INFO
                 logger.log(level, "token refresh: sweep exceeded %ds (blocked DNS/socket?) — "
                            "abandoned, will retry (%d consecutive)",
                            int(sweep_deadline), fails)
-                # #385: the abandoned worker still holds the SOLE slot of this max_workers=1
-                # pool; a permanent wedge would queue every later sweep behind that dead thread
-                # forever (and, once it cleared, fire a burst of back-to-back token rotations from
-                # the backlog). Replace the pool: the next sweep gets a live worker and
-                # cancel_futures drops the backlog. Leaks at most one thread per distinct
-                # permanent wedge (unavoidable for an uninterruptible getaddrinfo).
+                # Replace the pool after a timeout.
+                # - Abandoned worker holds the pool's only slot
+                # - Otherwise later sweeps queue behind it, then burst-rotate tokens
+                # - `cancel_futures` drops the backlog
+                # - Leaks at most one thread per permanent wedge
                 executor.shutdown(wait=False, cancel_futures=True)
                 executor = concurrent.futures.ThreadPoolExecutor(
                     max_workers=1, thread_name_prefix="oauth-refresh")
             except asyncio.CancelledError:
                 break
             except Exception as exc:
-                # #385: record the failure in `status` so the heartbeat below does not report a
-                # STALE "last status" after an unexpected-exception sweep.
-                # #390: count it as a failed sweep too (parity with the fail/timeout paths) so a
-                # PERSISTENT unexpected exception feeds the consecutive-fail escalation instead of
-                # only a traceback each sweep; a healthy ok / "skip: …s left" still resets fails.
+                # Record unexpected-exception sweeps in `status` and count as failed.
+                # - Keeps the heartbeat's last status accurate
+                # - Persistent exceptions then feed consecutive-failure escalation
                 fails += 1
                 status = f"fail: {type(exc).__name__}"
                 logger.warning("token refresh sweep failed", exc_info=True)
-            # #408: the escalation above only reaches journald. Push it to the OWNER too —
-            # while the login is dead every turn fails with a generic "server-side error",
-            # so the alert is the only thing that names the real cause (re-login on the host).
-            # A "skip: no refresh token" / "skip: creds unreadable" is TERMINAL (no sweep can
-            # recover it), so it alerts on the FIRST occurrence instead of waiting out the
-            # streak the transient-failure threshold is there to filter.
+            # Push escalation to the owner as well as journald.
+            # - A dead login makes every turn fail generically
+            # - The alert is the only message naming the cause
+            # - Terminal skips alert on first occurrence
             if on_alert is not None:
                 terminal = status.startswith("skip")     # only non-healthy skips reach here
                 threshold = 1 if terminal else ALERT_AFTER_FAILS
@@ -343,8 +300,8 @@ async def refresh_loop(interval: float = DEFAULT_INTERVAL_SECONDS,
                         alerted = False
             sweeps += 1
             if heartbeat_every > 0 and sweeps % heartbeat_every == 0:
-                # #385: these lines sit OUTSIDE the per-sweep try/except — guard the heartbeat log
-                # so a raising handler here cannot escape to `finally` and kill the loop.
+                # These lines sit outside the per-sweep try/except.
+                # - Guard heartbeat log so errors cannot kill the loop
                 with contextlib.suppress(Exception):
                     logger.info("token refresh: alive — %d sweeps done, last status: %s",
                                 sweeps, status)
