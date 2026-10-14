@@ -88,12 +88,18 @@ COMMANDS: tuple[Cmd, ...] = (
     Cmd("schedules", {"en": "List / pause / delete schedules",
                       "ru": "Список / пауза / удаление расписаний"}, help_group="run"),
     # — Tier C · occasional · settings (pickers/toggles; also in the /settings hub) —
-    Cmd("model", {"en": "Switch model: opus | sonnet | haiku",
-                  "ru": "Сменить модель: opus | sonnet | haiku"}, help_group="settings"),
-    Cmd("effort", {"en": "Reasoning depth: low … max",
-                   "ru": "Глубина рассуждений: low … max"}, help_group="settings"),
-    Cmd("memory", {"en": "1M context window (chat): on | off",
-                   "ru": "Окно контекста 1M (чат): on | off"}, help_group="settings"),
+    # #415: no model / effort names here — both lists come from the Claude Code CLI. was:
+    #   Cmd("model", {"en": "Switch model: opus | sonnet | haiku",
+    #                 "ru": "Сменить модель: opus | sonnet | haiku"}, help_group="settings"),
+    #   Cmd("effort", {"en": "Reasoning depth: low … max",
+    #                  "ru": "Глубина рассуждений: low … max"}, help_group="settings"),
+    Cmd("model", {"en": "Switch model",
+                  "ru": "Сменить модель"}, help_group="settings"),
+    Cmd("effort", {"en": "Reasoning depth",
+                   "ru": "Глубина рассуждений"}, help_group="settings"),
+    # #428: /memory (the 1M-context toggle) is retired — 1M is the models' native window. was:
+    #   Cmd("memory", {"en": "1M context window (chat): on | off",
+    #                  "ru": "Окно контекста 1M (чат): on | off"}, help_group="settings"),
     Cmd("forget", {"en": "Clear this topic's agent-saved memory (code)",
                    "ru": "Очистить память темы, сохранённую агентом (код)"},
         scope="code", help_group="settings"),  # #362: session memory is code-only

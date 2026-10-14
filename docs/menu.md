@@ -217,15 +217,12 @@ Conventions legend).
 
 | Command | EN label | RU label | Args | Access |
 |---|---|---|---|---|
-| `/model` | Switch model: opus \| sonnet \| haiku | Сменить модель: opus \| sonnet \| haiku | none → picker | 🟢 |
-| `/effort` | Reasoning depth: low … max | Глубина рассуждений: low … max | none → picker | 🟢 (`max` gated) |
-| `/memory` | 1M context window (chat): on \| off | Окно контекста 1M (чат): on \| off | none → toggle | 🟢 |
+| `/model` | Switch model | Сменить модель | none → picker (the models the CLI offers, minus the withheld Fable family) | 🟢 |
+| `/effort` | Reasoning depth | Глубина рассуждений | none → picker (the CLI's levels for the session's model) | 🟢 (`max` gated) |
 | `/forget` | Clear this topic's agent-saved memory (code) | Очистить память темы, сохранённую агентом (код) | none | 🟦 |
 | `/language` | Choose the interface language | Выбрать язык интерфейса | none → picker | 🟢 |
 | `/context` | Context-window usage | Использование окна контекста | none | 🟢 |
 | `/limits` | 📊 Your usage limits | 📊 Ваши лимиты использования | none | 🟢 |
-| `/queue` | Show the pending-prompt queue | Показать очередь запросов | none | 🟢 |
-| `/clearqueue` | Clear the pending queue | Очистить очередь | none | 🟢 |
 | `/rename` | Rename the current session | Переименовать текущую сессию | prompts for a name (capture) | 🟢 |
 | `/recap` | 📋 Recap the session in one line (AI) | 📋 Краткая сводка сессии в одну строку (ИИ) | none → runs a model turn | 🟢 |
 | `/last` | Show the last exchange (verbatim) | Показать последний обмен (как есть) | none | 🟢 |
@@ -322,7 +319,6 @@ rows appear only in a code session (§1.7).
 | ⚡ Effort: high ▸ | ▮ full width |
 | 🔐 Permissions: auto-edits ▸ *(code)* | ▮ full width |
 | 🔁 Max turns: unlimited ▸ *(code)* | ▮ full width |
-| 🗄 1M context: off *(granted)* | ▮ full width |
 | 🧪 Sandbox: on ▸ *(owner)* | ▮ full width |
 | 🌐 Language: English ▸ | ▮ full width |
 | 🔥 Warm-cache note: off | ▮ full width |
@@ -343,7 +339,6 @@ rows appear only in a code session (§1.7).
 | Effort | ⚡ Effort: {value} ▸ | ⚡ Усилие: {value} ▸ | 🟢 (`max` gated) |
 | Permissions | 🔐 Permissions: {value} ▸ | 🔐 Права: {value} ▸ | 🟦 |
 | Max turns | 🔁 Max turns: {value} ▸ | 🔁 Лимит ходов: {value} ▸ | 🟦 |
-| 1M context | 🗄 1M context: {on/off} | 🗄 Контекст 1M: {вкл/выкл} | 🟢 (granted) |
 | Sandbox | 🧪 Sandbox: {value} ▸ | 🧪 Песочница: {value} ▸ | 👑 |
 | Language | 🌐 Language: {name} ▸ | 🌐 Язык: {name} ▸ | 🟢 |
 | Warm-cache note | 🔥 Warm-cache note: {on/off} | 🔥 Заметка о тёплом кэше: {вкл/выкл} | 🟢 (delegated) |
@@ -366,7 +361,11 @@ not surfaced as their own hub rows: the **🗄 Archive retention** picker
 6 months), the global owner toggles **🧩 Code split** and **⏳ Working plate**, and
 quick launchers for the user-management commands (**➕ Allow · ➖ Deny · 🎚 Level ·
 ⏳ Expiry · 💳 Tokens · 📊 Stats**). Each launcher starts the matching command's
-arg-capture (§1.5) or opens its page.
+arg-capture (§1.5) or opens its page. The **🔄 CLI update** row opens a page with the
+installed Claude Code CLI version, the last update check and its outcome, a daily update
+time picker (Off · 00:00 · 03:00 · … · 21:00 UTC, every three hours; default 12:00 UTC) and a
+**🔄 Check now** action. Sessions move to a new CLI version without cutting a reply: idle ones
+at once, busy ones after their answer.
 
 ### 3.3 The sessions browser (`/sessions`)
 
@@ -402,6 +401,23 @@ there is no Export, so 🟩 *Convert to code* pairs with 📄 *Transcript*
 (`📄 Transcript | 🟩 Convert to code`) and appears only if the session owner has
 code access. **📋 Recap runs the AI one-line recap** (a model turn); the verbatim
 last prompt+reply is the `/last` command, not a menu button.
+
+**What a session runs on.** Creating a session (`/new`) confirms with a single line: the mode
+glyph and the model the session runs on with its version and effort, as the Claude Code CLI reports
+them — e.g. `💬 Opus 5.5 · medium` (the effort is the session's own level, else the model's CLI
+default; it is left out for a model that takes no effort). Switching into a session (✅ Switch),
+the session action menu and the status card show the labelled form,
+`Model: Opus 5.5 · Effort: medium`. While a reply is being prepared, the first line of the
+animated "Thinking…" indicator names the same model and effort (experimental,
+`THINKING_MODEL_LINE`).
+
+**Session names.** A session names itself, in this order: a name the user set (`/rename`) →
+the CLI's own title for the conversation → the first substantive user message → the first user
+message as typed, however short → the topic of the first substantial reply (only when the user
+sent no text at all, e.g. a captionless photo). Message-derived names are cut on a word
+boundary to what fits on the sessions-browser button. A session left on the "Not named yet"
+placeholder that holds nothing to name it by is archived once it is no longer current (as a
+never-used one already was), by the sessions-browser refresh, an idle rotation, and a daily sweep.
 
 **Table 14 — Session action buttons.**
 
@@ -473,12 +489,12 @@ option showing that user's effective access — their **exception** if set, else
 Read-only · Hidden**. This is how *"give it to only some users"* is expressed:
 **leave the base Hidden, then delegate per user here.**
 
-> **Worked example — delegate 🗄 1M context to specific users.** 1M context's base
-> access is **Hidden** (Table 23), so by default no one but the owner sees it. To
-> grant it to a chosen user: **👥 Users → tap the user → 🔑 Access → 🗄 1M context →
-> Delegated**. That user now sees and toggles 1M context; everyone else still has it
-> hidden. (If you previously changed its **Global** base to Read-only, set it back to
-> **Hidden** on 🌍 Global → 🗄 1M context → 🔑 Base access first.)
+> **Worked example — delegate 📦 Auto-compact to specific users.** Auto-compact's base
+> access is **Hidden** (Table 23), so by default no one but the owner sees it and it stays
+> on for everyone. To let a chosen user turn it off: **👥 Users → tap the user → 🔑 Access →
+> 📦 Auto-compact → Delegated**. That user now sees and toggles it; everyone else still has
+> it hidden. (If you previously changed its **Global** base to Read-only, set it back to
+> **Hidden** on 🌍 Global → 📦 Auto-compact → 🔑 Base access first.)
 
 ### 3.5 Choice pickers
 
@@ -498,8 +514,8 @@ current value, `◂ Back` to the parent. Used by `/model`, `/effort`, `/language
 
 | Picker | Choices | Access |
 |---|---|---|
-| Model | opus · sonnet · haiku | 🟢 |
-| Effort | low · medium · high · xhigh · max · default | 🟢 (`max` gated) |
+| Model | the aliases the Claude Code CLI offers, labelled with what each resolves to (e.g. Default (recommended) · Opus 5.5 · Sonnet 5.5 · Haiku 4.5) | 🟢 |
+| Effort | the CLI's levels for the session's model (names translated when known) · default (with the model's CLI default named) | 🟢 (`max` gated) |
 | Permissions | ask · auto-edits · plan · full-access | 🟦 (`full-access` 👑) |
 | Usage display | off · footer · pinned · both | 👑 |
 | Max turns | 10 · 25 · 50 · 100 · unlimited | 🟦 |
@@ -596,11 +612,10 @@ One row per option. *Applies to* marks code-only options (§1.7). *Base access* 
 
 | Option | Type / values | Global | Applies to | Base access | Exceptions / gates |
 |---|---|---|---|---|---|
-| `model` | enum: opus, sonnet, haiku | opus | all | Delegated | — |
-| `effort` | enum: low, medium, high, xhigh, max, default | high | all | Delegated | `max`: delegated only to granted users |
+| `model` | a CLI alias or pinned id (the CLI's catalog) | `DEFAULT_MODEL` | all | Delegated | `MODEL_PICKER` can narrow the picker |
+| `effort` | the CLI's levels for the model, or default | the model's CLI default | all | Delegated | `max`: delegated only to granted users |
 | `permission_mode` | enum: ask, auto-edits, plan, full-access | auto-edits | code | Delegated | `full-access`: owner only; default `auto-edits` auto-runs in-jail edits + ordinary shell, prompts only for push/destructive/web |
 | `max_turns` | int 1–1000, or unlimited | unlimited | code | Delegated | — |
-| `memory` | bool | off | all | Hidden | Delegated: granted users (the per-session 1M-context toggle) |
 | `sandbox` | bool | on | all (chat & code) | Hidden | owner: Delegated (jail covers chat sessions too) |
 | `language` | enum: supported locales | en | all (UI) | Delegated | — |
 | `usage_display` | enum: off, footer, pinned, both | footer | account-wide | Read-only | owner: Delegated |

@@ -15,8 +15,12 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-# Default model id used when DEFAULT_MODEL is not provided in the environment.
-DEFAULT_MODEL = "claude-opus-4-8"
+# Default model used when DEFAULT_MODEL is not provided in the environment: the Claude Code
+# CLI's own "default" alias — the model Claude Code recommends for the account, resolved by
+# the CLI (app/core/models.py). No model family or version is named in code; a deployment
+# that wants a family pins it in .env (e.g. DEFAULT_MODEL=opus).
+# was: DEFAULT_MODEL = "claude-opus-4-8" — replaced for #411.
+DEFAULT_MODEL = "default"
 # Default base directory for per-thread working directories.
 DEFAULT_BASE_WORKDIR = "./workdirs"
 # Default SQLite database path for persisted per-thread state and usage.
@@ -107,6 +111,15 @@ class Settings:
     # next message starts clean instead of re-ingesting stale history (context drift). The old
     # transcript + workdir are kept on disk. 0 = never auto-rotate. Per-user override → idle_reset_min.
     idle_reset_sec: int = 2700     # 45 min (was 1800 / 30 min — #359)
+    # #412: how often the bot runs the host CLI's own updater (`claude update`) and re-stages
+    # the jail copy, so new models (taken from the CLI, #411) arrive with no bot change.
+    # was (#412, an interval in hours — replaced for #423 by a daily run at a fixed UTC time):
+    #   cli_update_hours: int = 24
+    # #423: run that update once a day at this UTC time ("HH:MM"; "off" = never), then move the
+    # clients onto the new binary without cutting a reply (idle ones at once, busy ones after
+    # their turn). The owner can change it at runtime from /settings → Admin (persisted in kv
+    # `cli_update_at`, which overrides this startup default).
+    cli_update_at: str = "12:00"
     max_concurrent_turns: int = 4  # cap on SIMULTANEOUS active turns (the generation spike)
     min_free_mb: int = 400         # below this MemAvailable, evict idle clients before a turn
     # Extra prompt keyword triggers to neutralize, ON TOP of the built-in defaults
@@ -142,7 +155,7 @@ def load_settings() -> Settings:
         OWNER_ID           -- integer Telegram user id allowed to use the bot.
 
     Optional environment variables:
-        DEFAULT_MODEL  -- model id (default "claude-opus-4-8").
+        DEFAULT_MODEL  -- model alias or id (default "default" — the CLI's recommended model).
         BASE_WORKDIR   -- base directory for per-thread cwds (default "./workdirs").
         DB_PATH        -- SQLite database path (default "./bot.db").
         ALLOWLIST_PATH -- JSON allowlist file path (default "./allowlist.json").
@@ -255,6 +268,13 @@ def load_settings() -> Settings:
                                                        # buffer (per-user override → #182)
     idle_reset_sec = max(0, _int("IDLE_RESET_SEC", 2700))  # #261: 45-min idle → fresh session (was 1800)
                                                            # (0 = off; per-user override → idle_reset_min)
+    # was: cli_update_hours = max(0, _int("CLI_UPDATE_INTERVAL_HOURS", 24))  # #412 — replaced for #423
+    # #423: daily CLI update time, UTC ("off" = never). A legacy CLI_UPDATE_INTERVAL_HOURS=0
+    # (the old "never") still disables it when CLI_UPDATE_AT_UTC is not set.
+    cli_update_at = (os.environ.get("CLI_UPDATE_AT_UTC") or "").strip()
+    if not cli_update_at:
+        cli_update_at = ("off" if os.environ.get("CLI_UPDATE_INTERVAL_HOURS", "").strip() == "0"
+                         else "12:00")
     shell_ttl_sec = max(0, _int("SHELL_TTL_SEC", 86400))   # #274: detached-shell TTL (0 = until delete)
     max_concurrent_turns = max(1, _int("MAX_CONCURRENT_TURNS", _default_turns))
     min_free_mb = max(0, _int("MIN_FREE_MB", 400))
@@ -318,6 +338,7 @@ def load_settings() -> Settings:
         idle_ttl_sec=idle_ttl_sec,
         shell_ttl_sec=shell_ttl_sec,
         idle_reset_sec=idle_reset_sec,
+        cli_update_at=cli_update_at,  # #423 (was: cli_update_hours=cli_update_hours, #412)
         max_concurrent_turns=max_concurrent_turns,
         min_free_mb=min_free_mb,
         archive_retention_days=archive_retention_days,

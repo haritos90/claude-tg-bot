@@ -284,6 +284,31 @@ CATALOG: dict[str, dict[str, str]] = {
     "admin.idle_off": {"en": "Off (never)", "ru": "Выкл (никогда)"},
     "admin.idle_mins": {"en": "{n} min", "ru": "{n} мин"},
     "admin.idle_hours": {"en": "{n} h", "ru": "{n} ч"},
+    # #412/#423: Admin → Claude Code CLI page (version, last check, daily update time, check now).
+    "admin.cli_btn": {"en": "🔄 CLI update: {val} ▸", "ru": "🔄 Обновление CLI: {val} ▸"},
+    "admin.cli_title": {
+        "en": "🔄 <b>Claude Code CLI</b>\nVersion: <code>{ver}</code>\nLast check: {last}",
+        "ru": "🔄 <b>Claude Code CLI</b>\nВерсия: <code>{ver}</code>\nПоследняя проверка: {last}"},
+    "admin.cli_ver_jail": {"en": "{host} (sandbox copy: {jail})",
+                           "ru": "{host} (копия в песочнице: {jail})"},
+    "admin.cli_never": {"en": "never", "ru": "ещё не было"},
+    "admin.cli_res_failed": {"en": "⚠️ The last update failed: {detail}",
+                             "ru": "⚠️ Последнее обновление не удалось: {detail}"},
+    "admin.cli_res_updated": {"en": "✅ Updated {before} → {after}",
+                              "ru": "✅ Обновлено: {before} → {after}"},
+    "admin.cli_res_current": {"en": "✅ Up to date ({ver})", "ru": "✅ Версия актуальна ({ver})"},
+    "admin.cli_pick": {
+        "en": "The bot runs <code>claude update</code> once a day at this time (UTC). Sessions "
+              "move to a new version without cutting a reply: idle ones at once, busy ones "
+              "after their answer.",
+        "ru": "Бот запускает <code>claude update</code> раз в день в это время (UTC). Сессии "
+              "переходят на новую версию, не обрывая ответ: простаивающие — сразу, занятые — "
+              "после своего ответа."},
+    "admin.cli_off": {"en": "Off", "ru": "Выкл"},
+    "admin.cli_daily": {"en": "{time} UTC", "ru": "{time} UTC"},
+    "admin.cli_now": {"en": "🔄 Check now", "ru": "🔄 Проверить сейчас"},
+    "admin.cli_saved": {"en": "✓ CLI update: {val}", "ru": "✓ Обновление CLI: {val}"},
+    "admin.cli_checking": {"en": "Checking for a CLI update…", "ru": "Проверяю обновление CLI…"},
     "admin.ret_never": {"en": "♾ Never (keep forever)", "ru": "♾ Никогда (хранить всегда)"},
     "admin.ret_1mo": {"en": "1 month", "ru": "1 месяц"},
     "admin.ret_3mo": {"en": "3 months", "ru": "3 месяца"},
@@ -340,7 +365,8 @@ CATALOG: dict[str, dict[str, str]] = {
     },
     "settings.row_streaming": {"en": "Streaming: {val}", "ru": "Стриминг: {val}"},
     # #154: 🗄 is the canonical memory/context emoji (🧠 is reserved for MODEL).
-    "settings.row_memory": {"en": "🗄 1M context: {val}", "ru": "🗄 Контекст 1M: {val}"},
+    # #428: the 1M-context row is retired (1M is the models' native window). was:
+    # "settings.row_memory": {"en": "🗄 1M context: {val}", "ru": "🗄 Контекст 1M: {val}"},
     # #140-fix: dedicated max_turns label (was reusing settings.row_model, which
     # rendered TWO "🧠 Model" rows in the registry-driven /settings hub).
     "settings.row_maxturns": {"en": "🔁 Max turns: {val} ▸", "ru": "🔁 Лимит ходов: {val} ▸"},
@@ -375,13 +401,18 @@ CATALOG: dict[str, dict[str, str]] = {
     },
 
     # -- session create / switch / rename / delete -------------------------- #
-    "session.created": {
-        "en": "Created {glyph} <b>{name}</b> and switched to it.\n{tagline}\n"
-              "Send a message to start · /rename to rename · /sessions to switch.",
-        "ru": "Создана {glyph} <b>{name}</b>, переключаемся на неё.\n{tagline}\n"
-              "Отправьте сообщение, чтобы начать · /rename — переименовать · "
-              "/sessions — переключиться.",
-    },
+    # #415: {meta} = the session's model + effort line (session.card_meta), as the CLI reports.
+    # #424: the confirmation is ONLY the mode glyph + the model line ("💬 Opus 5.5 · medium").
+    # was:
+    #   "en": "Created {glyph} <b>{name}</b> and switched to it.\n{meta}\n{tagline}\n"
+    #         "Send a message to start · /rename to rename · /sessions to switch.",
+    #   "ru": "Создана {glyph} <b>{name}</b>, переключаемся на неё.\n{meta}\n{tagline}\n"
+    #         "Отправьте сообщение, чтобы начать · /rename — переименовать · "
+    #         "/sessions — переключиться.",
+    "session.created": {"en": "{glyph} {meta}", "ru": "{glyph} {meta}"},
+    # #422/#424: the model a session runs on with its version (CLI display name) and the effort
+    # (effort.level.* when translated) — the /new confirmation and the thinking-tag first line.
+    "session.model_line": {"en": "{model} · {effort}", "ru": "{model} · {effort}"},
     # #143: session.new_pick is DEAD — the /new chat/code chooser was removed in
     # #133 (every session is born a chat and is promotable via /code), and its
     # on_new_cb handler is commented out. Row removed (restore alongside the chooser).
@@ -452,6 +483,11 @@ CATALOG: dict[str, dict[str, str]] = {
         "en": "Model: <code>{model}</code> · Effort: <code>{effort}</code>",
         "ru": "Модель: <code>{model}</code> · Усилие: <code>{effort}</code>",
     },
+    # #415: the same line for a model that takes no effort level (the CLI lists none for it).
+    "session.card_meta_model": {
+        "en": "Model: <code>{model}</code>",
+        "ru": "Модель: <code>{model}</code>",
+    },
     "session.delete_confirm": {
         "en": "Delete session <b>{name}</b>?\nThis permanently removes its "
               "history and code working files.",
@@ -519,10 +555,11 @@ CATALOG: dict[str, dict[str, str]] = {
     },
     "mode.already": {"en": "Already a <b>{mode}</b> session.", "ru": "Уже <b>{mode}</b>-сессия."},
     "mode.switched_toast": {"en": "Now a {mode} session.", "ru": "Теперь {mode}-сессия."},
-    "session.upgrade_hint": {
-        "en": "💡 This is a chat. Need to run code or edit files? Upgrade with /code.",
-        "ru": "💡 Это чат. Нужно запускать код или править файлы? Повысьте через /code.",
-    },
+    # #424: unused — the /new confirmation is the model line only. Kept for a revert:
+    # "session.upgrade_hint": {
+    #     "en": "💡 This is a chat. Need to run code or edit files? Upgrade with /code.",
+    #     "ru": "💡 Это чат. Нужно запускать код или править файлы? Повысьте через /code.",
+    # },
 
     # -- /model ------------------------------------------------------------- #
     "model.current": {
@@ -543,14 +580,16 @@ CATALOG: dict[str, dict[str, str]] = {
     },
 
     # -- /effort ------------------------------------------------------------ #
-    "effort.default_label": {"en": "default (high)", "ru": "по умолчанию (high)"},
+    # #415: the effort levels are the CLI's own list for the session's model ({levels}), never a
+    # fixed set here. was: "default (high)" / a hardcoded "low|medium|high|xhigh|max".
+    "effort.default_label": {"en": "default ({level})", "ru": "по умолчанию ({level})"},
     "effort.show": {
         "en": "Reasoning effort: <b>{cur}</b>.\nSet with "
-              "<code>/effort low|medium|high|xhigh|max</code> "
+              "<code>/effort {levels}</code> "
               "(<code>/effort default</code> to reset). Higher = deeper thinking, "
               "more tokens.",
         "ru": "Глубина рассуждений: <b>{cur}</b>.\nЗадайте через "
-              "<code>/effort low|medium|high|xhigh|max</code> "
+              "<code>/effort {levels}</code> "
               "(<code>/effort default</code> — сброс). Выше = глубже мышление, "
               "больше токенов.",
     },
@@ -559,9 +598,21 @@ CATALOG: dict[str, dict[str, str]] = {
         "ru": "Глубина рассуждений сброшена к значению по умолчанию.{defer}",
     },
     "effort.usage": {
-        "en": "Usage: <code>/effort low|medium|high|xhigh|max</code>.",
-        "ru": "Использование: <code>/effort low|medium|high|xhigh|max</code>.",
+        "en": "Usage: <code>/effort {levels}</code>.",
+        "ru": "Использование: <code>/effort {levels}</code>.",
     },
+    "effort.unsupported": {
+        "en": "<b>{model}</b> has no reasoning-effort levels.",
+        "ru": "У <b>{model}</b> нет уровней глубины рассуждений.",
+    },
+    # #415: OPPORTUNISTIC display names for effort levels — the level set itself comes from the
+    # CLI (supportedEffortLevels); a level the CLI reports that has no row here is shown under
+    # its own name (i18n.maybe_t). Adding a row only adds a translation, never a level.
+    "effort.level.low": {"en": "low", "ru": "низкое"},
+    "effort.level.medium": {"en": "medium", "ru": "среднее"},
+    "effort.level.high": {"en": "high", "ru": "высокое"},
+    "effort.level.xhigh": {"en": "xhigh", "ru": "очень высокое"},
+    "effort.level.max": {"en": "max", "ru": "максимальное"},
     "effort.set": {
         "en": "Reasoning effort: <b>{val}</b>.{defer}",
         "ru": "Глубина рассуждений: <b>{val}</b>.{defer}",
@@ -875,45 +926,46 @@ CATALOG: dict[str, dict[str, str]] = {
     },
 
     # -- /memory ------------------------------------------------------------ #
-    "memory.show": {
-        "en": "1M context: <b>{current}</b>.\nWhen <b>on</b>, this session requests "
-              "the <b>1M-token</b> context window via the model's [1m] variant — active "
-              "on <b>Opus</b> (auto-included on Max). On Sonnet 1M needs paid "
-              "usage-credits and Haiku has no 1M, so it has no effect there. Your "
-              "conversation persists across restarts either way. Toggle with "
-              "<code>/memory on</code> / <code>/memory off</code>.",
-        "ru": "Контекст 1M: <b>{current}</b>.\nКогда <b>вкл</b>, эта сессия "
-              "запрашивает окно контекста на <b>1M токенов</b> через [1m]-вариант "
-              "модели — работает на <b>Opus</b> (включено на Max). На Sonnet для 1M "
-              "нужны платные кредиты, а у Haiku 1M нет, так что там это ни на что не "
-              "влияет. Разговор и так сохраняется между перезапусками. Переключение: "
-              "<code>/memory on</code> / <code>/memory off</code>.",
-    },
-    "memory.usage": {
-        "en": "Usage: <code>/memory on</code> or <code>/memory off</code>.",
-        "ru": "Использование: <code>/memory on</code> или <code>/memory off</code>.",
-    },
-    "memory.already": {
-        "en": "1M context is already <b>{state}</b>.",
-        "ru": "Контекст 1M уже <b>{state}</b>.",
-    },
-    "memory.on": {
-        "en": "1M context <b>on</b> — on <b>Opus</b> this session now uses the 1M-token "
-              "context window (on Sonnet/Haiku 1M isn't available, so context stays "
-              "standard).{note}",
-        "ru": "Контекст 1M <b>вкл</b> — на <b>Opus</b> эта сессия теперь использует "
-              "окно контекста на 1M токенов (на Sonnet/Haiku 1M недоступно, контекст "
-              "остаётся стандартным).{note}",
-    },
-    "memory.off": {
-        "en": "1M context <b>off</b> — back to the standard context window.{note}",
-        "ru": "Контекст 1M <b>выкл</b> — назад к стандартному окну контекста.{note}",
-    },
-    # #352: session memory (agent-saved per-topic notes via the `remember` tool).
-    "memory.notes": {
-        "en": "\n📝 Session memory: <b>{n}</b> chars saved by the agent (use /forget to clear).",
-        "ru": "\n📝 Память сессии: <b>{n}</b> символов сохранил агент (/forget — очистить).",
-    },
+    # #415: no model names baked in — {models} lists the models the 1M variant is enabled for
+    # (BIG_MEMORY_1M_MODELS, named via the CLI catalog). was: "active on <b>Opus</b> (auto-
+    # included on Max). On Sonnet 1M needs paid usage-credits and Haiku has no 1M, …".
+    # #428: /memory is retired — these rows are unused; kept for a revert.
+    # "memory.show": {
+    #     "en": "1M context: <b>{current}</b>.\nWhen <b>on</b>, this session requests "
+    #           "the <b>1M-token</b> context window via the model's [1m] variant — active "
+    #           "on <b>{models}</b>; on other models it has no effect. Your "
+    #           "conversation persists across restarts either way. Toggle with "
+    #           "<code>/memory on</code> / <code>/memory off</code>.",
+    #     "ru": "Контекст 1M: <b>{current}</b>.\nКогда <b>вкл</b>, эта сессия "
+    #           "запрашивает окно контекста на <b>1M токенов</b> через [1m]-вариант "
+    #           "модели — работает на <b>{models}</b>, на остальных моделях ни на что не "
+    #           "влияет. Разговор и так сохраняется между перезапусками. Переключение: "
+    #           "<code>/memory on</code> / <code>/memory off</code>.",
+    # },
+    # "memory.usage": {
+    #     "en": "Usage: <code>/memory on</code> or <code>/memory off</code>.",
+    #     "ru": "Использование: <code>/memory on</code> или <code>/memory off</code>.",
+    # },
+    # "memory.already": {
+    #     "en": "1M context is already <b>{state}</b>.",
+    #     "ru": "Контекст 1M уже <b>{state}</b>.",
+    # },
+    # "memory.on": {
+    #     "en": "1M context <b>on</b> — on <b>{models}</b> this session now uses the 1M-token "
+    #           "context window (on other models the context stays standard).{note}",
+    #     "ru": "Контекст 1M <b>вкл</b> — на <b>{models}</b> эта сессия теперь использует "
+    #           "окно контекста на 1M токенов (на остальных моделях контекст остаётся "
+    #           "стандартным).{note}",
+    # },
+    # "memory.off": {
+    #     "en": "1M context <b>off</b> — back to the standard context window.{note}",
+    #     "ru": "Контекст 1M <b>выкл</b> — назад к стандартному окну контекста.{note}",
+    # },
+    # # #352: session memory (agent-saved per-topic notes via the `remember` tool).
+    # "memory.notes": {
+    #     "en": "\n📝 Session memory: <b>{n}</b> chars saved by the agent (use /forget to clear).",
+    #     "ru": "\n📝 Память сессии: <b>{n}</b> символов сохранил агент (/forget — очистить).",
+    # },
     "forget.empty": {
         "en": "📝 Session memory is already empty — nothing to forget.",
         "ru": "📝 Память сессии уже пуста — забывать нечего.",
@@ -1528,13 +1580,15 @@ CATALOG: dict[str, dict[str, str]] = {
         "ru": "Показ использования: <b>{usage}</b>",
     },
     "status.streaming": {"en": "Streaming: <b>{state}</b>", "ru": "Стриминг: <b>{state}</b>"},
-    "status.big_memory": {"en": "1M context: <b>{state}</b>", "ru": "Контекст 1M: <b>{state}</b>"},
+    # #428: unused (the 1M toggle is retired). was:
+    # "status.big_memory": {"en": "1M context: <b>{state}</b>", "ru": "Контекст 1M: <b>{state}</b>"},
     "status.busy": {
         "en": "Busy: {busy}; queued: {queued}",
         "ru": "Занят: {busy}; в очереди: {queued}",
     },
     # #170: native-checklist labels (the checkbox itself shows on/off).
-    "status.chk_bigmem": {"en": "1M context", "ru": "Контекст 1M"},
+    # #428: unused (the 1M toggle is retired). was:
+    # "status.chk_bigmem": {"en": "1M context", "ru": "Контекст 1M"},
     "status.chk_busy": {"en": "Busy ({queued} queued)", "ru": "Занят (в очереди: {queued})"},
     "status.cache": {
         "en": "Cache window (5 min): ~{secs}s left",
@@ -2243,6 +2297,11 @@ def mode_word(mode: str, lang: str = DEFAULT_LANG) -> str:
     return t("mode.word_code" if mode == "code" else "mode.word_chat", lang)
 
 
+def maybe_t(key: str, lang: str = DEFAULT_LANG, fallback: str = "", /, **kwargs) -> str:
+    """#415: OPPORTUNISTIC translation — ``t(key)`` when the catalog has that row, else
+    ``fallback`` verbatim. For names that come from outside the bot (e.g. the CLI's effort
+    levels): a known name gets translated, an unknown one is shown as it came."""
+    return t(key, lang, **kwargs) if key in CATALOG else fallback
 
 
 def placeholder_session_names() -> set[str]:

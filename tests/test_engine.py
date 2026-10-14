@@ -207,40 +207,18 @@ def test_remember_tool_persists_caps_and_rejects_empty():
     assert saved[-1] == s.session_notes                                  # hook got the final blob
 
 
-# ----------------------------------------------------------- big_memory 1M (#134)
+# ------------------------------------------------- context window (#134 → #428)
 
-def test_one_m_model_appends_suffix_for_capable_models_only():
-    """[1m] is appended only to 1M-capable models (Opus by default), never doubled."""
-    assert engine._one_m_model("claude-opus-4-8") == "claude-opus-4-8[1m]"
-    assert engine._one_m_model("opus") == "opus[1m]"                 # alias form too
-    assert engine._one_m_model("claude-sonnet-4-6") == "claude-sonnet-4-6"   # paid → off
-    assert engine._one_m_model("claude-haiku-4-5-20251001") == "claude-haiku-4-5-20251001"
-    assert engine._one_m_model("claude-opus-4-8[1m]") == "claude-opus-4-8[1m]"  # no double
-    assert engine._one_m_model("") == ""
-
-
-def test_big_memory_requests_1m_via_model_suffix():
-    """big_memory ON appends [1m] to an Opus session's model (the real 1M request);
-    OFF leaves it clean; a paid-gated model (Sonnet) stays unchanged even when ON; and
-    the retired `betas` no-op is never passed."""
-    on = _sess("chat", big_memory=True)._build_options()
-    assert on.model == "claude-opus-4-8[1m]"
-    assert not getattr(on, "betas", None)                  # retired no-op not passed
-
-    off = _sess("chat", big_memory=False)._build_options()
-    assert off.model == "claude-opus-4-8"
-
-    son = engine.ClaudeSession(mode="code", model="claude-sonnet-4-6", cwd="/tmp",
-                               big_memory=True)._build_options()
-    assert son.model == "claude-sonnet-4-6"                 # paid-gated → no suffix
-
-
-def test_big_memory_1m_models_env_override(monkeypatch):
-    """A deployer who enabled usage-credits can widen the 1M set via BIG_MEMORY_1M_MODELS."""
-    monkeypatch.setattr(engine, "_ONE_M_MODELS", ("opus", "sonnet"))
-    son = engine.ClaudeSession(mode="chat", model="claude-sonnet-4-6", cwd="/tmp",
-                               big_memory=True)._build_options()
-    assert son.model == "claude-sonnet-4-6[1m]"
+def test_model_passes_through_without_a_1m_suffix():
+    """#428: the window is the model's own (1M is native on current models) — the model goes
+    to the CLI as stored, whatever the retired big_memory flag says; no `betas`, no window
+    override in the env."""
+    for flag in (True, False):
+        opts = _sess("chat", big_memory=flag)._build_options()
+        assert opts.model == "claude-opus-4-8"
+        assert not getattr(opts, "betas", None)
+        assert "CLAUDE_CODE_AUTO_COMPACT_WINDOW" not in (opts.env or {})
+    assert not hasattr(engine, "_one_m_model")
 
 
 # ------------------------------------------------ #227a persistent-shell parsing

@@ -32,6 +32,7 @@ from claude_agent_sdk import (
 )
 
 from app import DEPLOY_DIR  # repo-root deploy/ scripts (#302: modules live in the package now)
+from app.core import models  # #411: model catalog reported by the CLI
 
 logger = logging.getLogger(__name__)
 
@@ -94,35 +95,32 @@ try:
 except ValueError:
     _STALL_TIMEOUT_SEC = 180.0
 
-
-# #134: request the 1M-token context window via the [1m] model-id SUFFIX, NOT the
-# `betas` param. Under the OAuth subscription `betas` are IGNORED ("Custom betas are
-# only available for API key users. Ignoring provided betas."), but the suffix works
-# and stays subscription-billed. Empirically (this subscription, 2026-06-16):
-#   • Opus   + [1m] → OK, auto-included, no usage credits, service_tier "standard".
-#   • Sonnet + [1m] → "API Error: Usage credits required for 1M context" (PAID; off here).
-#   • Haiku         → no 1M variant at all.
-# So [1m] is applied ONLY to models that get 1M WITHOUT paid credits — Opus by default.
-# A deployer who has enabled usage credits (claude.ai/settings/usage) can widen the set
-# via env BIG_MEMORY_1M_MODELS (comma-separated model-id substrings, e.g. "opus,sonnet").
-_ONE_M_SUFFIX = "[1m]"
-_ONE_M_MODELS = tuple(
-    s.strip().lower()
-    for s in os.environ.get("BIG_MEMORY_1M_MODELS", "opus").split(",")
-    if s.strip()
-)
+# #417: how long, after a result in a run that injected follow-up messages, to wait for the CLI
+# to say whether it folded them in (idle) or is starting a turn for them. The decision comes in
+# well under a second; the bound only keeps a silent CLI from holding the reply back.
+_SETTLE_TIMEOUT_SEC = 15.0
 
 
-def _one_m_model(model: str) -> str:
-    """Append the [1m] 1M-context suffix to `model` when it is a 1M-capable model
-    (matches _ONE_M_MODELS and isn't already suffixed); otherwise return it unchanged.
-    Used for big_memory sessions so the 1M window is actually requested (#134)."""
-    m = model or ""
-    if not m or _ONE_M_SUFFIX in m:
-        return m
-    if any(tag in m.lower() for tag in _ONE_M_MODELS):
-        return m + _ONE_M_SUFFIX
-    return m
+# #428 / decision-26: the 1M window is NATIVE on every current model (the CLI's own model
+# catalog marks Opus 5.5, Opus 5 / 4.8 / 4.7, Sonnet 5.5 / 5 and Fable `native_1m`), so the
+# [1m] suffix below is a no-op for them and the family list was model knowledge in code. The
+# CLI offers no context-size choice for them, so the 1M toggle is retired: every session runs
+# the model's own window. was (#134 → #411 / decision-22, kept for history):
+#   # request the 1M window via the [1m] model-id SUFFIX, NOT the `betas` param (ignored under
+#   # the OAuth subscription); Opus + [1m] worked, Sonnet + [1m] needed usage credits, Haiku has
+#   # no 1M — so [1m] went only to the families in env BIG_MEMORY_1M_MODELS (default "opus").
+#   _ONE_M_SUFFIX = "[1m]"
+#   _ONE_M_MODELS = tuple(s.strip().lower()
+#                         for s in os.environ.get("BIG_MEMORY_1M_MODELS", "opus").split(",")
+#                         if s.strip())
+#   def _one_m_model(model: str) -> str:
+#       m = model or ""
+#       if not m or _ONE_M_SUFFIX in m: return m
+#       if any(tag in m.lower() for tag in _ONE_M_MODELS): return m + _ONE_M_SUFFIX
+#       resolved = models.resolve(m) or ""   # #411: a family-less alias ("default")
+#       if resolved != m and any(tag in resolved.lower() for tag in _ONE_M_MODELS):
+#           return resolved + _ONE_M_SUFFIX
+#       return m
 
 # Short, friendly system prompt for chat mode. Chat now ships the read-only web
 # research tools (see _build_options), so the prompt tells the model it CAN browse
@@ -791,11 +789,19 @@ class ClaudeSession:
         # dynamic "this session right now" note so the model knows whether the user can /code.
         self.user_level = user_level
         self.model = model
+        # #411: the concrete model id the CLI resolved ``model`` (usually a family alias such
+        # as "opus") to, read from the init message of the current client. None until known.
+        self.resolved_model: str | None = None
+        # #411: the effort the CLI applies to this session (get_settings) — the explicit level,
+        # or the model's default when none is set; None when the model takes none / unknown.
+        self.applied_effort: str | None = None
         self.cwd = cwd
         self.can_use_tool = can_use_tool
         self.permission_mode = permission_mode
         # Big memory: opt-in 1M context window for CHAT mode (code mode already
         # runs with the 1M beta). Set per topic via /memory.
+        # #428: unused since the 1M toggle was retired (the window is the model's own); kept so
+        # callers and the commented #134 branches below still read.
         self.big_memory = big_memory
         # Per-session ENABLED TOOLS (the Tools settings page, #129). None = the mode's
         # full default universe (chat → CHAT_TOOLS web research tools; code →
@@ -1411,7 +1417,9 @@ class ClaudeSession:
             # model-id suffix (see _one_m_model) — for 1M-capable models only (Opus by
             # default; the `betas` param below was ignored under the subscription).
             # was: "model": self.model,
-            "model": _one_m_model(self.model) if self.big_memory else self.model,
+            # #428: back to the plain model — 1M is native on current models. was:
+            #   "model": _one_m_model(self.model) if self.big_memory else self.model,
+            "model": self.model,
             # Isolation: pass [] (NOT None) so the CLI loads NO user/project/local
             # settings and NO CLAUDE.md. In this SDK version None means "load all
             # filesystem sources" — the opposite of what we want.
@@ -1615,6 +1623,23 @@ class ClaudeSession:
                         continue
                     raise exc
                 self.client = client
+                # #411: refresh the bot-wide model catalog from this CLI's initialize response
+                # (the /model picker lists what the CLI offers, so a CLI update surfaces new
+                # models with no code change). Best-effort — never fails the connect.
+                with contextlib.suppress(Exception):
+                    models.capture(await client.get_server_info())
+                # #411: ask the CLI what this session ACTUALLY runs as — the concrete model the
+                # alias resolved to and the applied effort (with none set, the model's own
+                # default, e.g. medium) — for the session line, and teach the catalog that
+                # default. A local control request: no API call, no tokens.
+                with contextlib.suppress(Exception):
+                    resp = await client._query._send_control_request(
+                        {"subtype": "get_settings"}, timeout=10.0)
+                    applied = (resp or {}).get("applied") or {}
+                    if isinstance(applied.get("model"), str) and applied["model"]:
+                        self.resolved_model = applied["model"]
+                    self.applied_effort = applied.get("effort") or None
+                    models.note_applied(self.model, applied, self.effort)
                 return
 
     async def _send_query(self, prompt: str, attachments: list | None) -> None:

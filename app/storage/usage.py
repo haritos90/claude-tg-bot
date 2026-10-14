@@ -128,21 +128,31 @@ async def fetch_account_usage(creds_path: str = _DEFAULT_CREDS, timeout: float =
     out = normalize_account_usage(data)
     return out or None
 
-LABELS = {
-    "five_hour": "5h",
-    "seven_day": "7d",
-    "seven_day_opus": "7d Opus",
-    "seven_day_sonnet": "7d Sonnet",
-    "overage": "overage",
-}
+# #415: window labels are DERIVED from the key (five_hour → "5h", seven_day_<x> → "7d <X>"),
+# so a per-model window for a new family needs no entry here. was a fixed map:
+#   LABELS = {"five_hour": "5h", "seven_day": "7d", "seven_day_opus": "7d Opus",
+#             "seven_day_sonnet": "7d Sonnet", "overage": "overage"}
+_FIXED_LABELS = {"five_hour": "5h", "seven_day": "7d"}
 
-# Deterministic display order for windows.
+
+def window_label(key: str | None) -> str:
+    """Language-neutral label for a usage window key (#415)."""
+    if not key:
+        return "?"
+    if key in _FIXED_LABELS:
+        return _FIXED_LABELS[key]
+    if key.startswith("seven_day_"):
+        return "7d " + key[len("seven_day_"):].replace("_", " ").title()
+    return key.replace("_", " ")
+
+
+# Deterministic display order: the account-wide windows first; every other window the API
+# reports (per-model weekly windows, extra usage, …) follows in the order it arrived
+# (_ordered_present). #415: was a fixed tuple that also named the per-model windows:
+#   ("five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet", "overage")
 WINDOW_ORDER = (
     "five_hour",
     "seven_day",
-    "seven_day_opus",
-    "seven_day_sonnet",
-    "overage",
 )
 
 # Friendly label shown when the API does not send a numeric utilization (it only
@@ -213,7 +223,7 @@ def window_str(info, lang: str = "en") -> str:
     if rate_limit_type == "overage":
         label = i18n.t("usage.label.overage", lang)
     else:
-        label = LABELS.get(rate_limit_type, rate_limit_type or "?")
+        label = window_label(rate_limit_type)  # #415: was LABELS.get(...)
 
     util = None
     if utilization is not None:
@@ -251,6 +261,11 @@ def window_str(info, lang: str = "en") -> str:
         if r:
             out = f"{out} · {i18n.t('usage.resets', lang, when=r)}"
     return out
+
+
+def ordered_windows(rate_by_type: dict):
+    """#415: public alias of _ordered_present — (key, info) for every present window."""
+    return _ordered_present(rate_by_type)
 
 
 def _ordered_present(rate_by_type: dict):

@@ -15,7 +15,7 @@ from types import SimpleNamespace
 from app.storage import db
 from app.storage import archive
 from app import i18n
-from app.core import sessions
+from app.core import models, sessions
 
 
 class _FakeStreamer:
@@ -799,6 +799,14 @@ def test_effective_settings_soft_revoke_and_capability_gates(monkeypatch):
         settings = SimpleNamespace(owner_id=OWNER, default_model="claude-opus-4-8")
         sm = sessions.SessionManager(bot=SimpleNamespace(), settings=settings,
                                      gate=SimpleNamespace(), allowlist=_AL())
+        # #420: the max step-down and the withheld family are read from the CLI catalog.
+        monkeypatch.setattr(models, "_catalog", [
+            {"value": "claude-opus-4-8", "resolvedModel": "claude-opus-4-8",
+             "supportsEffort": True,
+             "supportedEffortLevels": ["low", "medium", "high", "xhigh", "max"]},
+            {"value": "fable", "resolvedModel": "claude-fable-5-1", "supportsEffort": True,
+             "supportedEffortLevels": ["low", "medium", "high", "max"]},
+        ])
 
         def _state(uid):
             return SimpleNamespace(
@@ -810,18 +818,28 @@ def test_effective_settings_soft_revoke_and_capability_gates(monkeypatch):
         # Non-owner code user with stale overrides the owner has since restricted.
         eff = await sm._effective_settings(_state(5))
         assert eff["model"] == "claude-opus-4-8"        # read-only → global (soft revoke)
-        assert eff["effort"] == "xhigh"                 # max not granted → downgraded
+        assert eff["effort"] == "xhigh"                 # max not granted → the CLI's next level
         # #212: full-access is owner-only; a non-owner reverts to the normal
         # baseline, which is now acceptEdits (was "default"). Jail-backed default.
         assert eff["permission_mode"] == "acceptEdits"   # full-access owner-only → revert to baseline
-        assert eff["big_memory"] is False               # memory Hidden by default → off
+        assert "big_memory" not in eff                  # #428: the 1M toggle is retired
 
         # The owner keeps their own values (always Delegated + full capability).
         effo = await sm._effective_settings(_state(OWNER))
         assert effo["model"] == "claude-haiku-4-5"
         assert effo["effort"] == "max"
         assert effo["permission_mode"] == "bypassPermissions"
-        assert effo["big_memory"] is True
+        assert "big_memory" not in effo                 # #428
+
+        # #420: a withheld family never runs — not even for the owner, not even when stored.
+        def _fable(uid):
+            st = _state(uid)
+            st.model = "fable"
+            return st
+        assert (await sm._effective_settings(_fable(OWNER)))["model"] == "claude-opus-4-8"
+        # #420: with no catalog known yet, an ungranted max falls back to the model default.
+        monkeypatch.setattr(models, "_catalog", [])
+        assert (await sm._effective_settings(_state(5)))["effort"] is None
 
     asyncio.run(_run())
 

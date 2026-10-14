@@ -1486,6 +1486,62 @@ async def set_user_default(uid: int, key: str, value) -> None:
     await set_kv(kvkey, json.dumps(value))
 
 
+_MODEL_ALIAS_MIGRATION_KV = "model_alias_migrated"
+
+
+async def migrate_model_ids_to_aliases(family_of) -> int:
+    """#411: ONE-TIME move of every stored CONCRETE model id onto its CLI family alias.
+
+    Before #411 the /model picker stored concrete ids (``claude-opus-4-8``), so every stored
+    value was really "the current Opus" frozen at the pick. ``family_of`` maps such an id to
+    its family alias (``models.family_alias``: ``claude-opus-4-8`` → ``opus``, None for an id it
+    can't place). Session rows (``threads.model``) and per-user defaults (kv
+    ``user_default:<uid>:model``) are rewritten to the alias, which the Claude Code CLI resolves
+    to the newest model of the family — so later releases reach them with no further migration.
+
+    Runs ONCE (kv ``model_alias_migrated``): after it, a concrete id can only come from a
+    deliberate ``/model claude-…`` pin, which must survive restarts. Usage rows keep their
+    historical model (accounting history, not configuration). Returns the rows rewritten."""
+    if await get_kv(_MODEL_ALIAS_MIGRATION_KV):
+        return 0
+
+    def _target(model) -> str | None:
+        alias = family_of(model) if isinstance(model, str) else None
+        return alias if alias and alias != model else None
+
+    conn = _require_conn()
+    changed = 0
+    async with _lock:
+        cur = await conn.execute("SELECT DISTINCT model FROM threads WHERE model IS NOT NULL")
+        stored = [r[0] for r in await cur.fetchall()]
+        await cur.close()
+        for model in stored:
+            target = _target(model)
+            if target:
+                res = await conn.execute(
+                    "UPDATE threads SET model = ? WHERE model = ?", (target, model))
+                changed += res.rowcount or 0
+        cur = await conn.execute(
+            "SELECT key, value FROM kv WHERE key LIKE 'user_default:%:model'")
+        defaults = await cur.fetchall()
+        await cur.close()
+        for kvkey, raw in defaults:
+            try:
+                model = json.loads(raw)
+            except (ValueError, TypeError):
+                continue
+            target = _target(model)
+            if target:
+                await conn.execute(
+                    "UPDATE kv SET value = ? WHERE key = ?", (json.dumps(target), kvkey))
+                changed += 1
+        await conn.execute(
+            "INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)",
+            (_MODEL_ALIAS_MIGRATION_KV, "1"))
+        await conn.commit()
+    return changed
+
+
 # --------------------------------------------------------------------------- #
 # Owner-configured per-option ACCESS overrides (#151, menu.md §4)
 # --------------------------------------------------------------------------- #

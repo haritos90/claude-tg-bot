@@ -140,14 +140,14 @@ Fixed-choice commands open an inline picker; commands needing free text prompt f
 message (with `/cancel`). `/help` is generated from the same registry. The full menu structure is
 in [menu.md](docs/menu.md).
 
-| Group          | Commands                                                                                                                      |
-| -------------- | ----------------------------------------------------------------------------------------------------------------------------- |
-| Sessions       | `/new` `/code` (upgrade) `/chat` (downgrade) `/sessions` `/rename` `/fork` `/clear` (alias `/reset`)                          |
-| Run            | `/status` `/retry` `/context` `/limits` `/queue` `/clearqueue`                                                                |
-| Tuning         | `/model` `/effort` `/memory` `/language` · _(code)_ `/permissions` `/files` `/export` `/maxturns` `/tools` `/shell` `/secret` |
-| Recap & export | `/recap` `/last` `/history`                                                                                                   |
-| Meta           | `/settings` `/usage` `/help` `/whoami`                                                                                        |
-| Owner          | `/users` `/userstats` `/allow` `/deny` `/level` `/expire` `/limit` `/auto` `/codesplit`                                       |
+| Group          | Commands                                                                                                                       |
+| -------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| Sessions       | `/new` `/code` (upgrade) `/chat` (downgrade) `/sessions` `/rename` `/fork` `/clear` (alias `/reset`)                           |
+| Run            | `/status` `/retry` `/context` `/limits`                                                                                        |
+| Tuning         | `/model` `/effort` `/language` · _(code)_ `/permissions` `/files` `/export` `/maxturns` `/tools` `/shell` `/secret`            |
+| Recap & export | `/recap` `/last` `/history`                                                                                                    |
+| Meta           | `/settings` `/usage` `/help` `/whoami`                                                                                         |
+| Owner          | `/users` `/userstats` `/allow` `/deny` `/level` `/expire` `/limit` `/auto` `/codesplit`                                        |
 
 ---
 

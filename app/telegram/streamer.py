@@ -156,6 +156,15 @@ configure_custom_emoji(os.environ.get("THINKING_EMOJI_IDS", ""))
 def _thinking_placeholder_html(lang: str = "en") -> str:
     """#294: the static <tg-thinking> placeholder in the user's language."""
     return f"<tg-thinking>{i18n.t('stream.thinking', lang)}…</tg-thinking>"
+# #422 (EXPERIMENTAL): the first line of the <tg-thinking> indicator names the model, its
+# version and the effort the turn runs at ("Opus 5.5 · medium"); the indicator text follows on
+# the second line (`<br>` — rich HTML collapses a bare newline). THINKING_MODEL_LINE=0 turns it
+# off. To remove it entirely: drop this flag, Streamer.model_line and Streamer._thinking_html
+# (its three callers then wrap `inner` in <tg-thinking> as before — the `was:` lines there),
+# and the model_line assignment in SessionManager._run_one.
+_THINKING_MODEL_LINE = os.environ.get("THINKING_MODEL_LINE", "1").strip().lower() not in (
+    "0", "false", "no", "off")
+
 # #240c: extended-thinking (reasoning) shown in the <tg-thinking> block. Keep only the
 # tail (the block is a compact live indicator, not a transcript) and retain a little more
 # than is shown so the frontier animates smoothly as deltas arrive.
@@ -332,6 +341,9 @@ class Streamer:
         # #323: set if a custom-emoji draft send fails this turn → fall back to plain unicode for
         # the rest of the turn, so a rejected custom emoji can never blank the thinking tag.
         self._custom_emoji_failed: bool = False
+        # #422 (experimental): plain-text first line of the <tg-thinking> indicator (model +
+        # version + effort), set by the session worker before start(); "" = no line.
+        self.model_line: str = ""
 
         self.message_id: int | None = None
         self._start_time: float = 0.0
@@ -547,6 +559,13 @@ class Streamer:
         self._phase = None
         self._searching = False  # #319: reasoning resumed — leave search-mode rotation
 
+    def _thinking_html(self, inner: str) -> str:
+        """#422 (experimental): wrap the indicator text (already HTML) in <tg-thinking>, led by
+        the model line when one is set and THINKING_MODEL_LINE is on."""
+        if _THINKING_MODEL_LINE and self.model_line:
+            return (f"<tg-thinking>{markup.escape_html(self.model_line)}<br>{inner}"
+                    "</tg-thinking>")
+        return f"<tg-thinking>{inner}</tg-thinking>"
     async def _render_draft(self) -> None:
         """Push the current text as a native message draft (DM streaming).
 
@@ -637,7 +656,8 @@ class Streamer:
                 lang = i18n.cached_lang(self.chat_id)   # #294: localized gerund
                 inner = (self._emoji("💭", "think")
                          + f" {_thinking_label(time.monotonic() - self._start_time, lang)}…")
-            html = f"<tg-thinking>{inner}</tg-thinking>"
+            # #422: was: html = f"<tg-thinking>{inner}</tg-thinking>"
+            html = self._thinking_html(inner)
             # #242: skip only if unchanged AND sent recently; otherwise re-send to keep the
             # ephemeral ~30s draft alive (a static phase during a long tool would else expire).
             if html == self._rendered_text and (time.monotonic() - self._last_edit) < _DRAFT_KEEPALIVE_SECS:
@@ -653,12 +673,15 @@ class Streamer:
                 self._last_edit = time.monotonic()
             except TelegramRetryAfter as exc:
                 self._draft_retry_after = time.monotonic() + float(getattr(exc, "retry_after", 1) or 1)
-            except Exception:
+            except Exception as exc:
                 # #323: a draft can fail if a custom emoji is rejected (owner lost premium, a bad
                 # id, or drafts don't accept custom emoji) — fall back to plain unicode for the
                 # rest of the turn so the indicator keeps showing (unicode always works).
                 if _OWNER_PREMIUM and _CUSTOM_EMOJI_IDS:
                     self._custom_emoji_failed = True
+                # #422: likewise drop the experimental model line for the rest of the turn.
+                if isinstance(exc, TelegramBadRequest):
+                    self.model_line = ""
             return
         self._phase = None  # #240b: real content is streaming — drop any live tool phase
         self._searching = False  # #319: and any search-mode rotation
@@ -857,18 +880,26 @@ class Streamer:
                 # throttle never silently reverts a DM to the chunky 1/sec write-head.
                 # was: await self.bot.send_message_draft(chat_id=…, draft_id=…, text="")
                 #      — an empty plain draft (Telegram's own native "Thinking…"); #239.
-                try:
-                    await self.bot(
-                        SendRichMessageDraft(
-                            chat_id=self.chat_id, draft_id=self._draft_id,
-                            rich_message={"html": _thinking_placeholder_html(
-                                i18n.cached_lang(self.chat_id))},
+                # #422: two attempts — a draft rejected while it carries the experimental model
+                # line is retried once without it, so the line can never cost a turn its drafts.
+                for _attempt in range(2):
+                    try:
+                        await self.bot(
+                            SendRichMessageDraft(
+                                chat_id=self.chat_id, draft_id=self._draft_id, **self._draft_extra(),
+                                # #422: was: rich_message={"html": _thinking_placeholder_html(
+                                #     i18n.cached_lang(self.chat_id))},
+                                rich_message={"html": self._thinking_placeholder()},
+                            )
                         )
-                    )
-                except TelegramBadRequest:
-                    self.use_drafts = False
-                except Exception:
-                    pass
+                    except TelegramBadRequest:
+                        if self.model_line:
+                            self.model_line = ""
+                            continue
+                        self.use_drafts = False
+                    except Exception:
+                        pass
+                    break
 
             if not self.use_drafts:
                 if placeholder is None:
@@ -981,9 +1012,10 @@ class Streamer:
             with contextlib.suppress(Exception):
                 await self.bot(
                     SendRichMessageDraft(
-                        chat_id=self.chat_id, draft_id=self._draft_id,
-                        rich_message={"html": _thinking_placeholder_html(
-                            i18n.cached_lang(self.chat_id))},
+                        chat_id=self.chat_id, draft_id=self._draft_id, **self._draft_extra(),
+                        # #422: was: rich_message={"html": _thinking_placeholder_html(
+                        #     i18n.cached_lang(self.chat_id))},
+                        rich_message={"html": self._thinking_placeholder()},
                     )
                 )
         else:

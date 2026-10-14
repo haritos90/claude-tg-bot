@@ -105,15 +105,19 @@ def test_role_ordering_and_gates():
     assert not model.can_edit(Role.GUEST)
 
 
-def test_memory_bool_user_coercion():
-    """A stored user-default of 0/1 coerces to a real bool in the USER getter."""
-    s = settings_schema.get("memory")
-    # big_memory=None so the SESSION tier has no opinion and we fall to USER.
-    ctx = settings_schema.make_ctx(
-        state=_state(big_memory=None), user_defaults={"memory": 1}
-    )
+def test_bool_user_coercion():
+    """A stored user-default of 0/1 coerces to a real bool in the USER getter. (#428: was on
+    the retired "memory" setting; auto_compact is the same USER-scope bool shape.)"""
+    s = settings_schema.get("auto_compact")
+    ctx = settings_schema.make_ctx(state=_state(), user_defaults={"auto_compact": 0})
     value, scope = settings_schema.resolve(s, ctx)
-    assert value is True and scope is Scope.USER
+    assert value is False and scope is Scope.USER
+
+
+def test_retired_1m_toggle_is_gone():
+    """#428: the 1M-context toggle is retired — no setting, no base-access row."""
+    assert "memory" not in settings_schema.SETTINGS
+    assert "memory" not in settings_schema.BASE_ACCESS_DEFAULTS
 
 
 # --------------------------------------------------------------------------- #
@@ -123,19 +127,19 @@ from app.access.settings_schema import Access  # noqa: E402
 
 
 def test_base_access_defaults_match_table_23():
-    """The built-in base access matches menu.md Table 23 (memory/sandbox Hidden,
+    """The built-in base access matches menu.md Table 23 (sandbox / auto-compact Hidden,
     usage Read-only, the rest Delegated)."""
     d = settings_schema.BASE_ACCESS_DEFAULTS
     assert d["model"] is Access.DELEGATED
-    assert d["memory"] is Access.HIDDEN
+    assert d["auto_compact"] is Access.HIDDEN   # #428: was d["memory"] (retired)
     assert d["sandbox"] is Access.HIDDEN
     assert d["usage_display"] is Access.READONLY
 
 
 def test_effective_access_owner_always_delegated():
     """The owner always has full (DELEGATED) access, even to a Hidden-by-default option."""
-    mem = settings_schema.get("memory")  # default HIDDEN
-    assert settings_schema.effective_access(mem, settings_schema.make_ctx(role=Role.OWNER)) is Access.DELEGATED
+    hidden = settings_schema.get("auto_compact")  # default HIDDEN (#428: was "memory")
+    assert settings_schema.effective_access(hidden, settings_schema.make_ctx(role=Role.OWNER)) is Access.DELEGATED
 
 
 def test_effective_access_precedence_exception_over_base_over_default():
@@ -167,15 +171,16 @@ def test_can_view_edit_combine_role_and_access():
     assert not settings_schema.can_edit_setting(model, ctx)
 
 
-def test_memory_hidden_by_default_until_delegated():
-    """big_memory is Hidden by default for non-owners; an exception delegates it."""
-    mem = settings_schema.get("memory")
-    ctx = settings_schema.make_ctx(role=Role.CHAT, state=_state(big_memory=True))
-    assert not settings_schema.can_view_setting(mem, ctx)
-    ctx = settings_schema.make_ctx(role=Role.CHAT, state=_state(big_memory=True),
-                                   access_exceptions={"memory": "delegated"})
-    assert settings_schema.can_view_setting(mem, ctx)
-    assert settings_schema.can_edit_setting(mem, ctx)
+def test_hidden_by_default_until_delegated():
+    """A Hidden-by-default option is invisible to non-owners until an exception delegates
+    it. (#428: was on the retired "memory" setting.)"""
+    opt = settings_schema.get("auto_compact")
+    ctx = settings_schema.make_ctx(role=Role.CHAT, state=_state())
+    assert not settings_schema.can_view_setting(opt, ctx)
+    ctx = settings_schema.make_ctx(role=Role.CHAT, state=_state(),
+                                   access_exceptions={"auto_compact": "delegated"})
+    assert settings_schema.can_view_setting(opt, ctx)
+    assert settings_schema.can_edit_setting(opt, ctx)
 
 
 def test_resolve_effective_soft_revoke():

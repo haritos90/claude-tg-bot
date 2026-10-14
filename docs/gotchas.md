@@ -33,12 +33,13 @@ Re-check the matching section before editing `engine.py`, `handlers.py`, `stream
   `{"type":"image","source":{"type":"base64",…}}` blocks. It works in chat too; keep the per-message
   `session_id` as `"default"` (context comes from `resume`).
 - Sessions are durable by default. Both modes resume their persisted session id (saved each turn), so
-  context survives a restart or a Stop-button stop. `big_memory` is the 1M-context toggle for both
-  modes, requested via the `[1m]` model-id suffix (not the `betas` param, which OAuth ignores); it
-  applies to Opus by default. A session's mode is mutable: `/code` and `/chat` carry the conversation
-  by copying the resumable session id across mode columns, and both modes run in the per-session
-  workdir so the transcript is findable from either. Mode, model, and `big_memory` changes rebuild
-  the client.
+  context survives a restart or a Stop-button stop. The context window is the model's native one
+  (the CLI's built-in catalog marks the current models `native_1m`); there is no 1M switch and no
+  `[1m]` suffix — for a native-1M model the suffix changes nothing, and the CLI clamps to 200K by
+  itself when an account is not entitled to 1M. The stored `big_memory` flag is ignored. A session's
+  mode is mutable: `/code` and `/chat` carry the conversation by copying the resumable session id
+  across mode columns, and both modes run in the per-session workdir so the transcript is findable
+  from either. Mode and model changes rebuild the client.
 - The permission gate enforces the policy itself. The SDK calls `can_use_tool` for every
   non-auto-allowed tool regardless of `permission_mode`, so `permissions.make_callback` must honor
   the mode: `bypassPermissions` auto-allows everything; `acceptEdits` (the default) auto-allows file

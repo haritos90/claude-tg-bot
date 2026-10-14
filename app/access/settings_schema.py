@@ -88,7 +88,8 @@ BASE_ACCESS_DEFAULTS: dict[str, Access] = {
     "effort": Access.DELEGATED,           # `max` further gated (allow_max_effort)
     "permission_mode": Access.DELEGATED,  # #223: full-access now delegated to code users too
     "max_turns": Access.DELEGATED,
-    "memory": Access.HIDDEN,              # big_memory: owner delegates to granted users
+    # #428: the 1M toggle is retired (the window is the model's own). was:
+    # "memory": Access.HIDDEN,              # big_memory: owner delegates to granted users
     "sandbox": Access.HIDDEN,            # owner delegates
     "language": Access.DELEGATED,
     "usage_display": Access.READONLY,    # account-wide; owner delegates
@@ -419,10 +420,13 @@ def _language_user_setter() -> Setter:
     return setter
 
 
-# Effort choices/levels live in handlers.EFFORT_LEVELS; permission modes are the
-# SDK literals. Kept as literals here to avoid importing the handler layer (which
-# imports this module would risk a cycle) — PART 2 maps friendly labels via i18n.
-_EFFORT_CHOICES = ("low", "medium", "high", "xhigh", "max")
+# Permission modes are the SDK literals. #415: effort levels are NOT listed here any more —
+# they come from the Claude Code CLI for the session's model (app/core/models.py), rendered by
+# handlers._setting_choice_labels and enforced in handlers._ss_apply. was:
+#   # Effort choices/levels live in handlers.EFFORT_LEVELS; permission modes are the
+#   # SDK literals. Kept as literals here to avoid importing the handler layer (which
+#   # imports this module would risk a cycle) — PART 2 maps friendly labels via i18n.
+#   _EFFORT_CHOICES = ("low", "medium", "high", "xhigh", "max")
 # #223: dropped "default"/ask — auto-edits is the floor; full-access is un-gated for
 # code users (sandbox contains it). was: ("default", "acceptEdits", "plan", "bypassPermissions")
 _PERM_CHOICES = ("acceptEdits", "plan", "bypassPermissions")
@@ -432,8 +436,11 @@ SETTINGS: dict[str, Setting] = {
     "model": Setting(
         key="model",
         type=str,
-        choices=("opus", "sonnet", "haiku"),
-        default="opus",
+        # #411: open here — the offered set is the Claude Code CLI's own model catalog
+        # (app/core/models.py), rendered by handlers._setting_choice_labels and enforced in
+        # handlers._ss_apply. was: choices=("opus", "sonnet", "haiku"),
+        choices=None,
+        default=None,  # #411: the GLOBAL scope (settings.default_model) always answers. was: "opus"
         scopes=(Scope.SESSION, Scope.USER, Scope.GLOBAL),
         view_role=Role.CHAT,
         edit_role=Role.CHAT,
@@ -455,7 +462,7 @@ SETTINGS: dict[str, Setting] = {
     "effort": Setting(
         key="effort",
         type=str,
-        choices=_EFFORT_CHOICES,
+        choices=None,  # #415: the CLI's levels for the session's model. was: _EFFORT_CHOICES
         default=None,  # None = SDK default (no explicit effort)
         scopes=(Scope.SESSION, Scope.USER),
         view_role=Role.CHAT,
@@ -491,24 +498,27 @@ SETTINGS: dict[str, Setting] = {
             Scope.USER: _user_setter("permission_mode"),
         },
     ),
-    "memory": Setting(
-        key="memory",  # per-session big_memory (1M context window)
-        type=bool,
-        choices=(True, False),
-        default=False,
-        scopes=(Scope.SESSION, Scope.USER),
-        view_role=Role.CHAT,
-        edit_role=Role.CHAT,
-        name_key="settings.row_memory",
-        get={
-            Scope.SESSION: _session_attr_get("big_memory"),
-            Scope.USER: _bool_user_get("memory"),
-        },
-        set={
-            Scope.SESSION: _session_attr_setter("set_big_memory"),
-            Scope.USER: _user_setter("memory"),
-        },
-    ),
+    # #428 / decision-26: the 1M-context toggle is RETIRED — 1M is the native window of every
+    # current model and the CLI offers no size choice, so the row is gone from the hub and the
+    # access pages. The ThreadState.big_memory column + db setter are kept (harmless) for revert.
+    # "memory": Setting(
+    #     key="memory",  # per-session big_memory (1M context window)
+    #     type=bool,
+    #     choices=(True, False),
+    #     default=False,
+    #     scopes=(Scope.SESSION, Scope.USER),
+    #     view_role=Role.CHAT,
+    #     edit_role=Role.CHAT,
+    #     name_key="settings.row_memory",
+    #     get={
+    #         Scope.SESSION: _session_attr_get("big_memory"),
+    #         Scope.USER: _bool_user_get("memory"),
+    #     },
+    #     set={
+    #         Scope.SESSION: _session_attr_setter("set_big_memory"),
+    #         Scope.USER: _user_setter("memory"),
+    #     },
+    # ),
     # #144: the Streaming toggle is RETIRED — native Telegram sendMessageDraft
     # streaming is always-on (no user toggle; AGENTS §5), and /stream is gone. The
     # registry row is removed so the /settings hub no longer renders it. The
@@ -715,7 +725,8 @@ PAGE_ORDER: tuple[str, ...] = (
     # debug isolation vs bot bugs (#138); now that the jail is stable it's just a footgun.
     # The `sandbox` Setting still exists (drives resolution) but is no longer surfaced.
     # was: "memory", "sandbox", "language",
-    "memory", "language",
+    # #428: "memory" (the retired 1M toggle) removed too. was: "memory", "language",
+    "language",
     # #164: warm-cache note (delegated) + auto-compact + live context (forced-on,
     # delegate-to-disable; #167/#168).
     "hot_cache_timer", "auto_compact", "ctx_status",

@@ -206,6 +206,14 @@ rotating gerund (`stream.searching_words`, 🔎) while a web search/fetch is in 
 tool phase ("📖 Reading `sessions.py`") for other tools → otherwise a generic rotating gerund
 (`stream.thinking_words`, 💭). All localized to the user's language.
 
+**Model line (experimental, `THINKING_MODEL_LINE`, on by default).** The block's first line names
+the model, its version and the effort the reply runs at (`Opus 5.5 · medium`); the indicator text
+described above follows on the second line, separated by `<br>` (rich HTML collapses a bare newline). Live
+check: `sendRichMessageDraft` accepts `<tg-thinking>Opus 5.5 · medium<br>💭 Thinking…</tg-thinking>`.
+A draft Telegram rejects while it carries the line is re-sent without it and the line is dropped
+for the rest of the turn, so it can never cost a turn its drafts. The opt-in "building a table"
+note that streams below text carries no model line.
+
 ### Animation & "still-working" feedback — the hard constraints
 
 Only the `<tg-thinking>` block streamed as a rich DRAFT animates smoothly — Telegram drives the

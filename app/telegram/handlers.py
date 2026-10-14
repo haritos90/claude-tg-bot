@@ -30,7 +30,7 @@ import re
 import time
 import zipfile
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone  # #412: timezone for the CLI last-check stamp
 
 from aiogram import Router, F
 from aiogram.exceptions import TelegramBadRequest  # #173: detect "not modified" on rich edits
@@ -59,24 +59,64 @@ from app.access import settings_schema as ss
 from app.storage import usage
 from app.access.allowlist import normalize_date
 from app.telegram.rich_message import EditRichMessage, SendRichMessage  # #164/#173: native rich
+from app.core import models  # #411: model catalog reported by the Claude Code CLI
+from app.core import cli_update  # #412: CLI version / update for the Admin page
 
 log = logging.getLogger("handlers")
 
 
-# Friendly aliases mapped to concrete model ids for the /model command.
-MODEL_ALIASES: dict[str, str] = {
-    "opus": "claude-opus-4-8",
-    "sonnet": "claude-sonnet-4-6",
-    "haiku": "claude-haiku-4-5-20251001",
-}
-# Reverse map so the settings menu can show a friendly alias for a stored id.
-MODEL_ID_TO_ALIAS: dict[str, str] = {v: k for k, v in MODEL_ALIASES.items()}
+# was — replaced for #411 (models come from the CLI's own catalog — app/core/models.py — and
+# sessions store the family ALIAS the CLI resolves to its newest model, so no model version is
+# hardcoded here any more):
+#   # Friendly aliases mapped to concrete model ids for the /model command.
+#   MODEL_ALIASES: dict[str, str] = {
+#       "opus": "claude-opus-4-8",
+#       "sonnet": "claude-sonnet-4-6",
+#       "haiku": "claude-haiku-4-5-20251001",
+#   }
+#   # Reverse map so the settings menu can show a friendly alias for a stored id.
+#   MODEL_ID_TO_ALIAS: dict[str, str] = {v: k for k, v in MODEL_ALIASES.items()}
 
 # The two session types. A session's type is FIXED at creation (no switching).
 VALID_MODES = ("chat", "code")
 
-# Reasoning-effort levels accepted by /effort (SDK EffortLevel literals, #23).
-EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+# was — replaced for #415 (the levels come from the CLI's catalog for the session's model,
+# models.effort_levels; only `max` stays special, as a per-user permission — _may_max_effort):
+#   # Reasoning-effort levels accepted by /effort (SDK EffortLevel literals, #23).
+#   EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+
+
+# #428: unused since the 1M toggle was retired (it named the BIG_MEMORY_1M_MODELS families).
+# def _one_m_models_label() -> str:
+#     """#415: the models the [1m] variant is enabled for (BIG_MEMORY_1M_MODELS tags), named
+#     by the CLI catalog where a family alias matches (e.g. "Opus 5.5"), else the raw tag."""
+#     names: list[str] = []
+#     for tag in engine._ONE_M_MODELS:
+#         # #422: was: `... and not r["value"].lower().startswith("claude-")` — via models.is_pinned
+#         hits = [models.label(r["value"]) for r in models.entries()
+#                 if tag in r["value"].lower() and not models.is_pinned(r["value"])]
+#         for n in (hits or [tag]):
+#             if n not in names:
+#                 names.append(n)
+#     return ", ".join(names) or "—"
+
+
+def _effort_label(level: str | None, lang: str) -> str:
+    """#415: display name of an effort level — the CLI's own name, translated when the i18n
+    catalog happens to have it (opportunistic: no list of levels is assumed). None → the
+    localized 'default'."""
+    if not level:
+        return i18n.t("settings.val_default", lang)
+    return i18n.maybe_t(f"effort.level.{level}", lang, level)
+
+
+def _effort_default_label(model: str | None, lang: str) -> str:
+    """#415: the 'default' choice of the effort picker, naming what default means for this
+    model when the CLI has reported it (e.g. "default (medium)")."""
+    dflt = models.default_effort(model) if model else None
+    if dflt:
+        return i18n.t("effort.default_label", lang, level=_effort_label(dflt, lang))
+    return i18n.t("settings.val_default", lang)
 
 
 def mode_glyph(mode: str) -> str:
@@ -518,7 +558,8 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         """Whether this user may select the (expensive) `max` reasoning effort — the
         owner (unless self-revoked for testing, #185), or a user explicitly granted it.
         Guests are blocked so they can't burn the owner's one shared subscription via
-        max thinking (#120 / effort gate)."""
+        max thinking (#120 / effort gate). decision-20: `max` is the one effort level the
+        bot names — every other level comes from the CLI."""
         # #185: route the owner through allow_max_effort_of too — it defaults the owner
         # to True, so default behaviour is unchanged, but an owner self-revoke now gates
         # the owner. was an unconditional owner pass:
@@ -788,7 +829,8 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             value, src = (ss.resolve_from(setting, ctx, scope) if editable
                           else ss.resolve_effective(setting, ctx))
             name = _setting_name(setting, lang)
-            vlabel = _setting_value_label(setting, value, lang)
+            vlabel = _setting_value_label(setting, value, lang,
+                                          _scope_model(ctx, scope) if setting.key == "effort" else None)
             badge = _scope_badge(src, lang)
             text = i18n.t("settings.v2_row", lang, name=name, val=vlabel, badge=badge)
             sc_code = _SCOPE_CODE[scope]
@@ -865,6 +907,59 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                      B(text=i18n.t("btn.close", lang), callback_data="sx:close")])
         return InlineKeyboardMarkup(inline_keyboard=rows)
 
+    # was (#412 — an interval picker, replaced for #423 by a daily UTC time):
+    #   _CLI_UPDATE_CHOICES = (0, 6, 12, 24, 72, 168)
+    #   def _cli_update_label(hours, lang): off / "{n} d" / "{n} h" (admin.cli_days / cli_hours)
+    # #423: the daily update time picker — off, or a whole UTC hour every three hours (any
+    # "HH:MM" set via CLI_UPDATE_AT_UTC is shown as is).
+    _CLI_UPDATE_TIMES: tuple = (None,) + tuple((h, 0) for h in range(0, 24, 3))
+
+    def _cli_update_label(hm, lang: str) -> str:
+        """#423: "12:00 UTC", or the localized "off"."""
+        if not hm:
+            return i18n.t("admin.cli_off", lang)
+        return i18n.t("admin.cli_daily", lang, time=_sessions.format_update_time(hm))
+
+    def _cli_update_text(lang: str) -> str:
+        """#412: the CLI page header — installed version (and the jail copy when it lags),
+        the last check and its outcome, then the cadence prompt."""
+        host_v = cli_update.version_of(cli_update.host_cli()) or "?"
+        ver = host_v
+        if getattr(settings, "sandbox_per_session_uid", False):
+            jail_v = cli_update.version_of(cli_update.staged_source())
+            if jail_v and jail_v != host_v:
+                ver = i18n.t("admin.cli_ver_jail", lang, host=host_v, jail=jail_v)
+        last_ts = float(getattr(sessions, "cli_last_check", 0) or 0)
+        last = (datetime.fromtimestamp(last_ts, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+                if last_ts else i18n.t("admin.cli_never", lang))
+        lines = [i18n.t("admin.cli_title", lang, ver=markup.escape_html(ver),
+                        last=markup.escape_html(last))]
+        res = getattr(sessions, "cli_last_result", None)
+        if res is not None:
+            if not res.ok:
+                lines.append(i18n.t("admin.cli_res_failed", lang,
+                                    detail=markup.escape_html(res.detail)))
+            elif res.changed:
+                lines.append(i18n.t("admin.cli_res_updated", lang,
+                                    before=res.before or "?", after=res.after))
+            else:
+                lines.append(i18n.t("admin.cli_res_current", lang, ver=res.after or "?"))
+        lines.append("")
+        lines.append(i18n.t("admin.cli_pick", lang))
+        return "\n".join(lines)
+
+    def _ss_cli_keyboard(cur, lang: str) -> InlineKeyboardMarkup:
+        # #423: was _ss_cli_keyboard(cur_hours, lang) over _CLI_UPDATE_CHOICES (hours).
+        B = InlineKeyboardButton
+        btns = [B(text=("✓ " if hm == cur else "") + _cli_update_label(hm, lang),
+                  callback_data="sx:admin:cliset:" + (f"{hm[0]:02d}{hm[1]:02d}" if hm else "off"))
+                for hm in _CLI_UPDATE_TIMES]
+        rows = [btns[i:i + 3] for i in range(0, len(btns), 3)]
+        rows.append([B(text=i18n.t("admin.cli_now", lang), callback_data="sx:admin:clinow")])
+        rows.append([B(text=i18n.t("settings.back_to", lang), callback_data="sx:admin"),
+                     B(text=i18n.t("btn.close", lang), callback_data="sx:close")])
+        return InlineKeyboardMarkup(inline_keyboard=rows)
+
     def _ss_admin_bool_keyboard(which: str, cur: bool, lang: str) -> InlineKeyboardMarkup:
         """#275: On/Off picker (with Back) for an Admin boolean, so it no longer flips in
         place. `which` is the toggle key (cs/wp)."""
@@ -909,7 +1004,8 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         return InlineKeyboardMarkup(inline_keyboard=rows)
 
     def _ss_admin_keyboard(lang: str, ret_days: int, cs_on: bool, wp_on: bool,
-                           gsl: int = 10, idle_min: int = 30) -> InlineKeyboardMarkup:
+                           gsl: int = 10, idle_min: int = 30,
+                           cli_at=(12, 0)) -> InlineKeyboardMarkup:  # #423: was cli_hours=24
         B = InlineKeyboardButton
         gsl_lbl = "∞" if gsl <= 0 else str(gsl)
         rows = [
@@ -918,6 +1014,9 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
              B(text=i18n.t("admin.gsl_btn", lang, val=gsl_lbl), callback_data="sx:admin:gsl")],
             [B(text=i18n.t("admin.idle_btn", lang, val=_idle_reset_label(idle_min, lang)),
                callback_data="sx:admin:idle")],
+            # #412/#423: Claude Code CLI daily update time (+ a check-now action inside).
+            [B(text=i18n.t("admin.cli_btn", lang, val=_cli_update_label(cli_at, lang)),
+               callback_data="sx:admin:cli")],
             # #275: open an On/Off picker (with Back) instead of flipping in place.
             [B(text=i18n.t("admin.tog_codesplit", lang, val=i18n.onoff(cs_on, lang)),
                callback_data="sx:admin:bool:cs"),
@@ -941,9 +1040,19 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         wp = bool(getattr(sessions, "working_plate", True))
         gsl = await _global_session_limit()
         idle_min = _idle_reset_min()
+        # was: cli_hours = float(getattr(sessions, "cli_update_hours", 0) or 0)  # #412
+        cli_at = getattr(sessions, "cli_update_at", None)  # #423
         with contextlib.suppress(Exception):
             await _edit_menu(msg, i18n.t("admin.title", lang),  # #173: native rich nav-edit
-                             _ss_admin_keyboard(lang, days, cs, wp, gsl, idle_min))
+                             _ss_admin_keyboard(lang, days, cs, wp, gsl, idle_min, cli_at))
+
+    def _scope_model(ctx: ss.Ctx, scope) -> str:
+        """#415: the model effective at a settings scope (what an effort picker lists the
+        CLI's levels for); the deployment default when nothing resolves."""
+        val = None
+        with contextlib.suppress(Exception):
+            val, _ = ss.resolve_from(ss.SETTINGS["model"], ctx, scope)
+        return val or settings.default_model
 
     def _ss_picker_keyboard(setting, scope, ctx: ss.Ctx, lang: str,
                             may_max: bool = True) -> InlineKeyboardMarkup:
@@ -954,9 +1063,12 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         # #138-fix: mark the value held at THIS scope (chain from it), not the
         # cross-scope resolved one, so the picker's ✓ matches the tab.
         value, _ = ss.resolve_from(setting, ctx, scope)
-        cur_label = _setting_value_label(setting, value, lang)
+        # #415: effort lists the levels of the model effective at THIS scope (and the model
+        # picker falls back to it before the CLI has reported a catalog).
+        scope_model = _scope_model(ctx, scope) if setting.key in ("effort", "model") else None
+        cur_label = _setting_value_label(setting, value, lang, scope_model)
         sc_code = _SCOPE_CODE[scope]
-        choices = _setting_choice_labels(setting, lang)
+        choices = _setting_choice_labels(setting, lang, scope_model)
         if setting.key == "effort" and not may_max:
             choices = [(v, lbl) for v, lbl in choices if v != "max"]
         # #223: full-access (bypassPermissions) is now offered to all code users — the
@@ -993,6 +1105,15 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         # 4. Per-setting extra gates that the role matrix alone doesn't cover.
         if setting.key == "effort" and raw_val == "max" and not _may_max_effort(uid, uname):
             return False
+        # #411: only a model the CLI offers (or a fallback family alias) — a forged tap can't
+        # store an arbitrary string the CLI would reject on the next turn.
+        if setting.key == "model" and not models.is_selectable(raw_val):
+            return False
+        # #415: likewise an effort level must be one the CLI lists (any model) — "default"
+        # clears it. Nothing to check against before the CLI has reported a catalog.
+        if (setting.key == "effort" and raw_val not in ("default", "none", "reset")
+                and models.entries() and raw_val not in models.all_effort_levels()):
+            return False
         # #223: full-access (bypassPermissions) un-gated for code users (the #119 sandbox
         # confines it to their own session; the user opts into the risk). was OWNER-ONLY
         # (AGENTS §2 / #150):
@@ -1022,7 +1143,9 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         if setting.type is bool:
             return raw_val if isinstance(raw_val, bool) else (raw_val == "on")
         if setting.key == "model":
-            return MODEL_ALIASES.get(raw_val, raw_val)
+            # #411: store the catalog value itself (a family alias, or a pinned id) — the CLI
+            # resolves an alias to the newest model. was: MODEL_ALIASES.get(raw_val, raw_val)
+            return models.match(raw_val) or raw_val
         if setting.key == "permission_mode":
             return PERM_NAME_TO_MODE.get(raw_val, raw_val)
         if setting.key == "effort":
@@ -1277,6 +1400,35 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                             msg, i18n.t("admin.idle_title", lang),
                             _ss_idle_keyboard(_idle_reset_min(), lang))
                     await cb.answer()
+                    return
+                if sub == "cli":
+                    # #412: open the CLI auto-update page (version, last check, daily time).
+                    with contextlib.suppress(Exception):
+                        await _edit_menu(msg, _cli_update_text(lang),
+                                         _ss_cli_keyboard(sessions.cli_update_at, lang))
+                    await cb.answer()
+                    return
+                if sub == "cliset":
+                    # #423: arg is "HHMM" (UTC) or "off". was (#412): hours = max(0, int(arg))
+                    #   → sessions.set_cli_update_hours(hours)
+                    raw = str(arg or "")
+                    hm = (_sessions.parse_update_time(f"{raw[:2]}:{raw[2:]}")
+                          if len(raw) == 4 and raw.isdigit() else None)
+                    await sessions.set_cli_update_at(hm)
+                    await _send_ss_admin(msg, lang)
+                    await cb.answer(
+                        i18n.t("admin.cli_saved", lang, val=_cli_update_label(hm, lang)))
+                    return
+                if sub == "clinow":
+                    # #412: run one update round now; the page re-renders with the outcome.
+                    await cb.answer(i18n.t("admin.cli_checking", lang))
+                    with contextlib.suppress(Exception):
+                        await sessions.update_cli_now()
+                    with contextlib.suppress(Exception):
+                        await sessions.probe_models()  # #411: new CLI → refresh the model list
+                    with contextlib.suppress(Exception):
+                        await _edit_menu(msg, _cli_update_text(lang),
+                                         _ss_cli_keyboard(sessions.cli_update_at, lang))
                     return
                 if sub == "idleset":
                     try:
@@ -1570,14 +1722,40 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             lang,
         )
 
-    def _created_text(mode: str, name: str, lang: str) -> str:
+    async def _session_meta_line(st, lang: str) -> str:
+        """#415: "Model: Opus 5.5 · Effort: medium" — what the session runs on, straight from
+        the CLI: the model's display name (catalog) and the effort it runs at (its own level,
+        else the model's CLI default; omitted for a model that takes none)."""
+        model, effort = await sessions.model_and_effort(st)
+        # #422: the model it RUNS AS ("Opus 5.5" for the CLI's "default" too). was:
+        #   mlabel = markup.escape_html(models.label(model))
+        mlabel = markup.escape_html(models.runs_as_label(model))
+        if not models.effort_levels(model) and models.entries():
+            return i18n.t("session.card_meta_model", lang, model=mlabel)
+        return i18n.t("session.card_meta", lang, model=mlabel,
+                      effort=markup.escape_html(_effort_label(effort, lang)))
+
+    async def _session_model_line(st, lang: str) -> str:
+        """#424: "Opus 5.5 · medium" — the model a session runs on (display name with its
+        version, from the CLI) and its effort; just the model for one that takes no effort level
+        (or while its default effort is still unknown)."""
+        model, effort = await sessions.model_and_effort(st)
+        name = markup.escape_html(models.runs_as_label(model))
+        if not effort or (models.entries() and not models.effort_levels(model)):
+            return name
+        return i18n.t("session.model_line", lang, model=name,
+                      effort=markup.escape_html(_effort_label(effort, lang)))
+
+    def _created_text(mode: str, name: str, lang: str, meta: str = "") -> str:
         """Confirmation shown after creating + switching to a session — leads with
-        the mode glyph + tagline so the session type is unmistakable."""
+        the mode glyph + tagline so the session type is unmistakable. #415: ``meta`` is the
+        session's model + effort line (_session_meta_line)."""
         return i18n.t(
             "session.created",
             lang,
             glyph=mode_glyph(mode),
             name=markup.escape_html(name),
+            meta=meta,
             tagline=mode_tagline(mode, lang=lang),
         )
 
@@ -1744,10 +1922,18 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
                 await db.switch_mode(key, "code")
                 await _rebuild_session(key)
             final = "code" if want_code else "chat"
-            txt = _created_text(final, name, lang)
-            # On a fresh CHAT, tell code-capable users they can upgrade (#133 / req).
-            if final == "chat" and can_code:
-                txt += "\n" + i18n.t("session.upgrade_hint", lang)
+            # #415: name the model + effort the new session runs on. was:
+            #   txt = _created_text(final, name, lang)
+            # #424: only the mode glyph + "Opus 5.5 · medium". was (#415):
+            #   meta = await _session_meta_line(await db.get_thread(key), lang)
+            meta = ""
+            with contextlib.suppress(Exception):
+                meta = await _session_model_line(await db.get_thread(key), lang)
+            txt = _created_text(final, name, lang, meta or markup.escape_html(name))
+            # #424: dropped — the confirmation is the model line only. was (#133):
+            #   On a fresh CHAT, tell code-capable users they can upgrade.
+            #   if final == "chat" and can_code:
+            #       txt += "\n" + i18n.t("session.upgrade_hint", lang)
             await reply(message, txt)
             return
         # #253: supergroup support PAUSED — rich-draft streaming doesn't work in supergroups
@@ -2142,9 +2328,13 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         if st is None:
             return i18n.t("common.switched", lang)
         name = st.name or ("General" if key == 0 else f"#{abs(key)}")
-        return i18n.t("session.switched_to", lang, glyph=mode_glyph(st.mode),
+        line = i18n.t("session.switched_to", lang, glyph=mode_glyph(st.mode),
                       name=markup.escape_html(name)
                       + (" [shell]" if getattr(st, "shell_mode", False) else ""))
+        # #415: plus what the session runs on (model + effort, from the CLI). was: return line
+        with contextlib.suppress(Exception):
+            line += "\n" + await _session_meta_line(st, lang)
+        return line
 
     async def _session_card(key: int, lang: str = "en") -> str:
         st = await db.get_thread(key)
@@ -2160,9 +2350,11 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             # #330: dropped the mode tagline (the glyph already conveys chat/code) and
             # the sid/date from the meta line — only the model is kept. was:
             #   mode_tagline(st.mode, cwd=st.cwd, lang=lang),
-            i18n.t("session.card_meta", lang,
-                   model=MODEL_ID_TO_ALIAS.get(st.model, st.model),
-                   effort=st.effort or "high"),  # #331: effort tier ("high" = the SDK default)
+            # #411/#415: model + effort straight from the CLI (_session_meta_line). was:
+            #   i18n.t("session.card_meta", lang,
+            #          model=MODEL_ID_TO_ALIAS.get(st.model, st.model),
+            #          effort=st.effort or "high"),  # #331: effort tier ("high" = the SDK default)
+            await _session_meta_line(st, lang),
         ]
         return "\n".join(lines)
 
@@ -2191,9 +2383,11 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             # #330: dropped the mode tagline (the glyph already conveys chat/code) and
             # the sid/date from the meta line — only the model is kept. was:
             #   mode_tagline(st.mode, cwd=st.cwd, lang=lang),
-            i18n.t("session.card_meta", lang,
-                   model=MODEL_ID_TO_ALIAS.get(st.model, st.model),
-                   effort=st.effort or "high"),  # #331: effort tier ("high" = the SDK default)
+            # #411/#415: model + effort straight from the CLI (_session_meta_line). was:
+            #   i18n.t("session.card_meta", lang,
+            #          model=MODEL_ID_TO_ALIAS.get(st.model, st.model),
+            #          effort=st.effort or "high"),  # #331: effort tier ("high" = the SDK default)
+            await _session_meta_line(st, lang),
         ])
         fav = bool(st.favorite)
         B = InlineKeyboardButton
@@ -2751,20 +2945,24 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             uname = message.from_user.username if message.from_user else None
             if await _send_setting_picker(message.chat.id, key, uid, uname, lang, "model"):
                 return
-            await reply(message, i18n.t("model.pick", lang, model=markup.escape_html(state.model)))
+            await reply(message, i18n.t("model.pick", lang,
+                                        model=markup.escape_html(models.label(state.model))))
             return
 
         # Resolve a friendly alias OR an exact model id; reject anything else.
         # was: model = MODEL_ALIASES.get(arg.lower(), arg) — which set ANY string as a
         # bogus model. #215: an unknown arg now falls back to the picker (closed choice).
-        arg_l = arg.lower()
-        model = MODEL_ALIASES.get(arg_l) or (arg_l if arg_l in MODEL_ID_TO_ALIAS else None)
+        # #411: the accepted set is the CLI's own catalog (aliases + pinned ids). was:
+        #   arg_l = arg.lower()
+        #   model = MODEL_ALIASES.get(arg_l) or (arg_l if arg_l in MODEL_ID_TO_ALIAS else None)
+        model = models.match(arg)
         if model is None:
             uid = message.from_user.id if message.from_user else None
             uname = message.from_user.username if message.from_user else None
             if await _send_setting_picker(message.chat.id, key, uid, uname, lang, "model"):
                 return
-            await reply(message, i18n.t("model.pick", lang, model=markup.escape_html(state.model)))
+            await reply(message, i18n.t("model.pick", lang,
+                                        model=markup.escape_html(models.label(state.model))))
             return
 
         await db.set_model(key, model)
@@ -2772,7 +2970,8 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         defer = i18n.t("common.defer_note", lang) if deferred else ""
         await reply(
             message,
-            i18n.t("model.set", lang, model=markup.escape_html(model), defer=defer),
+            # #411: show what the alias resolves to (e.g. "Opus 5.5"). was: model=model
+            i18n.t("model.set", lang, model=markup.escape_html(models.label(model)), defer=defer),
         )
 
     # ---- Pro commands (#23): /effort /maxturns /dirs /fork --------------------
@@ -2793,7 +2992,9 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             # standalone pe: picker is retired.
             if await _send_setting_picker(message.chat.id, key, uid, uname, lang, "effort"):
                 return
-            cur = state.effort or "default"
+            # #415: was cur = state.effort or "default"
+            cur = (_effort_label(state.effort, lang) if state.effort
+                   else _effort_default_label(state.model, lang))
             await reply(message, i18n.t("effort.pick", lang, cur=markup.escape_html(cur)))
             return
         if arg in ("default", "reset", "none"):
@@ -2802,8 +3003,19 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             defer = i18n.t("common.defer_note", lang) if deferred else ""
             await reply(message, i18n.t("effort.reset", lang, defer=defer))
             return
-        if arg not in EFFORT_LEVELS:
-            await reply(message, i18n.t("effort.usage", lang))
+        # #415: the accepted levels are what the CLI lists for this session's model. was:
+        #   if arg not in EFFORT_LEVELS:
+        #       await reply(message, i18n.t("effort.usage", lang))
+        #       return
+        levels = models.effort_levels(state.model or settings.default_model)
+        if not levels and models.entries():
+            await reply(message, i18n.t("effort.unsupported", lang,
+                                        model=markup.escape_html(models.label(state.model))))
+            return
+        if arg not in levels:
+            shown = [lv for lv in levels if lv != "max" or may_max]
+            await reply(message, i18n.t("effort.usage", lang,
+                                        levels=markup.escape_html("|".join(shown) or "…")))
             return
         if arg == "max" and not may_max:
             await reply(message, i18n.t("effort.max_denied", lang))
@@ -2811,7 +3023,9 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         await db.set_effort(key, arg)
         deferred = await _rebuild_session(key)
         defer = i18n.t("common.defer_note", lang) if deferred else ""
-        await reply(message, i18n.t("effort.set", lang, val=arg, defer=defer))
+        # #415: the level under its (opportunistically translated) name. was: val=arg
+        await reply(message, i18n.t("effort.set", lang,
+                                    val=markup.escape_html(_effort_label(arg, lang)), defer=defer))
 
     @router.message(Command("maxturns"))
     async def cmd_maxturns(message: Message) -> None:
@@ -2907,45 +3121,52 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             return
         await reply(message, i18n.t("session.cleared", lang))
 
-    @router.message(Command("memory"))
-    async def cmd_memory(message: Message) -> None:
-        """Toggle (or show) big memory for this topic: the 1M context window in
-        chat plus a durable chat session that survives restarts and /stop."""
-        state = await _ensure_state(message)
-        key = await _session_key(message)
-        lang = _lang(message)
-        arg = _command_arg(message).lower()
-        # #352/#362: the agent-saved session notes are a code-only feature, so only surface
-        # their size in a code session for a code-level user. was (#352): shown in any session.
-        _uid = message.from_user.id if message.from_user else None
-        _uname = message.from_user.username if message.from_user else None
-        _mem_on = state.mode == "code" and _has_code_access(_uid, _uname)
-        _n = len((state.session_notes or "").strip()) if _mem_on else 0
-        mem_suffix = i18n.t("memory.notes", lang, n=_n) if _n else ""
-
-        if not arg:
-            # No arg → toggle in place (menu.md §2: "none → toggle"; #145). Was a
-            # show-only text reply that forced the user to type /memory on|off.
-            on = not bool(state.big_memory)
-            await db.set_big_memory(key, on)
-            deferred = await _rebuild_session(key)
-            note = i18n.t("common.defer_note", lang) if deferred else ""
-            await reply(message, i18n.t("memory.on" if on else "memory.off", lang, note=note) + mem_suffix)
-            return
-
-        if arg not in ("on", "off"):
-            await reply(message, i18n.t("memory.usage", lang))
-            return
-
-        on = arg == "on"
-        if bool(state.big_memory) == on:
-            await reply(message, i18n.t("memory.already", lang, state=i18n.onoff(on, lang)))
-            return
-
-        await db.set_big_memory(key, on)
-        deferred = await _rebuild_session(key)
-        note = i18n.t("common.defer_note", lang) if deferred else ""
-        await reply(message, i18n.t("memory.on" if on else "memory.off", lang, note=note) + mem_suffix)
+    # #428 / decision-26: /memory (the 1M-context toggle) is RETIRED — 1M is the native window
+    # of every current model and the CLI offers no size choice. The handler is COMMENTED OUT
+    # (not deleted) for revert; the big_memory column + db.set_big_memory stay intact.
+    # @router.message(Command("memory"))
+    # async def cmd_memory(message: Message) -> None:
+    #     """Toggle (or show) big memory for this topic: the 1M context window in
+    #     chat plus a durable chat session that survives restarts and /stop."""
+    #     state = await _ensure_state(message)
+    #     key = await _session_key(message)
+    #     lang = _lang(message)
+    #     arg = _command_arg(message).lower()
+    #     # #352/#362: the agent-saved session notes are a code-only feature, so only surface
+    #     # their size in a code session for a code-level user. was (#352): shown in any session.
+    #     _uid = message.from_user.id if message.from_user else None
+    #     _uname = message.from_user.username if message.from_user else None
+    #     _mem_on = state.mode == "code" and _has_code_access(_uid, _uname)
+    #     _n = len((state.session_notes or "").strip()) if _mem_on else 0
+    #     mem_suffix = i18n.t("memory.notes", lang, n=_n) if _n else ""
+    #
+    #     if not arg:
+    #         # No arg → toggle in place (menu.md §2: "none → toggle"; #145). Was a
+    #         # show-only text reply that forced the user to type /memory on|off.
+    #         on = not bool(state.big_memory)
+    #         await db.set_big_memory(key, on)
+    #         deferred = await _rebuild_session(key)
+    #         note = i18n.t("common.defer_note", lang) if deferred else ""
+    #         await reply(message, i18n.t("memory.on" if on else "memory.off", lang, note=note,
+    #                                     models=markup.escape_html(_one_m_models_label()))
+    #                     + mem_suffix)
+    #         return
+    #
+    #     if arg not in ("on", "off"):
+    #         await reply(message, i18n.t("memory.usage", lang))
+    #         return
+    #
+    #     on = arg == "on"
+    #     if bool(state.big_memory) == on:
+    #         await reply(message, i18n.t("memory.already", lang, state=i18n.onoff(on, lang)))
+    #         return
+    #
+    #     await db.set_big_memory(key, on)
+    #     deferred = await _rebuild_session(key)
+    #     note = i18n.t("common.defer_note", lang) if deferred else ""
+    #     await reply(message, i18n.t("memory.on" if on else "memory.off", lang, note=note,
+    #                                 models=markup.escape_html(_one_m_models_label()))
+    #                 + mem_suffix)
 
     @router.message(Command("forget"))
     async def cmd_forget(message: Message) -> None:
@@ -4582,10 +4803,11 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         # lines.append(i18n.t("status.streaming", lang, state=i18n.onoff(stream_on, lang)))
         # #170: session flags as a NATIVE checklist (the checkbox is the on/off).
         _chk = lambda on: " checked" if on else ""  # noqa: E731
+        # #428: the "1M context" checkbox is gone with the retired toggle. was:
+        #   f'<li><input type="checkbox"{_chk(bool(state.big_memory))}> '
+        #   f'{markup.escape_html(i18n.t("status.chk_bigmem", lang))}</li>'
         lines.append(
             "<ul>"
-            f'<li><input type="checkbox"{_chk(bool(state.big_memory))}> '
-            f'{markup.escape_html(i18n.t("status.chk_bigmem", lang))}</li>'
             f'<li><input type="checkbox"{_chk(busy)}> '
             f'{markup.escape_html(i18n.t("status.chk_busy", lang, queued=queued))}</li>'
             "</ul>"
@@ -4598,12 +4820,11 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         rbt = getattr(sessions, "rate_by_type", {}) or {}
         win_items = []
         with contextlib.suppress(Exception):
-            for _wk in usage.WINDOW_ORDER:
-                _info = rbt.get(_wk)
-                if _info is not None:
-                    _s = usage.window_str(_info, lang)
-                    if _s:
-                        win_items.append(_s)
+            # #415: every window the API reported (was: only the fixed usage.WINDOW_ORDER).
+            for _wk, _info in usage.ordered_windows(rbt):
+                _s = usage.window_str(_info, lang)
+                if _s:
+                    win_items.append(_s)
         if win_items:
             lines.append("")
             lines.append("<b>" + i18n.t("usage.pinned_header", lang) + "</b>")
@@ -5227,9 +5448,11 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         # revocation takes effect on the next turn (handle_text then rebuilds the
         # session) — mirrors the run-time code-level gate above. Owner is exempt.
         if st is not None and st.effort == "max" and not _may_max_effort(uid, uname):
-            await db.set_effort(key, "xhigh")
-        # Rolling-window rate limits (#120 → #165 → #264): deny when the user's trailing
-        # 5h or trailing-7d WEIGHTED USAGE UNITS reach their cap. Windows are computed
+            # #420: the level under max for this model (was a hardcoded "xhigh").
+            await db.set_effort(key, models.effort_below_max(st.model or settings.default_model))
+        # Rolling-window rate limits (#120 → #165 → #264 → #419): deny when the user's
+        # trailing 5h or trailing-7d TOKENS (input + output) reach their cap — #419 dropped
+        # the weighted units below; the notes are kept for history. Windows are computed
         # from usage timestamps, so they free up on their own (no reset job). #165: the
         # cap counts cost-weighted units (model weight + cache + output) instead of raw
         # input+output, so a big warm context no longer reads as near-zero spend; caps
@@ -5734,35 +5957,50 @@ def _scope_badge(scope, lang: str) -> str:
     }[scope], lang)
 
 
-def _setting_value_label(setting, value, lang: str) -> str:
+def _setting_value_label(setting, value, lang: str, model: str | None = None) -> str:
     """Human label for a resolved value: bool → on/off; model id → friendly alias;
-    None → the localized 'default'/'unlimited'; else the raw value."""
+    None → the localized 'default'/'unlimited'; else the raw value. ``model`` (#415) is the
+    model effective at the same scope — the effort labels name its CLI default."""
     if value is None:
         if setting.key == "max_turns":
             return i18n.t("maxturns.unlimited", lang)
+        if setting.key == "effort":
+            return _effort_default_label(model, lang)  # #415
         return i18n.t("settings.val_default", lang)
     if setting.type is bool:
         return i18n.onoff(bool(value), lang)
     if setting.key == "model":
-        return MODEL_ID_TO_ALIAS.get(value, value)
+        return models.label(value)  # #411: was MODEL_ID_TO_ALIAS.get(value, value)
     if setting.key == "permission_mode":
         return PERM_MODE_TO_NAME.get(value, value)
     if setting.key == "language":
         return i18n.lang_name(value)
+    if setting.key == "effort":
+        return _effort_label(value, lang)  # #415: opportunistically translated CLI level
     return str(value)
 
 
-def _setting_choice_labels(setting, lang: str) -> list[tuple[str, str]]:
-    """[(callback_value, button_label)] for a fixed-choice setting's picker."""
+def _setting_choice_labels(setting, lang: str,
+                           model: str | None = None) -> list[tuple[str, str]]:
+    """[(callback_value, button_label)] for a fixed-choice setting's picker. ``model``
+    (#415) is the model effective at the picker's scope — effort lists ITS CLI levels."""
     if setting.type is bool:
         # #275: booleans get a 2-option picker (On / Off) like any other setting, so they
         # open a sub-menu with Back instead of flipping in place. Labels match
         # _setting_value_label's bool rendering so the picker's ✓ lands on the current value.
         return [("on", i18n.onoff(True, lang)), ("off", i18n.onoff(False, lang))]
     if setting.key == "model":
-        return [(a, a) for a in ("opus", "sonnet", "haiku")]
+        # #411: the families the CLI currently offers (labelled with what each resolves to),
+        # not a hardcoded trio. was: [(a, a) for a in ("opus", "sonnet", "haiku")]
+        # Before the CLI has reported any catalog, offer just the scope's current model.
+        return [(v, models.label(v))
+                for v in models.picker_values(fallback=(model,) if model else ())]
     if setting.key == "effort":
-        return [(lv, lv) for lv in EFFORT_LEVELS] + [("default", i18n.t("settings.val_default", lang))]
+        # #415: the levels the CLI lists for this model (none for a model without effort),
+        # labelled by the opportunistic translation. was:
+        #   [(lv, lv) for lv in EFFORT_LEVELS] + [("default", i18n.t("settings.val_default", lang))]
+        return ([(lv, _effort_label(lv, lang)) for lv in models.effort_levels(model)]
+                + [("default", _effort_default_label(model, lang))])
     if setting.key == "permission_mode":
         return [(PERM_MODE_TO_NAME.get(m, m), PERM_MODE_TO_NAME.get(m, m))
                 for m in ("default", "acceptEdits", "plan", "bypassPermissions")]
@@ -5822,7 +6060,8 @@ def _ss_option_admin_kb(setting, ctx, lang: str = "en") -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = []
     if setting.set.get(ss.Scope.GLOBAL) is not None:
         gval, _ = ss.resolve_from(setting, ctx, ss.Scope.GLOBAL)
-        vlabel = _setting_value_label(setting, gval, lang)
+        vlabel = _setting_value_label(setting, gval, lang,  # #415: GLOBAL scope → default model
+                                      getattr(getattr(ctx, "settings", None), "default_model", None))
         cbv = (f"sx:tog:g:{setting.key}" if setting.type is bool
                else f"sx:nav:g:{setting.key}")
         rows.append([B(text=i18n.t("settings.opt_value", lang, val=vlabel), callback_data=cbv)])

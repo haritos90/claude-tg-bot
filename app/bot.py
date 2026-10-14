@@ -12,7 +12,7 @@ import contextlib
 import datetime
 import logging
 import os
-import shutil
+# import shutil  # #412: unused after the CLI staging moved to app.core.cli_update
 import subprocess
 import sys
 # from pathlib import Path  # #302: unused after deploy/ paths moved to app.DEPLOY_DIR
@@ -23,8 +23,10 @@ from aiogram.exceptions import TelegramNetworkError
 
 from app.config import load_settings
 from app.storage.db import (init_db, close_db, migrate_workdirs_to_sid,
-                            migrate_workdirs_to_ulid,
+                            migrate_workdirs_to_ulid, migrate_model_ids_to_aliases,
                             migrate_sessions_to_ulid, load_sid_cache, sandbox_uid_collisions)
+from app.core import models  # #411: the model catalog the CLI reports
+from app.core import cli_update  # #412: stage / update the Claude Code CLI
 from app.access.allowlist import Allowlist
 from app.access.access import AllowlistMiddleware, LanguageMiddleware
 from app.access.permissions import PermissionGate
@@ -65,6 +67,17 @@ async def main() -> None:
     # Persistent per-thread state. init_db expects a string path.
     await init_db(str(settings.db_path))
     logger.info("Database initialised at %s", settings.db_path)
+
+    # #411: restore the last model catalog the CLI reported (the /model picker reads it before
+    # the first client of this run connects), then — ONCE per database — turn the concrete ids
+    # the old picker stored (claude-opus-4-8 …) into their family alias (opus …), which the CLI
+    # resolves to the newest model of the family. Never blocks startup.
+    with contextlib.suppress(Exception):
+        await models.load()
+    with contextlib.suppress(Exception):
+        n = await migrate_model_ids_to_aliases(models.family_alias)
+        if n:
+            logger.info("Moved %d stored model id(s) onto CLI family aliases (#411)", n)
 
     # #140: one-time, idempotent rename of per-session workdirs from the raw
     # numeric thread_id to the stable public sid. Runs every startup (a no-op
@@ -159,6 +172,14 @@ async def main() -> None:
     with contextlib.suppress(Exception):
         sessions.start_token_refresher()
 
+    # #412: keep the Claude Code CLI current — run `claude update` and re-stage the jail copy
+    # (#423: once a day at CLI_UPDATE_AT_UTC, default 12:00 UTC, owner-adjustable in /settings →
+    # Admin, "off" = never; was the CLI_UPDATE_INTERVAL_HOURS cadence), so new models (read from
+    # the CLI itself, #411) arrive with no bot change or restart; clients move to a new binary
+    # between replies.
+    with contextlib.suppress(Exception):
+        sessions.start_cli_updater()
+
     # #413: name-or-dispose sweep over every DM user's sessions — a session left on the
     # "Not named yet" placeholder is either named (by the auto-name priority) or, when it holds
     # nothing to name it by, archived. Runs shortly after startup, then daily.
@@ -220,23 +241,28 @@ async def main() -> None:
     # ~/.local/bin/claude (/root is 0700). Stage the (self-contained) binary world-readably
     # at /usr/local/bin/claude so the jail (which binds /usr) can exec it. Refresh only on
     # a version change (a marker records the resolved source path).
+    # #412: the same copy also runs after every periodic `claude update` (cli_update, driven by
+    # SessionManager.start_cli_updater), so the jails follow CLI updates without a restart.
+    # was (inline here — moved to cli_update.stage for reuse by the updater):
+    #     with contextlib.suppress(Exception):
+    #         src = os.path.realpath(shutil.which("claude")
+    #                                or os.path.expanduser("~/.local/bin/claude"))
+    #         dst, marker = "/usr/local/bin/claude", "/usr/local/bin/claude.src"
+    #         cur = ""
+    #         if os.path.exists(marker):
+    #             with open(marker, encoding="utf-8") as fh:
+    #                 cur = fh.read().strip()
+    #         if src and os.path.exists(src) and (cur != src or not os.path.exists(dst)):
+    #             tmp = dst + ".tmp"
+    #             shutil.copy2(src, tmp)
+    #             os.chmod(tmp, 0o755)
+    #             os.replace(tmp, dst)
+    #             with open(marker, "w", encoding="utf-8") as fh:
+    #                 fh.write(src)
+    #             logger.info("Staged sandbox claude binary at %s (from %s)", dst, src)
     if getattr(settings, "sandbox_per_session_uid", False):
         with contextlib.suppress(Exception):
-            src = os.path.realpath(shutil.which("claude")
-                                   or os.path.expanduser("~/.local/bin/claude"))
-            dst, marker = "/usr/local/bin/claude", "/usr/local/bin/claude.src"
-            cur = ""
-            if os.path.exists(marker):
-                with open(marker, encoding="utf-8") as fh:
-                    cur = fh.read().strip()
-            if src and os.path.exists(src) and (cur != src or not os.path.exists(dst)):
-                tmp = dst + ".tmp"
-                shutil.copy2(src, tmp)
-                os.chmod(tmp, 0o755)
-                os.replace(tmp, dst)
-                with open(marker, "w", encoding="utf-8") as fh:
-                    fh.write(src)
-                logger.info("Staged sandbox claude binary at %s (from %s)", dst, src)
+            await asyncio.to_thread(cli_update.stage)
 
     # #119c: when egress filtering is on, set up the cgroup-scoped firewall once (fully
     # reverted on shutdown) and run the CONNECT allowlist proxy as a host sidecar. The

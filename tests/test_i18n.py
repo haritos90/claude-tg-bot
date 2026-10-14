@@ -130,3 +130,19 @@ def test_stream_rotation_words_parity_across_locales():
                   for lang, text in row.items()}
         assert len(set(counts.values())) == 1, f"{key} length differs across locales: {counts}"
         assert all(c == expect for c in counts.values()), f"{key} expected {expect}: {counts}"
+
+
+def test_every_key_used_in_code_exists():
+    """#423: a key the code looks up but the catalog lacks renders as the raw key (t() never
+    crashes), so a missing row ships silently — the Admin → CLI page once showed
+    ``admin.cli_btn``. Every literal ``i18n.t("…")`` / ``i18n.maybe_t("…")`` key in live code
+    (comment-only lines skipped) must be a catalog row."""
+    import pathlib
+    pat = re.compile(r'i18n\.(?:t|maybe_t)\(\s*"([a-z0-9_.]+)"')
+    missing = set()
+    for path in pathlib.Path(__file__).resolve().parent.parent.joinpath("app").rglob("*.py"):
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if line.lstrip().startswith("#"):
+                continue
+            missing.update(k for k in pat.findall(line) if k not in i18n.CATALOG)
+    assert not missing, sorted(missing)

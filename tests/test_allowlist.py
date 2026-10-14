@@ -201,15 +201,15 @@ def test_access_exception_set_get_clear(tmp_path):
     a = al.Allowlist(p, OWNER)
     a.add("123", level="code")
     assert a.access_of(123, None) == {}                       # none by default
-    assert a.set_access_exception("123", "memory", "delegated") is True
-    assert a.access_of(123, None) == {"memory": "delegated"}
+    assert a.set_access_exception("123", "auto_compact", "delegated") is True
+    assert a.access_of(123, None) == {"auto_compact": "delegated"}
     # a second option, and an invalid level is ignored.
     a.set_access_exception("123", "model", "readonly")
     a.set_access_exception("123", "effort", "bogus")
     got = a.access_of(123, None)
-    assert got == {"memory": "delegated", "model": "readonly"}
+    assert got == {"auto_compact": "delegated", "model": "readonly"}
     # clearing one removes just it; survives a reload from disk.
-    assert a.set_access_exception("123", "memory", None) is True
+    assert a.set_access_exception("123", "auto_compact", None) is True
     a2 = al.Allowlist(p, OWNER)
     assert a2.access_of(123, None) == {"model": "readonly"}
     # owner has no exceptions; setting on a missing target fails.

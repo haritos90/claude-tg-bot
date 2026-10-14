@@ -24,6 +24,7 @@ import re
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta, timezone  # #423: the daily CLI-update slot
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -34,6 +35,8 @@ from app.storage import db
 from app import i18n
 from app.telegram import markup
 from app.core import token_refresh
+from app.core import models  # #411: CLI model catalog (resolve / flush)
+from app.core import cli_update  # #412: periodic Claude Code CLI update + jail re-stage
 from app.storage import usage
 from app.access import settings_schema
 from app.core.engine import ClaudeSession
@@ -437,6 +440,13 @@ _USAGE_POLL_INTERVAL = 300.0
 # #179: how often the idle-client reaper sweeps (seconds). Cheap — just compares
 # timestamps + MemAvailable and aclose()s idle live clients over the TTL / cap.
 _REAPER_INTERVAL = 60.0
+# #412: how often the CLI auto-updater checks whether an update round is due (seconds).
+# was: _CLI_UPDATE_POLL = 300.0  — #423: the round now runs at a fixed daily UTC time
+# (CLI_UPDATE_AT_UTC / the Admin setting), so poll each minute to start it on time.
+_CLI_UPDATE_POLL = 60.0
+# #411: the startup model-catalog probe runs this long after start (post-READY, off the
+# startup path — it spawns the CLI and reaches the network).
+_CLI_PROBE_DELAY = 20.0
 # #413: the untitled-session sweep (name-or-dispose over every DM user) runs this long after
 # startup, then once per this interval. Interaction-driven sweeps (handlers) run in between.
 _UNTITLED_SWEEP_FIRST = 120.0
@@ -549,6 +559,33 @@ def _shell_input_keys(text: str) -> bytes | None:
     return out
 
 
+def parse_update_time(raw) -> tuple[int, int] | None:
+    """#423: a daily CLI-update time, UTC — "HH:MM" or "H" → (hour, minute); None for "off"
+    (also "", "never", "none") or anything malformed."""
+    text = str(raw or "").strip().lower()
+    m = re.fullmatch(r"(\d{1,2})(?::(\d{2}))?", text)
+    if not m:
+        return None
+    hour, minute = int(m.group(1)), int(m.group(2) or 0)
+    if hour > 23 or minute > 59:
+        return None
+    return hour, minute
+
+
+def format_update_time(hm: tuple[int, int] | None) -> str:
+    """#423: (hour, minute) → "HH:MM"; None → "off" (the kv / .env spelling)."""
+    return f"{hm[0]:02d}:{hm[1]:02d}" if hm else "off"
+
+
+def last_update_slot(now: float, hm: tuple[int, int]) -> float:
+    """#423: epoch seconds of the most recent daily ``hm`` (UTC) at or before ``now``."""
+    dt = datetime.fromtimestamp(now, tz=timezone.utc)
+    slot = dt.replace(hour=hm[0], minute=hm[1], second=0, microsecond=0)
+    if slot > dt:
+        slot -= timedelta(days=1)
+    return slot.timestamp()
+
+
 @dataclass
 class _ThreadRecord:
     """In-memory orchestration state for one isolated thread."""
@@ -575,6 +612,9 @@ class _ThreadRecord:
     # Per-USER tool cap (owner-set, #131) the live session was built for; a change
     # (owner edits the user's cap) rebuilds. Tuple, or None = uncapped.
     tool_cap: tuple | None = None
+    # #423: SessionManager._cli_generation when this client was built — older than the
+    # manager's means it still runs a CLI binary an update has since replaced.
+    cli_generation: int = 0
 
     # Queue items are (qid, text, attachments) tuples — qid is a per-thread
     # monotonic id (so a single queued follow-up can be cancelled by id, #13);
@@ -738,6 +778,21 @@ class SessionManager:
         # never gated the read for the ~27/30 days OUTSIDE the warn window — the creds file was
         # reopened+parsed on the event loop every owner turn-finish. This throttles the READ.
         self._login_check_last = 0.0
+        # #412: periodic Claude Code CLI update (`claude update` + jail re-stage). The cadence is
+        # the .env default, overridden at runtime by the owner (kv `cli_update_hours`, loaded in
+        # load_persisted); 0 = off. The lock keeps a manual "check now" and the loop from
+        # running the updater twice at once; the last result feeds the Admin page.
+        # was: self._cli_update_hours: float = float(getattr(settings, "cli_update_hours", 24) or 0)
+        # #423: a daily round at a fixed UTC time (hour, minute); None = off.
+        self._cli_update_at: tuple[int, int] | None = parse_update_time(
+            getattr(settings, "cli_update_at", "12:00"))
+        # #423: bumped whenever an update round replaced the CLI binary; a client built under
+        # an older generation is recycled once idle (never mid-reply) — _recycle_stale_clients.
+        self._cli_generation: int = 0
+        self._cli_update_task: asyncio.Task | None = None
+        self._cli_update_lock: asyncio.Lock = asyncio.Lock()
+        self.cli_last_result: cli_update.UpdateResult | None = None
+        self.cli_last_check: float = 0.0
         # #413: background name-or-dispose sweep over every DM user's untitled sessions.
         self._untitled_task: asyncio.Task | None = None
 
@@ -872,8 +927,38 @@ class SessionManager:
         return {
             "model": state.model, "effort": state.effort,
             "permission_mode": _coerce_perm(state.permission_mode),  # #278
-            "max_turns": state.max_turns, "big_memory": state.big_memory,
+            "max_turns": state.max_turns,
+            # #428: big_memory (the retired 1M toggle) no longer drives anything. was:
+            #   "big_memory": state.big_memory,
         }
+
+
+    def _model_line(self, rec: _ThreadRecord, lang: str) -> str:
+        """#422 (experimental): "Opus 5.5 · medium" — the model (display name with its version)
+        and the effort a turn runs at, for the first line of the <tg-thinking> indicator. Takes
+        what the CLI reported at connect (get_settings) when known, else the catalog; the effort
+        name is translated only when the i18n catalog has it. The effort part is left out for a
+        model that takes no effort level, or while it is unknown."""
+        model = rec.model or self.settings.default_model
+        session = rec.session
+        name = models.runs_as_label(model, getattr(session, "resolved_model", None))
+        if not name or (models.entries() and not models.effort_levels(model)):
+            return name or ""
+        effort = (getattr(session, "applied_effort", None)
+                  or models.effective_effort(model, rec.effort))
+        if not effort:
+            return name
+        return i18n.t("session.model_line", lang, model=name,
+                      effort=i18n.maybe_t(f"effort.level.{effort}", lang, effort))
+
+    async def model_and_effort(self, state: db.ThreadState) -> tuple[str, str | None]:
+        """#415: the model value and the effort level a session runs at — its EFFECTIVE
+        settings (access-aware, incl. the ``max`` gate), with an unset effort resolved to the
+        model's own CLI default (models.effective_effort). Effort is None when the model takes
+        no level, or before the CLI has reported the default."""
+        eff = await self._effective_settings(state)
+        model = eff.get("model") or self.settings.default_model
+        return model, models.effective_effort(model, eff.get("effort"))
 
     async def _effective_settings(self, state: db.ThreadState) -> dict:
         """Resolve the EFFECTIVE setting values for this session's OWNER through the
@@ -901,7 +986,8 @@ class SessionManager:
         with contextlib.suppress(Exception):
             access_exc = self.allowlist.access_of(owner_uid, None)
         user_defaults: dict = {}
-        for skey in ("model", "effort", "permission_mode", "max_turns", "memory",
+        # #428: "memory" (the retired 1M toggle) dropped from this list.
+        for skey in ("model", "effort", "permission_mode", "max_turns",
                      "auto_compact", "ctx_status", "todo_card"):  # #167/#168/#229
             with contextlib.suppress(Exception):
                 user_defaults[skey] = await db.get_user_default(owner_uid, skey)
@@ -923,7 +1009,7 @@ class SessionManager:
             # auto-run without a prompt (belt-and-suspenders alongside the db.py migration).
             "permission_mode": _coerce_perm(eff("permission_mode")),
             "max_turns": eff("max_turns"),
-            "big_memory": bool(eff("memory")),
+            # #428: retired 1M toggle. was: "big_memory": bool(eff("memory")),
             # #167/#168: forced-on (default True) unless the owner delegated a disable.
             "auto_compact": bool(eff("auto_compact")),
             "ctx_status": bool(eff("ctx_status")),
@@ -934,8 +1020,15 @@ class SessionManager:
         # #185: dropped the `is_owner or` bypass so an owner self-revoke (allow_max_effort
         # =False) downgrades the owner's run too; the getter still defaults the owner to True.
         # was: if out["effort"] == "max" and not (is_owner or self.allowlist.allow_max_effort_of(owner_uid, None)):
+        # #420 / decision-21: a withheld model family (Fable) never runs, even if stored before
+        # it was hidden.
+        if models.is_hidden(out.get("model")):
+            out["model"] = self.settings.default_model
         if out["effort"] == "max" and not self.allowlist.allow_max_effort_of(owner_uid, None):
-            out["effort"] = "xhigh"
+            # #420 / decision-20: step down to the level under max in the CLI's list for this
+            # model (was a hardcoded "xhigh", which not every model offers); None = the model's
+            # default.
+            out["effort"] = models.effort_below_max(out.get("model") or self.settings.default_model)
         if out["permission_mode"] == "bypassPermissions" and not is_owner:
             # Soft-revoked full-access reverts to the normal non-owner baseline,
             # which is acceptEdits since #212 (was "default") — same as a fresh user.
@@ -992,7 +1085,7 @@ class SessionManager:
             can_use_tool=can_use_tool,
             resume_session_id=resume_id,
             permission_mode=eff["permission_mode"],
-            big_memory=eff["big_memory"],
+            # #428: was big_memory=eff["big_memory"] — the window is the model's own now.
             global_memory=self._resolve_global_memory(state),
             tools_enabled=state.tools_enabled,
             tool_cap=self._resolve_tool_cap(state),
@@ -1061,7 +1154,7 @@ class SessionManager:
             or rec.model != eff["model"]
             or rec.cwd != state.cwd
             or rec.permission_mode != eff["permission_mode"]
-            or rec.big_memory != eff["big_memory"]
+            # #428: was `or rec.big_memory != eff["big_memory"]` (retired 1M toggle)
             or rec.global_memory != gmem
             or rec.tools_enabled != tkey
             or rec.tool_cap != capkey
@@ -1094,6 +1187,7 @@ class SessionManager:
                 with contextlib.suppress(Exception):
                     await old.aclose()
             rec.session = self._build_session(state, eff)
+            rec.cli_generation = self._cli_generation  # #423: the CLI binary it spawns
             # Re-attach a shell preserved from this rebuild OR stashed earlier by the reaper.
             # #289: this carries the live shell even across a code→chat mode switch. That is
             # DELIBERATE — a chat session never drives or closes the shell, but keeping it
@@ -1104,7 +1198,7 @@ class SessionManager:
             rec.model = eff["model"]
             rec.cwd = state.cwd
             rec.permission_mode = eff["permission_mode"]
-            rec.big_memory = eff["big_memory"]
+            # #428: was rec.big_memory = eff["big_memory"]
             rec.global_memory = gmem
             rec.tools_enabled = tkey
             rec.tool_cap = capkey
@@ -1459,6 +1553,10 @@ class SessionManager:
             await db.log_message(thread_id, "user", prompt)
 
         if stream:
+            # #422 (experimental; THINKING_MODEL_LINE=0 turns it off): the model, its version and
+            # the effort this turn runs at, as the first line of the <tg-thinking> indicator.
+            with contextlib.suppress(Exception):
+                streamer.model_line = self._model_line(rec, i18n.cached_lang(streamer.chat_id))
             await streamer.start()
         running_text = ""
         final_text = ""
@@ -1661,7 +1759,11 @@ class SessionManager:
                     with contextlib.suppress(Exception):
                         await db.add_usage(
                             thread_id, ev.usage, ev.cost,
-                            model=getattr(rec, "model", None),
+                            # #411: record the CONCRETE model the turn ran on — the session
+                            # stores a family alias ("opus") that the CLI resolves. was:
+                            #   model=getattr(rec, "model", None),
+                            model=(getattr(session, "resolved_model", None)
+                                   or models.resolve(getattr(rec, "model", None))),
                             context_tokens=int(getattr(rec, "last_context_tokens", 0) or 0),
                         )
                     # #261: stamp durable last-activity (wall clock) so the next message
@@ -2160,6 +2262,18 @@ class SessionManager:
             raw = await db.get_kv("idle_reset_sec")
             if raw is not None:
                 self._idle_reset = max(0.0, float(int(raw)))
+        # #412: CLI auto-update cadence (hours; 0 = off) — owner-set in Admin, else the .env
+        # default — and when it last ran (so a restart doesn't re-run it early).
+        # was (#412): kv `cli_update_hours` → self._cli_update_hours — replaced for #423 by the
+        # daily time below (kv `cli_update_at`: "HH:MM" UTC or "off").
+        with contextlib.suppress(Exception):
+            raw = await db.get_kv("cli_update_at")
+            if raw is not None:
+                self._cli_update_at = parse_update_time(raw)
+        with contextlib.suppress(Exception):
+            raw = await db.get_kv("cli_update_last")
+            if raw:
+                self.cli_last_check = float(raw)
 
         # Main chat id.
         with contextlib.suppress(Exception):
@@ -2220,6 +2334,123 @@ class SessionManager:
         idle_reset_min still overrides it for that owner."""
         self._idle_reset = max(0.0, float(sec))
         await db.set_kv("idle_reset_sec", str(int(self._idle_reset)))
+
+    # ------------------------------------------------------- CLI auto-update (#412)
+
+    # was (#412 — replaced for #423 by the daily UTC time below):
+    #   @property
+    #   def cli_update_hours(self) -> float: return self._cli_update_hours
+    #   async def set_cli_update_hours(self, hours: float) -> None:
+    #       self._cli_update_hours = max(0.0, float(hours))
+    #       await db.set_kv("cli_update_hours", str(self._cli_update_hours))
+
+    @property
+    def cli_update_at(self) -> tuple[int, int] | None:
+        """#423: the daily CLI-update time, UTC (hour, minute); None = off."""
+        return self._cli_update_at
+
+    async def set_cli_update_at(self, hm: tuple[int, int] | None) -> None:
+        """#423: set + persist the daily CLI-update time (UTC; None = off). Owner-set in
+        Admin; the running loop reads it on its next poll (no restart)."""
+        self._cli_update_at = hm
+        await db.set_kv("cli_update_at", format_update_time(hm))
+
+    def cli_update_due(self, now: float | None = None) -> bool:
+        """#423 / decision-25: True once today's update time (UTC) has passed and no round ran
+        since — including a slot missed while the bot was down (cli_last_check is persisted)."""
+        hm = self._cli_update_at
+        if hm is None:
+            return False
+        now = time.time() if now is None else now
+        return self.cli_last_check < last_update_slot(now, hm)
+
+    async def update_cli_now(self) -> "cli_update.UpdateResult":
+        """#412: run one CLI update round now (`claude update` + jail re-stage), serialized
+        with the periodic loop. The blocking work runs in a thread. The model catalog
+        refreshes by itself on the next client connect (engine → models.capture)."""
+        async with self._cli_update_lock:
+            stage_jail = bool(getattr(self.settings, "sandbox_per_session_uid", False))
+            res = await asyncio.to_thread(cli_update.update_and_stage, stage_jail)
+            self.cli_last_result = res
+            self.cli_last_check = time.time()
+            with contextlib.suppress(Exception):
+                await db.set_kv("cli_update_last", str(self.cli_last_check))
+        if not res.ok:
+            logger.warning("Claude CLI update failed (%s); still on %s", res.detail,
+                           res.after or res.before or "?")
+        elif res.changed:
+            logger.info("Claude CLI updated %s → %s (jail copy re-staged: %s)",
+                        res.before or "?", res.after, res.staged)
+        else:
+            logger.info("Claude CLI is up to date (%s)%s", res.after or "?",
+                        " — jail copy re-staged" if res.staged else "")
+        if res.changed or res.staged:
+            # #423: a new binary is in place — move every client onto it without cutting a
+            # reply: idle clients now, busy ones on the reaper sweep after their turn ends.
+            self._cli_generation += 1
+            with contextlib.suppress(Exception):
+                await self._recycle_stale_clients()
+        return res
+
+    async def _recycle_stale_clients(self) -> int:
+        """#423: close every IDLE client built before the last CLI update, so its next message
+        reconnects on the new binary (resume — the conversation and a live persistent shell are
+        kept, as for an idle-TTL reap). A busy client is skipped: the reaper calls this every
+        sweep, so it moves once its reply is done — a reply is never cut. Returns the count."""
+        gen = self._cli_generation
+        closed = 0
+        for tid in self._live_thread_ids(idle_only=True):
+            rec = self._records.get(tid)
+            if rec is None or rec.cli_generation >= gen:
+                continue
+            if await self._evict_session(tid):
+                closed += 1
+                logger.info("CLI update: recycled the idle client of thread %s onto the new "
+                            "binary", tid)
+        return closed
+
+    async def probe_models(self) -> bool:
+        """#411: refresh the model catalog + each family's default effort from the host CLI
+        (models.probe — no prompt, no tokens) and persist it. Serialized with CLI updates."""
+        async with self._cli_update_lock:
+            ok = False
+            with contextlib.suppress(Exception):
+                ok = await models.probe(cli_update.host_cli())
+            with contextlib.suppress(Exception):
+                await models.flush()
+        if not ok:
+            logger.warning("model catalog probe failed — menus use the last known catalog")
+        return ok
+
+    async def _cli_updater_loop(self) -> None:
+        """#412/#423: probe the CLI's model catalog shortly after startup (so menus are right
+        before the first user turn), then check every _CLI_UPDATE_POLL seconds whether the daily
+        update time (UTC) has passed since the last round (cli_update_due — persisted, so a
+        restart neither repeats a round nor skips one missed while the bot was down) and run
+        one, re-probing the catalog after it. The time is re-read each poll, so an Admin change
+        applies without a restart. All errors swallowed."""
+        first = True
+        while True:
+            try:
+                await asyncio.sleep(_CLI_PROBE_DELAY if first else _CLI_UPDATE_POLL)
+            except asyncio.CancelledError:
+                break
+            if first:
+                first = False
+                with contextlib.suppress(Exception):
+                    await self.probe_models()
+                # #423: no `continue` — a round missed while the bot was down runs right away.
+            with contextlib.suppress(Exception):
+                # was (#412): hours = self._cli_update_hours
+                #   if hours > 0 and time.time() - self.cli_last_check >= hours * 3600:
+                if self.cli_update_due():
+                    await self.update_cli_now()
+                    await self.probe_models()
+
+    def start_cli_updater(self) -> None:
+        """Start the periodic CLI updater (idempotent). Called once at startup."""
+        if self._cli_update_task is None or self._cli_update_task.done():
+            self._cli_update_task = asyncio.create_task(self._cli_updater_loop())
 
     # ------------------------------------------- untitled sessions: name or dispose (#413)
 
@@ -2834,8 +3065,15 @@ class SessionManager:
                 if await self._evict_session(tid):  # #414: logged (was a silent await)
                     logger.info("reaper: closed idle client of thread %s (live cap %d reached)",
                                 tid, cap)
+        # #423: clients still on a CLI binary an update replaced move over once idle.
+        if self._cli_generation:
+            with contextlib.suppress(Exception):
+                await self._recycle_stale_clients()
         # #274: independently age out persistent shells preserved past the client reap.
         await self._reap_detached_shells(now)
+        # #411: persist the CLI model catalog if a client connect refreshed it.
+        with contextlib.suppress(Exception):
+            await models.flush()
 
     async def _reaper_loop(self) -> None:
         """Periodic idle-client reaper (#179). Sleeps _REAPER_INTERVAL between sweeps;
@@ -3179,6 +3417,15 @@ class SessionManager:
             self._token_refresh_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._token_refresh_task
+        # #412/#413: stop the CLI updater and the untitled-session sweeper too.
+        for task in (self._cli_update_task, self._untitled_task):
+            if task is not None and not task.done():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await task
+        # #411: persist a model catalog captured since the last reaper flush.
+        with contextlib.suppress(Exception):
+            await models.flush()
         for thread_id in list(self._records.keys()):
             rec = self._records.get(thread_id)
             if rec is None:

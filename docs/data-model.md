@@ -14,7 +14,7 @@ separately in [`isolation.md`](isolation.md).
 | `<repo>/bot.db` (+ `-wal`, `-shm`) | SQLite state (below) | root, gitignored |
 | `BASE_WORKDIR` = `/var/lib/claude-tg-bot/workdirs/` | Per-session working trees + archives | root, `0711` |
 | `~/.claude/.credentials.json` | The subscription OAuth token | root `0600` |
-| `/usr/local/bin/claude` | Staged copy of the CLI for unprivileged jails | root `0755` |
+| `/usr/local/bin/claude` | Staged copy of the CLI for unprivileged jails — refreshed (marker `claude.src`) at startup and after each periodic `claude update` whenever the host CLI's version changed | root `0755` |
 
 `BASE_WORKDIR` lives under `/var/lib` (not the repo, which is under the root-only
 `/root`) so that a per-session unprivileged jail uid can traverse to its own
