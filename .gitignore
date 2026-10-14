@@ -18,4 +18,3 @@ bot.db-wal
 bot.db.bak*
 workdirs/
 *.log
-

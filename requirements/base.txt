@@ -17,6 +17,4 @@ Pillow==12.2.0
 # cairosvg: renders inline <svg> diagram as PNG images.
 cairosvg==2.9.0
 
-# Optional voice-note transcription is NOT installed by default (it keeps the heavy
-# CTranslate2 stack out of a deploy that does not need it). See requirements/voice.txt
-# and docs/voice.md.
+# requirements/dev.txt and requirements/voice.txt are optional.

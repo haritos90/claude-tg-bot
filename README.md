@@ -24,37 +24,34 @@ Built on the [Claude Agent SDK](https://docs.claude.com/en/api/agent-sdk/overvie
 
 ## Features
 
-- Streaming replies: each reply renders via native Telegram rich messages and stream live as they
+- _Streaming replies_: each reply renders via native Telegram rich messages and stream live as they
   are written (Bot API 10.1 drafts).
-- Chat and code in one session: chat has web search and fetch; code adds the full agent toolset
+- _Chat and code in one session_: chat has web search and fetch; code adds the full agent toolset
   (Bash, file edits, notebooks) with a working directory on the server.
-- Isolated sessions: each has its own context and working directory. Browse, switch, rename, favirite, fork,
+- _Isolated sessions_: each has its own context and working directory. Browse, switch, rename, favirite, fork,
   and delete via `/sessions`.
-- Voice input (optional): a voice message is transcribed on-device and handled as
+- _Voice message input (optional)_: a voice message is transcribed on-device and handled as
   if typed; the recognized text is shown so a mis-hearing is visible. See [voice.md](docs/voice.md).
-- Diagrams and maps inside the reply: an inline SVG in a chat reply is rasterized to PNG and a map
-  pin becomes a native map, both embedded in the same rich message as the text (wide tables too, as
-  images) — no extra bubbles.
-- Always-current models: the model list, model names and effort levels come from the Claude Code
-  CLI itself (`/model`, `/effort`); a session on a family alias such as `opus` always runs that
-  family's newest model, and the bot updates the CLI on its own once a day (12:00 UTC by default,
-  configurable), moving sessions to the new version without cutting a reply. No model version is
-  hardcoded; the few deliberate exceptions (the `max` effort grant, the withheld Fable family) are
-  listed in [configuration.md](docs/configuration.md).
-- Allowlist access: only the owner and explicitly allowed users can talk to the bot; each user has
+- _Diagrams and maps_: an inline SVG in a chat reply is captured as PNG and a map pin becomes a
+  native map, both embedded in the reply (wide tables too, as images).
+- _Always-current models_: the model list, model names and effort levels come from the Claude
+  Code CLI itself (`/model`, `/effort`); a family alias such as `opus` always runs that family's
+  newest model, and the bot updates the CLI once a day (12:00 UTC by default), moving sessions to
+  the new version without cutting a reply. The few deliberate exceptions are listed in
+  [configuration.md](docs/configuration.md).
+- _Allowlist access_: only the owner and explicitly allowed users can talk to the bot; each user has
   a level (chat or code), an optional expiry, and optional rolling usage caps. See
   [Access control](#access-control).
-- Owner control from Telegram: `/settings` sets per-session, personal-default, and global options,
-  and per-user access from the Users card — no server login needed.
-- Approvals: code defaults to auto-edits; only risky actions (push/publish, destructive deletes,
+- _Configuration in Telegram_: `/settings` sets per-session, personal-default, global options,
+  per-user access from the Users card.
+- _Approvals_: code defaults to auto-edits; only risky actions (push/publish, destructive deletes,
   web fetches) pause for a tap. `/permissions` switches modes; `/auto on` runs everything.
-- Follow-ups while it works: a message sent during a reply goes into that run, as in the Claude
+- _Follow-ups while it works_: a message sent during a reply goes into that run, as in the Claude
   Code CLI — folded in at the next tool call, or answered right after as its own reply.
-- Usage display: `/usage` and `/status` show the subscription's 5h and 7d windows as "% left".
-- Localized UI: English and Russian, auto-detected and changeable with `/language` (Claude's own
+- _Usage display_: `/usage` and `/status` show the subscription's 5h and 7d windows as "% left".
+- _Localized UI_: English and Russian, auto-detected and changeable with `/language` (Claude's own
   answers are unaffected).
-- Durable state: sessions, usage, settings, and language live in SQLite and survive a restart.
-- MAX messenger (optional): the same bot, commands and sessions model on [MAX](https://max.ru),
+- _MAX messenger (optional)_: the same bot, commands and sessions model on [MAX](https://max.ru),
   with replies delivered whole once ready and a "Thinking…" message meanwhile. MAX users are a
   separate population — their sessions, access and usage never overlap with Telegram's, and all
   administration (owner commands, access requests, tool approvals) stays in Telegram.
@@ -71,17 +68,11 @@ You ──DM──▸ @your_bot
                                 └── risky tool? ──▸ inline Allow / Deny
 ```
 
-Long polling — no webhook, domain, or public port.
+Every session runs on the same subscription and share one usage-limit pool. There is no
+cross-session memory.
 
-Every session runs on the same subscription (a Telegram identity is not a separate Claude account),
-so all sessions share one usage-limit pool — which is why per-user usage caps exist. There is no
-cross-session memory: the bot sets `setting_sources=[]`, so no account- or machine-wide `CLAUDE.md`
-or settings load, and each session keeps only its own conversation and resume id.
-
-Claude replies in Markdown; the bot renders each reply as one native rich message (headings, lists,
-tables, math, code) and streams it live, falling back to Markdown→HTML and then to a `.md` file if
-a rich send fails, so a message is never lost. The rendering contract is in
-[markup.md](docs/markup.md).
+Claude replies in Markdown; the bot renders each reply as native rich messages (headings, lists,
+tables, math, code) and streams it live, falling back to Markdown→HTML and a `.md` file.
 
 ---
 
@@ -104,18 +95,18 @@ a rich send fails, so a message is never lost. The rendering contract is in
 
 ### Server
 
-Requirements: a Linux server you control, Python 3.11+, the Claude Code CLI (`claude`) logged in to
+Requirements: a Linux server, Python 3.11+, the Claude Code CLI (`claude`) logged in to
 a Pro/Max subscription, and `bubblewrap` (every session runs in a jail). Optional extras are listed
 in [configuration.md](docs/configuration.md).
 
 ```bash
 claude setup-token     # log the CLI in to the subscription (no API key)
-claude --version       # should print a version
+claude --version       # prints version
 
 git clone https://github.com/haritos90/claude-tg-bot.git
 cd claude-tg-bot
 python3 -m venv .venv && . .venv/bin/activate
-pip install -r requirements/base.txt
+pip install -r requirements/base.txt -r requirements/dev.txt -r requirements/voice.txt
 
 cp .env.example .env                       # fill TELEGRAM_BOT_TOKEN + OWNER_ID
 cp allowlist.example.json allowlist.json   # add any users besides yourself
