@@ -388,6 +388,59 @@ def clip_partial_table(text: str) -> str:
     return text
 
 
+def hold_open_table(text: str) -> tuple[str, int | None]:
+    """#416: for DRAFT streaming — hold a trailing table back from the frame while it is still
+    OPEN (more rows may follow), so a table reaches the client only in its COMPLETE form.
+    Supersedes row-by-row streaming (clip_partial_table, #237) as the default.
+
+    Why: the Telegram iOS client renders a rich table with a view it builds ONCE, holding one
+    text view per cell present at that moment, and REUSES that view whenever the same table
+    comes back in a later frame — without creating views for cells added since (Telegram-iOS
+    ``InstantPageV2TableView``: "cell-count changes on later reuse are not reconciled"). The
+    final message inherits the draft's bubble (iOS gives it the draft's stable id), so a table
+    that grew row by row shows EMPTY rows — in the draft and in the persisted reply — until the
+    chat is reopened. A table that first appears complete is built with every cell.
+
+    Returns ``(text_before_the_open_table, data_rows_received)`` when the text ends inside a
+    table (or a pipe-led block that is becoming one), else ``(text, None)``. A table closes at
+    a blank line (GFM — a non-blank line right after it still belongs to it); tables inside a
+    code fence are left alone. The final message (finish) always carries everything."""
+    if "|" not in text:
+        return text, None
+    lines = text.split("\n")
+    partial_last = not text.endswith("\n")
+    if not partial_last:
+        lines = lines[:-1]  # the "" after the final newline
+    # The trailing run of non-blank lines (a blank line closes any table before it).
+    start = len(lines)
+    while start > 0 and lines[start - 1].strip():
+        start -= 1
+    block = lines[start:]
+    if not block:
+        return text, None
+    # A table INSIDE an open code fence is code, not a table.
+    in_fence = False
+    for line in lines[:start]:
+        if _FENCE_TOGGLE_RE.match(line):
+            in_fence = not in_fence
+    if in_fence:
+        return text, None
+    sep = next((i for i, line in enumerate(block) if _TABLE_SEP_RE.match(line)), None)
+    if sep is not None and sep >= 1:
+        head = sep - 1                      # the header line sits right above the separator
+    else:
+        head = next((i for i, line in enumerate(block) if line.lstrip().startswith("|")), None)
+        if head is None:
+            return text, None               # no table shape in the trailing block
+    if any(_FENCE_TOGGLE_RE.match(line) for line in block[:head]):
+        return text, None                   # a fence opened inside the block before it
+    rows = 0
+    if sep is not None and sep >= 1:
+        rows = len(block) - sep - 1 - (1 if partial_last else 0)
+    kept = lines[:start] + block[:head]
+    return "\n".join(kept), max(0, rows)
+
+
 def demote_headings(text: str) -> str:
     """#353: demote ATX headings (``# ``..``###### ``) to ``**bold**`` for the RICH
     ``{"markdown"}`` path (draft + commit).

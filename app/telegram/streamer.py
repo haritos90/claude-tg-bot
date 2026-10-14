@@ -95,7 +95,13 @@ _DRAFT_INTERVAL = 0.2
 # (a long tool run holding one phase, or a mid-reply pause) the draft — and the <tg-thinking>
 # indicator — would expire. Re-send the current draft if nothing changed for this many seconds
 # (< 30s) to keep it alive until content resumes.
-_DRAFT_KEEPALIVE_SECS = 20.0
+# #416: was 20.0 — but the Telegram iOS client drops a draft ~20 s after its LAST update (its
+# local typing-draft store expires entries at 20 s, independent of the 30 s the Bot API
+# documents), so a keepalive at 20 s arrived just too late: the draft vanished and came back
+# as a NEW bubble that re-revealed from the start. 12 s leaves room for network latency.
+_DRAFT_KEEPALIVE_SECS = 12.0
+# #418: Bot API rich-message limit — at most 50 media attachments in one rich message.
+_RICH_MEDIA_MAX = 50
 # Optional console cursor appended at the typing frontier. Default OFF (""):
 # Telegram's native draft animation owns the frontier and largely absorbs a
 # trailing glyph — a rotating one just flickers and vanishes, and even a steady
@@ -152,10 +158,19 @@ def configure_custom_emoji(raw: str | None) -> None:
 # Read the configured ids at import (startup); owner premium is set live per-message.
 configure_custom_emoji(os.environ.get("THINKING_EMOJI_IDS", ""))
 
+# #416: draft table streaming mode. Default: row-by-row (markup.clip_partial_table, #237), as
+# before. DRAFT_HOLD_OPEN_TABLES=1 opts into the iOS workaround — a table enters the draft only
+# once COMPLETE (markup.hold_open_table), because the Telegram iOS client never draws rows added
+# to a table it has already rendered (empty rows until the chat is reopened).
+_HOLD_OPEN_TABLES = os.environ.get("DRAFT_HOLD_OPEN_TABLES", "").strip().lower() in (
+    "1", "true", "yes", "on")
+
 
 def _thinking_placeholder_html(lang: str = "en") -> str:
     """#294: the static <tg-thinking> placeholder in the user's language."""
     return f"<tg-thinking>{i18n.t('stream.thinking', lang)}…</tg-thinking>"
+
+
 # #422 (EXPERIMENTAL): the first line of the <tg-thinking> indicator names the model, its
 # version and the effort the turn runs at ("Opus 5.5 · medium"); the indicator text follows on
 # the second line (`<br>` — rich HTML collapses a bare newline). THINKING_MODEL_LINE=0 turns it
@@ -606,7 +621,18 @@ class Streamer:
         # next tick resumes once it passes; finish() always sends the correct final message.
         if self._draft_retry_after and time.monotonic() < self._draft_retry_after:
             return
-        body = markup.clip_partial_table(self._full[: self._shown]).strip()
+        # #416: opt-in (DRAFT_HOLD_OPEN_TABLES) — hold a still-open trailing table out of the
+        # frame (markup.hold_open_table); an animated <tg-thinking> "building a table" note with
+        # the row count stands in for it. Default stays the #237 row-by-row clip below.
+        table_note = ""
+        if not _HOLD_OPEN_TABLES:
+            body = markup.clip_partial_table(self._full[: self._shown]).strip()
+        else:
+            held, pending_rows = markup.hold_open_table(self._full[: self._shown])
+            body = held.strip()
+            if pending_rows is not None:
+                table_note = i18n.t("stream.table_building", i18n.cached_lang(self.chat_id),
+                                    rows=pending_rows)
         # #256: a >20-col table can't render as a native rich DRAFT (cap is 20). Swap each wide
         # table for the same localized note _commit uses, so the draft matches the final bubble
         # (the table goes as a PNG only at finish()). Cheap no-op when nothing is wide.
@@ -631,7 +657,9 @@ class Streamer:
         _low = body.lower()
         if "```location" in _low or "```geo" in _low:
             body, _locs = markup.extract_locations(body)
-            body = self._location_notes(body, _locs)
+            # #418: the pin streams as the SAME inline map block the final message carries.
+            # was: body = self._location_notes(body, _locs)
+            body = self._location_maps(body, _locs)
             body = self._hide_unclosed_location(body)
         if not body:
             # Animate the <tg-thinking> placeholder. Priority (most → least specific):
@@ -639,7 +667,10 @@ class Streamer:
             #   #240b: a live tool PHASE ("⚙️ Running pytest…") when no reasoning is streaming;
             #   #240a: otherwise a rotating Claude-Code-style gerund (Thinking… → Pondering…).
             # Dedup on the rendered html → ~1 draft update per change.
-            if self._reasoning:
+            if table_note:
+                # #416: the reply opens with a table that is still being written.
+                inner = markup.escape_html(table_note)
+            elif self._reasoning:
                 inner = self._emoji("💭", "think") + " " + markup.escape_html(
                     self._reasoning[-_REASONING_DRAFT_TAIL:])
             elif self._searching:
@@ -703,6 +734,11 @@ class Streamer:
         body = markup.demote_headings(body)
         raw_chunks = markup.split_markdown(body, limit=markup.RICH_LIMIT)
         frontier = raw_chunks[-1] if raw_chunks else body
+        if table_note:
+            # #416: a table is being written below the text so far — keep the draft visibly
+            # alive (the row count changes, so the block animates) until the table is complete.
+            # #422: no model line here — the reply's text already streams above this note.
+            frontier = f"{frontier}\n\n<tg-thinking>{markup.escape_html(table_note)}</tg-thinking>"
         # #242: re-send an unchanged frontier before the ~30s draft expiry (e.g. a mid-reply
         # pause) so the streamed text doesn't vanish; otherwise skip (dedup).
         if frontier == self._rendered_text and (time.monotonic() - self._last_edit) < _DRAFT_KEEPALIVE_SECS:
@@ -1178,6 +1214,30 @@ class Streamer:
         # was: parts=split; out=parts[0]; for idx in range(len(locations)): out+=note+(parts[idx+1] if idx+1<len(parts) else "")
         return note.join(rich_text.split(markup.LOCATION_TOKEN))
 
+    @staticmethod
+    def _map_block(loc: dict) -> str:
+        """#418: one map pin as a NATIVE rich map block (RichBlockMap, ``<tg-map>``), inline in
+        the reply — the same block in the draft and the final message, so the pin never jumps
+        out into a separate message. Title/address (a venue) become the caption."""
+        lat, lon = float(loc["lat"]), float(loc["lon"])
+        block = f'<tg-map lat="{lat:.6f}" long="{lon:.6f}" zoom="15"/>'
+        cap = " — ".join(markup.escape_html(str(loc[k])) for k in ("title", "address")
+                         if loc.get(k))
+        if cap:
+            block = f"<figure>{block}<figcaption>{cap}</figcaption></figure>"
+        return f"\n\n{block}\n\n"
+
+    def _location_maps(self, rich_text: str, locations: list) -> str:
+        """#418: replace each ``LOCATION_TOKEN`` with its inline rich map block (was: a note in
+        the text + a separate sendLocation/sendVenue message, #344/#373)."""
+        if not locations:
+            return rich_text
+        parts = rich_text.split(markup.LOCATION_TOKEN)
+        out = parts[0]
+        for idx, part in enumerate(parts[1:]):
+            out += (self._map_block(locations[idx]) if idx < len(locations) else "") + part
+        return out
+
     def _hide_unclosed_location(self, body: str) -> str:
         """#344: in a streaming draft, a ```location fence that hasn't closed yet would show as raw
         JSON. Cut from the still-open fence to the end and leave the note, so the draft never
@@ -1383,6 +1443,81 @@ class Streamer:
             return False
         # The rich message is a fresh bubble, so clear the streaming write-head
         # placeholder if there was one (DM drafts have none — they self-expire).
+        if self.message_id is not None:
+            with contextlib.suppress(Exception):
+                await self.bot.delete_message(self.chat_id, self.message_id)
+            self.message_id = None
+        self._rendered_text = md
+        return True
+
+    async def _commit_rich_embedded(self, rich_text: str, locations: list, svgs: list,
+                                    wide_tables: list, footer: str, silent: bool,
+                                    reply_markup=None) -> bool:
+        """#418: post a reply that carries out-of-band blocks as ONE rich message: each map pin
+        becomes an inline ``<tg-map>`` block, each ``<svg>`` diagram and each wide (>20-column)
+        table a PNG photo embedded at its token via ``InputRichMessage.media`` (uploaded with the
+        send — aiogram turns the nested InputFile into a multipart ``attach://`` part). A diagram
+        that fails to render is embedded as its .svg document; a table that fails, as a text
+        grid. Returns False (→ the #374 interleave fallback) when the rich send fails or the
+        reply carries more media than one rich message may hold."""
+        loc_q, svg_q, tbl_q = list(locations), list(svgs), list(wide_tables)
+        if len(svg_q) + len(tbl_q) > _RICH_MEDIA_MAX:
+            return False
+        media: list[dict] = []
+
+        def _attach(kind: str, data: bytes, filename: str) -> str:
+            mid = f"m{len(media) + 1}"
+            media.append({"id": mid, "media": {"type": kind,
+                                               "media": BufferedInputFile(data, filename=filename)}})
+            return f"\n\n![](tg://{kind}?id={mid})\n\n"
+
+        out: list[str] = []
+        for idx, seg in enumerate(markup.split_on_attachment_tokens(rich_text)):
+            if not idx % 2:
+                out.append(seg)
+                continue
+            if seg == markup.LOCATION_TOKEN and loc_q:
+                out.append(self._map_block(loc_q.pop(0)))
+            elif seg == markup.SVG_TOKEN and svg_q:
+                svg = svg_q.pop(0)
+                try:
+                    png = await asyncio.to_thread(svg_image.render_svg_png, svg)
+                    out.append(_attach("photo", png, "diagram.png"))
+                except Exception:
+                    logger.warning("#418 svg render failed; embedding the raw .svg", exc_info=True)
+                    out.append(_attach("document", svg.encode("utf-8"), "diagram.svg"))
+            elif seg == markup.WIDE_TABLE_TOKEN and tbl_q:
+                tbl = tbl_q.pop(0)
+                try:
+                    rows = [[markup._strip_cell_emphasis(c) for c in r] for r in tbl.rows]
+                    png = await asyncio.to_thread(table_image.render_table_png, rows)
+                    out.append(_attach("photo", png, "table.png"))
+                except Exception:
+                    logger.warning("#418 wide-table render failed; embedding a text grid",
+                                   exc_info=True)
+                    grid = markup._render_table_pre(
+                        [[markup._strip_cell_emphasis(c) for c in r] for r in tbl.rows])
+                    out.append("\n\n```\n" + grid[len("<pre>"):-len("</pre>")] + "\n```\n\n")
+        md = markup.demote_headings("".join(out)).strip() or "…"
+        if footer:
+            foot = "  \n".join(f"_{ln}_" for ln in footer.splitlines() if ln.strip())
+            md = f"{md}\n\n{foot}"
+        rich: dict = {"markdown": md}
+        if media:
+            rich["media"] = media
+        try:
+            await self.bot(
+                SendRichMessage(
+                    chat_id=self.chat_id,
+                    rich_message=rich,
+                    disable_notification=silent,
+                    reply_markup=reply_markup,
+                    **self._kwargs(),
+                )
+            )
+        except Exception:
+            logger.warning("#418 embedded rich send failed; interleave fallback", exc_info=True)
+            return False
         if self.message_id is not None:
             with contextlib.suppress(Exception):
                 await self.bot.delete_message(self.chat_id, self.message_id)
@@ -1627,6 +1762,13 @@ class Streamer:
         # rich_text before the send). They still run on the DRAFT path so the streamed body shows
         # notes. The interleaver always delivers (per-segment rich→HTML fallback) — no classic fallback.
         if locations or svgs or wide_tables:
+            # #418: ONE rich message — maps as native map blocks, diagrams and wide tables as
+            # photos embedded at their spot (InputRichMessage.media) — so the draft is replaced
+            # in place instead of splitting into several bubbles. The #374 interleave (split the
+            # reply around each attachment) stays as the fallback if that send fails.
+            if await self._commit_rich_embedded(rich_text, locations, svgs, wide_tables,
+                                                footer, silent_first, reply_markup=reply_markup):
+                return
             await self._commit_rich_interleaved(
                 rich_text, locations, svgs, wide_tables, footer, silent_first,
                 reply_markup=reply_markup,

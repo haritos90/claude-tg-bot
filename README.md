@@ -32,7 +32,15 @@ Built on the [Claude Agent SDK](https://docs.claude.com/en/api/agent-sdk/overvie
   and delete via `/sessions`.
 - Voice input (optional): a voice message is transcribed on-device and handled as
   if typed; the recognized text is shown so a mis-hearing is visible. See [voice.md](docs/voice.md).
-- Diagrams: an inline SVG in a chat reply is captured as PNG and sent as an image.
+- Diagrams and maps inside the reply: an inline SVG in a chat reply is rasterized to PNG and a map
+  pin becomes a native map, both embedded in the same rich message as the text (wide tables too, as
+  images) — no extra bubbles.
+- Always-current models: the model list, model names and effort levels come from the Claude Code
+  CLI itself (`/model`, `/effort`); a session on a family alias such as `opus` always runs that
+  family's newest model, and the bot updates the CLI on its own once a day (12:00 UTC by default,
+  configurable), moving sessions to the new version without cutting a reply. No model version is
+  hardcoded; the few deliberate exceptions (the `max` effort grant, the withheld Fable family) are
+  listed in [configuration.md](docs/configuration.md).
 - Allowlist access: only the owner and explicitly allowed users can talk to the bot; each user has
   a level (chat or code), an optional expiry, and optional rolling usage caps. See
   [Access control](#access-control).

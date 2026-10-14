@@ -64,6 +64,17 @@ Re-check the matching section before editing `engine.py`, `handlers.py`, `stream
   definitive `TelegramBadRequest`, never on a transient throttle.
 - Code mode splits output into messages at each tool boundary (`streamer.segment_break`).
   Intermediate messages are silent; only the final answer pings. Links never preview.
+- A reply carrying map pins, `<svg>` diagrams or wide (>20-column) tables is still ONE rich message:
+  pins as inline `<tg-map>` blocks (in the draft too), diagrams and wide tables as photos embedded
+  via `InputRichMessage.media` (`tg://photo?id=…` + a nested InputFile aiogram uploads as
+  `attach://…`). A draft cannot upload files, so it shows a note where the picture will be; the
+  split-around-each-attachment path is only the fallback when that rich send fails.
+- The Telegram iOS client builds a rich table's view once, with one text view per cell present at
+  that moment, and reuses it when the same table returns in a later frame — rows added since are
+  never drawn, and the final message inherits the draft's bubble. Tables streamed row by row can
+  therefore show empty rows on iOS until the chat is reopened (`DRAFT_HOLD_OPEN_TABLES=1` streams
+  each table only once complete). The same client drops a draft ~20 s after its last update, hence
+  the 12 s draft keepalive.
 - `/recap` renders model text (`md_to_html`); `/history` is a raw-Markdown `.md` export — do not
   render it.
 

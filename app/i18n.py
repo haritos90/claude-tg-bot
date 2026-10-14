@@ -336,6 +336,8 @@ CATALOG: dict[str, dict[str, str]] = {
     # #229: live task-list card toggle (code sessions).
     "settings.row_todo_card": {"en": "📋 Live task list: {val}", "ru": "📋 Живой список задач: {val}"},
     "stream.context": {"en": "🧠 context {n}", "ru": "🧠 контекст {n}"},
+    # #416: draft stand-in while a table is still being written (it enters the draft complete).
+    "stream.table_building": {"en": "📊 Building a table… {rows}", "ru": "📊 Собираю таблицу… {rows}"},
     # #147: bare name for the usage-display picker title (sx: hub sub-page).
     "settings.usage_name": {"en": "📊 Usage display", "ru": "📊 Использование"},
     # #141: header for the per-session Tools grid ported onto the sx: hub.

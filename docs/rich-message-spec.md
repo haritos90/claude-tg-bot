@@ -1,7 +1,8 @@
 # Rich message, draft & table — authoritative spec
 
 Ground truth for streaming + sending rich messages, extracted **verbatim** from the
-official Telegram Bot API docs (<https://core.telegram.org/bots/api>) on 2026-06-19.
+official Telegram Bot API docs (<https://core.telegram.org/bots/api>) on 2026-06-19 and
+re-checked against the live docs on 2026-10-03 (Bot API 10.3).
 These methods are POST-cutoff (Bot API 10.1, 2026-06-11) — **never reason about them from
 memory**; re-verify with the `/verify-rich-draft` command, which re-fetches the live docs
 and can live-send a test to the owner.
@@ -39,11 +40,16 @@ Relevant doc sections: *Rich Message Formatting Options*, *sendRichMessage*,
 
 ## InputRichMessage
 
-> *Describes a rich message to be sent. **Exactly one of the fields `html` or `markdown`
-> must be used.***
+> *Describes a rich message to be sent. **Exactly one of the fields `html`, `markdown`, or
+> `blocks` must be used.*** (`blocks` and `media` arrived in Bot API 10.2.)
 
 - `html` (String) — content described using **Rich HTML**.
 - `markdown` (String) — content described using **Rich Markdown** (GFM-compatible).
+- `blocks` (Array of InputRichBlock) — the same content as explicit block objects (not used here).
+- `media` (Array of InputRichMessageMedia) — the media referenced from `markdown`/`html` by
+  `tg://photo?id=…`, `tg://video?id=…`, `tg://document?id=…` or `tg://audio?id=…`. Each item is
+  `{"id": <1–64 chars [A-Za-z0-9_-]>, "media": <InputMedia*>}` — a NEW upload goes in as
+  `attach://<part>` of a multipart request (aiogram does this for a nested InputFile).
 - `is_rtl` (Boolean, optional) — show right-to-left.
 - `skip_entity_detection` (Boolean, optional) — skip auto-detect of URLs/mentions/etc.
 
@@ -73,16 +79,17 @@ A table can be expressed in EITHER form (server converts both to a `RichBlockTab
 
 ```
 <table><tr><th>Header 1</th><th>Header 2</th></tr><tr><td>Value 1</td><td>Value 2</td></tr></table>
-<table bordered striped><caption>…</caption>…</table>
+<table bordered striped compact><caption>…</caption>…</table>
 ```
 
-- `<table>` with optional `bordered` / `striped` attributes and `<caption>`; `<th>` header
+- `<table>` with optional `bordered` / `striped` / `compact` (10.3) attributes and `<caption>`; `<th>` header
   cells, `<td>` data cells; cell `align` (left/center/right), `valign`, `colspan`, `rowspan`.
 
 ### Structured block (for reference — not used by this bot)
 
 - **RichBlockTable**: `type` = `"table"`, `cells` = Array of Array of RichBlockTableCell,
-  `is_bordered` (True, opt), `is_striped` (True, opt), `caption` (RichText, opt).
+  `is_bordered` (True, opt), `is_striped` (True, opt), `is_compact` (True, opt — 10.3),
+  `caption` (RichText, opt).
 - **RichBlockTableCell**: `text` (RichText, opt — omit ⇒ invisible cell), `is_header` (True,
   opt), `colspan`/`rowspan` (Integer, opt), `align` (left/center/right), `valign`
   (top/middle/bottom).
@@ -91,7 +98,22 @@ A table can be expressed in EITHER form (server converts both to a `RichBlockTab
 
 - ≤ 32768 UTF-8 chars total. ≤ 500 blocks (incl. nested blocks, list items, **table rows**,
   quotes, details). ≤ 16 nesting levels. ≤ 50 media attachments. **≤ 20 columns in a table.**
-- Media is a separate block (HTTP/HTTPS URLs only); not inside table cells.
+- Media is a separate block (HTTP/HTTPS URLs or `tg://…?id=` file references); not inside table
+  cells. Map pins are a native block too: `<tg-map lat="…" long="…" zoom="…"/>`, optionally in a
+  `<figure>` with a `<figcaption>` — valid in Rich Markdown as raw HTML.
+
+### iOS client: a table that grows in place is not redrawn
+
+The Telegram iOS client renders a rich table with a view it builds once — one text view per cell
+present at that moment — and reuses that view whenever the same table comes back in a later frame,
+without creating views for cells added since (Telegram-iOS `InstantPageV2TableView`). The final
+message inherits the draft's bubble (the client hands it the draft's stable id), so a table that
+streamed row by row can show EMPTY rows — in the draft and in the persisted reply — until the chat
+is reopened. Row-by-row streaming stays the default (it is correct on the other clients and the
+iOS client may fix this); `DRAFT_HOLD_OPEN_TABLES=1` makes a table enter the draft only once it is
+complete, with an animated `<tg-thinking>` note standing in. The same client drops a draft ~20 s
+after its last update (its local draft store), so the keepalive re-sends an unchanged draft every
+12 s rather than near the documented 30 s.
 
 ## Line breaks, paragraphs & code blocks — VERIFIED (2026-06-22, via parsed `rich_message.blocks`)
 
@@ -148,6 +170,12 @@ hinges on) — see the per-field table below.
 - `streamer._commit_rich_markdown` (finish) — `SendRichMessage({"markdown": full_text})`:
   the WHOLE reply as one rich message. SAME renderer as the draft, so a complete
   table renders identically; the draft is just an earlier valid prefix of it.
+- `streamer._commit_rich_embedded` (finish, when the reply carries map pins, `<svg>` diagrams or
+  wide >20-column tables) — STILL one rich message: each pin an inline `<tg-map>` block, each
+  diagram / wide table a PNG photo embedded at its spot through `media` (`![](tg://photo?id=mN)`),
+  ≤ 50 media. The draft shows the same map blocks and a short note where a picture will be (a
+  draft cannot upload). `_commit_rich_interleaved` (split the reply around each attachment) is
+  only the fallback when that send fails.
 - `markup.demote_headings` — rewrites ATX headings (`# …` → `**bold**`) on the rich
   `{"markdown"}` BEFORE both the draft frontier and `_commit_rich_markdown`: a heading
   BLOCK renders in the client's distinct heading typeface, which clashed with the body font
