@@ -24,6 +24,27 @@ Re-check the matching section before editing `engine.py`, `handlers.py`, `stream
   shared subscription or bypasses the per-user effort gate. The engine disables Workflows
   (`CLAUDE_CODE_DISABLE_WORKFLOWS=1`) and splits the keyword with a space (`engine.defuse_triggers`).
   Effort is controlled only via `/effort`.
+- The jail's `--clearenv` drops EVERY variable the SDK or the engine sets for the CLI unless
+  `deploy/sandbox-claude.sh` re-injects it by name. The SDK's own markers, the session-state stream
+  and `CLAUDE_CODE_DISABLE_WORKFLOWS` are on an explicit allowlist there; a new protocol flag that
+  must reach the jailed CLI has to be added to that list (never a pattern — it could carry a token).
+- No model or effort level is hardcoded. Sessions store a CLI alias (`opus`, `default`, …) that the
+  CLI resolves to its newest model; menus read the CLI's catalog (`app/core/models.py`, captured at
+  every connect, persisted, and probed token-free at startup and after a CLI update). The only
+  special-cased effort level is `max`, a per-user permission. The CLI's `get_settings` control
+  request reports the applied effort (with none set: the model's own default) — no API call.
+- A message sent while a turn runs goes INTO the CLI (`ClaudeSession.inject`): the CLI folds it in at
+  the next tool-call boundary, or runs it as the next turn when the current one ends first. Only the
+  `session_state_changed` stream tells these apart — after the result the CLI either goes `idle`
+  (folded in) or starts another turn, which `run(None)` renders as its own reply. Injection is
+  refused (and the message queued, silently, to run as the next turn) unless the turn is still
+  active and this client has streamed session state. A message that reaches the bot after the
+  answer is complete — while the worker is still delivering it — therefore runs as the next turn.
+  In practice that is the usual case: Telegram holds a message the user sends while a reply draft
+  streams and delivers it only after the reply is final (see rich-message-spec.md); the
+  experimental draft push button (`DRAFT_PUSH`) lets it through on demand. The journal logs
+  each decision (`message handed to the running turn` / `message runs after the current reply (turn
+  active=…, state events=…)`) and how long after Telegram stamped a message it arrived.
 - `RateLimitInfo.utilization` is usually `None` far from a window, so the real percentage comes from
   `usage.fetch_account_usage()` — a read-only GET to `/api/oauth/usage` with the OAuth bearer (not an
   API key, billing preserved). `sessions._usage_poll_loop` refreshes it every 5 minutes and on

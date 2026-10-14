@@ -8,12 +8,15 @@ subprocess per session. All state is one SQLite database.
 
 | Path                            | Responsibility                                                                                                |
 | ------------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| Path                            | Responsibility                                                                                                |
 | `app/bot.py`                    | Wiring, middleware, long polling, graceful shutdown.                                                          |
 | `app/watchdog.py`               | systemd liveness watchdog: `READY=1` before any network I/O, `WATCHDOG=1` after a successful Telegram probe.  |
 | `app/config.py`                 | `.env` → `Settings`; warns if `ANTHROPIC_API_KEY` is set.                                                     |
 | `app/i18n.py`                   | Localization table + `t(key, lang, …)`.                                                                       |
 | `app/core/engine.py`            | `ClaudeSession` over the Agent SDK. All SDK code lives here, including the sandbox launcher.                  |
-| `app/core/sessions.py`          | `SessionManager`: per-session worker, the chaining queue, `/stop`, usage accounting, idle reaping.            |
+| `app/core/sessions.py`          | `SessionManager`: per-session worker (messages sent mid-reply go into the running CLI turn; a turn the CLI starts for one renders as its own reply), `/stop`, usage accounting, idle reaping, session auto-naming and the untitled-session sweep, the daily CLI update with graceful client recycling (idle clients move to a new binary at once, busy ones after their reply). |
+| `app/core/models.py`            | The model + effort catalog read from the Claude Code CLI (aliases, what each resolves to, display names, effort levels, per-model default effort); persisted in kv; a token-free probe of the host CLI. No model is hardcoded beyond the deliberate exceptions listed in [configuration.md](configuration.md) (the withheld Fable family, the `max` grant). |
+| `app/core/cli_update.py`        | Keeps the CLI current: runs `claude update` and re-stages the jail copy at `/usr/local/bin/claude`.           |
 | `app/core/token_refresh.py`     | Background refresh of the subscription OAuth credential before it expires.                                    |
 | `app/core/schedules.py`         | Recurring / one-shot schedule runner.                                                                         |
 | `app/core/transcribe.py`        | Optional on-device voice-note transcription (ffmpeg + faster-whisper), run host-side.                         |

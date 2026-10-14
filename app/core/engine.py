@@ -25,6 +25,7 @@ from claude_agent_sdk import (
     ResultMessage,
     StreamEvent,
     RateLimitEvent,
+    SystemMessage,  # #411: the init message names the concrete model an alias resolved to
     TextBlock,
     ToolUseBlock,
     tool,
@@ -889,6 +890,21 @@ class ClaudeSession:
         # real failure: when interrupting, any exception out of receive_response()
         # is an expected end, not an error to surface. Reset at the start of run().
         self._interrupted = False
+        # #417: follow-up messages go INTO the running CLI session (inject) instead of a
+        # bot-side queue — the CLI folds one sent mid-turn in at the next tool-call boundary,
+        # or runs it as the very next turn when the current one ends first. `_turn_active`:
+        # a run() is between its query and its result. `_injected`: messages handed to the
+        # CLI that the bot has not yet seen it settle (cleared when the CLI reports idle).
+        # `_states_seen`: this client streams session_state_changed (CLI + env support it),
+        # the signal that tells "consumed mid-turn" (idle right after the result) apart from
+        # "a follow-up turn is starting". `_stash`: messages read past a result while telling
+        # those apart, replayed by the next run(); `followup_pending`: a follow-up turn has
+        # started and the caller should run(None) to render it.
+        self._turn_active = False
+        self._injected = 0
+        self._states_seen = False
+        self._stash: list = []
+        self.followup_pending = False
 
     def _on_stderr(self, line: str) -> None:
         """SDK stderr callback (#137). Append-only, no I/O / await — it runs on the
@@ -915,6 +931,9 @@ class ClaudeSession:
         env.pop("ANTHROPIC_API_KEY", None)
         env.pop("ANTHROPIC_AUTH_TOKEN", None)
         env["CLAUDE_CODE_DISABLE_WORKFLOWS"] = "1"
+        # #417: have the CLI stream its session state (running / idle) to us — how a turn
+        # with injected follow-ups tells "folded in" from "a follow-up turn is starting".
+        env["CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS"] = "1"
         # #168: disable the CLI's auto-compaction when the (effective) toggle is off.
         # Verified: this flips ContextUsageResponse.isAutoCompactEnabled to False.
         if not self.auto_compact:
@@ -1623,6 +1642,10 @@ class ClaudeSession:
                         continue
                     raise exc
                 self.client = client
+                # #417: a fresh CLI process — nothing injected, nothing stashed, and session-state
+                # support is re-learned from this process's own events.
+                self._injected, self._states_seen, self._stash = 0, False, []
+                self.followup_pending = False
                 # #411: refresh the bot-wide model catalog from this CLI's initialize response
                 # (the /model picker lists what the CLI offers, so a CLI update surfaces new
                 # models with no code change). Best-effort — never fails the connect.
@@ -1677,8 +1700,50 @@ class ClaudeSession:
 
         await self.client.query(_stream())
 
-    async def run(self, prompt: str, attachments: list | None = None):
+    async def inject(self, prompt: str, attachments: list | None = None) -> bool:
+        """#417: hand a follow-up message to the RUNNING turn, the way the Claude Code CLI
+        takes input typed while it works: the CLI folds it in at the next tool-call boundary,
+        or — when the turn ends first — runs it as the next turn, which run() then reports
+        through ``followup_pending``. Only while a turn is active on a live client that streams
+        session state (without that signal a follow-up turn could not be told apart and would
+        bleed into the next reply). Returns False when the caller should queue it instead."""
+        if not (self.client is not None and self._turn_active and self._states_seen):
+            return False
+        try:
+            await self._send_query(prompt, attachments)
+        except Exception:
+            logger.warning("inject failed — falling back to the queue", exc_info=True)
+            return False
+        self._injected += 1
+        return True
+
+    async def _messages(self):
+        """#417: the client's message stream, replaying first any messages a previous run()
+        read past its result (the start of a follow-up turn)."""
+        while self._stash:
+            yield self._stash.pop(0)
+        # A client without receive_messages (an older SDK, test doubles) still works through
+        # receive_response — it ends at the result, which is where run() stops reading anyway.
+        source = getattr(self.client, "receive_messages", None) or self.client.receive_response
+        async for msg in source():
+            yield msg
+
+    def _note_state(self, msg) -> str | None:
+        """#417: track session_state_changed; returns the state for such a message."""
+        if isinstance(msg, SystemMessage) and getattr(msg, "subtype", "") == "session_state_changed":
+            self._states_seen = True
+            state = (getattr(msg, "data", None) or {}).get("state")
+            if state == "idle":
+                self._injected = 0
+            return state if isinstance(state, str) else ""
+        return None
+
+    async def run(self, prompt: str | None, attachments: list | None = None):
         """Run one turn and yield normalized EngineEvent objects.
+
+        #417: ``prompt=None`` renders a FOLLOW-UP turn the CLI started by itself for a
+        message injected mid-run (see inject / followup_pending) — nothing is sent, the
+        stream is read where the previous run() left it.
 
         Yields text_delta events as they stream, tool/status/rate_limit events
         as they occur, and finally exactly one result (or error) event.
@@ -1723,9 +1788,14 @@ class ClaudeSession:
             return
 
         running_text = ""
+        self.followup_pending = False
+        _stream_iter = None  # #417: closed in the finally below
 
         try:
-            await self._send_query(prompt, attachments)
+            # #417: a follow-up turn (prompt None) was started by the CLI itself — send nothing.
+            if prompt is not None:
+                await self._send_query(prompt, attachments)
+            self._turn_active = True
 
             # #343: wrap the SDK stream so a turn that produces NO first message within
             # _FIRST_TOKEN_TIMEOUT_SEC (service overloaded/unavailable, CLI silently
@@ -1735,7 +1805,9 @@ class ClaudeSession:
             # never time it out (a long tool call / build legitimately emits no events for
             # minutes).
             # was: `async for msg in self.client.receive_response():`
-            _stream_iter = self.client.receive_response().__aiter__()
+            # #417: was `self.client.receive_response().__aiter__()` — our own iterator replays
+            # what a previous run() read past its result, and the loop ends at the result itself.
+            _stream_iter = self._messages().__aiter__()
             _progressed = False
             _answered = False  # #358: real ANSWER content started (text/tool/result), not thinking
             while True:
@@ -1796,6 +1868,13 @@ class ClaudeSession:
                 if _sid and _sid != self.session_id:
                     self.session_id = _sid
                     yield EngineEvent(kind="session", session_id=_sid)
+                # #411: the init message carries the concrete model the CLI resolved our
+                # model (a family alias) to — kept for usage accounting and display.
+                if isinstance(msg, SystemMessage) and getattr(msg, "subtype", "") == "init":
+                    _m = (getattr(msg, "data", None) or {}).get("model")
+                    if isinstance(_m, str) and _m:
+                        self.resolved_model = _m
+                self._note_state(msg)  # #417
                 # --- Incremental text deltas (preferred for live streaming) ---
                 if isinstance(msg, StreamEvent):
                     event = msg.event or {}
@@ -1898,6 +1977,13 @@ class ClaudeSession:
                     if getattr(msg, "session_id", None):
                         self.session_id = msg.session_id
                     final_text = msg.result if msg.result is not None else running_text
+                    # #417: messages were injected during this run — find out whether the
+                    # CLI folded them in (it goes idle right after this result) or is starting
+                    # a follow-up turn for them (anything else arrives) BEFORE reporting the
+                    # result, so the caller knows to render that turn as its own reply.
+                    if self._injected and self._states_seen:
+                        await self._settle_after_result(_stream_iter)
+                    self._turn_active = False
                     yield EngineEvent(
                         kind="result",
                         text=final_text or "",
@@ -1910,6 +1996,7 @@ class ClaudeSession:
                 # Any other message type (SystemMessage, UserMessage, etc.) is
                 # not surfaced to the Telegram layer; ignore silently.
         except Exception as exc:
+            self._turn_active = False  # #417
             # A requested interrupt (/stop) can surface as an exception out of
             # receive_response(); that is a deliberate end, not a failure, so we
             # return quietly and let the partial text already streamed stand as
@@ -1941,6 +2028,34 @@ class ClaudeSession:
                     error_key="err.exec_error",
                     error_detail=detail,
                 )
+        finally:
+            # #417: whatever ended the run (result, in-band error, failure, interrupt), the turn
+            # is no longer accepting injections, and our message iterator (an unbounded
+            # receive_messages() wrapper, unlike the old receive_response()) is closed.
+            self._turn_active = False
+            if _stream_iter is not None:
+                with contextlib.suppress(Exception):
+                    await _stream_iter.aclose()
+
+    async def _settle_after_result(self, stream_iter) -> None:
+        """#417: after a result in a run that injected messages, read on until the CLI either
+        reports idle (the injections were folded into this turn — done) or emits anything else
+        (it started a follow-up turn for them): that first message is stashed for the next
+        run(None) and ``followup_pending`` is raised. Bounded: if nothing arrives, give up
+        quietly (a late follow-up then merges into the next turn instead of hanging this one)."""
+        while True:
+            try:
+                msg = await asyncio.wait_for(stream_iter.__anext__(), _SETTLE_TIMEOUT_SEC)
+            except (asyncio.TimeoutError, StopAsyncIteration):
+                return
+            state = self._note_state(msg)
+            if state == "idle":
+                return
+            if state is not None:
+                continue  # running / requires_action: keep waiting for the decision
+            self._stash.append(msg)
+            self.followup_pending = True
+            return
 
     async def context_usage(self):
         """Return raw SDK context-window usage, or None if unavailable.

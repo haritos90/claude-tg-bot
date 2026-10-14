@@ -5295,73 +5295,92 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         #     return
         # await reply(message, i18n.t("topic.closed", lang))
 
-    async def _render_queue(key: int, lang: str = "en") -> tuple[str, InlineKeyboardMarkup | None]:
-        """Build the /queue view: each pending prompt with a ✖ cancel button."""
-        try:
-            items = sessions.queue_items(key)
-        except Exception:
-            items = []
-        if not items:
-            return i18n.t("queue.empty", lang), None
-        lines = [i18n.t("queue.header", lang, n=len(items))]
-        kb_rows: list[list[InlineKeyboardButton]] = []
-        for i, it in enumerate(items, start=1):
-            lines.append(f"{i}. <code>{markup.escape_html(str(it['text']))}</code>")
-            kb_rows.append([InlineKeyboardButton(
-                text=i18n.t("queue.cancel_btn", lang, i=i), callback_data=f"qx:{key}:{it['id']}")])
-        kb_rows.append([
-            InlineKeyboardButton(text=i18n.t("btn.clear_all", lang), callback_data=f"qx:{key}:all"),
-            InlineKeyboardButton(text=i18n.t("btn.close", lang), callback_data="qx:close"),
-        ])
-        return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=kb_rows)
-
-    @router.message(Command("queue"))
-    async def cmd_queue(message: Message) -> None:
-        """Show the prompts waiting to run next, each with a cancel button."""
-        await _ensure_state(message)
-        key = await _session_key(message)
-        text, kb = await _render_queue(key, _lang(message))
-        send_kwargs: dict = {}
-        if message.message_thread_id:
-            send_kwargs["message_thread_id"] = message.message_thread_id
-        # #173: native rich menu open
-        await _send_menu(message.chat.id, text, kb, **send_kwargs)
-
-    @router.callback_query(F.data.startswith("qx:"))
-    async def on_queue_cb(cb: CallbackQuery) -> None:
-        """Handle /queue cancel taps (cancel one by id, clear all, or close)."""
-        try:
-            parts = (cb.data or "").split(":")
-            msg = cb.message
-            if msg is None:
-                await cb.answer()
-                return
-            lang = _lang(cb)
-            if len(parts) >= 2 and parts[1] == "close":
-                with contextlib.suppress(Exception):
-                    await msg.delete()
-                await cb.answer()
-                return
-            key = int(parts[1])
-            # Only the tapper's OWN DM session (a negative key) may be touched —
-            # never let a forged callback_data clear/cancel another user's queue.
-            st = await db.get_thread(key)
-            if key >= 0 or st is None or st.chat_id != cb.from_user.id:
-                await cb.answer()
-                return
-            target = parts[2] if len(parts) > 2 else ""
-            if target == "all":
-                n = await sessions.clear_queue(key)
-                await cb.answer(i18n.t("queue.cleared_toast", lang, n=n))
-            else:
-                removed = await sessions.cancel_queued(key, int(target))
-                await cb.answer(i18n.t("queue.cancelled_toast" if removed else "queue.already_running", lang))
-            text, kb = await _render_queue(key, lang)
-            with contextlib.suppress(Exception):
-                await _edit_menu(msg, text, kb)  # #173: native rich nav-edit
-        except Exception:
-            with contextlib.suppress(Exception):
-                await cb.answer(i18n.t("common.error", _lang(cb)))
+    # #417: the /queue view (per-item cancel), its callbacks and /clearqueue are retired —
+    # a message sent while a reply runs is handed to that run (the CLI folds it in at the
+    # next tool-call boundary or answers it as the next turn), so there is no bot-side
+    # queue to manage. was:
+    # async def _render_queue(key: int, lang: str = "en") -> tuple[str, InlineKeyboardMarkup | None]:
+    #     """Build the /queue view: each pending prompt with a ✖ cancel button."""
+    #     try:
+    #         items = sessions.queue_items(key)
+    #     except Exception:
+    #         items = []
+    #     if not items:
+    #         return i18n.t("queue.empty", lang), None
+    #     lines = [i18n.t("queue.header", lang, n=len(items))]
+    #     kb_rows: list[list[InlineKeyboardButton]] = []
+    #     for i, it in enumerate(items, start=1):
+    #         lines.append(f"{i}. <code>{markup.escape_html(str(it['text']))}</code>")
+    #         kb_rows.append([InlineKeyboardButton(
+    #             text=i18n.t("queue.cancel_btn", lang, i=i), callback_data=f"qx:{key}:{it['id']}")])
+    #     kb_rows.append([
+    #         InlineKeyboardButton(text=i18n.t("btn.clear_all", lang), callback_data=f"qx:{key}:all"),
+    #         InlineKeyboardButton(text=i18n.t("btn.close", lang), callback_data="qx:close"),
+    #     ])
+    #     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=kb_rows)
+    #
+    # @router.message(Command("queue"))
+    # async def cmd_queue(message: Message) -> None:
+    #     """Show the prompts waiting to run next, each with a cancel button."""
+    #     await _ensure_state(message)
+    #     key = await _session_key(message)
+    #     text, kb = await _render_queue(key, _lang(message))
+    #     send_kwargs: dict = {}
+    #     if message.message_thread_id:
+    #         send_kwargs["message_thread_id"] = message.message_thread_id
+    #     # #173: native rich menu open
+    #     await _send_menu(message.chat.id, text, kb, **send_kwargs)
+    #
+    # @router.callback_query(F.data.startswith("qx:"))
+    # async def on_queue_cb(cb: CallbackQuery) -> None:
+    #     """Handle /queue cancel taps (cancel one by id, clear all, or close)."""
+    #     try:
+    #         parts = (cb.data or "").split(":")
+    #         msg = cb.message
+    #         if msg is None:
+    #             await cb.answer()
+    #             return
+    #         lang = _lang(cb)
+    #         if len(parts) >= 2 and parts[1] == "close":
+    #             with contextlib.suppress(Exception):
+    #                 await msg.delete()
+    #             await cb.answer()
+    #             return
+    #         key = int(parts[1])
+    #         # Only the tapper's OWN DM session (a negative key) may be touched —
+    #         # never let a forged callback_data clear/cancel another user's queue.
+    #         st = await db.get_thread(key)
+    #         if key >= 0 or st is None or st.chat_id != cb.from_user.id:
+    #             await cb.answer()
+    #             return
+    #         target = parts[2] if len(parts) > 2 else ""
+    #         if target == "all":
+    #             n = await sessions.clear_queue(key)
+    #             await cb.answer(i18n.t("queue.cleared_toast", lang, n=n))
+    #         else:
+    #             removed = await sessions.cancel_queued(key, int(target))
+    #             await cb.answer(i18n.t("queue.cancelled_toast" if removed else "queue.already_running", lang))
+    #         text, kb = await _render_queue(key, lang)
+    #         with contextlib.suppress(Exception):
+    #             await _edit_menu(msg, text, kb)  # #173: native rich nav-edit
+    #     except Exception:
+    #         with contextlib.suppress(Exception):
+    #             await cb.answer(i18n.t("common.error", _lang(cb)))
+    #
+    # @router.message(Command("clearqueue"))
+    # async def cmd_clearqueue(message: Message) -> None:
+    #     """Drop the queued prompts without stopping the current run."""
+    #     await _ensure_state(message)
+    #     key = await _session_key(message)
+    #     try:
+    #         n = await sessions.clear_queue(key)
+    #     except Exception as exc:
+    #         await reply(
+    #             message,
+    #             i18n.t("queue.clear_error", _lang(message), err=markup.escape_html(str(exc))),
+    #         )
+    #         return
+    #     await reply(message, i18n.t("queue.cleared", _lang(message), n=int(n or 0)))
 
     @router.callback_query(F.data.startswith("stop:"))
     async def on_stop_cb(cb: CallbackQuery) -> None:
@@ -5394,21 +5413,6 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
         except Exception:
             with contextlib.suppress(Exception):
                 await cb.answer(i18n.t("common.error", _lang(cb)))
-
-    @router.message(Command("clearqueue"))
-    async def cmd_clearqueue(message: Message) -> None:
-        """Drop the queued prompts without stopping the current run."""
-        await _ensure_state(message)
-        key = await _session_key(message)
-        try:
-            n = await sessions.clear_queue(key)
-        except Exception as exc:
-            await reply(
-                message,
-                i18n.t("queue.clear_error", _lang(message), err=markup.escape_html(str(exc))),
-            )
-            return
-        await reply(message, i18n.t("queue.cleared", _lang(message), n=int(n or 0)))
 
     @router.message(Command("retry"))
     async def cmd_retry(message: Message) -> None:
@@ -5492,6 +5496,12 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             await _run_pending(action, message, text)
             return
         key = await _session_key_for_turn(message)  # #266: may start a fresh session on idle
+        # #427: how long after Telegram stamped the message it reached the bot (no content) — a
+        # message the user sent while a reply draft streamed is held by Telegram until the reply
+        # is final; the stamp tells whether the client or the server held it.
+        with contextlib.suppress(Exception):
+            log.info("thread %s: message reached the bot %.1f s after Telegram stamped it",
+                     key, time.time() - message.date.timestamp())
         uid = message.from_user.id if message.from_user else 0
         uname = message.from_user.username if message.from_user else None
         block = await _access_block(uid, uname, _lang(message), key)
@@ -5518,8 +5528,11 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             if status == _sessions.SUBMIT_QUEUE_FULL:
                 await reply(message, i18n.t("queue.full_reject", lang,
                                             n=_sessions.MAX_QUEUED_MESSAGES))
-            elif status and status > 0:
-                await reply(message, i18n.t("queue.queued_ack", lang, n=status))
+            # #427: a message that waits behind the running reply is silent, like input typed
+            # while the Claude Code CLI works — it is folded into the turn or runs right after
+            # it. was (#236):
+            #   elif status and status > 0:
+            #       await reply(message, i18n.t("queue.queued_ack", lang, n=status))
         except Exception:
             pass
 

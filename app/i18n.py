@@ -1767,10 +1767,13 @@ CATALOG: dict[str, dict[str, str]] = {
     # -- /queue ------------------------------------------------------------- #
     # #236: ack shown when a message is accepted WHILE a turn is running (queued at
     # the turn boundary, not injected mid-turn), and the backlog-cap rejection.
-    "queue.queued_ack": {
-        "en": "📥 Queued — will run after the current reply ({n} waiting). /queue to manage.",
-        "ru": "📥 В очереди — выполню после текущего ответа (ждёт: {n}). /queue для управления.",
-    },
+    # #417: normally a message sent mid-reply goes INTO the running reply (no ack — like the
+    # CLI); this ack only covers the fallback before the run's client is live. No /queue any more.
+    # #427: unused — a message waiting behind the running reply is silent now. Kept for a revert:
+    # "queue.queued_ack": {
+    #     "en": "📥 Got it — I'll take this right after the current reply ({n} waiting).",
+    #     "ru": "📥 Принято — займусь этим сразу после текущего ответа (ждёт: {n}).",
+    # },
     "queue.full_reject": {
         "en": "⚠️ Too many queued ({n} max). Wait for the current reply, or /stop to interrupt.",
         "ru": "⚠️ Слишком много в очереди (макс. {n}). Дождитесь ответа или /stop, чтобы прервать.",

@@ -21,8 +21,31 @@ Relevant doc sections: *Rich Message Formatting Options*, *sendRichMessage*,
   - `draft_id` (Integer, required) — **must be non-zero**. *"Changes to drafts with the same
     identifier are animated."* (So reuse ONE id per chat and Telegram animates the appended
     text between successive drafts.)
-  - `rich_message` (InputRichMessage, required) — the partial message.
+  - `rich_message` (InputRichMessage, required) — the partial message. *"Direct upload of new
+    files and explicit upload of files by a URL isn't supported"* — a draft can show only media
+    that already has a Telegram file id.
   - `message_thread_id` (optional).
+  - `can_stop` / `keep_on_stop` (Boolean, optional, Bot API 10.3) — *"Pass True to show the user a
+    button to stop further drafts. The bot will receive an Update 'stopped_message_generation' if
+    the user presses the button"*; *"Pass True to keep the draft in the chat when the button is
+    pressed. The draft will still disappear after a short time or if the bot sends a message."*
+    `MessageGenerationStopped` carries `chat`, `message_thread_id`, `draft_id`. aiogram 3.28 does
+    not model this update yet — `bot.py` reads it from the raw update (`allowed_updates` must
+    list it). Used as a PUSH button (`DRAFT_PUSH`, on for every chat): on press the
+    reply carries on under a new `draft_id` instead of stopping; if no held message arrives within
+    1 s of the press (measured: it comes 20–30 ms after the press update), the press counts as stop (`SessionManager.stop`, the text so far is kept).
+  - **Observed (iOS client, not in the docs): a message the user sends while a reply draft is
+    streaming is held** — it shows a clock and reaches the bot only once the reply is finalized
+    (about 3 s after the final `sendRichMessage` in the logs). A draft cannot be committed
+    "briefly" to let it through: `sendRichMessage` creates a permanent message, so continuing the
+    reply afterwards means a second bubble or edits. The standard way for the user to get in
+    mid-reply is the stop button (`can_stop`), i.e. stop, then send — a button press is a
+    separate update (`callback_query` / `stopped_message_generation`), not a held message.
+    The push variant (`DRAFT_PUSH`): the user sends the message (it is held), then presses the
+    draft's button — the client ends the draft and lets the message through, the bot continues in
+    a new draft id and the message reaches the running turn; no bot message, so no notification.
+    A periodic land-and-delete cycle during thinking-only phases (`DRAFT_RELEASE`) was tried and
+    withdrawn: every landed message raised a notification, silent delivery only drops the sound.
 - **`sendRichMessage`** — persists the final message. `chat_id`, `rich_message` (required);
   `disable_notification`, `protect_content`, `message_thread_id`, … (optional). Returns the
   sent `Message`. It carries **no `draft_id`** and does NOT dismiss an associated draft.

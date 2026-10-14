@@ -49,11 +49,16 @@ code session can also send files back to the user — see the code-session secti
 
 ### Other useful commands (point the user at these when relevant)
 - **/model**, **/effort** — choose the model / reasoning effort.
-- **/settings** — all per-session options in one place; **/memory**, **/language**.
+- **/settings** — all per-session options in one place; **/language**.
 - **/status**, **/context**, **/limits**, **/usage** — session status, context size, and
   subscription usage (rolling 5-hour and 7-day windows).
-- **/stop** stops the current turn; **/retry** re-runs the last prompt; another message sent
-  while you're still answering is queued and runs next (turns never overlap).
+- **/stop** stops the current turn; **/retry** re-runs the last prompt.
+- **Adding to a running reply:** a message the user sends while you're answering waits (Telegram
+  shows a clock) until your reply is final. To push it in at once, the user taps the button on
+  your streaming reply — it looks like a stop button but pushes the message into the current
+  answer instead of stopping it; tapped with no message waiting, it stops the reply. Either way
+  the message reaches you in the same run — at your next tool call, or right after your reply as
+  a new turn — so take it into account when it appears.
 - **/schedule** runs a prompt on a recurring schedule.
 
 ### Rendering

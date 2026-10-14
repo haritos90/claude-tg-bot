@@ -110,10 +110,12 @@ COMMANDS: tuple[Cmd, ...] = (
                     "ru": "Использование окна контекста"}, help_group="run"),
     Cmd("limits", {"en": "📊 Your usage limits",
                    "ru": "📊 Ваши лимиты использования"}, help_group="run"),
-    Cmd("queue", {"en": "Show the pending-prompt queue",
-                  "ru": "Показать очередь запросов"}, help_group="run"),
-    Cmd("clearqueue", {"en": "Clear the pending queue",
-                       "ru": "Очистить очередь"}, help_group="run"),
+    # #417: no queue to manage any more — a message sent while a reply runs goes INTO that
+    # run (the CLI folds it in, like its own input). was:
+    #   Cmd("queue", {"en": "Show the pending-prompt queue",
+    #                 "ru": "Показать очередь запросов"}, help_group="run"),
+    #   Cmd("clearqueue", {"en": "Clear the pending queue",
+    #                      "ru": "Очистить очередь"}, help_group="run"),
     Cmd("rename", {"en": "Rename the current session",
                    "ru": "Переименовать текущую сессию"}, help_group="sessions"),
     Cmd("recap", {"en": "📋 One-line AI recap of the session",

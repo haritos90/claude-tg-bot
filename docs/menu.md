@@ -277,8 +277,14 @@ Conventions legend).
 | `/workingplate` | ⏳ Working/Stop plate: on \| off (owner) | ⏳ Плашка Working/Stop: on \| off (владелец) | none → toggle | 👑 |
 
 > **Not commands:** a plain message is a prompt to the current session; a photo,
-> PDF, or text/code file uses its caption as the prompt. Messages sent while a
-> reply is running are queued and run next in the same session.
+> PDF, or text/code file uses its caption as the prompt. A message sent while a
+> reply is running goes into that run, as in the Claude Code CLI: it is folded in at
+> the next tool-call boundary, or answered as the next turn (its own reply) when the
+> running turn ends first. There is no queue to manage and no acknowledgement
+> message — the next reply is the answer. Telegram holds such a message until the reply
+> is final; the button on the streaming reply (drawn by Telegram as a stop button) pushes
+> it through instead of stopping the reply; pressed with no message waiting, it stops
+> the reply (like `/stop`).
 
 ---
 

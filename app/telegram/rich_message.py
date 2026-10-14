@@ -74,3 +74,21 @@ class SendRichMessageDraft(TelegramMethod[bool]):
     draft_id: int
     rich_message: dict[str, Any]
     message_thread_id: int | None = None
+    # #431: Bot API 10.3 — the client's stop button on the draft (`stopped_message_generation`
+    # update on press) and whether the draft stays on screen after it.
+    can_stop: bool | None = None
+    keep_on_stop: bool | None = None
+
+
+def stopped_generation_of(update) -> tuple[int, int] | None:
+    """#431: ``(chat_id, draft_id)`` of a Bot API 10.3 ``stopped_message_generation`` update —
+    read from the raw fields aiogram keeps for an update type it does not know yet — or None
+    for any other update."""
+    extra = getattr(update, "model_extra", None) or {}
+    raw = extra.get("stopped_message_generation")
+    if not isinstance(raw, dict):
+        return None
+    try:
+        return int(raw["chat"]["id"]), int(raw["draft_id"])
+    except (KeyError, TypeError, ValueError):
+        return None

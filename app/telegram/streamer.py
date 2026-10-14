@@ -180,6 +180,54 @@ def _thinking_placeholder_html(lang: str = "en") -> str:
 _THINKING_MODEL_LINE = os.environ.get("THINKING_MODEL_LINE", "1").strip().lower() not in (
     "0", "false", "no", "off")
 
+# #430 (EXPERIMENTAL): Telegram holds a message the user sends while a reply draft streams and
+# delivers it only once a real message lands in the chat (observed on iOS — rich-message-spec.md).
+# While the draft shows ONLY the <tg-thinking> indicator (tool / search / thinking phases, the long
+# waits) the streamer, every DRAFT_RELEASE_SECS, lands a tiny silent message, deletes it and puts
+# the indicator back, so a held message reaches the bot mid-turn and goes into the running CLI
+# turn (#417). Never while answer text streams. DRAFT_RELEASE: "owner" (default while it is being
+# tested) | "all" | "off". Rollback: DRAFT_RELEASE=off, or drop these flags, draft_release_period,
+# Streamer.draft_release_secs and _release_held_messages / _drop_release_msg with their callers.
+# #431: WITHDRAWN — every placeholder raised a notification (disable_notification only drops the
+# sound), so the cycle is off by default; the draft push button (DRAFT_PUSH) replaces it.
+# was: os.environ.get("DRAFT_RELEASE", "owner")
+_DRAFT_RELEASE_SCOPE = os.environ.get("DRAFT_RELEASE", "off").strip().lower()
+# Period: 3 s (was 15 — the first, untested guess); one cycle takes ~1.3 s itself.
+try:
+    _DRAFT_RELEASE_SECS = max(0.0, float(os.environ.get("DRAFT_RELEASE_SECS", "3")))
+except ValueError:
+    _DRAFT_RELEASE_SECS = 3.0
+# How long the placeholder stays before it is deleted (long enough for the client to let go).
+_DRAFT_RELEASE_HOLD_SECS = 1.0
+
+
+def draft_release_period(chat_id: int, owner_id: int | None) -> float:
+    """#430: the thinking-phase release-cycle period for a chat, in seconds; 0 = off."""
+    if _DRAFT_RELEASE_SCOPE in ("", "0", "off", "no", "false") or _DRAFT_RELEASE_SECS <= 0:
+        return 0.0
+    if _DRAFT_RELEASE_SCOPE != "all" and chat_id != owner_id:
+        return 0.0
+    return _DRAFT_RELEASE_SECS
+
+
+# #431 (EXPERIMENTAL): the draft's own button (sendRichMessageDraft can_stop, Bot API 10.3) used as
+# PUSH, not stop. Telegram holds a message the user sends while a draft streams; pressing the button
+# ends the draft on the client, which lets that message through — no bot message, no notification.
+# The bot receives `stopped_message_generation` and, instead of stopping, carries on in a NEW
+# draft id (Streamer.on_push), so the message reaches the running turn (#417). The button is drawn
+# by Telegram (its look cannot be changed). DRAFT_PUSH: "all" (default — released to every user
+# after the owner's test) | "owner" | "off". Rollback: DRAFT_PUSH=off, or drop this flag,
+# draft_push_enabled, Streamer.push_button / _draft_extra / on_push and
+# SessionManager.on_generation_stopped with the bot.py middleware.
+# was: os.environ.get("DRAFT_PUSH", "owner")  — owner only while it was being tested
+_DRAFT_PUSH_SCOPE = os.environ.get("DRAFT_PUSH", "all").strip().lower()
+
+
+def draft_push_enabled(chat_id: int, owner_id: int | None) -> bool:
+    """#431: whether this chat's drafts carry the push button."""
+    if _DRAFT_PUSH_SCOPE in ("", "0", "off", "no", "false"):
+        return False
+    return _DRAFT_PUSH_SCOPE == "all" or chat_id == owner_id
 # #240c: extended-thinking (reasoning) shown in the <tg-thinking> block. Keep only the
 # tail (the block is a compact live indicator, not a transcript) and retain a little more
 # than is shown so the frontier animates smoothly as deltas arrive.
@@ -359,6 +407,13 @@ class Streamer:
         # #422 (experimental): plain-text first line of the <tg-thinking> indicator (model +
         # version + effort), set by the session worker before start(); "" = no line.
         self.model_line: str = ""
+        # #430 (experimental): thinking-phase release-cycle period (0 = off; set by the session
+        # worker), when the last cycle ran, and a placeholder message not yet deleted.
+        self.draft_release_secs: float = 0.0
+        self._last_release: float = 0.0
+        self._release_msg_id: int | None = None
+        # #431 (experimental): whether drafts carry the push button (set by the session worker).
+        self.push_button: bool = False
 
         self.message_id: int | None = None
         self._start_time: float = 0.0
@@ -581,6 +636,66 @@ class Streamer:
             return (f"<tg-thinking>{markup.escape_html(self.model_line)}<br>{inner}"
                     "</tg-thinking>")
         return f"<tg-thinking>{inner}</tg-thinking>"
+
+    def _draft_extra(self) -> dict[str, Any]:
+        """#431: extra sendRichMessageDraft fields — the push button when enabled."""
+        return {"can_stop": True} if self.push_button else {}
+
+    def on_push(self, draft_id: int) -> bool:
+        """#431 (experimental): the user pressed the draft's button. The client has ended this
+        draft (and lets a held message through); carry on in a new draft id — the old one takes no
+        further drafts — re-sent on the next frame. Returns True when it was this draft."""
+        if not self.use_drafts or self._closed or draft_id != self._draft_id:
+            return False
+        self._draft_id = _next_draft_id()
+        self._rendered_text = ""   # force the next frame to re-send under the new id
+        self._last_edit = 0.0
+        logger.info("chat %s: draft push (draft %s → %s)", self.chat_id, draft_id, self._draft_id)
+        return True
+
+    async def _release_held_messages(self, html: str) -> bool:
+        """#430 (experimental): land a tiny silent message, delete it, put the thinking
+        indicator back — Telegram then delivers a message the user sent while the draft was
+        streaming, so it reaches the running turn. Caller holds the lock. Returns True when the
+        cycle ran (the indicator is re-sent here or by the next frame)."""
+        self._last_release = time.monotonic()
+        lang = i18n.cached_lang(self.chat_id)
+        # Plain text that reads like the indicator (model line + "💭 Thinking…"), so the swap is
+        # as quiet as possible.
+        text = f"💭 {i18n.t('stream.thinking', lang)}…"
+        if _THINKING_MODEL_LINE and self.model_line:
+            text = f"{self.model_line}\n{text}"
+        try:
+            msg = await self.bot.send_message(
+                chat_id=self.chat_id, text=text,
+                disable_notification=True, link_preview_options=_NO_PREVIEW, **self._kwargs())
+        except Exception:
+            return False
+        self._release_msg_id = getattr(msg, "message_id", None)
+        await asyncio.sleep(_DRAFT_RELEASE_HOLD_SECS)
+        await self._drop_release_msg()
+        logger.info("chat %s: draft release cycle (thinking phase)", self.chat_id)
+        try:
+            await self.bot(SendRichMessageDraft(chat_id=self.chat_id, draft_id=self._draft_id, **self._draft_extra(),
+                                                rich_message={"html": html}))
+            self._rendered_text = html
+            self._last_edit = time.monotonic()
+        except Exception:
+            self._rendered_text = ""  # the next frame re-sends the indicator
+        return True
+
+    async def _drop_release_msg(self) -> None:
+        """#430: delete the release placeholder if one is still up (idempotent)."""
+        mid, self._release_msg_id = self._release_msg_id, None
+        if mid is not None:
+            with contextlib.suppress(Exception):
+                await self.bot.delete_message(self.chat_id, mid)
+
+    def _thinking_placeholder(self) -> str:
+        """#294/#422: the static "Thinking…" placeholder (with the model line when set)."""
+        return self._thinking_html(
+            f"{markup.escape_html(i18n.t('stream.thinking', i18n.cached_lang(self.chat_id)))}…")
+
     async def _render_draft(self) -> None:
         """Push the current text as a native message draft (DM streaming).
 
@@ -689,6 +804,13 @@ class Streamer:
                          + f" {_thinking_label(time.monotonic() - self._start_time, lang)}…")
             # #422: was: html = f"<tg-thinking>{inner}</tg-thinking>"
             html = self._thinking_html(inner)
+            # #430 (experimental): let a message the user typed meanwhile through — only in this
+            # thinking-only phase, never while answer text streams.
+            if (self.draft_release_secs > 0 and not table_note
+                    and time.monotonic() - max(self._start_time, self._last_release)
+                    >= self.draft_release_secs):
+                if await self._release_held_messages(html):
+                    return
             # #242: skip only if unchanged AND sent recently; otherwise re-send to keep the
             # ephemeral ~30s draft alive (a static phase during a long tool would else expire).
             if html == self._rendered_text and (time.monotonic() - self._last_edit) < _DRAFT_KEEPALIVE_SECS:
@@ -696,7 +818,7 @@ class Streamer:
             try:
                 await self.bot(
                     SendRichMessageDraft(
-                        chat_id=self.chat_id, draft_id=self._draft_id,
+                        chat_id=self.chat_id, draft_id=self._draft_id, **self._draft_extra(),
                         rich_message={"html": html},
                     )
                 )
@@ -749,6 +871,7 @@ class Streamer:
                     chat_id=self.chat_id,
                     draft_id=self._draft_id,
                     rich_message={"markdown": frontier},
+                    **self._draft_extra(),
                 )
             )
         except TelegramRetryAfter as exc:
@@ -887,6 +1010,11 @@ class Streamer:
             self._control_id = None
             with contextlib.suppress(Exception):
                 asyncio.create_task(self.bot.delete_message(self.chat_id, cid))
+        # #430: and a release placeholder still up (same fire-and-forget teardown).
+        if self._release_msg_id is not None:
+            mid, self._release_msg_id = self._release_msg_id, None
+            with contextlib.suppress(Exception):
+                asyncio.create_task(self.bot.delete_message(self.chat_id, mid))
 
     # ----------------------------------------------------------------- API
 
@@ -998,6 +1126,7 @@ class Streamer:
             self._last_edit = time.monotonic()
         # Outside the lock: tear down the Stop control message for this turn.
         await self._remove_control()
+        await self._drop_release_msg()  # #430: never leave a release placeholder behind
         # #321: web-search Sources card disabled (see add_web_source) — finalize call commented.
         # was (#319): await self.finalize_sources()
 

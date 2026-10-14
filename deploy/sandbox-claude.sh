@@ -78,6 +78,17 @@ args=(
 # it must be re-injected explicitly. Absent → autocompact stays ON (the CLI default).
 [ -n "${DISABLE_AUTO_COMPACT:-}" ] && args+=(--setenv DISABLE_AUTO_COMPACT "$DISABLE_AUTO_COMPACT")
 
+# #417: forward the Agent SDK / engine protocol switches the bot sets for the CLI — plain flags,
+# nothing secret — which --clearenv would otherwise drop: the SDK's own markers, the session-state
+# stream (how a run tells a follow-up message folded in mid-turn from one that starts its own
+# turn), and the engine's Workflows kill-switch (CLAUDE_CODE_DISABLE_WORKFLOWS — lost in the jail
+# until now). An explicit allowlist: never a pattern that could carry a token into the jail.
+for _v in CLAUDE_CODE_ENTRYPOINT CLAUDE_AGENT_SDK_VERSION CLAUDE_CODE_SDK_READS_SESSION_STATE \
+          CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS CLAUDE_CODE_DISABLE_WORKFLOWS \
+          CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING; do
+  [ -n "${!_v:-}" ] && args+=(--setenv "$_v" "${!_v}")
+done
+
 # #119b: in broker mode, point the inner CLI at the host credential broker (loopback).
 # The jail shares the host network namespace, so 127.0.0.1 reaches the broker; the real
 # OAuth token is injected there, never inside the jail.

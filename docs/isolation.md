@@ -71,7 +71,13 @@ and the egress proxy. Anything else is dropped by the firewall.
   `~/.local` as a non-root uid).
 - FS confinement — only the session's `work/` dir is bind-mounted writable; `/usr`,
   `/bin`, `/etc` are read-only; the root is `--remount-ro`.
-- `--clearenv` — the bot's env (incl. `TELEGRAM_BOT_TOKEN`) never reaches the agent.
+- `--clearenv` — the bot's env (incl. `TELEGRAM_BOT_TOKEN`) never reaches the agent. Only
+  explicitly listed variables are re-injected: `HOME`/`PATH`/`LANG`/`TERM`, the broker URL and
+  proxy settings, the session's own `/secret`s, and an allowlist of plain Agent SDK / engine
+  protocol flags (`CLAUDE_CODE_ENTRYPOINT`, `CLAUDE_AGENT_SDK_VERSION`,
+  `CLAUDE_CODE_SDK_READS_SESSION_STATE`, `CLAUDE_CODE_EMIT_SESSION_STATE_EVENTS`,
+  `CLAUDE_CODE_DISABLE_WORKFLOWS`, `CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING`, plus
+  `DISABLE_AUTO_COMPACT`) — named one by one, never a pattern that could carry a token in.
 - a private tmpfs `HOME`; `~/.claude/projects` is bind-mounted from the per-session
   `state/` dir so `resume` survives a rebuild.
 

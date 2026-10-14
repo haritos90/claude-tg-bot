@@ -41,6 +41,8 @@ from app.storage import usage
 from app.access import settings_schema
 from app.core.engine import ClaudeSession
 from app.telegram.streamer import Streamer, resolve_speed  # #294: tool_phase_label now used via streamer.set_tool_phase
+from app.telegram.streamer import draft_release_period  # #430 (experimental)
+from app.telegram.streamer import draft_push_enabled  # #431 (experimental)
 from app.access.permissions import PermissionGate
 
 logger = logging.getLogger(__name__)  # #325: drain progress → the journal
@@ -444,6 +446,11 @@ _REAPER_INTERVAL = 60.0
 # was: _CLI_UPDATE_POLL = 300.0  — #423: the round now runs at a fixed daily UTC time
 # (CLI_UPDATE_AT_UTC / the Admin setting), so poll each minute to start it on time.
 _CLI_UPDATE_POLL = 60.0
+# #432: after the draft's push button is pressed, how long to wait for the message Telegram was
+# holding before the press counts as STOP. Measured: the held message arrives 20–30 ms after the
+# press update (they come together); 1 s leaves a wide margin and still reads as instant.
+# was: 2.5
+_PUSH_STOP_WAIT_SECS = 1.0
 # #411: the startup model-catalog probe runs this long after start (post-READY, off the
 # startup path — it spawns the CLI and reaches the network).
 _CLI_PROBE_DELAY = 20.0
@@ -464,6 +471,7 @@ _SCHEDULE_INTERVAL = 30.0
 MAX_QUEUED_MESSAGES = 5
 SUBMIT_STARTED = 0      # ran immediately — the worker was idle
 SUBMIT_QUEUE_FULL = -1  # rejected — too many prompts already waiting
+SUBMIT_INJECTED = -2    # #417: handed to the RUNNING turn (the CLI folds it in, like its own input)
 # any value > 0 == queued behind a running turn, at that many waiting
 
 # #245 → #227b: line-interactive commands (gh auth login, sudo, REPLs, `read`, password
@@ -786,6 +794,10 @@ class SessionManager:
         # #423: a daily round at a fixed UTC time (hour, minute); None = off.
         self._cli_update_at: tuple[int, int] | None = parse_update_time(
             getattr(settings, "cli_update_at", "12:00"))
+        # #432: messages received per chat (handle_text) — tells a push that let a held message
+        # through from a press with nothing waiting (= stop); and the pending press checks.
+        self._inbound_by_chat: dict[int, int] = {}
+        self._push_tasks: set[asyncio.Task] = set()
         # #423: bumped whenever an update round replaced the CLI binary; a client built under
         # an older generation is recycled once idle (never mid-reply) — _recycle_stale_clients.
         self._cli_generation: int = 0
@@ -932,6 +944,47 @@ class SessionManager:
             #   "big_memory": state.big_memory,
         }
 
+    def on_generation_stopped(self, chat_id: int, draft_id: int) -> bool:
+        """#431 (experimental): the user pressed the push button on a reply draft
+        (``stopped_message_generation``). The reply goes on in a new draft (Streamer.on_push);
+        the message Telegram was holding then reaches the running turn. Returns True when a live
+        draft of that chat matched."""
+        # was (#431): for rec in list(self._records.values()): … if … st.on_push(draft_id): return True
+        for tid, rec in list(self._records.items()):
+            st = rec.streamer
+            if st is not None and st.chat_id == chat_id and st.on_push(draft_id):
+                # #432: if no held message follows the press, the user meant stop. (Always on
+                # the bot's event loop; a direct call without one just skips the check.)
+                try:
+                    loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    loop = None
+                if loop is not None:
+                    task = loop.create_task(self._stop_unless_pushed(
+                        tid, chat_id, st, self._inbound_by_chat.get(chat_id, 0)))
+                    self._push_tasks.add(task)
+                    task.add_done_callback(self._push_tasks.discard)
+                return True
+        logger.info("chat %s: push for draft %s — no live reply draft", chat_id, draft_id)
+        return False
+
+    async def _stop_unless_pushed(self, thread_id: int, chat_id: int, streamer, mark: int) -> None:
+        """#432: a press of the draft's button that let no held message through within
+        _PUSH_STOP_WAIT_SECS is a STOP — interrupt the reply gracefully, as /stop does (the text
+        so far is kept). Nothing happens when a message arrived or that reply is already over."""
+        try:
+            await asyncio.sleep(_PUSH_STOP_WAIT_SECS)
+        except asyncio.CancelledError:
+            return
+        if self._inbound_by_chat.get(chat_id, 0) != mark:
+            return  # a held message came through — it was a push
+        rec = self._records.get(thread_id)
+        if rec is None or rec.streamer is not streamer or not self._is_busy(thread_id):
+            return
+        logger.info("thread %s: draft button pressed with no message — stopping the reply",
+                    thread_id)
+        with contextlib.suppress(Exception):
+            await self.stop(thread_id)
 
     def _model_line(self, rec: _ThreadRecord, lang: str) -> str:
         """#422 (experimental): "Opus 5.5 · medium" — the model (display name with its version)
@@ -1234,7 +1287,13 @@ class SessionManager:
         ``SUBMIT_STARTED`` (0) when it runs immediately, a positive count of prompts
         now WAITING when it was queued behind a running turn, or ``SUBMIT_QUEUE_FULL``
         (-1) when the per-session backlog cap is hit and the prompt was NOT enqueued.
+        #417: ``SUBMIT_INJECTED`` (-2) when a run is in progress and the message went
+        straight INTO it — the Claude Code CLI folds it in at the next tool-call boundary,
+        or answers it as the very next turn (rendered as its own reply by the worker). The
+        bot-side queue is only the fallback for the moment before the turn's client is live.
         """
+        # #432: count it — a push-button press with no message after it means stop.
+        self._inbound_by_chat[chat_id] = self._inbound_by_chat.get(chat_id, 0) + 1
         # Remember the chat we are talking in so the pinned usage message can be
         # created/updated there. Persist only on change (best effort).
         if self._main_chat_id != chat_id:
@@ -1263,6 +1322,26 @@ class SessionManager:
                 # the queued depth so the caller can ack. The running turn already
                 # pulled its item off the queue, so qsize() == prompts still waiting.
                 busy = rec.worker is not None and not rec.worker.done()
+                # #417: a running turn takes the message itself, the way the CLI takes input
+                # typed while it works — no bot-side queue, no separate turn.
+                if busy and rec.session is not None and rec.queue.empty():
+                    # was (#417): `if await rec.session.inject(...)` inside the suppress block —
+                    # #427 keeps the outcome so the decision is logged (never the text).
+                    injected = False
+                    with contextlib.suppress(Exception):
+                        injected = await rec.session.inject(text, attachments)
+                    if injected:
+                        logger.info("thread %s: message handed to the running turn", thread_id)
+                        with contextlib.suppress(Exception):
+                            await db.log_message(thread_id, "user", text)
+                        return SUBMIT_INJECTED
+                    # #427: it waits and runs as the next turn — the reply had already finished
+                    # (turn active=False: the worker is still delivering it), or the client
+                    # reports no session state, without which a follow-up can't be told apart.
+                    logger.info("thread %s: message runs after the current reply (turn active=%s,"
+                                " state events=%s)", thread_id,
+                                getattr(rec.session, "_turn_active", None),
+                                getattr(rec.session, "_states_seen", None))
                 if busy and rec.queue.qsize() >= MAX_QUEUED_MESSAGES:
                     return SUBMIT_QUEUE_FULL
                 # #266: idle handling moved UP to the handler (_session_key_for_turn),
@@ -1317,27 +1396,33 @@ class SessionManager:
                 # them as whole messages client-side until it restores bot draft previews;
                 # we keep drafts regardless — write-head is a worse fallback we don't use.)
                 use_drafts = thread_id < 0
-                # #166: a new turn resets the warm-cache window → drop the previous
-                # turn's ticking countdown and its message.
-                self._cancel_hot_cache(rec, chat_id)
-                # #164: working-plate note (own limit ≥50% / owner account). Only the
-                # DM draft path shows the Stop-control plate, so compute it there only.
-                working_note = ""
-                if use_drafts:
-                    working_note = await self._working_note(
-                        chat_id, i18n.cached_lang(chat_id), rec
+
+                async def _new_streamer(use_drafts=use_drafts, interval=interval,
+                                        step=step) -> Streamer:
+                    # #417: one per reply — the queued turn's, and each follow-up turn's.
+                    # #166: a new turn resets the warm-cache window → drop the previous
+                    # turn's ticking countdown and its message.
+                    self._cancel_hot_cache(rec, chat_id)
+                    # #164: working-plate note (own limit ≥50% / owner account). Only the
+                    # DM draft path shows the Stop-control plate, so compute it there only.
+                    working_note = ""
+                    if use_drafts:
+                        working_note = await self._working_note(
+                            chat_id, i18n.cached_lang(chat_id), rec
+                        )
+                    return Streamer(
+                        self.bot,
+                        chat_id,
+                        send_tid,
+                        frame_interval=interval,
+                        base_step=step,
+                        use_drafts=use_drafts,
+                        split_code_messages=self.split_code_messages,
+                        working_note=working_note,
+                        controllable=self.working_plate,   # #175: global plate on/off
                     )
-                streamer = Streamer(
-                    self.bot,
-                    chat_id,
-                    send_tid,
-                    frame_interval=interval,
-                    base_step=step,
-                    use_drafts=use_drafts,
-                    split_code_messages=self.split_code_messages,
-                    working_note=working_note,
-                    controllable=self.working_plate,   # #175: global plate on/off
-                )
+
+                streamer = await _new_streamer()
                 rec.streamer = streamer
                 try:
                     # #179: global concurrency admission — relieve memory if low and
@@ -1356,6 +1441,14 @@ class SessionManager:
                         await self._run_one(
                             rec, thread_id, prompt, attachments, streamer
                         )
+                        # #417: the CLI answered a message injected mid-run as a turn of its
+                        # own — render each such follow-up as its own reply, inside this same
+                        # admission slot (the CLI is already generating it).
+                        while (getattr(rec.session, "followup_pending", False)
+                               and not self._draining):
+                            streamer = await _new_streamer()
+                            rec.streamer = streamer
+                            await self._run_one(rec, thread_id, None, None, streamer)
                     finally:
                         self._active_turns -= 1
                         if self._active_turns <= 0:
@@ -1522,11 +1615,13 @@ class SessionManager:
         self,
         rec: _ThreadRecord,
         thread_id: int,
-        prompt: str,
+        prompt: str | None,
         attachments: list | None,
         streamer: Streamer,
     ) -> None:
-        """Execute a single prompt turn (optionally with attachments)."""
+        """Execute a single prompt turn (optionally with attachments). #417: ``prompt=None``
+        renders a follow-up turn the CLI started by itself for a message injected mid-run
+        (already logged when it was injected) — nothing is sent, only rendered."""
         session = rec.session
         if session is None:
             # Should not happen (handle_text builds it), but stay safe.
@@ -1539,7 +1634,7 @@ class SessionManager:
 
         # #224: shell-mode overlay — route the message to a one-shot jailed command
         # instead of the model (code sessions only; no tokens).
-        if rec.shell_mode and rec.mode == "code":
+        if rec.shell_mode and rec.mode == "code" and prompt is not None:  # #417: not a follow-up
             await self._run_shell_command(rec, thread_id, prompt, streamer)
             return
 
@@ -1548,15 +1643,25 @@ class SessionManager:
         # end (the Streamer has message_id=None, so finish() posts a fresh message).
         stream = rec.stream_enabled
 
-        # Log the user's prompt (feeds /recap + /history); best-effort.
-        with contextlib.suppress(Exception):
-            await db.log_message(thread_id, "user", prompt)
+        # Log the user's prompt (feeds /recap + /history); best-effort. #417: a follow-up
+        # turn's message was logged when it was injected.
+        if prompt is not None:
+            with contextlib.suppress(Exception):
+                await db.log_message(thread_id, "user", prompt)
 
         if stream:
             # #422 (experimental; THINKING_MODEL_LINE=0 turns it off): the model, its version and
             # the effort this turn runs at, as the first line of the <tg-thinking> indicator.
             with contextlib.suppress(Exception):
                 streamer.model_line = self._model_line(rec, i18n.cached_lang(streamer.chat_id))
+            # #430 (experimental, withdrawn by #431 — off by default): the release cycle.
+            with contextlib.suppress(Exception):
+                streamer.draft_release_secs = draft_release_period(
+                    streamer.chat_id, getattr(self.settings, "owner_id", None))
+            # #431: the draft's own button, used as PUSH — every user by default (DRAFT_PUSH).
+            with contextlib.suppress(Exception):
+                streamer.push_button = draft_push_enabled(
+                    streamer.chat_id, getattr(self.settings, "owner_id", None))
             await streamer.start()
         running_text = ""
         final_text = ""

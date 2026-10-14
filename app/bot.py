@@ -27,6 +27,7 @@ from app.storage.db import (init_db, close_db, migrate_workdirs_to_sid,
                             migrate_sessions_to_ulid, load_sid_cache, sandbox_uid_collisions)
 from app.core import models  # #411: the model catalog the CLI reports
 from app.core import cli_update  # #412: stage / update the Claude Code CLI
+from app.telegram.rich_message import stopped_generation_of  # #431 (experimental)
 from app.access.allowlist import Allowlist
 from app.access.access import AllowlistMiddleware, LanguageMiddleware
 from app.access.permissions import PermissionGate
@@ -314,6 +315,20 @@ async def main() -> None:
     dp.message.outer_middleware(language_mw)
     dp.callback_query.outer_middleware(language_mw)
 
+    # #431 (experimental): the draft push button. aiogram 3.28 does not know the Bot API 10.3
+    # `stopped_message_generation` update (it would drop it as an unknown type), so it is read
+    # here from the raw update and handed to the session manager. Harmless for anyone else: it
+    # only acts on a live reply draft of that same chat.
+    async def _push_mw(handler, event, data):
+        info = stopped_generation_of(event)
+        if info is None:
+            return await handler(event, data)
+        with contextlib.suppress(Exception):
+            sessions.on_generation_stopped(*info)
+        return None
+
+    dp.update.outer_middleware(_push_mw)
+
     try:
         # #196/#234: watchdog.ready() (READY=1) is sent ABOVE, before the local sandbox
         # setup, so that setup can't delay READY. The watchdog TASK is created HERE — the
@@ -363,9 +378,10 @@ async def main() -> None:
                 )
 
         # Only the update types we actually handle are requested from Telegram.
+        # #431: + stopped_message_generation (the experimental draft push button).
         await dp.start_polling(
             bot,
-            allowed_updates=["message", "callback_query"],
+            allowed_updates=["message", "callback_query", "stopped_message_generation"],
         )
     finally:
         logger.info("Shutting down...")
