@@ -11,7 +11,7 @@ on:
 permissions:
   contents: read
 
-# Cancel an in-progress run when new commits land on the same ref.
+# Newer commits on the same ref cancel the running job.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
@@ -26,14 +26,13 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
-          # The default cache globs look for requirements*.txt at the root; the files
-          # moved under requirements/, so name them or pin bumps stop keying the cache (#401).
+          # Default cache globs miss requirements/; name the files.
           cache-dependency-path: requirements/*.txt
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements/dev.txt
+          pip install -r requirements/base.txt -r requirements/dev.txt
 
       - name: Lint (ruff)
         run: ruff check .
@@ -42,8 +41,8 @@ jobs:
         run: python -m compileall -q app conftest.py
 
       - name: Import smoke test
-        # No .env is present in CI; importing must not load settings or start
-        # polling (guarded by __main__), so this verifies the module graph only.
+        # No .env in CI: importing must not load settings.
+        # - Verifies the module graph only
         run: |
           python -c "import app.config, app.storage.db, app.access.access, app.access.allowlist, app.telegram.markup, app.telegram.streamer, app.access.permissions, app.core.engine, app.core.sessions, app.storage.usage, app.telegram.handlers, app.bot"
 
