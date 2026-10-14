@@ -1583,46 +1583,52 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
 
     async def _dispose_session(uid: int, key: int, name: str | None) -> bool:
         """#307: reset + delete + archive ONE session (shared by the cap-evictor and the
-        untitled-empty GC). Returns True if the row was deleted."""
-        with contextlib.suppress(Exception):
-            await sessions.reset(key)
-        ok = False
-        with contextlib.suppress(Exception):
-            ok = await db.delete_dm_session(uid, key)
-        if ok:
+        untitled-empty GC). Returns True if the row was deleted. #413: the body moved to
+        SessionManager.dispose_dm_session so the background untitled sweep shares it. was:
             with contextlib.suppress(Exception):
-                archive.archive_session(settings.base_workdir, db.session_pubid(key),  # #332: ULID dir
-                                        owner_id=uid, key=key, name=name)
-        return ok
+                await sessions.reset(key)
+            ok = False
+            with contextlib.suppress(Exception):
+                ok = await db.delete_dm_session(uid, key)
+            if ok:
+                with contextlib.suppress(Exception):
+                    archive.archive_session(settings.base_workdir, db.session_pubid(key),  # #332
+                                            owner_id=uid, key=key, name=name)
+            return ok"""
+        return await sessions.dispose_dm_session(uid, key, name)
 
     async def _gc_untitled_empties(uid: int, keep: int) -> int:
-        """#307: enforce AT MOST ONE empty untitled session per user. Deletes every DM
-        session that is UNUSED (zero requests) AND never manually named (``name_auto``) AND
-        not a favorite, except ``keep`` (the current/target). Idle rotation (#266/#271), the
-        New-chat button, and opening /sessions after an idle gap can each leave an abandoned
-        "Not named yet" session behind; this collapses them so the list never shows more than
-        the single live empty. A used or renamed session is never touched (it has content or
-        an intentional name)."""
+        """#307: enforce AT MOST ONE empty untitled session per user, except ``keep`` (the
+        current/target). #413: extended to name-or-dispose — a USED session still on the
+        "Not named yet" placeholder (the CLI writes no title for a <10-char prompt such as a
+        bare "you there?", and #345 skips a <10-letter one) is named by the auto-name priority
+        or, with nothing to name it by, archived (SessionManager.tidy_untitled). Returns the
+        number archived. was (#307 — zero-request sessions only, a used one never touched):
+            try:
+                page, _ = await db.browse_threads(uid, None, limit=100, offset=0)
+            except Exception:
+                return 0
+            cands = [r for r in page
+                     if r["thread_id"] != keep and r["thread_id"] < 0
+                     and not r.get("favorite") and r.get("name_auto", True)]
+            if not cands:
+                return 0
+            stats: dict = {}
+            with contextlib.suppress(Exception):
+                stats = await db.get_usage_totals_bulk([r["thread_id"] for r in cands])
+            n = 0
+            for r in cands:
+                tid = r["thread_id"]
+                if int((stats.get(tid) or {}).get("requests", 0) or 0) != 0:
+                    continue  # has usage → not empty; keep it
+                if await _dispose_session(uid, tid, r.get("name")):
+                    n += 1
+            return n"""
         try:
-            page, _ = await db.browse_threads(uid, None, limit=100, offset=0)
+            _named, disposed = await sessions.tidy_untitled(uid, keep)
         except Exception:
             return 0
-        cands = [r for r in page
-                 if r["thread_id"] != keep and r["thread_id"] < 0
-                 and not r.get("favorite") and r.get("name_auto", True)]
-        if not cands:
-            return 0
-        stats: dict = {}
-        with contextlib.suppress(Exception):
-            stats = await db.get_usage_totals_bulk([r["thread_id"] for r in cands])
-        n = 0
-        for r in cands:
-            tid = r["thread_id"]
-            if int((stats.get(tid) or {}).get("requests", 0) or 0) != 0:
-                continue  # has usage → not empty; keep it
-            if await _dispose_session(uid, tid, r.get("name")):
-                n += 1
-        return n
+        return disposed
 
     async def _evict_oldest_empty(uid: int, exclude: int) -> bool:
         """#266: free one session slot by archiving the user's OLDEST disposable session —
@@ -1698,6 +1704,11 @@ def build_router(settings, sessions, gate, bot, allowlist) -> Router:
             # (/code or /new code), so an automatic rotation must not silently mint one.
             # was: _new_dm_session(uid, st.mode, _default_session_name(st.mode, lang))
             newk = await _new_dm_session(uid, "chat", _default_session_name("chat", lang))
+            # #413: a rotation is exactly where an earlier rotation's leftover lands — e.g. a
+            # session that only ever got a liveness probe ("you there?") and never a name. Name
+            # or archive such leftovers now instead of letting them pile up in /sessions.
+            with contextlib.suppress(Exception):
+                await _gc_untitled_empties(uid, newk)
             return newk, True
 
     async def _session_key_for_turn(message: Message) -> int:

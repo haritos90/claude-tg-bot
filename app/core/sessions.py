@@ -20,6 +20,7 @@ import functools
 import json
 import logging
 import os
+import re
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -133,6 +134,22 @@ _CTX_STATUS_MIN = 50_000
 # #260: longest auto-name we adopt (Telegram session-label readability; manual
 # /rename is uncapped — the user owns that).
 _AI_TITLE_MAX = 64
+# #413: a name taken from a MESSAGE (the user's, or the reply's topic) is cut to what fits on
+# the /sessions button — the browser shows `name[:40]` — on a word boundary, so it reads as
+# whole words instead of being chopped mid-word by the button.
+_BUTTON_NAME_MAX = 40
+
+
+def _clip_words(s: str, limit: int = _BUTTON_NAME_MAX) -> str:
+    """#413: whitespace-collapsed ``s`` cut to at most ``limit`` chars on a word boundary
+    (an ellipsis marks the cut; a single over-long word is hard-cut)."""
+    s = " ".join(s.split())
+    if len(s) <= limit:
+        return s
+    cut = s[:limit - 1]
+    if " " in cut:
+        cut = cut.rsplit(" ", 1)[0]
+    return cut.rstrip(" -—–:;,.") + "…"
 
 
 def _user_text(obj: dict) -> str:
@@ -167,7 +184,23 @@ def _topic_from_text(txt: str) -> str | None:
         return None
     if sum(c.isalpha() for c in s) < 10:  # greetings / acks ("ok", "hi", "yo")
         return None
-    return s[:_AI_TITLE_MAX].strip() or None
+    # #413: as many whole words as fit on the /sessions button. was: s[:_AI_TITLE_MAX]
+    return _clip_words(s).strip() or None
+
+
+def _first_words(txt: str) -> str | None:
+    """#413: the next tier after _topic_from_text — the first user message AS TYPED, however
+    short ("you there?", "what is this?" under a photo), cut to the button width. Only an
+    injected prompt or a message with no letters/digits yields None. (#345 left such a session
+    on the "Not named yet" placeholder; a session always gets the user's own words now.)"""
+    if not txt:
+        return None
+    s = " ".join(txt.split())
+    if any(s.lower().startswith(p) for p in _NON_TOPIC_PREFIXES):
+        return None
+    if not any(c.isalnum() for c in s):
+        return None
+    return _clip_words(s) or None
 
 
 def _read_session_title(
@@ -218,6 +251,91 @@ def _read_session_title(
         return (title[:_AI_TITLE_MAX] if title else None, fallback)
     except OSError:
         return (None, None)
+
+
+# #413: a reply shorter than this is not a topic to name a session by — the answer to a
+# liveness probe ("are you there?" → "I'm here, how can I help?") stays well under it, while a
+# real answer (a photo identified, a question answered) clears it easily.
+_REPLY_TOPIC_MIN = 200
+_BOLD_RE = re.compile(r"\*\*(.+?)\*\*|__(.+?)__")
+_MD_NOISE_RE = re.compile(r"[*_`#>|~\[\]]+")
+_SENTENCE_END_RE = re.compile(r"(?<=[.!?…])\s+")
+
+
+def _clip_title(s: str) -> str:
+    """Trim a reply-derived name candidate to the button width on a word boundary and
+    capitalize it (it is a fragment lifted out of a sentence)."""
+    s = _clip_words(" ".join(s.split()).strip(" -—–:;,."))
+    return (s[:1].upper() + s[1:]) if s else s
+
+
+def _topic_from_reply(txt: str) -> str | None:
+    """#413: a session-name candidate from an ASSISTANT reply — the tier used only when the
+    engine wrote no ai-title AND no user message is substantive (e.g. a photo sent with a bare
+    "what is this?": the CLI skips titling a <10-char prompt, #345 skips a <10-letter one).
+    None for a short reply (a probe answer). Prefers the first **bold** phrase of 2+ words (the
+    model bolds the subject it identifies), else the first sentence with real words."""
+    if not txt or len(txt.strip()) < _REPLY_TOPIC_MIN:
+        return None
+    for m in _BOLD_RE.finditer(txt):
+        cand = (m.group(1) or m.group(2) or "").strip()
+        if len(cand.split()) >= 2 and sum(c.isalpha() for c in cand) >= 6:
+            return _clip_title(_MD_NOISE_RE.sub("", cand))
+    for line in txt.splitlines():
+        plain = _MD_NOISE_RE.sub("", line).strip()
+        if sum(c.isalpha() for c in plain) < 10:
+            continue
+        sentence = _SENTENCE_END_RE.split(plain, 1)[0]
+        return _clip_title(sentence)
+    return None
+
+
+def _read_name_fallbacks(cwd: str | None,
+                         session_id: str | None) -> tuple[str | None, str | None]:
+    """#413: the two name tiers after _read_session_title's, in ONE transcript pass (same
+    path/encoding): ``(first_words, reply_topic)`` — the first user message as typed
+    (:func:`_first_words`), and the topic of the first assistant text block long enough to
+    carry one (:func:`_topic_from_reply`; only used when the user sent no text at all, e.g.
+    a captionless photo). Meta/tool-result user lines are skipped."""
+    if not cwd or not session_id:
+        return (None, None)
+    first = topic = None
+    try:
+        path = archive.live_transcript_dir(cwd) / f"{session_id}.jsonl"
+        if not path.is_file():
+            return (None, None)
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if first is None and '"user"' in line:
+                    try:
+                        obj = json.loads(line)
+                    except ValueError:
+                        continue
+                    if obj.get("type") == "user" and not obj.get("isMeta"):
+                        text = _user_text(obj)
+                        if text.strip() and not text.lstrip().startswith("<"):
+                            first = _first_words(text)
+                elif topic is None and '"assistant"' in line:
+                    try:
+                        obj = json.loads(line)
+                    except ValueError:
+                        continue
+                    if obj.get("type") != "assistant":
+                        continue
+                    content = (obj.get("message") or {}).get("content")
+                    blocks = (content if isinstance(content, list)
+                              else [{"type": "text", "text": content}]
+                              if isinstance(content, str) else [])
+                    for b in blocks:
+                        if isinstance(b, dict) and b.get("type") == "text":
+                            topic = _topic_from_reply(b.get("text") or "")
+                            if topic:
+                                break
+                if first is not None and topic is not None:
+                    break
+    except OSError:
+        return (None, None)
+    return (first, topic)
 
 
 def _ctx_total(info) -> int:
@@ -319,6 +437,10 @@ _USAGE_POLL_INTERVAL = 300.0
 # #179: how often the idle-client reaper sweeps (seconds). Cheap — just compares
 # timestamps + MemAvailable and aclose()s idle live clients over the TTL / cap.
 _REAPER_INTERVAL = 60.0
+# #413: the untitled-session sweep (name-or-dispose over every DM user) runs this long after
+# startup, then once per this interval. Interaction-driven sweeps (handlers) run in between.
+_UNTITLED_SWEEP_FIRST = 120.0
+_UNTITLED_SWEEP_INTERVAL = 86400.0
 # #178: how often the archive-retention purge sweeps (seconds). Deleted-session
 # bundles are slow-moving, so once a day is plenty; it also runs once at startup.
 _ARCHIVE_PURGE_INTERVAL = 86400.0
@@ -616,6 +738,8 @@ class SessionManager:
         # never gated the read for the ~27/30 days OUTSIDE the warn window — the creds file was
         # reopened+parsed on the event loop every owner turn-finish. This throttles the READ.
         self._login_check_last = 0.0
+        # #413: background name-or-dispose sweep over every DM user's untitled sessions.
+        self._untitled_task: asyncio.Task | None = None
 
     # ------------------------------------------------------------------ records
 
@@ -1572,6 +1696,17 @@ class SessionManager:
                                 # or API-errored opening — #345). manual=False keeps the name
                                 # auto, so a real ai-title on a later turn still supersedes it.
                                 new_name = ai_title or fb_title
+                                # #413: next tiers — the first user message as typed, cut to
+                                # the button width (a short "you there?" too), then — only
+                                # when the user sent no text at all (a captionless photo) —
+                                # the topic of the first substantial reply.
+                                if not new_name:
+                                    first_words, reply_topic = await asyncio.to_thread(
+                                        _read_name_fallbacks, getattr(rec, "cwd", None),
+                                        ev.session_id,
+                                    )
+                                    new_name = (first_words or reply_topic
+                                                or _topic_from_reply(final_text))
                                 if new_name and new_name != getattr(rec, "name", None):
                                     await db.set_session_name(
                                         thread_id, new_name, manual=False
@@ -2086,6 +2221,152 @@ class SessionManager:
         self._idle_reset = max(0.0, float(sec))
         await db.set_kv("idle_reset_sec", str(int(self._idle_reset)))
 
+    # ------------------------------------------- untitled sessions: name or dispose (#413)
+
+    def _is_busy(self, thread_id: int) -> bool:
+        """True while a turn runs (or waits queued) on this session — never dispose that."""
+        rec = self._records.get(thread_id)
+        if rec is None:
+            return False
+        running = rec.worker is not None and not rec.worker.done()
+        return running or not rec.queue.empty()
+
+    async def dispose_dm_session(self, uid: int, key: int, name: str | None) -> bool:
+        """#307/#413: reset + delete + archive ONE DM session; True if the row was deleted.
+        Moved here from handlers._dispose_session so the background untitled sweep shares it;
+        the archive keeps the bundle for the retention window, so a disposal is recoverable."""
+        with contextlib.suppress(Exception):
+            await self.reset(key)
+        ok = False
+        with contextlib.suppress(Exception):
+            ok = await db.delete_dm_session(uid, key)
+        if ok:
+            with contextlib.suppress(Exception):
+                archive.archive_session(self.settings.base_workdir, db.session_pubid(key),
+                                        owner_id=uid, key=key, name=name)
+        return ok
+
+    async def _derive_session_name(self, key: int) -> str | None:
+        """#413: the auto-name priority for a STORED session (no live turn needed): the engine's
+        ai-title → the first substantive user message (#345) → the first user message as typed
+        (button width) → the topic of the first substantial reply (only when the user sent no
+        text at all). Reads the session's transcript(s); falls back to the logged messages when
+        the transcript is gone. None = nothing to name it by."""
+        st = await db.get_thread(key)
+        if st is None:
+            return None
+        order = ((st.code_session_id, st.chat_session_id) if st.mode == "code"
+                 else (st.chat_session_id, st.code_session_id))
+        sids = [x for x in order if x]
+        substantive = first = topic = None
+        for sid in sids:
+            ai, fb = await asyncio.to_thread(_read_session_title, st.cwd, sid)
+            if ai:
+                return ai
+            substantive = substantive or fb
+        if substantive:
+            return substantive
+        for sid in sids:
+            fw, tp = await asyncio.to_thread(_read_name_fallbacks, st.cwd, sid)
+            first, topic = first or fw, topic or tp
+        if first or topic:
+            return first or topic
+        msgs = await db.get_recent_messages(key, limit=200)
+        user_texts = [m["text"] for m in msgs if m["role"] == "user"]
+        for txt in user_texts:
+            if _topic_from_text(txt):
+                return _topic_from_text(txt)
+        for txt in user_texts:
+            if _first_words(txt):
+                return _first_words(txt)
+        for m in msgs:
+            if m["role"] == "assistant" and _topic_from_reply(m["text"]):
+                return _topic_from_reply(m["text"])
+        return None
+
+    async def tidy_untitled(self, uid: int, keep: int) -> tuple[int, int]:
+        """#413: make every UNTITLED DM session of ``uid`` either named or gone (the #307
+        zero-request GC, extended). Skips ``keep`` (the current/target session), favorites,
+        manually named sessions and busy ones. A never-used session is archived (#307). A used
+        one still on a placeholder name gets a name by the auto-name priority
+        (_derive_session_name) — and with nothing at all to name it by (no user text, no
+        substantial reply), it is archived. Returns (named, disposed)."""
+        # Every page, not just the 100 most recent: an old leftover sits far down the list.
+        # Collected up front, since disposals below would shift the offsets.
+        # was (#307, first page only): page, _ = await db.browse_threads(uid, None, limit=100, offset=0)
+        page: list = []
+        while True:
+            chunk, total = await db.browse_threads(uid, None, limit=100, offset=len(page))
+            page.extend(chunk)
+            if not chunk or len(page) >= total:
+                break
+        placeholders = i18n.placeholder_session_names()
+        cands = [r for r in page
+                 if r["thread_id"] != keep and r["thread_id"] < 0
+                 and not r.get("favorite") and r.get("name_auto", True)
+                 and not self._is_busy(r["thread_id"])]
+        if not cands:
+            return 0, 0
+        stats: dict = {}
+        with contextlib.suppress(Exception):
+            stats = await db.get_usage_totals_bulk([r["thread_id"] for r in cands])
+        named = disposed = 0
+        for r in cands:
+            tid = r["thread_id"]
+            requests = int((stats.get(tid) or {}).get("requests", 0) or 0)
+            if requests and (r.get("name") or "").strip() not in placeholders:
+                continue  # used AND already carries a real (auto) name
+            name = None
+            if requests:
+                try:
+                    name = await self._derive_session_name(tid)
+                except Exception:
+                    # Fail SAFE: an unreadable session is left as it is, never archived.
+                    logger.warning("untitled sweep: could not read session %s", tid,
+                                   exc_info=True)
+                    continue
+            if name:
+                with contextlib.suppress(Exception):
+                    await db.set_session_name(tid, name, manual=False)
+                    rec = self._records.get(tid)
+                    if rec is not None:
+                        rec.name = name
+                    named += 1
+            elif await self.dispose_dm_session(uid, tid, r.get("name")):
+                disposed += 1
+        return named, disposed
+
+    async def sweep_untitled_all(self) -> tuple[int, int]:
+        """#413: run tidy_untitled for every DM user (keeping each user's current session).
+        Returns the totals; logs a summary when it changed anything."""
+        named = disposed = 0
+        for uid in await db.dm_user_ids():
+            with contextlib.suppress(Exception):
+                keep = await db.get_dm_current(uid) or 0
+                n, d = await self.tidy_untitled(uid, keep)
+                named += n
+                disposed += d
+        if named or disposed:
+            logger.info("untitled sweep: named %d session(s), archived %d", named, disposed)
+        return named, disposed
+
+    async def _untitled_sweeper_loop(self) -> None:
+        """#413: first sweep shortly after startup (off the startup path), then daily."""
+        delay = _UNTITLED_SWEEP_FIRST
+        while True:
+            try:
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                break
+            delay = _UNTITLED_SWEEP_INTERVAL
+            with contextlib.suppress(Exception):
+                await self.sweep_untitled_all()
+
+    def start_untitled_sweeper(self) -> None:
+        """Start the untitled-session sweeper (idempotent). Called once at startup."""
+        if self._untitled_task is None or self._untitled_task.done():
+            self._untitled_task = asyncio.create_task(self._untitled_sweeper_loop())
+
     def _login_expiry_banner(self, chat_id: int) -> str | None:
         """#379: one-line localized heads-up when the host login (the OAuth refresh token,
         `refreshTokenExpiresAt`) is within LOGIN_EXPIRY_WARN_DAYS of its ~monthly deadline.
@@ -2503,6 +2784,8 @@ class SessionManager:
                 break
             if await self._evict_session(tid):
                 freed += 1
+                logger.info("reaper: closed idle client of thread %s (low memory, floor %d MB)",
+                            tid, floor)  # #414
             if self._mem_available_mb() >= floor:
                 break
         return freed
@@ -2533,7 +2816,11 @@ class SessionManager:
             # applies as the hard safety, so ∞ never risks an OOM).
             ttl = rec.idle_ttl if rec.idle_ttl is not None else self._idle_ttl
             if ttl > 0 and now - rec.last_activity >= ttl:
-                await self._evict_session(tid)
+                # #414: log every eviction (was a silent `await self._evict_session(tid)`), so
+                # "closed after the configured idle time" is visible in the journal.
+                if await self._evict_session(tid):
+                    logger.info("reaper: closed idle client of thread %s (idle %ds, ttl %ds)",
+                                tid, int(now - rec.last_activity), int(ttl))
         # Count ALL live (idle+busy) against the cap, but only ever evict idle ones.
         live_total = len(self._live_thread_ids())
         cap = self._max_live
@@ -2544,7 +2831,9 @@ class SessionManager:
             ]
             idle.sort()
             for _, tid in idle[: live_total - cap]:
-                await self._evict_session(tid)
+                if await self._evict_session(tid):  # #414: logged (was a silent await)
+                    logger.info("reaper: closed idle client of thread %s (live cap %d reached)",
+                                tid, cap)
         # #274: independently age out persistent shells preserved past the client reap.
         await self._reap_detached_shells(now)
 

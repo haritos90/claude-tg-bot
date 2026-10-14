@@ -452,8 +452,9 @@ def test_auto_name_falls_back_to_first_user_message(monkeypatch, tmp_path):
         mode="code", stream_enabled=True, cwd=cwd, name=None, name_auto=True,
     )
     asyncio.run(sm._run_one(rec, -1, "prompt", None, _FakeStreamer()))
-    assert calls == [(-1, "Compare the two SAP reports by aggregation totals", False)]
-    assert rec.name == "Compare the two SAP reports by aggregation totals"
+    # #413: a message-derived name is cut to the /sessions button width on a word boundary.
+    assert calls == [(-1, "Compare the two SAP reports by…", False)]
+    assert rec.name == "Compare the two SAP reports by…"
 
 
 def test_agent_ai_title_overrides_fallback_on_later_turn(monkeypatch, tmp_path):
@@ -1177,19 +1178,20 @@ def test_shell_keypad_builds():
 
 def test_topic_from_text_skips_thin_keeps_substantive():
     """#345: greetings/probes/acks and the injected recap prompt are NOT topics; a
-    real message is kept (whitespace-collapsed) and capped at _AI_TITLE_MAX. The
-    threshold is letter-count, so it is language-agnostic (a short non-English probe
-    is filtered by the same rule)."""
+    real message is kept (whitespace-collapsed) and — #413 — cut to the /sessions button
+    width (_BUTTON_NAME_MAX) on a word boundary. The threshold is letter-count, so it is
+    language-agnostic (a short non-English probe is filtered by the same rule)."""
     tf = sessions._topic_from_text
     assert tf("hi") is None
     assert tf("you up?") is None          # 5 letters < 10
     assert tf("  ok  ") is None
     assert tf("Recap our conversation so far in one short sentence.") is None
     assert tf("Compare the two SAP reports by aggregation totals") == (
-        "Compare the two SAP reports by aggregation totals"
+        "Compare the two SAP reports by…"           # #413: whole words up to the button width
     )
     assert tf("first line of a real ask\nmore detail") == "first line of a real ask more detail"
-    assert len(tf("name " + "z" * 200)) == sessions._AI_TITLE_MAX
+    assert tf("name " + "z" * 200) == "name…"        # a single over-long word is dropped
+    assert len(tf("word " * 30)) <= sessions._BUTTON_NAME_MAX
 
 
 def test_read_session_title_prefers_ai_title(tmp_path):
@@ -1203,7 +1205,7 @@ def test_read_session_title_prefers_ai_title(tmp_path):
     ])
     ai, fb = sessions._read_session_title(cwd, "s1")
     assert ai == "SAP report comparison (final)"
-    assert fb == "Compare the two SAP reports by aggregation totals"
+    assert fb == "Compare the two SAP reports by…"   # #413: button-width cut
 
 
 def test_read_session_title_fallback_on_errored_trivial_opening(tmp_path):
@@ -1219,7 +1221,7 @@ def test_read_session_title_fallback_on_errored_trivial_opening(tmp_path):
     ])
     ai, fb = sessions._read_session_title(cwd, "s2")
     assert ai is None
-    assert fb == "Compare the two SAP reports by aggregation totals"
+    assert fb == "Compare the two SAP reports by…"   # #413: button-width cut
 
 
 def test_read_session_title_all_trivial_stays_unnamed(tmp_path):

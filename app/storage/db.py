@@ -1421,6 +1421,18 @@ async def allocate_dm_session(
     return key
 
 
+async def dm_user_ids() -> list[int]:
+    """#413: every user that owns at least one DM session (a negative ``thread_id`` keyed by
+    the owner's positive ``chat_id`` — the same scope ``browse_threads(uid)`` lists)."""
+    conn = _require_conn()
+    async with _lock:
+        cur = await conn.execute(
+            "SELECT DISTINCT chat_id FROM threads WHERE thread_id < 0 AND chat_id > 0")
+        rows = await cur.fetchall()
+        await cur.close()
+    return [int(r[0]) for r in rows]
+
+
 async def get_dm_current(user_id: int) -> int | None:
     """Return the user's current DM session key, or None if unset."""
     raw = await get_kv(f"dm_current:{user_id}")

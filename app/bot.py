@@ -159,6 +159,12 @@ async def main() -> None:
     with contextlib.suppress(Exception):
         sessions.start_token_refresher()
 
+    # #413: name-or-dispose sweep over every DM user's sessions — a session left on the
+    # "Not named yet" placeholder is either named (by the auto-name priority) or, when it holds
+    # nothing to name it by, archived. Runs shortly after startup, then daily.
+    with contextlib.suppress(Exception):
+        sessions.start_untitled_sweeper()
+
     # #196: Mark the service "up" to systemd IMMEDIATELY (sd_notify READY=1) and start the
     # watchdog BEFORE any network I/O AND before the (local-only) sandbox setup below —
     # so a slow box's seccomp-compile / egress-firewall steps can't delay READY and trip a

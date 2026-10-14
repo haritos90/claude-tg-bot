@@ -413,6 +413,13 @@ CATALOG: dict[str, dict[str, str]] = {
     "session.default_name_chat": {"en": "Not named yet", "ru": "Пока без названия"},
     "session.default_name_code": {"en": "Not named yet", "ru": "Пока без названия"},
     "session.first_default": {"en": "Not named yet", "ru": "Пока без названия"},
+    # #413: placeholder names an untitled session wore under earlier defaults (#273/#282 renamed
+    # them) — never rendered; read by placeholder_session_names() so the untitled sweep still
+    # recognizes an old session that never got a real name. Pipe-separated.
+    "session.legacy_default_names": {
+        "en": "Chat session|Code session|Session 1|New chat|New code session|Untitled",
+        "ru": "Чат-сессия|Код-сессия|Сессия 1|Новый чат|Новая код-сессия|Без названия",
+    },
     "session.fork_name": {"en": "{base} (fork)", "ru": "{base} (форк)"},
     "session.limit_reached": {
         "en": "🔢 You've reached your session limit (<b>{total}/{cap}</b>). Delete a session "
@@ -2234,6 +2241,21 @@ def yesno(value: bool, lang: str = DEFAULT_LANG) -> str:
 def mode_word(mode: str, lang: str = DEFAULT_LANG) -> str:
     """Localized session-type word for display ('chat'/'code')."""
     return t("mode.word_code" if mode == "code" else "mode.word_chat", lang)
+
+
+
+
+def placeholder_session_names() -> set[str]:
+    """#413: every name a session carries while still untitled — the current default names in
+    every locale plus the legacy defaults — so the untitled sweep can tell an unnamed session
+    from one that already holds a real (auto) name."""
+    out: set[str] = set()
+    for key in ("session.default_name_chat", "session.default_name_code",
+                "session.first_default"):
+        out.update(v.strip() for v in CATALOG.get(key, {}).values() if v.strip())
+    for v in CATALOG.get("session.legacy_default_names", {}).values():
+        out.update(x.strip() for x in v.split("|") if x.strip())
+    return out
 
 
 def lang_name(lang: str) -> str:
