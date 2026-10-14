@@ -1,16 +1,16 @@
 # Telegram bot for Claude via Claude Agent SDK
 
-A private, multi-user Telegram bot that fronts Claude Code. You run it on your own
-server on a Claude Pro/Max subscription. The subscription owner
-uses it and can grant access to other Telegram users; each user talks to the bot in a DM and
-keeps named, isolated sessions whose histories never cross.
+A private, multi-user Telegram bot that fronts Claude Code, with optional support for the
+[MAX](https://max.ru) messenger. You run it on your own server on a Claude Pro/Max subscription.
+The subscription owner uses it and can grant access to other users; each user talks to the bot
+in a DM and keeps named, isolated sessions whose histories never cross.
 
 A session starts as chat and can be upgraded to code and back, in the same conversation:
 
 - chat — a Claude conversation with web tools (search and fetch).
 - code — a Claude Code agent with a working directory on the server, it runs shell commands and
   edits files. Permissions are managed with Allow/Deny tap, with auto mode available `/auto on`. `/code`
-  upgrades a chat (needs code user priviliges); `/chat` downgrades, keeping the files.
+  upgrades a chat (needs code user privileges); `/chat` downgrades, keeping the files.
 
 Built on the [Claude Agent SDK](https://docs.claude.com/en/api/agent-sdk/overview).
 
@@ -28,7 +28,7 @@ Built on the [Claude Agent SDK](https://docs.claude.com/en/api/agent-sdk/overvie
   are written (Bot API 10.1 drafts).
 - _Chat and code in one session_: chat has web search and fetch; code adds the full agent toolset
   (Bash, file edits, notebooks) with a working directory on the server.
-- _Isolated sessions_: each has its own context and working directory. Browse, switch, rename, favirite, fork,
+- _Isolated sessions_: each has its own context and working directory. Browse, switch, rename, favorite, fork,
   and delete via `/sessions`.
 - _Voice message input (optional)_: a voice message is transcribed on-device and handled as
   if typed; the recognized text is shown so a mis-hearing is visible. See [voice.md](docs/voice.md).
@@ -62,7 +62,7 @@ Built on the [Claude Agent SDK](https://docs.claude.com/en/api/agent-sdk/overvie
 ## How it works
 
 ```bash
-You ──DM──▸ @your_bot
+You ──DM──▸ @your_bot                                  (Telegram, or MAX when enabled)
              └── /new ──▸ a chat session   (switch with /sessions · upgrade with /code)
                    ├── chat: Agent SDK + web research (WebSearch/WebFetch)
                    └── code: Agent SDK + full tools, cwd = BASE_WORKDIR/<session>
@@ -73,7 +73,9 @@ Every session runs on the same subscription and share one usage-limit pool. Ther
 cross-session memory.
 
 Claude replies in Markdown; the bot renders each reply as native rich messages (headings, lists,
-tables, math, code) and streams it live, falling back to Markdown→HTML and a `.md` file.
+tables, math, code) and streams it live, falling back to Markdown→HTML and a `.md` file. On MAX,
+which has neither drafts nor rich blocks, the reply arrives whole once ready, and a map pin,
+diagram or wide table is sent as its own message at its spot in the text.
 
 ---
 
@@ -92,7 +94,7 @@ tables, math, code) and streams it live, falling back to Markdown→HTML and a `
 2. Open the bot in MAX and send any message. Your Telegram chat with the bot receives the access
    request — tap Allow there (the MAX account is a separate user, even when it is yours).
    The platform's TLS root is bundled; nothing to install. See
-   [configuration.md](docs/configuration.md#max-messenger).
+   [configuration.md](docs/configuration.md#max-messenger) and the [MAX Bot API docs][max-api].
 
 ### Server
 
@@ -136,7 +138,9 @@ Each user has a level (`chat`, or `code` for chat plus code), an optional expiry
 rolling usage caps (a trailing 5h and a trailing 7d cap). Usage and caps are counted in tokens
 (input + output). Manage from Telegram
 (owner only): `/allow`, `/deny`, `/level`, `/expire`, `/limit`, `/users`. Numeric ids are
-authoritative; a `@username` grant pins to its id on the user's first message.
+authoritative; a `@username` grant pins to its id on the user's first message. MAX users are
+allowlisted the same way under their own ids (a MAX account is never the owner); their access
+requests arrive in your Telegram chat with one-tap Allow buttons.
 
 Every setting (model, effort, permissions, memory, language, …) also has an owner-set base access —
 Delegated, Read-only, or Hidden — with per-user exceptions on the user card. Effective values
@@ -147,7 +151,7 @@ resolve per prompt (session → personal default → global). The full model is 
 
 ## Commands
 
-The full set lives in the tap-to-open Telegram menu; code-only commands are hidden from chat-level
+The full set lives in the tap-to-open Telegram menu (the `/` hint list on MAX); code-only commands are hidden from chat-level
 users, owner commands from everyone else. Plain text goes to the current session's Claude.
 Fixed-choice commands open an inline picker; commands needing free text prompt for your next
 message (with `/cancel`). `/help` is generated from the same registry. The full menu structure is
@@ -182,6 +186,8 @@ access to is trusting you, the operator; share accordingly and keep the host sec
   session can consume. Each layer has an `.env` off-switch for a host that can't support it, and the
   bot runs with them on. The mechanism and threat model are in [isolation.md](docs/isolation.md); the
   storage layout is in [data-model.md](docs/data-model.md).
+- MAX is off unless `MAX_BOT_TOKEN` is set. Its client trusts the bundled Russian Trusted Root CA
+  for the platform host only (`MAX_CA_BUNDLE`); nothing is installed system-wide.
 - Hidden CLI keyword triggers (`ultrathink`, `ultracode`) that could burn the shared subscription
   are defused; reasoning depth is controlled only via `/effort`.
 
@@ -205,7 +211,8 @@ It restarts on any crash and on boot and never gives up; a connection watchdog f
 about three minutes without reaching Telegram; a background loop refreshes the subscription OAuth
 token before it expires and warns before the monthly login lapses. Run the service as the same user
 that ran `claude setup-token`, and never start a second `python -m app` against the same token (two
-pollers give a 409). Tunables and the resilience knobs are in [configuration.md](docs/configuration.md).
+pollers give a 409). A MAX outage only logs and backs off; it never takes the Telegram side down.
+Tunables and the resilience knobs are in [configuration.md](docs/configuration.md).
 
 ---
 
@@ -213,16 +220,17 @@ pollers give a 409). Tunables and the resilience knobs are in [configuration.md]
 
 The code is one package, `app`, run with `python -m app`: `app/core` (the Agent-SDK engine, session
 manager, token refresh, schedules, transcription), `app/storage` (SQLite state, archives, usage),
-`app/access` (allowlist, permission gate, settings), and `app/telegram` (handlers, streaming,
-formatting). Out-of-process helpers live in `deploy/`. The full module map is in
+`app/access` (allowlist, permission gate, settings), `app/telegram` (handlers, streaming,
+formatting), and `app/max` (the MAX transport behind the aiogram session seam). Out-of-process
+helpers live in `deploy/`. The full module map is in
 [architecture.md](docs/architecture.md); the contribution guide is [CONTRIBUTING.md](CONTRIBUTING.md),
 and [AGENTS.md](AGENTS.md) is the context file for AI coding agents.
 
 | Document                                          | Covers                                                                  |
 | ------------------------------------------------- | ----------------------------------------------------------------------- |
-| [architecture.md](docs/architecture.md)           | Package layout and the module map                                       |
+| [architecture.md](docs/architecture.md)           | Package layout, the module map, and the two-messenger seam              |
 | [gotchas.md](docs/gotchas.md)                     | Hard-won SDK / Telegram / lifecycle / sandbox invariants, per subsystem |
-| [configuration.md](docs/configuration.md)         | Every `.env` setting, concurrency/resource tunables, capacity planning  |
+| [configuration.md](docs/configuration.md)         | Every `.env` setting, the MAX messenger, resource tunables, capacity    |
 | [data-model.md](docs/data-model.md)               | What is persisted, the on-disk layout, the SQLite schema                |
 | [isolation.md](docs/isolation.md)                 | The sandbox and containment stack, and its threat model                 |
 | [menu.md](docs/menu.md)                           | Every command, menu, and the settings/access model                      |
@@ -234,13 +242,21 @@ and [AGENTS.md](AGENTS.md) is the context file for AI coding agents.
 
 Telegram reference: [Rich message formatting][tg-fmt] · [HTML style][tg-html].
 
+MAX reference: [Bot API][max-api] · [Updates (long polling)][max-updates] ·
+[Attachment types][max-attachments] · [OpenAPI schema][max-schema] · [Bot creation][max-setup].
+
 [tg-fmt]: https://core.telegram.org/bots/api#rich-message-formatting-options
 [tg-html]: https://core.telegram.org/bots/api#html-style
+[max-api]: https://dev.max.ru/docs-api
+[max-updates]: https://dev.max.ru/docs-api/methods/GET/updates
+[max-attachments]: https://dev.max.ru/docs-api/use-cases/sending-messages/attachment-types
+[max-schema]: https://github.com/max-messenger/api-schema
+[max-setup]: https://business.max.ru/self
 
 ---
 
 ## Legal
 
 For personal, development, and research use. You are solely responsible for how you use it and must
-comply with applicable laws and with the Anthropic and Telegram terms of service. MIT licensed — see
+comply with applicable laws and with the Anthropic, Telegram and MAX terms of service. MIT licensed — see
 [`LICENSE`](LICENSE).
